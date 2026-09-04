@@ -10,16 +10,16 @@ use rvt_schema::{FieldType, PropertyDefinition, Schema, TypeReference};
 
 use crate::{geometry::GElementNodeReference, member::MAX_STRING_CHARS};
 
-/// A serialized reference to another node: identifier plus class index.
+/// A serialized reference written by a geometry-graph node: identifier plus
+/// class index, both always present. See [`GEOMETRY_NODE_ROOT_CLASS_NAME`].
 const OBJECT_REFERENCE_BYTES: usize = 6;
-/// Short width of an `Integer32Alternate`, which is variable. Only
-/// `GInfo.m_flags` is known to take this form, and only there is a trigger
-/// established: see [`ALTERNATE_CONTINUATION_BIT`]. It is also what the record
-/// header reads - see [`NODE_STREAM_PREFIX_BYTES`].
+/// Short width of an `Integer32Alternate`. Two fields take it: `GInfo.m_flags`,
+/// where the lead word's top bit is the trigger (see
+/// [`ALTERNATE_CONTINUATION_BIT`]), and whichever variable-width field opens a
+/// record body (see [`FIRST_RECORD_IDENTIFIER_BYTES`]).
 const ALTERNATE_INTEGER32_BYTES: usize = 2;
 /// Long width of an `Integer32Alternate`, which is its declared width, and the
-/// width every alternate integer in the node stream other than `GInfo.m_flags`
-/// is written at.
+/// width every alternate integer other than those two is written at.
 ///
 /// Measured, not guessed. Reading them at the short width leaves the rest of
 /// the record shifted two bytes early, which the record's own length hides
@@ -31,15 +31,25 @@ const ALTERNATE_INTEGER32_BYTES: usize = 2;
 /// `GFilling.m_fillColor` reads as colours - 0x01000000 for the great
 /// majority, then 0x0000ffff, 0x00fdfdfd, 0x0000bb00 - where the short read
 /// splits each colour across two fields.
-///
-/// The record's own header is left alone: there the same field reads two bytes
-/// followed by [`NODE_STREAM_PREFIX_BYTES`], and widening it to four with no
-/// prefix parses the corpus identically, so nothing here separates the two.
 const ALTERNATE_INTEGER32_LONG_BYTES: usize = 4;
 /// Width read for `Integer16Alternate`, by the same reasoning.
 const ALTERNATE_INTEGER16_BYTES: usize = 1;
 /// Inline object whose `m_flags` carries the variable width.
 const GINFO_CLASS_NAME: &str = "GInfo";
+/// Root of the geometry graph's class chain. Objects rooted here write a
+/// reference's class index even when the identifier is null; every other object
+/// stops after a null identifier, so a null costs four bytes rather than six.
+///
+/// Measured, not guessed, and the split is real rather than a convenience:
+/// reading every reference at the fixed six bytes explains 97.4% of SMALL's
+/// `GElement` records and 0% of its `FamilyInstance` records; reading every
+/// reference variably explains 54.3% of the `FamilyInstance` records and drops
+/// `GElement` to 79.1%; splitting on the class chain's root holds both at once,
+/// 97.4% and 54.3%, with `FamilySymbol` going from 0% to 72.9%. Single records
+/// corroborate both forms: `GeomTable.m_bigTableOwner`, a null in a
+/// `FamilyInstance` record, is followed four bytes later by the next property's
+/// value, while a `GFace` node's null filling is followed six bytes later.
+const GEOMETRY_NODE_ROOT_CLASS_NAME: &str = "GNode";
 /// Top bit of an alternate integer's lead word, marking the longer form.
 const ALTERNATE_CONTINUATION_BIT: u16 = 0x8000;
 /// Bit of the loading mode that marks a property holding references rather
@@ -51,6 +61,34 @@ const REFERENCE_LOADING_BIT: u8 = 0x01;
 const IDENTIFIER_ONLY_LOADING_BIT: u8 = 0x02;
 /// A bare identifier reference.
 const IDENTIFIER_REFERENCE_BYTES: usize = 4;
+/// Width of the variable-width field that opens a record body, which is written
+/// two bytes narrower than its declared four.
+///
+/// Measured, not guessed. On 17 `Element`-rooted record classes across roughly
+/// 57 000 records of SMALL - `FamilyInstance`, `FamilySymbol`, `Level`,
+/// `LeaderStyle`, `RbsPipeCurve`, `CategoryElem`, `GStyleElem` and ten more -
+/// reading the record's first identifier at two bytes and every later one at
+/// four lands `Element.m_id` on the record's own identifier in 100% of records;
+/// reading the first at four lands it in 0%.
+///
+/// The same rule covers what an earlier reading called a two-byte prefix
+/// between a record's declared properties and its node stream. A `GElement`
+/// record's first variable-width field is `GInfo.m_flags`, not an identifier,
+/// and reading that one narrow while every later alternate integer takes its
+/// declared width explains those records byte for byte - the same 97.4% /
+/// 98.3% / 97.6% as the prefix reading, with the same stop histogram - so one
+/// rule replaces two. The prefix reading is what the same two bytes look like
+/// when the narrowing is attributed to the end of the header instead of its
+/// start.
+///
+/// Why the opening field is narrow is *not* established. Nothing in the corpus
+/// separates "the record header omits the field's high half" from "the record
+/// framing eats two bytes the body would otherwise carry", because the opening
+/// field is the only place the narrow form appears.
+const FIRST_RECORD_IDENTIFIER_BYTES: usize = 2;
+/// Width of a reference's class index, written only when the identifier names
+/// an object. A null reference - identifier zero - stops after the identifier.
+const REFERENCE_CLASS_INDEX_BYTES: usize = 2;
 /// Guard against a cyclic or malformed class chain.
 const MAX_WALK_DEPTH: usize = 64;
 /// Guard against a corrupt collection count claiming an absurd number of items.
@@ -105,6 +143,8 @@ pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk
         numbers: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
+        fixed_references: false,
+        record_narrow_pending: true,
         node_flags: 0,
         trace: None,
     };
@@ -133,6 +173,8 @@ pub fn walk_object_stream(schema: &Schema, class_index: u16, body: &[u8]) -> Ser
         numbers: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
+        fixed_references: false,
+        record_narrow_pending: true,
         node_flags: 0,
         trace: None,
     };
@@ -171,10 +213,6 @@ pub struct SerialStreamWalk {
     pub stop: Option<SerialStop>,
 }
 
-/// Bytes between a record's own declared properties and its node stream. This
-/// gap is real, not an artefact of the alternate integer: records whose
-/// `GRep.m_flags` lead word has its top bit clear still hold it.
-const NODE_STREAM_PREFIX_BYTES: usize = 2;
 /// Trailing `u32` that repeats the record's own body length.
 pub const RECORD_LENGTH_TRAILER_BYTES: usize = 4;
 /// Inline object that holds a live document handle rather than data. Its one
@@ -326,16 +364,12 @@ fn walk_record_inner(
         numbers: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
+        fixed_references: false,
+        record_narrow_pending: true,
         node_flags: 0,
         trace: trace.then(Vec::new),
     };
     let mut stop = reader.read_class(class_index, 0).err();
-    if stop.is_none() && reader.advance(NODE_STREAM_PREFIX_BYTES).is_none() {
-        stop = Some(SerialStop::Truncated {
-            class: "record".to_owned(),
-            property: "node stream prefix".to_owned(),
-        });
-    }
     reader.node_headers = true;
     let mut nodes = 0_usize;
     let mut next = 0_usize;
@@ -354,6 +388,7 @@ fn walk_record_inner(
             continue;
         }
         nodes += 1;
+        reader.fixed_references = reader.is_geometry_node(reference.class_index);
         let began = reader.offset;
         let first_reference = reader.references.len();
         let first_identifier = reader.identifiers.len();
@@ -415,6 +450,13 @@ struct Reader<'a> {
     /// Whether the walk is inside the node stream rather than the record's
     /// own declared properties.
     node_headers: bool,
+    /// Whether the object being read writes a class index after a null
+    /// identifier. See [`GEOMETRY_NODE_ROOT_CLASS_NAME`].
+    fixed_references: bool,
+    /// Whether the record body's first variable-width field is still to come.
+    /// That field is written two bytes narrower than its declared width; every
+    /// later one takes the declared width. See [`FIRST_RECORD_IDENTIFIER_BYTES`].
+    record_narrow_pending: bool,
     /// Flags of the `GInfo` most recently read, which gate later-version
     /// properties for the rest of that object.
     node_flags: u32,
@@ -539,11 +581,17 @@ impl Reader<'_> {
                 self.read_property(class_name, element, depth + 1)
             }
             FieldType::Object => {
-                if property.loading_mode & REFERENCE_LOADING_BIT != 0 {
-                    if property.loading_mode & IDENTIFIER_ONLY_LOADING_BIT != 0 {
-                        return self.take_identifier().ok_or_else(truncated);
+                let reference = property.loading_mode & REFERENCE_LOADING_BIT != 0;
+                let identifier_only = property.loading_mode & IDENTIFIER_ONLY_LOADING_BIT != 0;
+                if reference && identifier_only {
+                    return self.take_identifier().ok_or_else(truncated);
+                }
+                if reference || identifier_only {
+                    if self.fixed_references {
+                        self.take_reference().ok_or_else(&truncated)?;
+                    } else {
+                        self.take_record_reference().ok_or_else(&truncated)?;
                     }
-                    self.take_reference().ok_or_else(&truncated)?;
                     if class_name == FILLED_FACE_CLASS_NAME
                         && property.name == FILLED_FACE_FILLING_PROPERTY
                         && self
@@ -620,12 +668,12 @@ impl Reader<'_> {
                     };
                     return self.advance(width).ok_or_else(truncated);
                 }
-                // Every other alternate integer in the node stream is written
-                // at its declared four bytes.
-                let width = if self.node_headers {
-                    ALTERNATE_INTEGER32_LONG_BYTES
-                } else {
+                // Every other alternate integer is written at its declared
+                // four bytes, except the one that opens a record body.
+                let width = if self.take_narrow() {
                     ALTERNATE_INTEGER32_BYTES
+                } else {
+                    ALTERNATE_INTEGER32_LONG_BYTES
                 };
                 self.advance(width).ok_or_else(truncated)
             }
@@ -703,6 +751,61 @@ impl Reader<'_> {
         let bytes = self.body.get(self.offset..end)?;
         self.identifiers
             .push(u32::from_le_bytes(bytes.try_into().ok()?));
+        self.offset = end;
+        Some(())
+    }
+
+    /// Whether `class_index` descends from the geometry graph's root class.
+    fn is_geometry_node(&self, class_index: u16) -> bool {
+        let mut current = Some(class_index);
+        for _ in 0..MAX_WALK_DEPTH {
+            let Some(class) = current.and_then(|index| self.schema.class_by_index(index)) else {
+                return false;
+            };
+            if class.name == GEOMETRY_NODE_ROOT_CLASS_NAME {
+                return true;
+            }
+            current = class.parent.index();
+        }
+        false
+    }
+
+    /// Whether this is the record body's first variable-width field, which is
+    /// written narrow. Claims the narrow form, so only one field gets it.
+    fn take_narrow(&mut self) -> bool {
+        let narrow = self.record_narrow_pending;
+        self.record_narrow_pending = false;
+        narrow
+    }
+
+    /// Read a reference in a record's own header, where the identifier is
+    /// four bytes - two if it opens the body - and the class index follows only
+    /// when the identifier names an object.
+    fn take_record_reference(&mut self) -> Option<()> {
+        let identifier_bytes = if self.take_narrow() {
+            FIRST_RECORD_IDENTIFIER_BYTES
+        } else {
+            IDENTIFIER_REFERENCE_BYTES
+        };
+        let end = self.offset.checked_add(identifier_bytes)?;
+        let bytes = self.body.get(self.offset..end)?;
+        let mut identifier = [0_u8; 4];
+        identifier[..identifier_bytes].copy_from_slice(bytes);
+        let object_id = u32::from_le_bytes(identifier);
+        self.offset = end;
+        if object_id == 0 {
+            self.references.push(GElementNodeReference {
+                object_id: 0,
+                class_index: 0,
+            });
+            return Some(());
+        }
+        let end = self.offset.checked_add(REFERENCE_CLASS_INDEX_BYTES)?;
+        let bytes = self.body.get(self.offset..end)?;
+        self.references.push(GElementNodeReference {
+            object_id,
+            class_index: u16::from_le_bytes(bytes.try_into().ok()?),
+        });
         self.offset = end;
         Some(())
     }
@@ -870,9 +973,10 @@ mod tests {
         );
     }
 
-    /// A record shaped like the corpus: the root's declared properties, a
-    /// two-byte stream prefix, one node whose inline `GInfo` ends in the
-    /// variable-width flags word, and the length trailer.
+    /// A record shaped like the corpus: the root's declared properties, whose
+    /// first variable-width field is the inline `GInfo` flags word and so is
+    /// written narrow, one node whose own `GInfo` ends in the variable-width
+    /// flags word, and the length trailer.
     fn record_schema() -> Schema {
         let mut info = property("m_GInfo", FieldType::Object, 0x00, 0, None);
         info.static_type = Some(TypeReference::Reference {
@@ -930,7 +1034,6 @@ mod tests {
         body.extend(1_u32.to_le_bytes()); // one sub-node
         body.extend(3_u32.to_le_bytes());
         body.extend(node_class.to_le_bytes());
-        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
         body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
         body.extend(LONG_FLAGS.to_le_bytes()); // four bytes: top bit set
         body.extend(0_u16.to_le_bytes());
@@ -983,7 +1086,6 @@ mod tests {
         body.extend(1_u32.to_le_bytes()); // one sub-node
         body.extend(3_u32.to_le_bytes());
         body.extend(node_class.to_le_bytes());
-        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
         body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
         body.extend(SHORT_FLAGS.to_le_bytes());
         body.extend(0x0100_0000_u32.to_le_bytes()); // m_fillColor
@@ -1019,7 +1121,6 @@ mod tests {
         body.extend(1_u32.to_le_bytes()); // one sub-node
         body.extend(3_u32.to_le_bytes());
         body.extend(node_class.to_le_bytes());
-        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
         body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
         body.extend(SHORT_FLAGS.to_le_bytes());
         body.extend(0.0_f64.to_le_bytes());
@@ -1064,9 +1165,7 @@ mod tests {
         body.extend(2_u32.to_le_bytes()); // two sub-nodes: one real, one null
         body.extend(3_u32.to_le_bytes());
         body.extend(node_class.to_le_bytes());
-        body.extend(0_u32.to_le_bytes());
-        body.extend(0_u16.to_le_bytes());
-        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
+        body.extend(0_u32.to_le_bytes()); // the null: identifier only
         body.extend((-1_i32).to_le_bytes());
         body.extend(SHORT_FLAGS.to_le_bytes());
         body.extend(9_u32.to_le_bytes()); // m_pSurf: identifier and class
@@ -1091,6 +1190,115 @@ mod tests {
                 object_id: 9,
                 class_index: 565,
             })
+        );
+    }
+
+    #[test]
+    fn the_field_that_opens_a_record_body_is_written_narrow() {
+        // A record whose first declared property is a reference: its
+        // identifier holds two bytes, not the four a later one would.
+        let mut classes = record_schema().classes;
+        classes[1].properties = vec![
+            property("m_pHead", FieldType::Object, 0x01, 0, None),
+            property("m_pTail", FieldType::Object, 0x01, 0, None),
+        ];
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+        let node_class = FIRST_CLASS_INDEX + 2;
+
+        let mut body = Vec::new();
+        body.extend(0xffff_u16.to_le_bytes()); // m_pHead: a narrow identifier
+        body.extend(node_class.to_le_bytes());
+        body.extend(0_u32.to_le_bytes()); // m_pTail: null, identifier only
+        body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(0.0_f64.to_le_bytes());
+        body.extend(287.5_f64.to_le_bytes());
+        let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+        body.extend(length.to_le_bytes());
+
+        let walk = walk_record(&schema, FIRST_CLASS_INDEX + 1, &body);
+        assert_eq!(walk.stop, None);
+        assert!(walk.is_exact());
+        assert_eq!(walk.nodes, 1);
+        assert_eq!(
+            walk.references,
+            [
+                GElementNodeReference {
+                    object_id: 0xffff,
+                    class_index: node_class,
+                },
+                GElementNodeReference {
+                    object_id: 0,
+                    class_index: 0,
+                },
+            ]
+        );
+
+        // The same body with two more bytes in the opening identifier is not
+        // explained: the narrow form is the record's, not this fixture's.
+        let mut wide = body.clone();
+        wide.splice(2..2, [0_u8; 2]);
+        let length = u32::try_from(wide.len()).unwrap();
+        let last = wide.len() - RECORD_LENGTH_TRAILER_BYTES;
+        wide[last..].copy_from_slice(&length.to_le_bytes());
+        assert!(!walk_record(&schema, FIRST_CLASS_INDEX + 1, &wide).is_exact());
+    }
+
+    #[test]
+    fn a_geometry_node_writes_a_class_index_after_a_null_identifier() {
+        // Two nodes of the same shape, one rooted at the geometry graph and one
+        // not. The null reference costs six bytes in the first and four in the
+        // second.
+        let mut classes = record_schema().classes;
+        classes[2].properties = vec![
+            classes[2].properties[0].clone(),
+            property("m_pSurf", FieldType::Object, 0x01, 0, None),
+        ];
+        classes.push(class(
+            FIRST_CLASS_INDEX + 3,
+            GEOMETRY_NODE_ROOT_CLASS_NAME,
+            TypeReference::None,
+            Vec::new(),
+        ));
+        let mut geometry_node = classes[2].clone();
+        geometry_node.index = FIRST_CLASS_INDEX + 4;
+        geometry_node.name = "GFace".to_owned();
+        geometry_node.parent = TypeReference::Reference {
+            index: FIRST_CLASS_INDEX + 3,
+            name: GEOMETRY_NODE_ROOT_CLASS_NAME.to_owned(),
+        };
+        classes.push(geometry_node);
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+
+        let record = |node_class: u16, null_bytes: usize| {
+            let mut body = Vec::new();
+            body.extend(6_i32.to_le_bytes()); // Root's inline GInfo
+            body.extend(SHORT_FLAGS.to_le_bytes());
+            body.extend(1_u32.to_le_bytes()); // one sub-node
+            body.extend(3_u32.to_le_bytes());
+            body.extend(node_class.to_le_bytes());
+            body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
+            body.extend(SHORT_FLAGS.to_le_bytes());
+            body.extend(vec![0_u8; null_bytes]); // m_pSurf: null
+            let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+            body.extend(length.to_le_bytes());
+            body
+        };
+
+        let root = FIRST_CLASS_INDEX + 1;
+        let plain = FIRST_CLASS_INDEX + 2;
+        let geometry = FIRST_CLASS_INDEX + 4;
+        assert!(walk_record(&schema, root, &record(plain, IDENTIFIER_REFERENCE_BYTES)).is_exact());
+        assert!(!walk_record(&schema, root, &record(plain, OBJECT_REFERENCE_BYTES)).is_exact());
+        assert!(walk_record(&schema, root, &record(geometry, OBJECT_REFERENCE_BYTES)).is_exact());
+        assert!(
+            !walk_record(&schema, root, &record(geometry, IDENTIFIER_REFERENCE_BYTES)).is_exact()
         );
     }
 
@@ -1123,7 +1331,6 @@ mod tests {
         body.extend(1_u32.to_le_bytes());
         body.extend(3_u32.to_le_bytes());
         body.extend((FIRST_CLASS_INDEX + 2).to_le_bytes());
-        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
         body.extend((-1_i32).to_le_bytes());
         body.extend(SHORT_FLAGS.to_le_bytes());
         let prefix = body.clone();
