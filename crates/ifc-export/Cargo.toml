@@ -1,0 +1,12 @@
+[package]
+name = "ifc-export"
+description = "Minimal IFC4 STEP writer for canonical BIM models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bim-core = { path = "../bim-core" }
+
+[lints]
+workspace = true

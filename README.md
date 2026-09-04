@@ -46,6 +46,8 @@ cargo run -p rivet-cli -- inspect model.rvt
 cargo run -p rivet-cli -- names model.rvt
 cargo run -p rivet-cli -- parameters model.rvt --class FamilyInstance
 cargo run -p rivet-cli -- export-json model.rvt --output model.jsonl
+cargo run -p rivet-cli -- export-ifc model.rvt --output model.ifc
+python -m ifcopenshell.validate model.ifc --rules
 ```
 
 `schema` reports the generic class hierarchy and property counts without
@@ -63,11 +65,37 @@ inventory: identifiers, records, and the class histogram. `element` lists every
 record belonging to one identifier, with its category and family reference when
 the element's header record carries them. `bodies` prints record payloads of one
 class as hex for field analysis. `export-json` writes one JSON object per
-element with its class, name, category code, level, phase, parameter values,
-deletion/lock flags, and the byte location it came from. `names` reports where each class keeps its
+element with its class, name, category code, level, phase, level elevation,
+parameter values, Revit 2023 built-in names, model-defined parameter specs,
+known canonical-unit conversions, deletion/lock flags, and the byte location
+it came from. Independently bounds-verified straight pipes additionally carry
+a metric swept-disk axis and radius; owner-verified, single-line pipe-fitting
+centerlines carry an axis-only metric representation. A diagnostic
+`FamilyInstance` placement is included only when one orthonormal
+`m_instOrigin`/`m_RefDir`/`m_zAxis` candidate is unique inside independently
+recovered owner bounds; it is not yet promoted to IFC. `names` reports where each class keeps its
 string and how consistently, so a name read at a calibrated offset can be told
-apart from one found by scanning. Parameters, names, and geometry are still undecoded, so they are
-absent from the export rather than approximated.
+apart from one found by scanning.
+`export-ifc` writes an IFC4 Reference View file with
+`IfcProject -> IfcSite -> IfcBuilding -> IfcBuildingStorey`, metric units,
+deterministic 22-character GlobalIds, and typed MEP elements. The current
+conservative mapping covers pipe segments/fittings, sanitary/air/fire-
+suppression terminals; unknown class/category pairs remain
+`IfcBuildingElementProxy` instances. Verified straight pipes receive an
+`IfcPolyline` axis and `IfcSweptDiskSolid` body. Pipe fittings with one
+unambiguous straight `PipeFittingCenterLine` receive an `IfcPolyline` axis but
+no invented body. Bounds-verified, right-handed `GInstance` transforms become
+storey-relative `IfcLocalPlacement` values; world-space geometry is converted
+back into that local frame. Other geometry is omitted rather than approximated.
+Project storeys are `Level` records without a family reference; family-local
+reference levels are not promoted to building storeys.
+By default it includes live categorized records with a recovered level;
+`--include-unplaced` also includes categorized records without one. Parameter
+arrays are written only when their value kinds agree with the dynamic set
+classes referenced by the element and exactly one matching run is present;
+legacy unbound results from unsupported releases stay out of IFC. Pass
+`--model-namespace <UUID>` to keep IDs stable if the source file moves,
+otherwise the canonical RVT path determines the namespace.
 Unknown stream bytes are always available through `dump-stream` and the
 `rvt-container` API.
 
@@ -77,6 +105,8 @@ Unknown stream bytes are always available through `dump-stream` and the
 - `rvt-schema`: generic schema definitions
 - `rvt-model`: loss-preserving serialized-object IR
 - `bim-core`: format-independent BIM types
+- `revit-catalog`: versioned Revit identifiers and Forge unit conversion
+- `ifc-export`: IFC4 model builder, GlobalId and STEP writer
 - `rivet-cli`: command-line interface
 
 See [`docs/architecture.md`](docs/architecture.md) and
@@ -85,10 +115,15 @@ evidence.
 
 ## Status
 
-Rivet is experimental. It recovers the object graph's records, identifiers, and
-classes, but not yet record contents or geometry, and it never writes RVT
-files.
+Rivet is experimental. It recovers the object graph's records, identifiers,
+classes, selected fields, level elevations, names, and schema-bound parameter
+sets, plus independently checked straight-pipe bodies and straight fitting
+axes. General geometry is not decoded, and Rivet never writes RVT files.
 
-The exporter targets are JSON first and IFC after it, both reading `bim-core`
-only. Neither is implemented yet: they follow the object graph and semantic
-reconstruction. See [`docs/architecture.md`](docs/architecture.md).
+The JSON-lines diagnostic exporter and a conservative IFC4 exporter are
+implemented. Coordination IFC still requires most element geometry, and legacy
+parameter candidates from unsupported schemas stay out of IFC. See
+[`docs/architecture.md`](docs/architecture.md).
+
+The live metadata sample is checked with IfcOpenShell's schema validator and
+IFC4 EXPRESS rules in addition to the Rust test suite.

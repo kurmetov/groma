@@ -567,6 +567,85 @@ impl ElementFields {
     }
 }
 
+/// Serialized bytes from a dynamic `Plane` class marker through its `m_yVec`.
+///
+/// The layout is the two-byte dynamic class index, the `Surface` base fields
+/// (`Envelope`, then `m_orientFlag`), and the three `Plane` vectors
+/// (`m_origin`, `m_xVec`, `m_yVec`).
+pub const LEVEL_SERIALIZED_PLANE_BYTES: usize = 2 + 4 * 8 + 1 + 3 * 3 * 8;
+
+/// Fields recovered from the plane stored by a `Level`/`DatumPlane`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LevelFields {
+    /// Offset of the schema-resolved dynamic `Plane` class marker.
+    pub plane_offset: usize,
+    /// `Plane.m_origin[2]`, in Revit's internal length unit (feet).
+    pub elevation_feet: f64,
+}
+
+impl LevelFields {
+    /// Locate the serialized `DatumPlane.m_pSurface` and read its origin Z.
+    ///
+    /// `plane_class_index` comes from `Formats/Latest`; it must not be
+    /// hardcoded because schema indexes can drift by release. A candidate is
+    /// accepted only when the complete plane fits, all numbers are finite,
+    /// the orientation flag is boolean, and its X/Y axes are orthonormal.
+    /// Multiple surviving candidates are rejected as ambiguous.
+    #[must_use]
+    pub fn parse(body: &[u8], plane_class_index: u16) -> Option<Self> {
+        const VECTOR_TOLERANCE: f64 = 1.0e-8;
+
+        let marker = plane_class_index.to_le_bytes();
+        let mut found = None;
+        for offset in 0..=body.len().checked_sub(LEVEL_SERIALIZED_PLANE_BYTES)? {
+            if body.get(offset..offset + 2)? != marker {
+                continue;
+            }
+            let plane = body.get(offset..offset + LEVEL_SERIALIZED_PLANE_BYTES)?;
+            if plane[34] > 1 {
+                continue;
+            }
+            let read_f64 = |at: usize| {
+                let bytes: [u8; 8] = plane.get(at..at + 8)?.try_into().ok()?;
+                Some(f64::from_le_bytes(bytes))
+            };
+            let envelope = [read_f64(2)?, read_f64(10)?, read_f64(18)?, read_f64(26)?];
+            let origin = [read_f64(35)?, read_f64(43)?, read_f64(51)?];
+            let x_axis = [read_f64(59)?, read_f64(67)?, read_f64(75)?];
+            let y_axis = [read_f64(83)?, read_f64(91)?, read_f64(99)?];
+            if envelope
+                .into_iter()
+                .chain(origin)
+                .chain(x_axis)
+                .chain(y_axis)
+                .any(|value| !value.is_finite())
+            {
+                continue;
+            }
+            let squared_norm = |axis: [f64; 3]| axis.into_iter().map(|v| v * v).sum::<f64>();
+            let dot = x_axis
+                .into_iter()
+                .zip(y_axis)
+                .map(|(left, right)| left * right)
+                .sum::<f64>();
+            if (squared_norm(x_axis) - 1.0).abs() > VECTOR_TOLERANCE
+                || (squared_norm(y_axis) - 1.0).abs() > VECTOR_TOLERANCE
+                || dot.abs() > VECTOR_TOLERANCE
+            {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(Self {
+                plane_offset: offset,
+                elevation_feet: origin[2],
+            });
+        }
+        found
+    }
+}
+
 /// Longest string accepted from a record body, in UTF-16 code units.
 pub const MAX_STRING_CHARS: u32 = 4096;
 /// Shortest string accepted. A single character is indistinguishable from
@@ -978,6 +1057,43 @@ mod tests {
         let found = RecordString::scan_from(&bytes, 0).unwrap();
         assert_eq!(found.offset, at);
         assert_eq!(found.value, "Системная панель");
+    }
+
+    fn serialized_plane(index: u16, elevation_feet: f64) -> Vec<u8> {
+        let mut bytes = index.to_le_bytes().to_vec();
+        for value in [-10.0_f64, -20.0, 30.0, 40.0] {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes.push(1);
+        for value in [4.0_f64, 5.0, elevation_feet, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn reads_level_elevation_from_the_schema_resolved_plane() {
+        let mut body = vec![0xaa; 37];
+        body.extend(serialized_plane(565, 10.826_771_653_543_318));
+        body.extend([0xbb; 9]);
+
+        let fields = LevelFields::parse(&body, 565).unwrap();
+        assert_eq!(fields.plane_offset, 37);
+        assert!((fields.elevation_feet - 10.826_771_653_543_318).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rejects_a_plane_with_non_orthonormal_axes() {
+        let mut body = serialized_plane(565, 12.0);
+        body[59..67].copy_from_slice(&2.0_f64.to_le_bytes());
+        assert!(LevelFields::parse(&body, 565).is_none());
+    }
+
+    #[test]
+    fn rejects_ambiguous_level_planes() {
+        let mut body = serialized_plane(565, 3.0);
+        body.extend(serialized_plane(565, 6.0));
+        assert!(LevelFields::parse(&body, 565).is_none());
     }
 
     #[test]

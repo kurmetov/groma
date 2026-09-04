@@ -1,19 +1,27 @@
 #![forbid(unsafe_code)]
 
 mod elem_table;
+mod geometry;
 mod member;
 mod parameter;
 
 pub use elem_table::{
     ElemTable, ElemTableError, ElemTableHeader, ElemTableLayout, ElemTableRecord, RecordFraming,
 };
+pub use geometry::{
+    FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds,
+    GInstanceTransformFields, PipeLineGeometryFields, RvtPoint3,
+};
 pub use member::{
     ELEMENT_HEADER_ID_BLOCK_BYTES, ELEMENT_ID_SEARCH_WINDOW_BYTES, ELEMENT_PRE_ID_WORD_BYTES,
-    ELEMENT_TAIL_BYTES, ElementAnchor, ElementFields, ElementHeaderFields, MAX_STRING_CHARS,
-    MIN_STRING_CHARS, MemberRecord, MemberRecordError, MemberRecords, MemberWalk, RecordHeader,
-    RecordLayout, RecordString,
+    ELEMENT_TAIL_BYTES, ElementAnchor, ElementFields, ElementHeaderFields,
+    LEVEL_SERIALIZED_PLANE_BYTES, LevelFields, MAX_STRING_CHARS, MIN_STRING_CHARS, MemberRecord,
+    MemberRecordError, MemberRecords, MemberWalk, RecordHeader, RecordLayout, RecordString,
 };
-pub use parameter::{MAX_PARAMETERS_PER_SET, Parameter, ParameterSets, ParameterValue};
+pub use parameter::{
+    AUTODESK_SPEC_PREFIX, MAX_PARAMETERS_PER_SET, Parameter, ParameterSetClassIndexes,
+    ParameterSets, ParameterSpec, ParameterValue,
+};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RvtObject {

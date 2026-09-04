@@ -346,3 +346,192 @@ Confidence. High for the entry layout, which is read straight from the schema.
 The run's position is still found by scanning, so a body whose parameters sit
 behind a chance match could in principle be misread; the narrow code window and
 the all-entries-must-validate rule make that unlikely but do not exclude it.
+
+### Result: level elevation is the Z origin of the datum plane
+
+Observation. `Level` declares no elevation value of its own;
+`m_roomComputationElevationOffset` is a separate room-calculation adjustment.
+Its `DatumPlane` parent instead owns `m_pFace` and `m_pSurface`, and the dynamic
+surface class resolves through `Formats/Latest` to `Plane`.
+
+Hypothesis. Revit derives `Level.Elevation` from `Plane.m_origin[2]` rather than
+storing it in the element's parameter sets.
+
+Experiment. Resolve the `Plane` class index from each file's schema, locate
+that dynamic class marker in every `Level` body, then parse the inherited
+`Surface` envelope/orientation fields and the `Plane` origin/X/Y vectors. A
+candidate is accepted only when all numbers are finite, the orientation flag
+is boolean, and the X/Y axes are orthonormal; zero or multiple candidates are
+rejected. Convert origin Z from Revit's internal feet to metres only for the
+corpus report, not while reading the RVT value.
+
+Result. Confirmed on all 1,335 `Level` bodies in the three-model Revit 2023
+corpus: 269/269, 293/293 and 773/773 bodies contain exactly one valid plane.
+The named project floors form the expected metric sequences after multiplying
+by 0.3048 (for example 0, 3.3, 6.3, ... metres in one model), including the
+negative basement elevation. `rvt-model::LevelFields` now exposes the original
+value explicitly as `elevation_feet`, and JSON exports it as
+`elevation_internal_feet`.
+
+Confidence. High for this release and corpus. The class index is schema-
+resolved rather than hardcoded, and the full serialized plane shape provides
+an independent structural check beyond a plausible floating-point number.
+
+### Result: parameter values link to specs, not directly to display units
+
+Observation. A double entry in a `ParamValueSetDouble` contains only
+`[value:f64][paramId]`. Positive IDs resolve to `ParamElem` records. Their
+`m_pParamDef` objects carry length-prefixed Forge type IDs such as
+`autodesk.spec.aec.structural:massPerUnitLength-1.0.0`. Separately,
+`Global/Latest` contains a Forge registry with 350 unit definitions and 161
+spec definitions in the smallest model; the registry's spec JSON names
+applicable and canonical storage units. The document schema also declares
+`AUnits.m_formatOptionsMap` as `ForgeTypeId -> FormatOptions`, with
+`FormatOptions.m_unitTypeId` describing display formatting.
+
+Hypothesis. The semantic chain for a project/shared value is
+`ParamValue.paramId -> ParamElem.m_pParamDef -> spec`; project display units
+are a separate spec-to-formatting choice and do not describe the raw double's
+storage.
+
+Experiment. Scan only parameter-definition bodies for a single structurally
+valid length-prefixed `autodesk.spec.*` identifier and join it back to stored
+values by the already verified positive parameter element ID. Compare the
+roles declared by `ParamDef`, `ParamDefValue`, `AUnits`, and `FormatOptions` in
+the decoded schema.
+
+Result. Confirmed for genuine project/shared parameters. `revit-catalog`
+captures 151 version-insensitive measurable spec keys from the Revit 2023
+registry. It recursively resolves primitive, derived, factor-prefixed and
+absolute units and applies Revit's internal bases (feet for length; radians,
+kilograms, seconds, amperes, kelvin and candelas for the remaining bases). JSON
+emits the raw double plus `storage_value`, Forge unit ID and unit name only when
+the spec is known. Unknown values remain raw.
+
+The first full-model conversion audit also found a counterexample to the
+original parameter-set scan: a `Family` body can contain a list of positive
+`ParamElem` references that mimics a counted value array. The replacement
+reader resolves the dynamic `ParamValueSetDouble/Int/AString/ElementId` class
+indexes from `Formats/Latest`, finds which of those classes are referenced
+before the element's `m_id`, and accepts only one post-tail run containing
+exactly those value kinds with release-validated IDs. This corrected a real
+misclassification from `int=1` to the schema-declared string `"3"`.
+
+On a complete 2023 model the schema-bound reader recovered 197,315 values on
+67,751 owners. No `-1`, unknown negative code, fallback parameter name, extreme
+double, or ambiguous run survived; 1,714 project/shared doubles had specs and
+were converted to canonical units. Results from the retained unbound fallback
+for unsupported releases remain diagnostic and are not promoted to IFC.
+
+The same body-level audit on all three corpus models accepted 71,398, 105,704
+and 237,074 bodies respectively, recovering 202,842, 361,874 and 850,846
+values. That is 1,415,562 schema-bound values in total.
+
+Built-in negative parameter names resolve through the public Revit 2023
+`BuiltInParameter` catalog. Their data type/spec is a separate issue. Autodesk
+documents that
+[`Definition.GetDataType()`](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/1c008d27-9e61-362c-308c-8b718ee0f8df.htm)
+returns the concrete parameter's
+data type and that some built-ins even return an empty type. The public enum
+table itself does not contain that mapping, and built-ins have no `ParamElem`
+record to join inside the model.
+
+Confidence. High for conversion once a spec is established and for a run bound
+to its schema-resolved set classes; low for the legacy unbound scan. Unit
+conversion is never inferred from a nearby unit string or an English parameter
+name.
+
+### Result: release-specific names are external catalog data
+
+The Revit 2023 catalog is selected only when `BasicFileInfo` reports release
+2023. It contains 3,439 unique `BuiltInParameter` codes with English labels and
+all 1,189 `BuiltInCategory` codes. Alias enum members sharing one integer are
+collapsed to a deterministic canonical name. Fifteen obsolete/internal
+parameter members that disappeared before Autodesk published numeric-value
+tables are omitted instead of assigned guessed integers. Unsupported releases
+and unknown codes retain `param_<number>` / numeric fallbacks.
+
+The checked-in tables are generated by
+`scripts/generate_revit_2023_catalog.py`. Membership and labels come from the
+[Revit 2023 API reference](https://www.revitapidocs.com/2023/fb011c91-be7e-f737-28c7-3f1e1917a0e0.htm);
+numeric values are intersected with Autodesk's published
+[BuiltInParameter](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/fb011c91-be7e-f737-28c7-3f1e1917a0e0.htm)
+and
+[BuiltInCategory](https://help.autodesk.com/cloudhelp/2026/ENU/Revit-API-MainReference/files/html/ba1c5b30-242f-5fdc-8ea9-ec3b61e6e722.htm)
+tables. The generator reads the Forge registry from an extracted 2023
+`Global/Latest` stream; model content is not copied into the generated source.
+
+### Result: IFC identity and STEP syntax no longer block the exporter
+
+`ifc-export` encodes a 128-bit UUID with buildingSMART's published
+[22-character IFC alphabet](https://technical.buildingsmart.org/resources/ifcimplementationguidance/ifc-guid/).
+When Revit `UniqueId` is unavailable, callers can derive an RFC 4122 version-5
+identity from an explicit model namespace and the source element ID. Reusing
+the same namespace makes repeated exports stable; different model namespaces
+prevent equal element numbers in different files from colliding.
+
+The same crate writes complete ISO 10303-21 envelopes and checked entity
+syntax, including references, lists, typed values, finite real numbers and
+Unicode names. Its metadata builder now supplies the IFC4 project/site/
+building/storey hierarchy, metric `IfcUnitAssignment`, spatial containment,
+typed MEP elements with a building-element proxy fallback, and property sets
+for trusted canonical values. The CLI derives a default model namespace from
+the canonical RVT path or accepts an explicit UUID for path-independent
+repeatability.
+
+The first live model contains 269 structurally valid `Level` records, but 257
+of them carry a family reference and have names such as "Ref. Level" or the
+localized equivalent. The 12 top-level records without a family reference form
+the expected project sequence from basement through roof. The CLI therefore
+promotes only the latter to `IfcBuildingStorey`.
+
+A full live export exercised those 12 project levels, 292 elements
+and 509 recovered Revit properties. The source mapping produced 77
+`IfcPipeSegment`, 48 `IfcPipeFitting`, 7 `IfcSanitaryTerminal`, 4
+`IfcAirTerminal`, 16 `IfcFireSuppressionTerminal`, and retained 140 unknown
+pairs as `IfcBuildingElementProxy`. All 77 pipe segments carry a recovered
+straight axis and outer radius whose analytic swept-disk envelope independently
+matches the element's duplicated `GElement` bounds. They are emitted as
+`IfcPolyline` axes and `IfcSweptDiskSolid` bodies. Of the 48 pipe fittings, 31
+also have an unambiguous one-line `PipeFittingCenterLine` whose `GInfo` tag
+resolves uniquely back to the fitting and whose endpoints lie inside the
+owner's independent `GElement` bounds; those receive an axis-only
+`IfcPolyline`, without an inferred radius or body. Across the complete source
+object set, 6,737 pipe records have a structurally valid straight-line
+candidate, 6,735 also have parseable `GElement` bounds, and 6,510 reproduce
+those bounds within `1e-8` feet. The two without bounds and 225 mismatches stay
+geometry-free. The bounds check also caught a semantic distinction: an `Ø40`
+pipe stores 40 mm as its nominal width/diameter while its physical outside
+envelope is 48 mm, so the exporter derives the outer radius from the bounds
+rather than silently treating the nominal value as geometry.
+
+The earlier metadata-only result contained 2,634 STEP entities with
+sequential entity numbers and no dangling references; all 607 rooted entities
+and relationships had unique 22-character GlobalIds. Its typed values include
+77 metric `IfcLengthMeasure` values; unresolved dimensions are labels rather
+than guessed measures. IfcOpenShell 0.8.5 reports no schema or EXPRESS rule
+violations. After adding the 77 pipe bodies and 31 fitting axes, IfcOpenShell
+constructs all 108 represented elements when curve dimensionality is enabled
+and reports no schema or EXPRESS rule violations.
+Legacy parameter candidates and unverified geometry remain absent by design.
+
+The next placement probe resolved the three fixed `FamilyInstance` fields
+`m_instOrigin`, `m_RefDir`, and `m_zAxis` and required orthonormal axes plus a
+unique origin inside a separate `GElement` bounds pair. Across the complete
+model, 9,940 family instances contain a structural candidate and 573 pass the
+uniqueness/bounds gate, but only 7 of the 75 mapped family instances selected
+for IFC pass. The raw frame is therefore exposed only by the diagnostic JSON
+export; no IFC placement is inferred until the family/project coordinate-space
+relationship is independently established.
+
+That relationship is available in the separate geometry record. A
+schema-resolved `GInstance` embeds `InstanceInfo`, whose inherited
+`InstInfoBase.m_Trf` stores a 3×3 basis followed by a project-space origin. A
+second decoder requires a unique finite orthonormal right-handed transform and
+checks its origin against the element's independent bounds. It recovers 6,524
+transforms across the model and covers 66 of the 75 mapped family instances in
+the default export. Those transforms now become storey-relative
+`IfcLocalPlacement` values. Existing axes are converted from world coordinates
+to their element-local frame; IfcOpenShell reconstructs all 108 world shapes
+with every represented axis endpoint matching the pre-placement reference
+export in world coordinates within `1e-9`.

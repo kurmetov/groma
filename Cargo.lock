@@ -221,6 +221,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "ifc-export"
+version = "0.1.0"
+dependencies = [
+ "bim-core",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -302,12 +309,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "revit-catalog"
+version = "0.1.0"
+
+[[package]]
 name = "rivet-cli"
 version = "0.1.0"
 dependencies = [
+ "bim-core",
  "cfb",
  "clap",
  "flate2",
+ "ifc-export",
+ "revit-catalog",
  "rvt-container",
  "rvt-model",
  "rvt-schema",

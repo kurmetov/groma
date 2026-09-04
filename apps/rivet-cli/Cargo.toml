@@ -10,7 +10,10 @@ name = "rivet"
 path = "src/main.rs"
 
 [dependencies]
+bim-core = { path = "../../crates/bim-core" }
 clap.workspace = true
+ifc-export = { path = "../../crates/ifc-export" }
+revit-catalog = { path = "../../crates/revit-catalog" }
 rvt-container = { path = "../../crates/rvt-container" }
 rvt-model = { path = "../../crates/rvt-model" }
 rvt-schema = { path = "../../crates/rvt-schema" }

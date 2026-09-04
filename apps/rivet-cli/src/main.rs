@@ -8,17 +8,28 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use bim_core::{
+    BimCategory, BimElement, BimElementId, BimExternalId, BimGeometry, BimLevel, BimLineSegment,
+    BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue, BimSource,
+    BimSweptDisk, BimUnit,
+};
 use clap::{Parser, Subcommand};
+use ifc_export::{MetadataOptions, element_type_for_source, metadata_ifc, uuid_v5};
+use revit_catalog::Catalog;
 use rvt_container::{
     BasicFileInfo, DEFAULT_DECODE_LIMIT, MarkerEnvelope, MarkerEnvelopeOptions,
     PartitionReadOptions, REVIT_STORED_PAGE_BYTES, RvtContainer, StreamFraming,
     decode_known_framing, strip_revit_page_checksums,
 };
 use rvt_model::{
-    ELEMENT_TAIL_BYTES, ElemTable, ElementAnchor, ElementFields, ElementHeaderFields, MemberWalk,
-    ParameterSets, ParameterValue, RecordFraming, RecordHeader, RecordLayout, RecordString,
+    ELEMENT_TAIL_BYTES, ElemTable, ElementAnchor, ElementFields, ElementHeaderFields,
+    FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds,
+    GInstanceTransformFields, LevelFields, MemberWalk, ParameterSetClassIndexes, ParameterSets,
+    ParameterSpec, ParameterValue, PipeLineGeometryFields, RecordFraming, RecordHeader,
+    RecordLayout, RecordString,
 };
 use rvt_schema::{Schema, TypeReference};
 
@@ -40,6 +51,12 @@ const ELEMENT_CLASS_FORMAT_TAG: u32 = 102;
 /// Largest decoded member observed in the corpus; a record that runs past a
 /// member of exactly this size is the continuation candidate.
 const MEMBER_PAGE_LIMIT_BYTES: u64 = 128 * 1024;
+/// `UUIDv5` namespace used only to turn a canonical source path into a model
+/// namespace. Users can supply a persistent namespace explicitly when a model
+/// may move between paths.
+const SOURCE_PATH_NAMESPACE: [u8; 16] = [
+    0x76, 0x26, 0xfd, 0xf2, 0xc2, 0xad, 0x51, 0xd0, 0xb9, 0x1f, 0xc6, 0xcc, 0x07, 0x36, 0x0c, 0x62,
+];
 
 const KNOWN_STREAMS: [&str; 4] = [
     "BasicFileInfo",
@@ -203,6 +220,25 @@ enum Command {
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
     },
+    /// Export an IFC4 spatial tree, typed elements, and verified geometry.
+    ExportIfc {
+        file: PathBuf,
+        /// Write to this path instead of replacing the `.rvt` extension with `.ifc`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Stable model namespace UUID. By default it is derived from the canonical RVT path.
+        #[arg(long)]
+        model_namespace: Option<String>,
+        /// Include categorized records without a recovered level association.
+        #[arg(long)]
+        include_unplaced: bool,
+        /// Stop after this many exported elements.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
     /// Print record bodies of one class as hex, for field analysis.
     Bodies {
         file: PathBuf,
@@ -293,6 +329,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 }
 
 /// Commands that go past the container into schema, records, and export.
+#[allow(clippy::too_many_lines)]
 fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
     match command {
         Command::Schema { file, class } => schema(&file, class.as_deref()),
@@ -349,6 +386,21 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             limit,
             max_member_bytes,
         } => export_json(&file, output.as_deref(), limit, max_member_bytes),
+        Command::ExportIfc {
+            file,
+            output,
+            model_namespace,
+            include_unplaced,
+            limit,
+            max_member_bytes,
+        } => export_ifc(
+            &file,
+            output.as_deref(),
+            model_namespace.as_deref(),
+            include_unplaced,
+            limit,
+            max_member_bytes,
+        ),
         Command::Bodies {
             file,
             class,
@@ -1606,9 +1658,21 @@ struct ExportedElement {
     owner_view_id: Option<i32>,
     created_phase_id: Option<i32>,
     design_option_id: Option<i32>,
+    /// `Plane.m_origin[2]` for a `Level`, in Revit internal feet.
+    elevation_feet: Option<f64>,
     /// First readable string in the body, with how it was located.
     name: Option<(String, &'static str)>,
     parameters: Vec<rvt_model::Parameter>,
+    /// Forge spec carried by this element when it defines a parameter.
+    parameter_spec: Option<String>,
+    pipe_line_candidate: Option<PipeLineGeometryFields>,
+    fitting_center_line_candidate: Option<FittingCenterLineFields>,
+    fitting_axis_candidate: Option<FittingCenterLineFields>,
+    family_instance_placement_candidates: Vec<FamilyInstancePlacementFields>,
+    family_instance_placement: Option<FamilyInstancePlacementFields>,
+    ginstance_transform: Option<GInstanceTransformFields>,
+    geometry_bounds: Option<GElementBounds>,
+    placement_bounds: Option<GElementBounds>,
     /// `m_moribund` from the `Element` tail: the element is marked deleted.
     moribund: bool,
     locked: bool,
@@ -1707,6 +1771,7 @@ fn parameter_class_indexes(schema: Option<&Schema>) -> BTreeSet<u16> {
         .unwrap_or_default()
 }
 
+#[allow(clippy::too_many_lines)]
 fn parameters(
     path: &Path,
     class_name: Option<&str>,
@@ -1714,7 +1779,11 @@ fn parameters(
     max_member_bytes: u64,
 ) -> Result<(), Box<dyn Error>> {
     let container = RvtContainer::open(path)?;
+    let catalog = read_basic_file_info(&container)?
+        .and_then(|info| info.revit_version)
+        .and_then(Catalog::for_release);
     let schema = read_schema(&container)?;
+    let parameter_set_classes = parameter_set_class_indexes(schema.as_ref());
     let wanted = class_name
         .map(|name| {
             schema
@@ -1737,6 +1806,13 @@ fn parameters(
         max_member_bytes,
     )?;
     let accept = |id: i32| parameter_ids.contains(&id);
+    let accept_verified = |id: i32| {
+        if id < 0 {
+            catalog.is_some_and(|catalog| catalog.built_in_parameter(id).is_some())
+        } else {
+            parameter_ids.contains(&id)
+        }
+    };
 
     println!("Parameter sets:");
     println!("Known parameter elements: {}", parameter_ids.len());
@@ -1764,7 +1840,21 @@ fn parameters(
                     .get(record.body_offset()..record.end())
                     .unwrap_or_default();
                 bodies += 1;
-                let Some(found) = ParameterSets::scan(body, &accept) else {
+                let Some(fields) = ElementFields::parse(body, header.id) else {
+                    continue;
+                };
+                let found = if let (Some(classes), Some(_)) = (parameter_set_classes, catalog) {
+                    ParameterSets::scan_schema_bound(
+                        body,
+                        fields.id_offset + 4 + ELEMENT_TAIL_BYTES,
+                        fields.id_offset,
+                        classes,
+                        &accept_verified,
+                    )
+                } else {
+                    ParameterSets::scan(body, &accept)
+                };
+                let Some(found) = found else {
                     continue;
                 };
                 with_parameters += 1;
@@ -1868,18 +1958,27 @@ fn names(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(), Box<d
     Ok(())
 }
 
-fn export_json(
+#[allow(clippy::too_many_lines)] // One streaming pass keeps large RVT payloads out of memory.
+fn recover_elements(
     path: &Path,
-    output: Option<&Path>,
-    limit: Option<usize>,
     max_member_bytes: u64,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<RecoveredElements, Box<dyn Error>> {
     let container = RvtContainer::open(path)?;
+    let release = read_basic_file_info(&container)?.and_then(|info| info.revit_version);
+    let catalog = release.and_then(Catalog::for_release);
     let schema = read_schema(&container)?;
-    let header_class_index = schema
-        .as_ref()
-        .and_then(|schema| schema.class_by_name(ELEMENT_HEADER_CLASS))
-        .map(|class| class.index);
+    let header_class_index = schema_class_index(schema.as_ref(), ELEMENT_HEADER_CLASS);
+    let level_class_index = schema_class_index(schema.as_ref(), "Level");
+    let plane_class_index = schema_class_index(schema.as_ref(), "Plane");
+    let pipe_curve_class_index = schema_class_index(schema.as_ref(), "RbsPipeCurve");
+    let family_instance_class_index = schema_class_index(schema.as_ref(), "FamilyInstance");
+    let curve_driver_class_index = schema_class_index(schema.as_ref(), "RbsCurveDriver");
+    let pipe_fitting_center_line_class_index =
+        schema_class_index(schema.as_ref(), "PipeFittingCenterLine");
+    let gline_class_index = schema_class_index(schema.as_ref(), "GLine");
+    let ginstance_class_index = schema_class_index(schema.as_ref(), "GInstance");
+    let geometry_element_class_index = schema_class_index(schema.as_ref(), "GElement");
+    let parameter_set_classes = parameter_set_class_indexes(schema.as_ref());
     let partition_paths = partition_paths(&container);
     let (calibrations, parameter_ids) = calibrate_names(
         &container,
@@ -1888,6 +1987,13 @@ fn export_json(
         max_member_bytes,
     )?;
     let accept_parameter = |id: i32| parameter_ids.contains(&id);
+    let accept_verified_parameter = |id: i32| {
+        if id < 0 {
+            catalog.is_some_and(|catalog| catalog.built_in_parameter(id).is_some())
+        } else {
+            parameter_ids.contains(&id)
+        }
+    };
     let mut elements: BTreeMap<u32, ExportedElement> = BTreeMap::new();
 
     for (partition_index, partition_path) in partition_paths.iter().enumerate() {
@@ -1906,6 +2012,25 @@ fn export_json(
                         .get(record.body_offset()..record.end())
                         .unwrap_or_default();
 
+                    if Some(header.class_index) == geometry_element_class_index {
+                        let exact_bounds = GElementBounds::parse(body);
+                        let placement_bounds =
+                            exact_bounds.or_else(|| GElementBounds::parse_near_duplicate(body));
+                        if let Some(bounds) = exact_bounds {
+                            entry.geometry_bounds = Some(bounds);
+                        }
+                        if let Some(bounds) = placement_bounds {
+                            entry.placement_bounds = Some(bounds);
+                            if let Some(ginstance_class_index) = ginstance_class_index {
+                                entry.ginstance_transform = GInstanceTransformFields::parse(
+                                    body,
+                                    ginstance_class_index,
+                                    &bounds,
+                                );
+                            }
+                        }
+                    }
+
                     if Some(header.class_index) == header_class_index {
                         if let Some(fields) = ElementHeaderFields::parse(body) {
                             entry.category = entry.category.or(fields.category);
@@ -1915,19 +2040,37 @@ fn export_json(
                         entry.class_index = Some(header.class_index);
                         entry.source = Some((partition_index, member.index, record.offset));
                         if let Some(fields) = ElementFields::parse(body, header.id) {
+                            let tail_end = fields.id_offset + 4 + ELEMENT_TAIL_BYTES;
                             if entry.name.is_none() {
                                 entry.name = read_name(
                                     body,
-                                    fields.id_offset + 4 + ELEMENT_TAIL_BYTES,
+                                    tail_end,
                                     calibrations
                                         .get(&header.class_index)
                                         .and_then(NameCalibration::settled_offset),
                                 );
                             }
                             if entry.parameters.is_empty() {
-                                if let Some(found) = ParameterSets::scan(body, &accept_parameter) {
+                                let found = if let (Some(classes), Some(_)) =
+                                    (parameter_set_classes, catalog)
+                                {
+                                    ParameterSets::scan_schema_bound(
+                                        body,
+                                        tail_end,
+                                        fields.id_offset,
+                                        classes,
+                                        &accept_verified_parameter,
+                                    )
+                                } else {
+                                    ParameterSets::scan(body, &accept_parameter)
+                                };
+                                if let Some(found) = found {
                                     entry.parameters = found.parameters;
                                 }
+                            }
+                            if Some(header.class_index) == family_instance_class_index {
+                                entry.family_instance_placement_candidates =
+                                    FamilyInstancePlacementFields::candidates(body, tail_end);
                             }
                             entry.moribund |= fields.moribund;
                             entry.locked |= fields.locked;
@@ -1939,44 +2082,751 @@ fn export_json(
                             entry.design_option_id =
                                 entry.design_option_id.or(fields.design_option_id);
                         }
+                        if Some(header.class_index) == level_class_index {
+                            if let Some(plane_index) = plane_class_index {
+                                if let Some(fields) = LevelFields::parse(body, plane_index) {
+                                    entry.elevation_feet = Some(fields.elevation_feet);
+                                }
+                            }
+                        }
+                        if Some(header.class_index) == pipe_curve_class_index {
+                            if let Some(curve_driver_class_index) = curve_driver_class_index {
+                                entry.pipe_line_candidate =
+                                    PipeLineGeometryFields::parse(body, curve_driver_class_index);
+                            }
+                        }
+                        if Some(header.class_index) == pipe_fitting_center_line_class_index {
+                            if let Some(gline_class_index) = gline_class_index {
+                                entry.fitting_center_line_candidate =
+                                    FittingCenterLineFields::parse(body, gline_class_index);
+                            }
+                        }
+                        if i32::try_from(header.id).is_ok_and(|id| parameter_ids.contains(&id)) {
+                            entry.parameter_spec =
+                                ParameterSpec::scan(body).map(|spec| spec.type_id);
+                        }
                     }
                 }
             },
         )?;
     }
 
-    let mut writer: Box<dyn Write> = match output {
+    attach_fitting_axes(&mut elements, catalog);
+    verify_family_instance_placements(&mut elements);
+
+    let (parameter_names, parameter_specs) = parameter_metadata(&elements);
+    Ok(RecoveredElements {
+        release,
+        catalog,
+        parameter_values_schema_bound: catalog.is_some() && parameter_set_classes.is_some(),
+        schema,
+        partition_paths,
+        parameter_names,
+        parameter_specs,
+        elements,
+    })
+}
+
+fn verify_family_instance_placements(elements: &mut BTreeMap<u32, ExportedElement>) {
+    for element in elements.values_mut() {
+        let Some(bounds) = element.placement_bounds else {
+            continue;
+        };
+        let mut inside = element
+            .family_instance_placement_candidates
+            .iter()
+            .copied()
+            .filter(|candidate| bounds.contains_point(candidate.origin));
+        let Some(candidate) = inside.next() else {
+            continue;
+        };
+        if inside.next().is_none() {
+            element.family_instance_placement = Some(candidate);
+        }
+    }
+}
+
+fn attach_fitting_axes(elements: &mut BTreeMap<u32, ExportedElement>, catalog: Option<Catalog>) {
+    let mut by_owner: BTreeMap<u32, Vec<FittingCenterLineFields>> = BTreeMap::new();
+    for element in elements.values() {
+        let Some(line) = element.fitting_center_line_candidate else {
+            continue;
+        };
+        if category_name(element, catalog) == Some("OST_PipeFittingCenterLine") {
+            by_owner
+                .entry(line.owner_element_id)
+                .or_default()
+                .push(line);
+        }
+    }
+    for (owner_id, lines) in by_owner {
+        if lines.len() != 1 {
+            continue;
+        }
+        let Some(owner) = elements.get_mut(&owner_id) else {
+            continue;
+        };
+        if category_name(owner, catalog) == Some("OST_PipeFitting")
+            && owner
+                .geometry_bounds
+                .is_some_and(|bounds| bounds.contains_line_segment(lines[0].start, lines[0].end))
+        {
+            owner.fitting_axis_candidate = lines.first().copied();
+        }
+    }
+}
+
+fn category_name(element: &ExportedElement, catalog: Option<Catalog>) -> Option<&'static str> {
+    catalog?
+        .built_in_category(element.category?)
+        .map(|category| category.enum_name)
+}
+
+fn export_json(
+    path: &Path,
+    output: Option<&Path>,
+    limit: Option<usize>,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let recovered = recover_elements(path, max_member_bytes)?;
+    let writer: Box<dyn Write> = match output {
         Some(output) => Box::new(File::create(output)?),
         None => Box::new(io::stdout().lock()),
     };
-    // Parameter identifiers point at elements this same export already named.
-    let parameter_names = elements
+    let metadata = ExportMetadata {
+        schema: recovered.schema.as_ref(),
+        partition_paths: &recovered.partition_paths,
+        parameter_names: &recovered.parameter_names,
+        parameter_specs: &recovered.parameter_specs,
+        catalog: recovered.catalog,
+    };
+    let written = write_exported_elements(writer, &recovered.elements, &metadata, limit)?;
+    if output.is_some() {
+        println!(
+            "Elements written: {written} of {}",
+            recovered.elements.len()
+        );
+    }
+    Ok(())
+}
+
+struct RecoveredElements {
+    release: Option<u16>,
+    catalog: Option<Catalog>,
+    parameter_values_schema_bound: bool,
+    schema: Option<Schema>,
+    partition_paths: Vec<String>,
+    parameter_names: BTreeMap<i32, String>,
+    parameter_specs: BTreeMap<i32, String>,
+    elements: BTreeMap<u32, ExportedElement>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_ifc(
+    path: &Path,
+    output: Option<&Path>,
+    model_namespace: Option<&str>,
+    include_unplaced: bool,
+    limit: Option<usize>,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let output = output.map_or_else(|| path.with_extension("ifc"), Path::to_path_buf);
+    if same_existing_file(path, &output)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IFC output must not overwrite the source RVT file",
+        )
+        .into());
+    }
+
+    let recovered = recover_elements(path, max_member_bytes)?;
+    let geometry_statistics = geometry_statistics(&recovered.elements);
+    let namespace = if let Some(value) = model_namespace {
+        parse_uuid(value)?
+    } else {
+        let canonical = std::fs::canonicalize(path)?;
+        uuid_v5(
+            SOURCE_PATH_NAMESPACE,
+            canonical.as_os_str().as_encoded_bytes(),
+        )
+    };
+    let (creation_time, timestamp) = current_utc_timestamp()?;
+    let project_name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Rivet Project")
+        .to_owned();
+    let (model, included_properties, omitted_properties) =
+        metadata_model(&recovered, include_unplaced, limit);
+    let level_count = model.levels.len();
+    let element_count = model.elements.len();
+    let geometry_count = model
+        .elements
+        .iter()
+        .filter(|element| element.geometry.is_some())
+        .count();
+    let (mapped_family_instances, mapped_family_instance_placements) =
+        mapped_family_instance_placement_counts(&model, &recovered);
+    let options = MetadataOptions {
+        model_namespace: namespace,
+        file_name: output.to_string_lossy().into_owned(),
+        timestamp,
+        creation_time,
+        project_name,
+        site_name: "Site".to_owned(),
+        building_name: "Building".to_owned(),
+    };
+    let file = metadata_ifc(&model, &options)?;
+    let mut writer = File::create(&output)?;
+    file.write_to(&mut writer)?;
+    writer.flush()?;
+
+    println!("IFC written: {}", output.display());
+    println!("Model namespace: {}", format_uuid(namespace));
+    println!("Building storeys: {level_count}");
+    println!("Elements: {element_count}");
+    println!("Elements with verified geometry: {geometry_count}");
+    println!(
+        "Recovered straight-pipe candidates: {} ({} have GElement bounds; {} match them)",
+        geometry_statistics.pipe_candidates,
+        geometry_statistics.pipe_candidates_with_bounds,
+        geometry_statistics.verified_pipe_lines
+    );
+    println!(
+        "Recovered single-line pipe-fitting centerlines: {} ({} link uniquely to pipe fittings)",
+        geometry_statistics.fitting_center_line_candidates,
+        geometry_statistics.verified_fitting_axes
+    );
+    println!(
+        "Recovered family-instance placement candidates: {} ({} are unique inside owner bounds)",
+        geometry_statistics.family_instances_with_placement_candidates,
+        geometry_statistics.verified_family_instance_placements
+    );
+    println!(
+        "Recovered bounds-verified GInstance transforms: {}",
+        geometry_statistics.verified_ginstance_transforms
+    );
+    println!(
+        "Mapped family instances with verified placement: {mapped_family_instance_placements} of {mapped_family_instances}"
+    );
+    println!("Recovered Revit properties: {included_properties}");
+    if omitted_properties > 0 {
+        println!(
+            "Unverified parameter candidates omitted for this Revit release: {omitted_properties}"
+        );
+    }
+    Ok(())
+}
+
+fn mapped_family_instance_placement_counts(
+    model: &BimModel,
+    recovered: &RecoveredElements,
+) -> (usize, usize) {
+    let mapped = model.elements.iter().filter(|element| {
+        matches!(
+            element.element_type,
+            bim_core::BimElementType::PipeFitting
+                | bim_core::BimElementType::SanitaryTerminal
+                | bim_core::BimElementType::AirTerminal
+                | bim_core::BimElementType::FireSuppressionTerminal
+        )
+    });
+    let mut total = 0;
+    let mut placed = 0;
+    for element in mapped {
+        total += 1;
+        placed += usize::from(
+            element
+                .id
+                .0
+                .parse::<u32>()
+                .ok()
+                .and_then(|id| recovered.elements.get(&id))
+                .is_some_and(|element| element.ginstance_transform.is_some()),
+        );
+    }
+    (total, placed)
+}
+
+fn metadata_model(
+    recovered: &RecoveredElements,
+    include_unplaced: bool,
+    limit: Option<usize>,
+) -> (BimModel, usize, usize) {
+    let class_name = |element: &ExportedElement| {
+        element.class_index.and_then(|index| {
+            recovered
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.class_by_index(index))
+                .map(|class| class.name.as_str())
+        })
+    };
+    let levels = recovered
+        .elements
+        .iter()
+        .filter(|(_, element)| {
+            !element.moribund
+                && class_name(element) == Some("Level")
+                // Family documents contribute their own reference levels to
+                // the project database. In the corpus those carry a family
+                // reference; top-level project storeys do not.
+                && element.family_id.is_none()
+                && element.header_family_id.is_none()
+        })
+        .map(|(id, element)| BimLevel {
+            id: BimElementId(id.to_string()),
+            name: element.name.as_ref().map(|(name, _)| name.clone()),
+            elevation: element.elevation_feet.and_then(|value| {
+                Some(BimNumber {
+                    value: revit_catalog::internal_feet_to_metres(value)?,
+                    unit: Some(BimUnit {
+                        id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
+                        name: "Meters".to_owned(),
+                    }),
+                })
+            }),
+        })
+        .collect::<Vec<_>>();
+    let level_ids = levels
+        .iter()
+        .map(|level| level.id.clone())
+        .collect::<BTreeSet<_>>();
+    let candidates = recovered.elements.iter().filter(|(_, element)| {
+        !element.moribund
+            && element.category.is_some()
+            && class_name(element) != Some("Level")
+            && (include_unplaced || element.level_id.is_some())
+    });
+    let mut included_properties = 0_usize;
+    let mut omitted_properties = 0_usize;
+    let elements = candidates
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|(id, element)| {
+            let mut normalized = normalize_element(
+                *id,
+                element,
+                recovered.schema.as_ref(),
+                &recovered.parameter_names,
+                &recovered.parameter_specs,
+                recovered.catalog,
+            );
+            if normalized
+                .level_id
+                .as_ref()
+                .is_some_and(|level_id| !level_ids.contains(level_id))
+            {
+                normalized.level_id = None;
+            }
+            let mut properties = trusted_source_properties(&normalized);
+            if recovered.parameter_values_schema_bound {
+                included_properties += normalized.properties.len();
+                properties.append(&mut normalized.properties);
+            } else {
+                omitted_properties += normalized.properties.len();
+            }
+            normalized.properties = properties;
+            normalized
+        })
+        .collect();
+
+    (
+        BimModel {
+            source: Some(BimSource {
+                application: "Autodesk Revit".to_owned(),
+                release: recovered.release.map(|release| release.to_string()),
+            }),
+            elements,
+            levels,
+            relations: Vec::new(),
+        },
+        included_properties,
+        omitted_properties,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GeometryStatistics {
+    pipe_candidates: usize,
+    pipe_candidates_with_bounds: usize,
+    verified_pipe_lines: usize,
+    fitting_center_line_candidates: usize,
+    verified_fitting_axes: usize,
+    family_instances_with_placement_candidates: usize,
+    verified_family_instance_placements: usize,
+    verified_ginstance_transforms: usize,
+}
+
+fn geometry_statistics(elements: &BTreeMap<u32, ExportedElement>) -> GeometryStatistics {
+    let mut statistics = GeometryStatistics::default();
+    for element in elements.values() {
+        if let Some(line) = element.pipe_line_candidate {
+            statistics.pipe_candidates += 1;
+            statistics.pipe_candidates_with_bounds +=
+                usize::from(element.geometry_bounds.is_some());
+            statistics.verified_pipe_lines += usize::from(
+                element
+                    .geometry_bounds
+                    .is_some_and(|bounds| line.matches_bounds(&bounds)),
+            );
+        }
+        statistics.fitting_center_line_candidates +=
+            usize::from(element.fitting_center_line_candidate.is_some());
+        statistics.verified_fitting_axes += usize::from(element.fitting_axis_candidate.is_some());
+        statistics.family_instances_with_placement_candidates +=
+            usize::from(!element.family_instance_placement_candidates.is_empty());
+        statistics.verified_family_instance_placements +=
+            usize::from(element.family_instance_placement.is_some());
+        statistics.verified_ginstance_transforms +=
+            usize::from(element.ginstance_transform.is_some());
+    }
+    statistics
+}
+
+fn trusted_source_properties(element: &BimElement) -> Vec<BimProperty> {
+    let mut properties = vec![BimProperty {
+        id: None,
+        name: "Revit Element Id".to_owned(),
+        specification: None,
+        value: BimPropertyValue::Text(element.id.0.clone()),
+    }];
+    for (name, value) in [
+        ("Revit Class", element.class_name.as_deref()),
+        (
+            "Revit Category",
+            element
+                .category
+                .as_ref()
+                .map(|category| category.name.as_str()),
+        ),
+    ] {
+        if let Some(value) = value {
+            properties.push(BimProperty {
+                id: None,
+                name: name.to_owned(),
+                specification: None,
+                value: BimPropertyValue::Text(value.to_owned()),
+            });
+        }
+    }
+    properties
+}
+
+fn same_existing_file(left: &Path, right: &Path) -> io::Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    if !right.exists() {
+        return Ok(false);
+    }
+    Ok(std::fs::canonicalize(left)? == std::fs::canonicalize(right)?)
+}
+
+fn parse_uuid(value: &str) -> Result<[u8; 16], io::Error> {
+    let digits = value
+        .bytes()
+        .filter(|byte| *byte != b'-')
+        .collect::<Vec<_>>();
+    if digits.len() != 32 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "model namespace must be a UUID (32 hexadecimal digits, with optional hyphens)",
+        ));
+    }
+    let mut uuid = [0_u8; 16];
+    for (target, pair) in uuid.iter_mut().zip(digits.chunks_exact(2)) {
+        let text = std::str::from_utf8(pair).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid UUID: {error}"),
+            )
+        })?;
+        *target = u8::from_str_radix(text, 16).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid UUID: {error}"),
+            )
+        })?;
+    }
+    Ok(uuid)
+}
+
+fn format_uuid(uuid: [u8; 16]) -> String {
+    let hex = uuid.map(|byte| format!("{byte:02x}")).concat();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+fn current_utc_timestamp() -> Result<(i64, String), io::Error> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            io::Error::other(format!("system clock is before the Unix epoch: {error}"))
+        })?;
+    let seconds = i64::try_from(elapsed.as_secs())
+        .map_err(|_| io::Error::other("current time does not fit an IFC timestamp"))?;
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_days(days);
+    let hour = day_seconds / 3_600;
+    let minute = day_seconds % 3_600 / 60;
+    let second = day_seconds % 60;
+    Ok((
+        seconds,
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"),
+    ))
+}
+
+/// Gregorian date for a day offset from 1970-01-01.
+fn civil_date_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+struct ExportMetadata<'a> {
+    schema: Option<&'a Schema>,
+    partition_paths: &'a [String],
+    parameter_names: &'a BTreeMap<i32, String>,
+    parameter_specs: &'a BTreeMap<i32, String>,
+    catalog: Option<Catalog>,
+}
+
+fn write_exported_elements(
+    mut writer: Box<dyn Write>,
+    elements: &BTreeMap<u32, ExportedElement>,
+    metadata: &ExportMetadata<'_>,
+    limit: Option<usize>,
+) -> io::Result<usize> {
+    let mut written = 0_usize;
+    for (id, element) in elements {
+        if limit.is_some_and(|limit| written >= limit) {
+            break;
+        }
+        written += 1;
+        write_element_json(&mut writer, *id, element, metadata)?;
+    }
+    writer.flush()?;
+    Ok(written)
+}
+
+fn schema_class_index(schema: Option<&Schema>, name: &str) -> Option<u16> {
+    schema
+        .and_then(|schema| schema.class_by_name(name))
+        .map(|class| class.index)
+}
+
+fn parameter_set_class_indexes(schema: Option<&Schema>) -> Option<ParameterSetClassIndexes> {
+    Some(ParameterSetClassIndexes {
+        double: schema_class_index(schema, "ParamValueSetDouble")?,
+        integer: schema_class_index(schema, "ParamValueSetInt")?,
+        text: schema_class_index(schema, "ParamValueSetAString")?,
+        reference: schema_class_index(schema, "ParamValueSetElementId")?,
+    })
+}
+
+/// Parameter identifiers point at definition elements in this same export.
+fn parameter_metadata(
+    elements: &BTreeMap<u32, ExportedElement>,
+) -> (BTreeMap<i32, String>, BTreeMap<i32, String>) {
+    let names = elements
         .iter()
         .filter_map(|(id, element)| {
             let name = element.name.as_ref()?;
             Some((i32::try_from(*id).ok()?, name.0.clone()))
         })
-        .collect::<BTreeMap<_, _>>();
-    let mut written = 0_usize;
-    for (id, element) in &elements {
-        if limit.is_some_and(|limit| written >= limit) {
-            break;
+        .collect();
+    let specs = elements
+        .iter()
+        .filter_map(|(id, element)| {
+            Some((
+                i32::try_from(*id).ok()?,
+                element.parameter_spec.as_ref()?.clone(),
+            ))
+        })
+        .collect();
+    (names, specs)
+}
+
+/// Cross the format boundary once: raw Revit identifiers stay available as
+/// external IDs, while numbers with a known spec become unit-bearing values.
+fn normalize_element(
+    id: u32,
+    element: &ExportedElement,
+    schema: Option<&Schema>,
+    parameter_names: &BTreeMap<i32, String>,
+    parameter_specs: &BTreeMap<i32, String>,
+    catalog: Option<Catalog>,
+) -> BimElement {
+    let class_name = element.class_index.and_then(|class_index| {
+        schema
+            .and_then(|schema| schema.class_by_index(class_index))
+            .map(|class| class.name.clone())
+    });
+    let category = element.category.map(|code| BimCategory {
+        id: Some(BimExternalId {
+            system: "autodesk.revit.builtInCategory".to_owned(),
+            value: code.to_string(),
+        }),
+        name: catalog
+            .and_then(|catalog| catalog.built_in_category(code))
+            .map_or_else(
+                || code.to_string(),
+                |category| category.enum_name.to_owned(),
+            ),
+    });
+    let properties = element
+        .parameters
+        .iter()
+        .map(|parameter| normalize_property(parameter, parameter_names, parameter_specs, catalog))
+        .collect();
+
+    BimElement {
+        id: BimElementId(id.to_string()),
+        element_type: element_type_for_source(
+            class_name.as_deref(),
+            category.as_ref().map(|category| category.name.as_str()),
+        ),
+        class_name,
+        name: element.name.as_ref().map(|(name, _)| name.clone()),
+        category,
+        level_id: element.level_id.map(|id| BimElementId(id.to_string())),
+        // The recovered family reference is not proven to be a type reference
+        // for every serialized class.
+        type_id: None,
+        placement: normalize_placement(element.ginstance_transform),
+        geometry: normalize_geometry(element),
+        properties,
+    }
+}
+
+fn normalize_placement(transform: Option<GInstanceTransformFields>) -> Option<BimPlacement> {
+    let transform = transform?;
+    let origin = transform
+        .origin
+        .coordinates_feet
+        .map(revit_catalog::internal_feet_to_metres);
+    let [Some(origin_x), Some(origin_y), Some(origin_z)] = origin else {
+        return None;
+    };
+    Some(BimPlacement {
+        origin: BimPoint3 {
+            coordinates: [origin_x, origin_y, origin_z],
+            unit: metres_unit(),
+        },
+        reference_direction: transform.basis[0],
+        axis: transform.basis[2],
+    })
+}
+
+fn normalize_geometry(element: &ExportedElement) -> Option<BimGeometry> {
+    let metres = |value| revit_catalog::internal_feet_to_metres(value);
+    let point = |coordinates: [f64; 3]| {
+        Some(BimPoint3 {
+            coordinates: [
+                metres(coordinates[0])?,
+                metres(coordinates[1])?,
+                metres(coordinates[2])?,
+            ],
+            unit: metres_unit(),
+        })
+    };
+    if let (Some(line), Some(bounds)) = (element.pipe_line_candidate, element.geometry_bounds) {
+        if let Some(radius_feet) = line.swept_radius_feet(&bounds) {
+            return Some(BimGeometry::SweptDisk(BimSweptDisk {
+                directrix: BimLineSegment {
+                    start: point(line.start.coordinates_feet)?,
+                    end: point(line.end.coordinates_feet)?,
+                },
+                radius: BimNumber {
+                    value: metres(radius_feet)?,
+                    unit: Some(metres_unit()),
+                },
+            }));
         }
-        written += 1;
-        write_element_json(
-            &mut writer,
-            *id,
-            element,
-            schema.as_ref(),
-            &partition_paths,
-            &parameter_names,
-        )?;
     }
-    writer.flush()?;
-    if output.is_some() {
-        println!("Elements written: {written} of {}", elements.len());
+    let line = element.fitting_axis_candidate?;
+    Some(BimGeometry::AxisLine(BimLineSegment {
+        start: point(line.start.coordinates_feet)?,
+        end: point(line.end.coordinates_feet)?,
+    }))
+}
+
+fn metres_unit() -> BimUnit {
+    BimUnit {
+        id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
+        name: "Meters".to_owned(),
     }
-    Ok(())
+}
+
+fn normalize_property(
+    parameter: &rvt_model::Parameter,
+    parameter_names: &BTreeMap<i32, String>,
+    parameter_specs: &BTreeMap<i32, String>,
+    catalog: Option<Catalog>,
+) -> BimProperty {
+    let built_in = catalog.and_then(|catalog| catalog.built_in_parameter(parameter.id));
+    let name = parameter_names
+        .get(&parameter.id)
+        .cloned()
+        .or_else(|| built_in.map(|parameter| parameter.display_name.to_owned()))
+        .unwrap_or_else(|| format!("param_{}", parameter.id));
+    let specification = parameter_specs.get(&parameter.id).cloned();
+    let value = match &parameter.value {
+        ParameterValue::Double(number) => {
+            let normalized = specification
+                .as_deref()
+                .and_then(|type_id| catalog.and_then(|catalog| catalog.specification(type_id)))
+                .and_then(|specification| {
+                    Some((specification, specification.from_internal(*number)?))
+                });
+            let (value, unit) = normalized.map_or((*number, None), |(specification, value)| {
+                (
+                    value,
+                    Some(BimUnit {
+                        id: specification.storage_unit.to_owned(),
+                        name: specification.storage_unit_name.to_owned(),
+                    }),
+                )
+            });
+            BimPropertyValue::Number(BimNumber { value, unit })
+        }
+        ParameterValue::Integer(number) => BimPropertyValue::Integer(i64::from(*number)),
+        ParameterValue::Text(text) => BimPropertyValue::Text(text.clone()),
+        ParameterValue::Reference(reference) => {
+            BimPropertyValue::Reference(BimElementId(reference.to_string()))
+        }
+    };
+    BimProperty {
+        id: Some(BimExternalId {
+            system: if parameter.is_built_in() {
+                "autodesk.revit.builtInParameter"
+            } else {
+                "autodesk.revit.parameterElementId"
+            }
+            .to_owned(),
+            value: parameter.id.to_string(),
+        }),
+        name,
+        specification,
+        value,
+    }
 }
 
 /// Emit one element as a JSON object on its own line. Fields that were not
@@ -1985,14 +2835,23 @@ fn write_element_json(
     writer: &mut impl Write,
     id: u32,
     element: &ExportedElement,
-    schema: Option<&Schema>,
-    partition_paths: &[String],
-    parameter_names: &BTreeMap<i32, String>,
+    metadata: &ExportMetadata<'_>,
 ) -> io::Result<()> {
+    let normalized = normalize_element(
+        id,
+        element,
+        metadata.schema,
+        metadata.parameter_names,
+        metadata.parameter_specs,
+        metadata.catalog,
+    );
     write!(writer, "{{\"id\":{id}")?;
     if let Some(class_index) = element.class_index {
         write!(writer, ",\"class_index\":{class_index}")?;
-        if let Some(name) = schema.and_then(|schema| schema.class_by_index(class_index)) {
+        if let Some(name) = metadata
+            .schema
+            .and_then(|schema| schema.class_by_index(class_index))
+        {
             write!(writer, ",\"class\":\"{}\"", json_escape(&name.name))?;
         }
     }
@@ -2008,11 +2867,27 @@ fn write_element_json(
             write!(writer, ",\"{key}\":{value}")?;
         }
     }
+    if let Some(category) = &normalized.category {
+        write!(
+            writer,
+            ",\"category_name\":\"{}\"",
+            json_escape(&category.name)
+        )?;
+    }
+    write_geometry_json(writer, normalized.geometry.as_ref())?;
+    write_family_instance_placement(writer, element.family_instance_placement)?;
+    write_ginstance_transform(writer, element.ginstance_transform)?;
     if element.moribund {
         write!(writer, ",\"moribund\":true")?;
     }
     if element.locked {
         write!(writer, ",\"locked\":true")?;
+    }
+    if let Some(elevation) = element.elevation_feet {
+        write!(writer, ",\"elevation_internal_feet\":{elevation}")?;
+        if let Some(metres) = revit_catalog::internal_feet_to_metres(elevation) {
+            write!(writer, ",\"elevation_meters\":{metres}")?;
+        }
     }
     if let Some((name, source)) = &element.name {
         write!(
@@ -2023,29 +2898,17 @@ fn write_element_json(
     }
     if !element.parameters.is_empty() {
         write!(writer, ",\"parameters\":[")?;
-        for (index, parameter) in element.parameters.iter().enumerate() {
-            if index > 0 {
-                write!(writer, ",")?;
-            }
-            write!(writer, "{{\"id\":{}", parameter.id)?;
-            if let Some(name) = parameter_names.get(&parameter.id) {
-                write!(writer, ",\"name\":\"{}\"", json_escape(name))?;
-            }
-            match &parameter.value {
-                ParameterValue::Double(number) => write!(writer, ",\"double\":{number}")?,
-                ParameterValue::Integer(number) => write!(writer, ",\"int\":{number}")?,
-                ParameterValue::Text(text) => {
-                    write!(writer, ",\"text\":\"{}\"", json_escape(text))?;
-                }
-                ParameterValue::Reference(reference) => write!(writer, ",\"ref\":{reference}")?,
-            }
-            write!(writer, "}}")?;
-        }
+        write_parameters_json(
+            writer,
+            &element.parameters,
+            &normalized.properties,
+            metadata.catalog,
+        )?;
         write!(writer, "]")?;
     }
     write!(writer, ",\"records\":{}", element.record_count)?;
     if let Some((partition_index, member_index, offset)) = element.source {
-        if let Some(partition) = partition_paths.get(partition_index) {
+        if let Some(partition) = metadata.partition_paths.get(partition_index) {
             write!(
                 writer,
                 ",\"source\":{{\"partition\":\"{}\",\"member\":{member_index},\"offset\":{offset}}}",
@@ -2054,6 +2917,141 @@ fn write_element_json(
         }
     }
     writeln!(writer, "}}")
+}
+
+fn write_geometry_json(writer: &mut impl Write, geometry: Option<&BimGeometry>) -> io::Result<()> {
+    match geometry {
+        Some(BimGeometry::SweptDisk(swept_disk)) => {
+            let start = swept_disk.directrix.start.coordinates;
+            let end = swept_disk.directrix.end.coordinates;
+            write!(
+                writer,
+                ",\"geometry\":{{\"kind\":\"swept_disk\",\"start_meters\":[{},{},{}],\"end_meters\":[{},{},{}],\"radius_meters\":{}}}",
+                start[0], start[1], start[2], end[0], end[1], end[2], swept_disk.radius.value
+            )
+        }
+        Some(BimGeometry::AxisLine(line)) => {
+            let start = line.start.coordinates;
+            let end = line.end.coordinates;
+            write!(
+                writer,
+                ",\"geometry\":{{\"kind\":\"axis_line\",\"start_meters\":[{},{},{}],\"end_meters\":[{},{},{}]}}",
+                start[0], start[1], start[2], end[0], end[1], end[2]
+            )
+        }
+        None => Ok(()),
+    }
+}
+
+fn write_family_instance_placement(
+    writer: &mut impl Write,
+    placement: Option<FamilyInstancePlacementFields>,
+) -> io::Result<()> {
+    let Some(placement) = placement else {
+        return Ok(());
+    };
+    let [Some(origin_x), Some(origin_y), Some(origin_z)] = placement
+        .origin
+        .coordinates_feet
+        .map(revit_catalog::internal_feet_to_metres)
+    else {
+        return Ok(());
+    };
+    write!(
+        writer,
+        ",\"family_instance_frame\":{{\"origin_meters\":[{origin_x},{origin_y},{origin_z}],\"reference_direction\":[{},{},{}],\"axis\":[{},{},{}]}}",
+        placement.reference_direction[0],
+        placement.reference_direction[1],
+        placement.reference_direction[2],
+        placement.axis[0],
+        placement.axis[1],
+        placement.axis[2]
+    )
+}
+
+fn write_ginstance_transform(
+    writer: &mut impl Write,
+    transform: Option<GInstanceTransformFields>,
+) -> io::Result<()> {
+    let Some(transform) = transform else {
+        return Ok(());
+    };
+    let [Some(origin_x), Some(origin_y), Some(origin_z)] = transform
+        .origin
+        .coordinates_feet
+        .map(revit_catalog::internal_feet_to_metres)
+    else {
+        return Ok(());
+    };
+    let [x, y, z] = transform.basis;
+    write!(
+        writer,
+        ",\"ginstance_transform\":{{\"origin_meters\":[{origin_x},{origin_y},{origin_z}],\"basis\":[[{},{},{}],[{},{},{}],[{},{},{}]]}}",
+        x[0], x[1], x[2], y[0], y[1], y[2], z[0], z[1], z[2]
+    )
+}
+
+fn write_parameters_json(
+    writer: &mut impl Write,
+    parameters: &[rvt_model::Parameter],
+    properties: &[BimProperty],
+    catalog: Option<Catalog>,
+) -> io::Result<()> {
+    for (index, (parameter, property)) in parameters.iter().zip(properties).enumerate() {
+        if index > 0 {
+            write!(writer, ",")?;
+        }
+        write!(
+            writer,
+            "{{\"id\":{},\"name\":\"{}\"",
+            parameter.id,
+            json_escape(&property.name)
+        )?;
+        if let Some(parameter) =
+            catalog.and_then(|catalog| catalog.built_in_parameter(parameter.id))
+        {
+            write!(
+                writer,
+                ",\"built_in\":\"{}\"",
+                json_escape(parameter.enum_name)
+            )?;
+        }
+        if let Some(spec) = &property.specification {
+            write!(writer, ",\"spec\":\"{}\"", json_escape(spec))?;
+        }
+        write_parameter_value_json(writer, &parameter.value, &property.value)?;
+        write!(writer, "}}")?;
+    }
+    Ok(())
+}
+
+fn write_parameter_value_json(
+    writer: &mut impl Write,
+    source: &ParameterValue,
+    normalized: &BimPropertyValue,
+) -> io::Result<()> {
+    match source {
+        ParameterValue::Double(value) => {
+            write!(writer, ",\"double\":{value}")?;
+            if let BimPropertyValue::Number(number) = normalized {
+                if let Some(unit) = &number.unit {
+                    write!(
+                        writer,
+                        ",\"storage_value\":{},\"unit\":\"{}\",\"unit_name\":\"{}\"",
+                        number.value,
+                        json_escape(&unit.id),
+                        json_escape(&unit.name)
+                    )?;
+                }
+            }
+        }
+        ParameterValue::Integer(value) => write!(writer, ",\"int\":{value}")?,
+        ParameterValue::Text(value) => {
+            write!(writer, ",\"text\":\"{}\"", json_escape(value))?;
+        }
+        ParameterValue::Reference(value) => write!(writer, ",\"ref\":{value}")?,
+    }
+    Ok(())
 }
 
 /// Read the element's name, preferring the offset the class agrees on and
@@ -2638,4 +3636,98 @@ fn read_basic_file_info(container: &RvtContainer) -> Result<Option<BasicFileInfo
     }
     let bytes = container.read_stream_with_limit("BasicFileInfo", 16 * 1024 * 1024)?;
     Ok(Some(BasicFileInfo::parse(&bytes)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promotes_only_a_bounds_verified_pipe_to_metric_geometry() {
+        let element = ExportedElement {
+            pipe_line_candidate: Some(PipeLineGeometryFields {
+                line_offset: 100,
+                nominal_diameter_feet: 0.2,
+                start: rvt_model::RvtPoint3 {
+                    coordinates_feet: [12.0, 20.0, 30.0],
+                },
+                end: rvt_model::RvtPoint3 {
+                    coordinates_feet: [15.0, 20.0, 30.0],
+                },
+            }),
+            geometry_bounds: Some(GElementBounds {
+                offset: 24,
+                min: [12.0, 19.88, 29.88],
+                max: [15.0, 20.12, 30.12],
+            }),
+            ..ExportedElement::default()
+        };
+
+        let Some(BimGeometry::SweptDisk(geometry)) = normalize_geometry(&element) else {
+            panic!("verified pipe geometry was not promoted");
+        };
+        assert!((geometry.directrix.start.coordinates[0] - 3.6576).abs() < 1.0e-12);
+        assert!((geometry.directrix.end.coordinates[0] - 4.572).abs() < 1.0e-12);
+        assert!((geometry.radius.value - 0.036_576).abs() < 1.0e-12);
+
+        let mut mismatched = element;
+        mismatched.geometry_bounds.as_mut().unwrap().max[2] += 1.0;
+        assert!(normalize_geometry(&mismatched).is_none());
+    }
+
+    #[test]
+    fn promotes_an_owner_verified_fitting_axis_without_inventing_a_body() {
+        let element = ExportedElement {
+            fitting_axis_candidate: Some(FittingCenterLineFields {
+                owner_element_id: 417_660,
+                start: rvt_model::RvtPoint3 {
+                    coordinates_feet: [10.0, 20.0, 30.0],
+                },
+                end: rvt_model::RvtPoint3 {
+                    coordinates_feet: [10.0, 20.0, 32.0],
+                },
+            }),
+            ..ExportedElement::default()
+        };
+        let Some(BimGeometry::AxisLine(line)) = normalize_geometry(&element) else {
+            panic!("verified fitting axis was not promoted");
+        };
+        for (actual, expected) in line
+            .start
+            .coordinates
+            .into_iter()
+            .chain(line.end.coordinates)
+            .zip([3.048, 6.096, 9.144, 3.048, 6.096, 9.7536])
+        {
+            assert!((actual - expected).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn promotes_a_bounds_verified_ginstance_transform_to_metric_placement() {
+        let transform = GInstanceTransformFields {
+            offset: 164,
+            basis: [[0.0, 0.0, 1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]],
+            origin: rvt_model::RvtPoint3 {
+                coordinates_feet: [10.0, 20.0, 30.0],
+            },
+        };
+        let placement = normalize_placement(Some(transform)).unwrap();
+        for (actual, expected) in placement
+            .origin
+            .coordinates
+            .into_iter()
+            .zip([3.048, 6.096, 9.144])
+        {
+            assert!((actual - expected).abs() < 1.0e-12);
+        }
+        for (actual, expected) in placement
+            .reference_direction
+            .into_iter()
+            .chain(placement.axis)
+            .zip(transform.basis[0].into_iter().chain(transform.basis[2]))
+        {
+            assert!((actual - expected).abs() < f64::EPSILON);
+        }
+    }
 }

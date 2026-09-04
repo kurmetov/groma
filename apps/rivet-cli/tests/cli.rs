@@ -822,6 +822,63 @@ fn export_json_writes_to_a_file_and_honours_the_limit() {
 }
 
 #[test]
+fn export_ifc_writes_an_ifc4_spatial_model() {
+    let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
+    let target = NamedTempFile::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-ifc",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            target.path().to_str().unwrap(),
+            "--model-namespace",
+            "00112233-4455-6677-8899-aabbccddeeff",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Model namespace: 00112233-4455-6677-8899-aabbccddeeff"));
+    assert!(stdout.contains("Building storeys: 0"));
+    assert!(stdout.contains("Elements: 0"));
+    let written = std::fs::read_to_string(target.path()).unwrap();
+    assert!(written.starts_with("ISO-10303-21;\nHEADER;"));
+    assert!(written.contains("FILE_SCHEMA(('IFC4'))"));
+    assert!(written.contains("=IFCPROJECT("));
+    assert!(written.contains("=IFCSITE("));
+    assert!(written.contains("=IFCBUILDING("));
+    assert!(written.ends_with("END-ISO-10303-21;\n"));
+}
+
+#[test]
+fn export_ifc_refuses_to_overwrite_the_source_rvt() {
+    let fixture = fixture();
+    let before = std::fs::read(fixture.path()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-ifc",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            fixture.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("IFC output must not overwrite the source RVT file")
+    );
+    assert_eq!(std::fs::read(fixture.path()).unwrap(), before);
+}
+
+#[test]
 fn names_report_where_a_class_keeps_its_string() {
     let mut wide = Vec::new();
     for (index, name) in [(1_u32, "01 Этаж"), (2, "02 Этаж")] {
@@ -899,6 +956,6 @@ fn export_json_carries_parameter_values() {
         .find(|line| line.contains("\"id\":8"))
         .unwrap();
     assert!(line.contains("\"parameters\":["));
-    assert!(line.contains("{\"id\":-1114242,\"int\":0}"));
-    assert!(line.contains("{\"id\":-1001203,\"text\":\"153\"}"));
+    assert!(line.contains("{\"id\":-1114242,\"name\":\"param_-1114242\",\"int\":0}"));
+    assert!(line.contains("{\"id\":-1001203,\"name\":\"param_-1001203\",\"text\":\"153\"}"));
 }

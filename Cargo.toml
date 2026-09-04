@@ -2,6 +2,8 @@
 members = [
     "apps/rivet-cli",
     "crates/bim-core",
+    "crates/ifc-export",
+    "crates/revit-catalog",
     "crates/rvt-container",
     "crates/rvt-model",
     "crates/rvt-schema",

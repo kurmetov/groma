@@ -8,8 +8,9 @@ reverse-engineering work cannot leak into the canonical BIM model.
   -> rvt-container  (CFB, streams, compression/framing)
   -> rvt-schema     (generic type and field declarations)
   -> rvt-model      (serialized objects, including unknown bytes)
+     + revit-catalog (release-specific public names and Forge units)
   -> bim-core       (format-independent BIM entities)
-  -> exporters      (future JSON, IFC, databases)
+  -> ifc-export     (metadata IFC4 graph, GlobalId and ISO 10303-21)
 ```
 
 ## Current milestone
@@ -64,8 +65,9 @@ produces an unknown release rather than a guessed value.
 generic class and property definitions. It preserves original name bytes,
 unknown header words, GUID bytes, unresolved references, index mismatches, and
 trailing bytes. It contains no `Wall`, `Door`, or other Revit-specific class
-catalog. The object and BIM crates currently define only stable,
-loss-preserving data shapes. `rvt-model` recognizes only corpus-backed
+catalog. `bim-core` now distinguishes source-system identifiers, unknown units,
+explicitly unit-bearing numbers, levels, and element relationships without
+depending on an RVT crate. `rvt-model` recognizes only corpus-backed
 `Global/ElemTable` record layouts. It validates an initial run of project-record
 markers, reports declared/parsed count differences, and retains the complete
 decoded byte sequence so unknown header, record, and trailing fields remain
@@ -80,14 +82,24 @@ neutral names. Parameter sets are read with the layout the schema declares for
 raw bytes except for that, the strings, and the
 `ElementHeader` identifier block, where the category and family reference are
 corpus-verified; the neighbouring `ElementId` slots are returned as unverified
-values rather than named fields, and nothing else in a body is interpreted.
+values rather than named fields. `LevelFields` additionally reads a schema-
+resolved, structurally validated `Plane` and exposes its origin Z as internal
+feet. Project/shared parameter definitions expose their Forge spec type ID, so
+positive `paramId` values can be joined to a dimension without mistaking
+document display units for storage units. The reader resolves the four dynamic
+`ParamValueSet*` class indexes, identifies which typed sets are referenced
+before `m_id`, and accepts only one post-tail run with exactly those value
+kinds and release-validated parameter IDs. The older unbound scan remains
+diagnostic-only for unsupported schemas.
 
 ## Export roadmap
 
 JSON is the first exporter and IFC is a required target, not an optional one.
 The JSON exporter currently lives in the CLI and emits only fields the readers
-actually recovered, omitting anything unknown rather than emitting a default;
-it will move behind `bim-core` once the model carries names and parameters.
+actually recovered, omitting anything unknown rather than emitting a default.
+Its normalization step now creates `bim-core` categories, properties, external
+identifiers and unit-bearing numbers; collection will move out of the CLI as
+the remaining record-specific normalization moves into `rvt-model`.
 The dependency direction is fixed: exporters read `bim-core` only. Element
 identity, category, family/type/instance hierarchy, parameters with units,
 levels, spaces, and host-child relations must therefore be reconstructed in
@@ -95,6 +107,74 @@ levels, spaces, and host-child relations must therefore be reconstructed in
 reaches back into RVT structures would reintroduce the coupling this split
 exists to prevent. Geometry stays out of both exporters until the object graph
 and semantics are reliable.
+
+Built-in names are external catalog data, not RVT serialization.
+`revit-catalog` implements the Revit 2023 `BuiltInParameter` and
+`BuiltInCategory` tables selected from `BasicFileInfo.release`: stable enum
+names are the machine-readable default and unknown codes retain a numeric
+fallback. It also converts a known Forge spec from Revit's internal base units
+to the registry's canonical storage unit. Catalog lookups never erase the
+source code or become a prerequisite for lossless parsing.
+
+`ifc-export` implements the buildingSMART 22-character UUID encoding,
+deterministic RFC 4122 version-5 identities, STEP references, typed values,
+enumerations, lists, finite-number checks, apostrophe/backslash escaping, and
+UTF-16 `\X2\` strings. Its high-level builder emits an IFC4 Reference View
+graph: project, site, building, metric unit assignment, storeys with recovered
+elevations, spatial decomposition and containment, typed elements with a proxy
+fallback, and property sets for trusted `bim-core` values. A declarative source
+class/category table maps `RbsPipeCurve` pipes,
+pipe fittings, plumbing fixtures, duct terminals and sprinklers to the
+corresponding format-neutral `BimElementType`; the entity dispatcher emits
+`IfcPipeSegment`, `IfcPipeFitting`, `IfcSanitaryTerminal`, `IfcAirTerminal` or
+`IfcFireSuppressionTerminal`. Unknown or
+unsupported numeric units become labelled values rather than guessed IFC
+measures, and a storey without an explicit metric elevation is rejected.
+
+The first geometry slice is deliberately narrow. `rvt-model` accepts a
+straight `RbsPipeCurve` only when its schema-resolved curve-driver line and
+an outer radius solved from the independently stored `GElement` bounds
+reproduce those bounds on every axis. The stored width/diameter is retained as
+nominal evidence rather than assumed to be the physical outside diameter. `bim-core`
+represents that result as a metric line directrix plus swept-disk radius. The
+IFC exporter writes `IfcPolyline` axis geometry and an
+`IfcSweptDiskSolid`/`AdvancedSweptSolid` body relative to the element's storey;
+an unverified candidate keeps its typed metadata but no representation.
+For `PipeFittingCenterLine`, `rvt-model` accepts only a one-item center-curve
+collection whose schema-resolved `GLine` has a finite, non-empty unit-direction
+domain. Its `GInfo` element tag must resolve uniquely to an
+`OST_PipeFitting`, and the helper itself must carry
+`OST_PipeFittingCenterLine`; both endpoints must also lie inside the owner's
+independently serialized `GElement` bounds. `bim-core` retains this as an axis-only line and
+the IFC exporter writes only the `Axis`/`Curve3D` representation: it does not
+infer a fitting radius or body from the centerline.
+
+The CLI bridge is intentionally conservative. It selects live categorized
+records with a recovered level association, with an option to include unplaced
+categorized records. For storeys it selects top-level `Level` records without
+a family reference, excluding reference levels contributed by loaded family
+documents. It writes source ID, class and category properties and promotes
+only schema-bound parameter runs. Known units become IFC measures; unresolved
+units become labels rather than guessed measures. Curved and multi-branch
+fitting axes, fitting bodies, terminals and general element geometry remain
+separate future layers.
+
+The raw `FamilyInstance` frame remains diagnostic. The reader finds the
+schema-declared consecutive `m_instOrigin`,
+`m_RefDir`, and `m_zAxis` fields, requires unit orthogonal directions, and can
+cross-check the origin against a separately serialized near-duplicate bounds
+pair. Only 7 of the 75 mapped family instances in the first live export pass
+that gate, so treating the raw origin as a project/world placement would be
+unsupported. These candidates are visible in JSON but are not used for IFC.
+
+The independently stored `GElement` record provides the project-space bridge:
+a schema-resolved `GInstance` contains `InstanceInfo.m_Trf`, represented by a
+3×3 basis and origin. Promotion requires one finite orthonormal right-handed
+transform after the `GInstance` marker and an origin inside the independent
+element bounds. The first live model yields 6,524 verified transforms, covering
+66 of 75 mapped family instances. `bim-core` retains world origin, local X and
+local Z; the IFC exporter writes a storey-relative `IfcLocalPlacement` and
+converts any world-space element geometry back to that local frame.
 
 ## Invariants
 
