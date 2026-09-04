@@ -4,13 +4,14 @@ mod elem_table;
 mod geometry;
 mod member;
 mod parameter;
+mod serial;
 
 pub use elem_table::{
     ElemTable, ElemTableError, ElemTableHeader, ElemTableLayout, ElemTableRecord, RecordFraming,
 };
 pub use geometry::{
-    FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds,
-    GInstanceTransformFields, PipeLineGeometryFields, RvtPoint3,
+    FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds, GElementGraphFields,
+    GElementNodeReference, GInstanceTransformFields, PipeLineGeometryFields, RvtPoint3,
 };
 pub use member::{
     ELEMENT_HEADER_ID_BLOCK_BYTES, ELEMENT_ID_SEARCH_WINDOW_BYTES, ELEMENT_PRE_ID_WORD_BYTES,
@@ -21,6 +22,10 @@ pub use member::{
 pub use parameter::{
     AUTODESK_SPEC_PREFIX, MAX_PARAMETERS_PER_SET, Parameter, ParameterSetClassIndexes,
     ParameterSets, ParameterSpec, ParameterValue,
+};
+pub use serial::{
+    SerialObject, SerialRecordWalk, SerialStop, SerialStreamWalk, SerialTraceEntry, SerialWalk,
+    walk_object, walk_object_stream, walk_record, walk_record_collecting, walk_record_traced,
 };
 
 #[derive(Clone, Debug, Default, PartialEq)]

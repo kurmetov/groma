@@ -5,8 +5,8 @@ use std::{
 };
 
 use bim_core::{
-    BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel, BimLineSegment,
-    BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
+    BimBoundingBox, BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel,
+    BimLineSegment, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
 };
 
 use crate::{EntityRef, IfcGuid, StepFile, StepHeader, StepValue, mapping::resolved_element_type};
@@ -561,14 +561,7 @@ fn push_element(
             .as_ref()
             .map(|category| category.name.as_str())
     });
-    let entity_name = match resolved_element_type(element) {
-        BimElementType::PipeSegment => "IFCPIPESEGMENT",
-        BimElementType::PipeFitting => "IFCPIPEFITTING",
-        BimElementType::SanitaryTerminal => "IFCSANITARYTERMINAL",
-        BimElementType::AirTerminal => "IFCAIRTERMINAL",
-        BimElementType::FireSuppressionTerminal => "IFCFIRESUPPRESSIONTERMINAL",
-        BimElementType::Unknown => "IFCBUILDINGELEMENTPROXY",
-    };
+    let entity = product_entity(resolved_element_type(element));
     let representation = element.geometry.as_ref().and_then(|geometry| {
         push_geometry(
             file,
@@ -578,20 +571,46 @@ fn push_element(
             geometry_context.placement,
         )
     });
-    file.push(
-        entity_name,
-        vec![
-            global_id(options, &format!("element:{}", element.id.0)),
-            reference(owner),
-            string(element.name.as_deref().unwrap_or(&element.id.0)),
-            omitted(),
-            optional_string(object_type),
-            reference(placement),
-            representation.map_or_else(omitted, reference),
-            string(&element.id.0),
-            enumeration("NOTDEFINED"),
-        ],
-    )
+    let mut attributes = vec![
+        global_id(options, &format!("element:{}", element.id.0)),
+        reference(owner),
+        string(element.name.as_deref().unwrap_or(&element.id.0)),
+        omitted(),
+        optional_string(object_type),
+        reference(placement),
+        representation.map_or_else(omitted, reference),
+        string(&element.id.0),
+    ];
+    if entity.has_predefined_type {
+        attributes.push(enumeration("NOTDEFINED"));
+    }
+    file.push(entity.name, attributes)
+}
+
+/// The IFC4 product entity for a normalized type. The distribution supertypes
+/// are instantiable but, unlike the typed leaves, declare no `PredefinedType`.
+struct ProductEntity {
+    name: &'static str,
+    has_predefined_type: bool,
+}
+
+fn product_entity(element_type: BimElementType) -> ProductEntity {
+    let (name, has_predefined_type) = match element_type {
+        BimElementType::PipeSegment => ("IFCPIPESEGMENT", true),
+        BimElementType::PipeFitting => ("IFCPIPEFITTING", true),
+        BimElementType::SanitaryTerminal => ("IFCSANITARYTERMINAL", true),
+        BimElementType::AirTerminal => ("IFCAIRTERMINAL", true),
+        BimElementType::FireSuppressionTerminal => ("IFCFIRESUPPRESSIONTERMINAL", true),
+        BimElementType::Alarm => ("IFCALARM", true),
+        BimElementType::CableCarrierFitting => ("IFCCABLECARRIERFITTING", true),
+        BimElementType::DistributionElement => ("IFCDISTRIBUTIONELEMENT", false),
+        BimElementType::DistributionFlowElement => ("IFCDISTRIBUTIONFLOWELEMENT", false),
+        BimElementType::Unknown => ("IFCBUILDINGELEMENTPROXY", true),
+    };
+    ProductEntity {
+        name,
+        has_predefined_type,
+    }
 }
 
 fn push_geometry(
@@ -657,7 +676,51 @@ fn push_geometry(
                 ],
             ))
         }
+        BimGeometry::BoundingBox(bounds) => push_bounding_box(file, bounds, representation_context),
     }
+}
+
+fn push_bounding_box(
+    file: &mut StepFile,
+    bounds: &BimBoundingBox,
+    representation_context: EntityRef,
+) -> Option<EntityRef> {
+    let min = metric_coordinates(&bounds.min)?;
+    let max = metric_coordinates(&bounds.max)?;
+    let dimensions = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    if dimensions
+        .into_iter()
+        .any(|dimension| !dimension.is_finite() || dimension <= 0.0)
+    {
+        return None;
+    }
+    let corner = push_cartesian_point(file, min);
+    let item = file.push(
+        "IFCBOUNDINGBOX",
+        vec![
+            reference(corner),
+            StepValue::Real(dimensions[0]),
+            StepValue::Real(dimensions[1]),
+            StepValue::Real(dimensions[2]),
+        ],
+    );
+    let representation = file.push(
+        "IFCSHAPEREPRESENTATION",
+        vec![
+            reference(representation_context),
+            string("Box"),
+            string("BoundingBox"),
+            StepValue::List(vec![reference(item)]),
+        ],
+    );
+    Some(file.push(
+        "IFCPRODUCTDEFINITIONSHAPE",
+        vec![
+            omitted(),
+            omitted(),
+            StepValue::List(vec![reference(representation)]),
+        ],
+    ))
 }
 
 fn push_axis_line(
@@ -1174,6 +1237,69 @@ mod tests {
         let relative_origin = format!("({:.15e},{:.15e},{:.15e})", 1.0, 2.0, 3.0 - 3.048);
         assert!(text.contains(&relative_origin));
         assert!(text.contains("(0.000000000000000e0,0.000000000000000e0,5.000000000000000e-1)"));
+    }
+
+    #[test]
+    fn writes_verified_local_extents_as_a_box_not_a_body() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::SanitaryTerminal;
+        model.elements[0].placement = Some(BimPlacement {
+            origin: BimPoint3 {
+                coordinates: [10.0, 20.0, 30.0],
+                unit: BimUnit {
+                    id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
+                    name: "Meters".to_owned(),
+                },
+            },
+            reference_direction: [1.0, 0.0, 0.0],
+            axis: [0.0, 0.0, 1.0],
+        });
+        let metres = BimUnit {
+            id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
+            name: "Meters".to_owned(),
+        };
+        model.elements[0].geometry = Some(BimGeometry::BoundingBox(BimBoundingBox {
+            min: BimPoint3 {
+                coordinates: [-0.1, -0.2, -0.3],
+                unit: metres.clone(),
+            },
+            max: BimPoint3 {
+                coordinates: [0.1, 0.2, 0.3],
+                unit: metres,
+            },
+        }));
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("=IFCSANITARYTERMINAL("));
+        assert!(text.contains("=IFCBOUNDINGBOX("));
+        assert!(text.contains("'Box','BoundingBox'"));
+        assert!(!text.contains("'Body'"));
+        assert!(
+            text.contains("(-1.000000000000000e-1,-2.000000000000000e-1,-3.000000000000000e-1)")
+        );
+        assert!(text.contains(",2.000000000000000e-1,4.000000000000000e-1,6.000000000000000e-1)"));
+    }
+
+    #[test]
+    fn writes_a_distribution_supertype_without_a_predefined_type() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::DistributionElement;
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("=IFCDISTRIBUTIONELEMENT("))
+            .expect("the mapped supertype was not written");
+        // `IfcDistributionElement` stops above the typed leaves and declares no
+        // `PredefinedType`, so the trailing enumeration must not be written.
+        assert!(!line.contains("NOTDEFINED"), "{line}");
+        assert!(!text.contains("=IFCBUILDINGELEMENTPROXY("));
     }
 
     #[test]

@@ -10,6 +10,10 @@ const SERIALIZED_GLINE_MARKER: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x
 const DIRECTION_TOLERANCE: f64 = 1.0e-8;
 const DIMENSION_TOLERANCE: f64 = 1.0e-10;
 const BOUNDS_TOLERANCE_FEET: f64 = 1.0e-8;
+const GELEMENT_NODE_COUNT_OFFSET: usize = 14;
+const GELEMENT_NODE_REFERENCES_OFFSET: usize = 18;
+const GELEMENT_NODE_REFERENCE_BYTES: usize = 6;
+const MAX_GELEMENT_TOP_LEVEL_NODES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RvtPoint3 {
@@ -145,6 +149,9 @@ pub struct GInstanceTransformFields {
     /// Local X/Y/Z basis vectors expressed in source world coordinates.
     pub basis: [[f64; 3]; 3],
     pub origin: RvtPoint3,
+    /// Referenced family-symbol element when the instance uses shared symbol
+    /// geometry. Embedded or otherwise unresolved geometry leaves this empty.
+    pub symbol_element_id: Option<u32>,
 }
 
 impl GInstanceTransformFields {
@@ -192,10 +199,14 @@ impl GInstanceTransformFields {
             if found.is_some() {
                 return None;
             }
+            let raw_symbol_id = read_u32(body, offset.checked_add(12 * 8)?)?;
+            let symbol_element_id = (raw_symbol_id > 0 && i32::try_from(raw_symbol_id).is_ok())
+                .then_some(raw_symbol_id);
             found = Some(Self {
                 offset,
                 basis,
                 origin,
+                symbol_element_id,
             });
         }
         found
@@ -321,6 +332,59 @@ pub struct GElementBounds {
     pub max: [f64; 3],
 }
 
+/// One dynamic top-level node reference in `GElement`'s inherited
+/// `GGroup.m_subNodes` collection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GElementNodeReference {
+    pub object_id: u32,
+    pub class_index: u16,
+}
+
+/// Structurally located `GElement` graph header and its local or world bounds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GElementGraphFields {
+    pub top_level_nodes: Vec<GElementNodeReference>,
+    pub bounds: GElementBounds,
+}
+
+impl GElementGraphFields {
+    /// Decode the leading `GGroup.m_subNodes` reference array and the two
+    /// immediately following `GRep` bounds blocks. The caller resolves node
+    /// classes against the active schema and accepts only `GNode` subclasses.
+    #[must_use]
+    pub fn parse(body: &[u8], mut accepts_node_class: impl FnMut(u16) -> bool) -> Option<Self> {
+        let node_count = usize::try_from(read_u32(body, GELEMENT_NODE_COUNT_OFFSET)?).ok()?;
+        if node_count > MAX_GELEMENT_TOP_LEVEL_NODES {
+            return None;
+        }
+        let bounds_offset = GELEMENT_NODE_REFERENCES_OFFSET
+            .checked_add(node_count.checked_mul(GELEMENT_NODE_REFERENCE_BYTES)?)?;
+        let mut top_level_nodes = Vec::with_capacity(node_count);
+        for index in 0..node_count {
+            let offset = GELEMENT_NODE_REFERENCES_OFFSET
+                .checked_add(index.checked_mul(GELEMENT_NODE_REFERENCE_BYTES)?)?;
+            let object_id = read_u32(body, offset)?;
+            let class_index = read_u16(body, offset.checked_add(4)?)?;
+            if object_id == 0
+                || !accepts_node_class(class_index)
+                || top_level_nodes
+                    .iter()
+                    .any(|node: &GElementNodeReference| node.object_id == object_id)
+            {
+                return None;
+            }
+            top_level_nodes.push(GElementNodeReference {
+                object_id,
+                class_index,
+            });
+        }
+        Some(Self {
+            top_level_nodes,
+            bounds: GElementBounds::parse_adjacent_at(body, bounds_offset, BOUNDS_TOLERANCE_FEET)?,
+        })
+    }
+}
+
 impl GElementBounds {
     /// Find exactly one adjacent pair of identical six-`f64` bounds blocks.
     #[must_use]
@@ -418,6 +482,95 @@ impl GElementBounds {
                     && value <= self.max[axis] + BOUNDS_TOLERANCE_FEET
             })
     }
+
+    /// Report whether the box has a strictly positive extent on every axis.
+    /// A box that is flat on one axis is a valid extent for containment tests
+    /// but not a solid volume, so it must not become a Box representation.
+    #[must_use]
+    pub fn is_volumetric(&self) -> bool {
+        self.min
+            .into_iter()
+            .zip(self.max)
+            .all(|(low, high)| high - low > BOUNDS_TOLERANCE_FEET)
+    }
+
+    /// Check that transforming every corner of `local` by the verified rigid
+    /// instance transform reproduces this world-axis-aligned box.
+    #[must_use]
+    pub fn matches_transformed(&self, local: &Self, transform: &GInstanceTransformFields) -> bool {
+        let mut transformed_min = [f64::INFINITY; 3];
+        let mut transformed_max = [f64::NEG_INFINITY; 3];
+        for corner in 0_u8..8 {
+            let local_point = [
+                if corner & 1 == 0 {
+                    local.min[0]
+                } else {
+                    local.max[0]
+                },
+                if corner & 2 == 0 {
+                    local.min[1]
+                } else {
+                    local.max[1]
+                },
+                if corner & 4 == 0 {
+                    local.min[2]
+                } else {
+                    local.max[2]
+                },
+            ];
+            let mut world = transform.origin.coordinates_feet;
+            for (local_axis, coordinate) in local_point.into_iter().enumerate() {
+                for (world_axis, value) in world.iter_mut().enumerate() {
+                    *value += transform.basis[local_axis][world_axis] * coordinate;
+                }
+            }
+            for (axis, value) in world.into_iter().enumerate() {
+                transformed_min[axis] = transformed_min[axis].min(value);
+                transformed_max[axis] = transformed_max[axis].max(value);
+            }
+        }
+        transformed_min
+            .into_iter()
+            .chain(transformed_max)
+            .zip(self.min.into_iter().chain(self.max))
+            .all(|(expected, actual)| {
+                expected.is_finite()
+                    && actual.is_finite()
+                    && (expected - actual).abs() <= BOUNDS_TOLERANCE_FEET
+            })
+    }
+
+    fn parse_adjacent_at(body: &[u8], offset: usize, tolerance: f64) -> Option<Self> {
+        const BLOCK_BYTES: usize = 6 * 8;
+        let first = read_f64_array::<6>(body, offset)?;
+        let second = read_f64_array::<6>(body, offset.checked_add(BLOCK_BYTES)?)?;
+        if first
+            .into_iter()
+            .zip(second)
+            .any(|(left, right)| !left.is_finite() || (left - right).abs() > tolerance)
+        {
+            return None;
+        }
+        let min = [
+            first[0].min(second[0]),
+            first[1].min(second[1]),
+            first[2].min(second[2]),
+        ];
+        let max = [
+            first[3].max(second[3]),
+            first[4].max(second[4]),
+            first[5].max(second[5]),
+        ];
+        if min.into_iter().zip(max).any(|(low, high)| low > high)
+            || !min
+                .into_iter()
+                .zip(max)
+                .any(|(low, high)| high - low > tolerance)
+        {
+            return None;
+        }
+        Some(Self { offset, min, max })
+    }
 }
 
 fn unique_circular_section(body: &[u8], curve_driver_class_index: u16) -> Option<f64> {
@@ -477,6 +630,12 @@ fn unique_valid_line_with_marker(body: &[u8], marker: &[u8]) -> Option<(usize, [
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
     ))
 }
 
@@ -586,6 +745,22 @@ mod tests {
         ] {
             body.extend(value.to_le_bytes());
         }
+        body.extend(417_391_u32.to_le_bytes());
+        body
+    }
+
+    fn gelement_graph_body() -> Vec<u8> {
+        let mut body = vec![0x55; GELEMENT_NODE_COUNT_OFFSET];
+        body.extend(2_u32.to_le_bytes());
+        body.extend(3_u32.to_le_bytes());
+        body.extend(2_081_u16.to_le_bytes());
+        body.extend(4_u32.to_le_bytes());
+        body.extend(GINSTANCE.to_le_bytes());
+        let first = [-1.0_f64, -2.0, -3.0, 1.0, 2.0, 3.0];
+        let second = [-1.0_f64 + 1.0e-12, -2.0, -3.0, 1.0, 2.0, 3.0];
+        for value in first.into_iter().chain(second) {
+            body.extend(value.to_le_bytes());
+        }
         body
     }
 
@@ -662,8 +837,93 @@ mod tests {
         let transform =
             GInstanceTransformFields::parse(&ginstance_body(), GINSTANCE, &bounds).unwrap();
         assert_eq!(transform.offset, 55);
+        assert_eq!(transform.symbol_element_id, Some(417_391));
         assert!(bounds.contains_point(transform.origin));
         assert!((determinant(transform.basis) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reads_schema_checked_gelement_nodes_and_structural_bounds() {
+        let graph = GElementGraphFields::parse(&gelement_graph_body(), |class_index| {
+            matches!(class_index, 2_081 | GINSTANCE)
+        })
+        .unwrap();
+        assert_eq!(graph.bounds.offset, 30);
+        for (actual, expected) in graph
+            .bounds
+            .min
+            .into_iter()
+            .chain(graph.bounds.max)
+            .zip([-1.0, -2.0, -3.0, 1.0, 2.0, 3.0])
+        {
+            assert!((actual - expected).abs() < f64::EPSILON);
+        }
+        assert_eq!(
+            graph.top_level_nodes,
+            [
+                GElementNodeReference {
+                    object_id: 3,
+                    class_index: 2_081,
+                },
+                GElementNodeReference {
+                    object_id: 4,
+                    class_index: GINSTANCE,
+                },
+            ]
+        );
+
+        assert!(
+            GElementGraphFields::parse(&gelement_graph_body(), |class_index| {
+                class_index == GINSTANCE
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn refuses_a_bounds_block_that_is_flat_on_one_axis_as_a_volume() {
+        let volumetric = GElementBounds {
+            offset: 0,
+            min: [-1.0, -2.0, -3.0],
+            max: [1.0, 2.0, 3.0],
+        };
+        assert!(volumetric.is_volumetric());
+        assert!(
+            !GElementBounds {
+                max: [1.0, 2.0, -3.0],
+                ..volumetric
+            }
+            .is_volumetric()
+        );
+    }
+
+    #[test]
+    fn verifies_symbol_bounds_after_rigid_instance_transform() {
+        let transform = GInstanceTransformFields {
+            offset: 0,
+            basis: [[0.0, 0.0, -1.0], [0.0, -1.0, 0.0], [-1.0, 0.0, 0.0]],
+            origin: RvtPoint3 {
+                coordinates_feet: [10.0, 20.0, 30.0],
+            },
+            symbol_element_id: Some(417_391),
+        };
+        let local = GElementBounds {
+            offset: 0,
+            min: [-1.0, -2.0, -3.0],
+            max: [1.0, 2.0, 3.0],
+        };
+        let world = GElementBounds {
+            offset: 0,
+            min: [7.0, 18.0, 29.0],
+            max: [13.0, 22.0, 31.0],
+        };
+        assert!(world.matches_transformed(&local, &transform));
+
+        let mismatched = GElementBounds {
+            max: [13.1, 22.0, 31.0],
+            ..world
+        };
+        assert!(!mismatched.matches_transformed(&local, &transform));
     }
 
     #[test]

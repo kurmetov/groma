@@ -41,6 +41,14 @@ pub enum BimElementType {
     SanitaryTerminal,
     AirTerminal,
     FireSuppressionTerminal,
+    Alarm,
+    CableCarrierFitting,
+    /// Source category that is certainly an MEP distribution element without
+    /// naming the device. Recorded as the supertype rather than guessed.
+    DistributionElement,
+    /// Source category that is certainly a flow element (a valve, strainer,
+    /// meter, pump or air handler) without naming which one.
+    DistributionFlowElement,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +56,15 @@ pub enum BimGeometry {
     /// An exact source centerline without an inferred body/profile.
     AxisLine(BimLineSegment),
     SweptDisk(BimSweptDisk),
+    /// An independently verified element-local extent. This is a bounding
+    /// representation, not a claim about the element's body or topology.
+    BoundingBox(BimBoundingBox),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BimBoundingBox {
+    pub min: BimPoint3,
+    pub max: BimPoint3,
 }
 
 #[derive(Clone, Debug, PartialEq)]

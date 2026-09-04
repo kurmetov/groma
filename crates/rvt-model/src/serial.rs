@@ -1,0 +1,979 @@
+//! Schema-driven walk of one serialized object body.
+//!
+//! The class schema declares, for every property, its field type, loading and
+//! item modes, fixed sizes and nested element type. This module reads a record
+//! body by following those declarations instead of hunting for offsets. The
+//! walk asserts nothing on its own: a body is only accepted when the declared
+//! properties tile it exactly, the same standard the member walk already uses.
+
+use rvt_schema::{FieldType, PropertyDefinition, Schema, TypeReference};
+
+use crate::{geometry::GElementNodeReference, member::MAX_STRING_CHARS};
+
+/// A serialized reference to another node: identifier plus class index.
+const OBJECT_REFERENCE_BYTES: usize = 6;
+/// Width read for `Integer32Alternate`. The encoding is variable - four
+/// objects were measured whose lengths only resolve if the field is sometimes
+/// four bytes - but the condition that lengthens it is not established, and
+/// treating the lead word's top bit as the trigger collapses corpus coverage
+/// from 59% to 3%. The walk reads the common two bytes.
+const ALTERNATE_INTEGER32_BYTES: usize = 2;
+/// Width read for `Integer16Alternate`, by the same reasoning.
+const ALTERNATE_INTEGER16_BYTES: usize = 1;
+/// Inline object whose `m_flags` carries the variable width.
+const GINFO_CLASS_NAME: &str = "GInfo";
+/// Top bit of an alternate integer's lead word, marking the longer form.
+const ALTERNATE_CONTINUATION_BIT: u16 = 0x8000;
+/// Bit of the loading mode that marks a property holding references rather
+/// than an inline object.
+const REFERENCE_LOADING_BIT: u8 = 0x01;
+/// Bit that narrows a reference to a bare identifier: the declaration already
+/// fixes the class, so no class index is written. Measured on `GEdge`, whose
+/// six face/next/previous links occupy twenty-four bytes, not thirty-six.
+const IDENTIFIER_ONLY_LOADING_BIT: u8 = 0x02;
+/// A bare identifier reference.
+const IDENTIFIER_REFERENCE_BYTES: usize = 4;
+/// Guard against a cyclic or malformed class chain.
+const MAX_WALK_DEPTH: usize = 64;
+/// Guard against a corrupt collection count claiming an absurd number of items.
+const MAX_COLLECTION_ITEMS: u32 = 1 << 20;
+
+/// Why a walk stopped before consuming the body exactly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SerialStop {
+    /// The declared properties ran past the end of the body.
+    Truncated { class: String, property: String },
+    /// The walk met a declaration it does not know how to read.
+    Unsupported {
+        class: String,
+        property: String,
+        reason: &'static str,
+    },
+    /// The class chain could not be resolved against the schema.
+    UnknownClass { class_index: u16 },
+    /// The chain nested deeper than the walk accepts.
+    TooDeep,
+}
+
+/// Result of walking one body against one class.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SerialWalk {
+    pub consumed: usize,
+    /// Bytes left over after the declared properties were read.
+    pub remaining: usize,
+    /// Every node reference met, in the order they were read.
+    pub references: Vec<GElementNodeReference>,
+    pub stop: Option<SerialStop>,
+}
+
+impl SerialWalk {
+    /// The body is explained exactly when nothing stopped the walk and no byte
+    /// is left over.
+    #[must_use]
+    pub fn is_exact(&self) -> bool {
+        self.stop.is_none() && self.remaining == 0
+    }
+}
+
+/// Walk `body` as an instance of `class_index`.
+#[must_use]
+pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk {
+    let mut reader = Reader {
+        schema,
+        body,
+        offset: 0,
+        references: Vec::new(),
+        identifiers: Vec::new(),
+        numbers: Vec::new(),
+        node_headers: false,
+        node_flags: 0,
+        trace: None,
+    };
+    let stop = reader.read_class(class_index, 0).err();
+    let consumed = reader.offset;
+    SerialWalk {
+        consumed,
+        remaining: body.len().saturating_sub(consumed),
+        references: reader.references,
+        stop,
+    }
+}
+
+/// Walk `body` as an instance of `class_index` and then keep walking the
+/// objects its references name, in the order the references were read, until
+/// the body is consumed. Newly met references join the back of the queue, so
+/// a nested group contributes its own children.
+#[must_use]
+pub fn walk_object_stream(schema: &Schema, class_index: u16, body: &[u8]) -> SerialStreamWalk {
+    let mut reader = Reader {
+        schema,
+        body,
+        offset: 0,
+        references: Vec::new(),
+        identifiers: Vec::new(),
+        numbers: Vec::new(),
+        node_headers: false,
+        node_flags: 0,
+        trace: None,
+    };
+    let mut stop = reader.read_class(class_index, 0).err();
+    let mut objects = 0_usize;
+    let mut next = 0_usize;
+    while stop.is_none() && reader.offset < body.len() {
+        let Some(reference) = reader.references.get(next).copied() else {
+            break;
+        };
+        next += 1;
+        objects += 1;
+        stop = reader.read_class(reference.class_index, 0).err();
+    }
+    let consumed = reader.offset;
+    SerialStreamWalk {
+        consumed,
+        remaining: body.len().saturating_sub(consumed),
+        objects,
+        pending_references: reader.references.len().saturating_sub(next),
+        references: reader.references,
+        stop,
+    }
+}
+
+/// Result of walking a record body as a header followed by its object stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SerialStreamWalk {
+    pub consumed: usize,
+    pub remaining: usize,
+    /// Referenced objects read after the header.
+    pub objects: usize,
+    /// References that were never reached because the body ran out first.
+    pub pending_references: usize,
+    pub references: Vec<GElementNodeReference>,
+    pub stop: Option<SerialStop>,
+}
+
+/// Bytes between a record's own declared properties and its node stream. This
+/// gap is real, not an artefact of the alternate integer: records whose
+/// `GRep.m_flags` lead word has its top bit clear still hold it.
+const NODE_STREAM_PREFIX_BYTES: usize = 2;
+/// Trailing `u32` that repeats the record's own body length.
+const RECORD_LENGTH_TRAILER_BYTES: usize = 4;
+/// Inline object that holds a live document handle rather than data. Measured
+/// on `InstanceInfo.m_cda`, which ends its object two bytes before the record
+/// ends, where walking the declared identifier would need four.
+const DOCUMENT_HANDLE_CLASS_NAME: &str = "ControlledConstDocAccess";
+const DOCUMENT_HANDLE_BYTES: usize = 2;
+
+/// Result of reading a whole record body: its own declared properties, then
+/// the serialized nodes its references name, then the length trailer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SerialRecordWalk {
+    pub consumed: usize,
+    /// Offset the walk had reached when it stopped.
+    pub stop_offset: usize,
+    pub remaining: usize,
+    /// Nodes read after the record's own properties.
+    pub nodes: usize,
+    /// Objects whose identifier no reference explained.
+    pub pending_references: usize,
+    /// Whether the trailing `u32` equals the body length.
+    pub length_trailer_matches: bool,
+    pub references: Vec<GElementNodeReference>,
+    pub stop: Option<SerialStop>,
+}
+
+impl SerialRecordWalk {
+    /// The record is explained when the walk consumed the body, the trailer
+    /// agrees with the body length, and nothing stopped it. References left in
+    /// the queue are not a fault: a record ends where its body ends, and the
+    /// objects its last references name may live in another record.
+    #[must_use]
+    pub fn is_exact(&self) -> bool {
+        self.stop.is_none() && self.remaining == 0 && self.length_trailer_matches
+    }
+}
+
+/// One property read, for diagnosing where a walk leaves the real layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerialTraceEntry {
+    pub offset: usize,
+    pub class: String,
+    pub property: String,
+    pub consumed: usize,
+}
+
+/// One object read out of a record's node stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SerialObject {
+    /// Identifier of the reference that named this object.
+    pub object_id: u32,
+    pub class_index: u16,
+    pub offset: usize,
+    pub bytes: usize,
+    /// Full references this object read, in order.
+    pub references: Vec<GElementNodeReference>,
+    /// Bare identifier references this object read, in order.
+    pub identifiers: Vec<u32>,
+    /// Every `Float64` this object read, in declaration order.
+    pub numbers: Vec<f64>,
+}
+
+/// Same as [`walk_record`], keeping each object the node stream held.
+#[must_use]
+pub fn walk_record_collecting(
+    schema: &Schema,
+    class_index: u16,
+    body: &[u8],
+) -> (SerialRecordWalk, Vec<SerialObject>) {
+    let (walk, _, objects) = walk_record_inner(schema, class_index, body, false, true);
+    (walk, objects)
+}
+
+/// Same as [`walk_record`], recording every property read.
+#[must_use]
+pub fn walk_record_traced(
+    schema: &Schema,
+    class_index: u16,
+    body: &[u8],
+) -> (SerialRecordWalk, Vec<SerialTraceEntry>) {
+    let (walk, trace, _) = walk_record_inner(schema, class_index, body, true, false);
+    (walk, trace)
+}
+
+/// Read `body` as a complete record: the declared properties of `class_index`,
+/// a two-byte stream prefix, one serialized node per reference in the order
+/// the references were read, and a trailing `u32` repeating the body length.
+#[must_use]
+pub fn walk_record(schema: &Schema, class_index: u16, body: &[u8]) -> SerialRecordWalk {
+    walk_record_inner(schema, class_index, body, false, false).0
+}
+
+fn walk_record_inner(
+    schema: &Schema,
+    class_index: u16,
+    body: &[u8],
+    trace: bool,
+    collect: bool,
+) -> (SerialRecordWalk, Vec<SerialTraceEntry>, Vec<SerialObject>) {
+    let trailer_offset = body.len().saturating_sub(RECORD_LENGTH_TRAILER_BYTES);
+    let length_trailer_matches = body
+        .get(trailer_offset..)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .is_some_and(|bytes| u32::from_le_bytes(bytes) as usize == body.len());
+    let mut reader = Reader {
+        schema,
+        body: &body[..trailer_offset],
+        offset: 0,
+        references: Vec::new(),
+        identifiers: Vec::new(),
+        numbers: Vec::new(),
+        node_headers: false,
+        node_flags: 0,
+        trace: trace.then(Vec::new),
+    };
+    let mut stop = reader.read_class(class_index, 0).err();
+    if stop.is_none() && reader.advance(NODE_STREAM_PREFIX_BYTES).is_none() {
+        stop = Some(SerialStop::Truncated {
+            class: "record".to_owned(),
+            property: "node stream prefix".to_owned(),
+        });
+    }
+    reader.node_headers = true;
+    let mut nodes = 0_usize;
+    let mut next = 0_usize;
+    let mut objects: Vec<SerialObject> = Vec::new();
+    // Objects are written in the order their references were read: a node's
+    // own references extend the queue behind those of its parent. A shared
+    // object is written once per reference to it, not once overall: reading
+    // each identifier only once leaves most records short.
+    while stop.is_none() && reader.offset < reader.body.len() {
+        let Some(reference) = reader.references.get(next).copied() else {
+            break;
+        };
+        next += 1;
+        // A null reference names no object and contributes no bytes.
+        if reference.object_id == 0 || schema.class_by_index(reference.class_index).is_none() {
+            continue;
+        }
+        nodes += 1;
+        let began = reader.offset;
+        let first_reference = reader.references.len();
+        let first_identifier = reader.identifiers.len();
+        let first_number = reader.numbers.len();
+        stop = reader.read_class(reference.class_index, 1).err();
+        if collect {
+            objects.push(SerialObject {
+                object_id: reference.object_id,
+                class_index: reference.class_index,
+                offset: began,
+                bytes: reader.offset.saturating_sub(began),
+                references: reader.references[first_reference..].to_vec(),
+                identifiers: reader.identifiers[first_identifier..].to_vec(),
+                numbers: reader.numbers[first_number..].to_vec(),
+            });
+        }
+    }
+    let consumed = reader.offset;
+    (
+        SerialRecordWalk {
+            consumed,
+            stop_offset: consumed,
+            remaining: trailer_offset.saturating_sub(consumed),
+            nodes,
+            pending_references: reader.references.len().saturating_sub(next),
+            length_trailer_matches,
+            references: reader.references,
+            stop,
+        },
+        reader.trace.unwrap_or_default(),
+        objects,
+    )
+}
+
+/// The object version a property named `_v<N>` was introduced in, if its name
+/// carries one. Measured on `GFace.m_faceFlags_v9`, which a version-8 face
+/// omits and a later face writes.
+fn version_gate(name: &str) -> Option<u32> {
+    let (head, digits) = name.rsplit_once("_v")?;
+    if head.is_empty() || digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+struct Reader<'a> {
+    schema: &'a Schema,
+    body: &'a [u8],
+    offset: usize,
+    references: Vec<GElementNodeReference>,
+    /// Bare identifier references, which name an object without its class.
+    identifiers: Vec<u32>,
+    /// Every `Float64` read, so a caller can recover coordinates.
+    numbers: Vec<f64>,
+    /// Whether the walk is inside the node stream rather than the record's
+    /// own declared properties.
+    node_headers: bool,
+    /// Flags of the `GInfo` most recently read, which gate later-version
+    /// properties for the rest of that object.
+    node_flags: u32,
+    trace: Option<Vec<SerialTraceEntry>>,
+}
+
+impl Reader<'_> {
+    /// Read every property of `class_index`, inherited properties first.
+    fn read_class(&mut self, class_index: u16, depth: usize) -> Result<(), SerialStop> {
+        if depth >= MAX_WALK_DEPTH {
+            return Err(SerialStop::TooDeep);
+        }
+        let mut chain = Vec::new();
+        let mut current = Some(class_index);
+        while let Some(index) = current {
+            let Some(class) = self.schema.class_by_index(index) else {
+                return Err(SerialStop::UnknownClass { class_index: index });
+            };
+            chain.push(class);
+            if chain.len() > MAX_WALK_DEPTH {
+                return Err(SerialStop::TooDeep);
+            }
+            current = class.parent.index();
+        }
+        for class in chain.into_iter().rev() {
+            for property in &class.properties {
+                self.read_property(&class.name, property, depth)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_property(
+        &mut self,
+        class_name: &str,
+        property: &PropertyDefinition,
+        depth: usize,
+    ) -> Result<(), SerialStop> {
+        // A property named `_v<N>` belongs to a later object version. Whether
+        // one is written varies inside a single file - two `GFace` objects
+        // differ by exactly this field - but no discriminator has been found:
+        // gating on the version carried in the node flags, or on the bit that
+        // separates those two faces, both score below simply skipping it.
+        if version_gate(&property.name).is_some() {
+            return Ok(());
+        }
+        match property.item_mode {
+            // A single value, and a string, which is one value however the
+            // item mode is written.
+            0 | 6 => self.read_item(class_name, property, depth),
+            1 => {
+                let count = property.size.unwrap_or(1).max(0);
+                for _ in 0..count {
+                    self.read_item(class_name, property, depth)?;
+                }
+                Ok(())
+            }
+            5 => {
+                let count = self.take_u32().ok_or_else(|| SerialStop::Truncated {
+                    class: class_name.to_owned(),
+                    property: property.name.clone(),
+                })?;
+                if count > MAX_COLLECTION_ITEMS {
+                    return Err(SerialStop::Unsupported {
+                        class: class_name.to_owned(),
+                        property: property.name.clone(),
+                        reason: "collection count out of range",
+                    });
+                }
+                for _ in 0..count {
+                    self.read_item(class_name, property, depth)?;
+                }
+                Ok(())
+            }
+            _ => Err(SerialStop::Unsupported {
+                class: class_name.to_owned(),
+                property: property.name.clone(),
+                reason: "item mode",
+            }),
+        }
+    }
+
+    fn read_item(
+        &mut self,
+        class_name: &str,
+        property: &PropertyDefinition,
+        depth: usize,
+    ) -> Result<(), SerialStop> {
+        let entered = self.offset;
+        let result = self.read_item_inner(class_name, property, depth);
+        if let Some(trace) = self.trace.as_mut() {
+            trace.push(SerialTraceEntry {
+                offset: entered,
+                class: class_name.to_owned(),
+                property: property.name.clone(),
+                consumed: self.offset.saturating_sub(entered),
+            });
+        }
+        result
+    }
+
+    fn read_item_inner(
+        &mut self,
+        class_name: &str,
+        property: &PropertyDefinition,
+        depth: usize,
+    ) -> Result<(), SerialStop> {
+        let truncated = || SerialStop::Truncated {
+            class: class_name.to_owned(),
+            property: property.name.clone(),
+        };
+        match property.field_type {
+            FieldType::Tuple => {
+                let Some(element) = property.element.as_deref() else {
+                    return Err(SerialStop::Unsupported {
+                        class: class_name.to_owned(),
+                        property: property.name.clone(),
+                        reason: "tuple without an element type",
+                    });
+                };
+                self.read_property(class_name, element, depth + 1)
+            }
+            FieldType::Object => {
+                if property.loading_mode & REFERENCE_LOADING_BIT != 0 {
+                    return if property.loading_mode & IDENTIFIER_ONLY_LOADING_BIT == 0 {
+                        self.take_reference().ok_or_else(truncated)
+                    } else {
+                        self.take_identifier().ok_or_else(truncated)
+                    };
+                }
+                let Some(static_index) =
+                    property.static_type.as_ref().and_then(TypeReference::index)
+                else {
+                    return Err(SerialStop::Unsupported {
+                        class: class_name.to_owned(),
+                        property: property.name.clone(),
+                        reason: "inline object without a static type",
+                    });
+                };
+                if self
+                    .schema
+                    .class_by_index(static_index)
+                    .is_some_and(|class| class.name == DOCUMENT_HANDLE_CLASS_NAME)
+                {
+                    return self.advance(DOCUMENT_HANDLE_BYTES).ok_or_else(truncated);
+                }
+                self.read_class(static_index, depth + 1)
+            }
+            FieldType::String => {
+                // A UTF-16 string: a character count, then two bytes each.
+                let count = self.take_u32().ok_or_else(&truncated)?;
+                if count > MAX_STRING_CHARS {
+                    return Err(SerialStop::Unsupported {
+                        class: class_name.to_owned(),
+                        property: property.name.clone(),
+                        reason: "string length out of range",
+                    });
+                }
+                let bytes = usize::try_from(count)
+                    .ok()
+                    .and_then(|count| count.checked_mul(2))
+                    .ok_or_else(&truncated)?;
+                self.advance(bytes).ok_or_else(truncated)
+            }
+            FieldType::Integer32Alternate => {
+                // Inside a node's `GInfo` this field is the one that varies:
+                // the lead word's top bit marks the four-byte form. Elsewhere
+                // the trigger is not established, so the common width is read.
+                if self.node_headers && class_name == GINFO_CLASS_NAME {
+                    let lead = self.peek_u16().ok_or_else(&truncated)?;
+                    let long = lead & ALTERNATE_CONTINUATION_BIT != 0;
+                    // The flags value gates the properties a later version
+                    // added, so it is kept for the rest of this object.
+                    self.node_flags = if long {
+                        self.peek_u32().unwrap_or_default()
+                    } else {
+                        u32::from(lead)
+                    };
+                    let width = if long {
+                        ALTERNATE_INTEGER32_BYTES + ALTERNATE_INTEGER32_BYTES
+                    } else {
+                        ALTERNATE_INTEGER32_BYTES
+                    };
+                    return self.advance(width).ok_or_else(truncated);
+                }
+                self.advance(ALTERNATE_INTEGER32_BYTES)
+                    .ok_or_else(truncated)
+            }
+            FieldType::Integer16Alternate => self
+                .advance(ALTERNATE_INTEGER16_BYTES)
+                .ok_or_else(truncated),
+            FieldType::Float64 => {
+                let bytes = self
+                    .body
+                    .get(self.offset..self.offset.saturating_add(8))
+                    .ok_or_else(&truncated)?;
+                let value = f64::from_le_bytes(bytes.try_into().map_err(|_| truncated())?);
+                self.numbers.push(value);
+                self.offset += 8;
+                Ok(())
+            }
+            other => {
+                let width = other.fixed_width().ok_or_else(|| SerialStop::Unsupported {
+                    class: class_name.to_owned(),
+                    property: property.name.clone(),
+                    reason: "field type without a width",
+                })?;
+                self.advance(width).ok_or_else(truncated)
+            }
+        }
+    }
+
+    fn advance(&mut self, bytes: usize) -> Option<()> {
+        let end = self.offset.checked_add(bytes)?;
+        (end <= self.body.len()).then(|| {
+            self.offset = end;
+        })
+    }
+
+    fn peek_u32(&self) -> Option<u32> {
+        let bytes = self.body.get(self.offset..self.offset.checked_add(4)?)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    fn peek_u16(&self) -> Option<u16> {
+        let bytes = self.body.get(self.offset..self.offset.checked_add(2)?)?;
+        Some(u16::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    fn take_u32(&mut self) -> Option<u32> {
+        let bytes = self.body.get(self.offset..self.offset.checked_add(4)?)?;
+        let value = u32::from_le_bytes(bytes.try_into().ok()?);
+        self.offset += 4;
+        Some(value)
+    }
+
+    fn take_identifier(&mut self) -> Option<()> {
+        let end = self.offset.checked_add(IDENTIFIER_REFERENCE_BYTES)?;
+        let bytes = self.body.get(self.offset..end)?;
+        self.identifiers
+            .push(u32::from_le_bytes(bytes.try_into().ok()?));
+        self.offset = end;
+        Some(())
+    }
+
+    fn take_reference(&mut self) -> Option<()> {
+        let end = self.offset.checked_add(OBJECT_REFERENCE_BYTES)?;
+        let bytes = self.body.get(self.offset..end)?;
+        self.references.push(GElementNodeReference {
+            object_id: u32::from_le_bytes(bytes[0..4].try_into().ok()?),
+            class_index: u16::from_le_bytes(bytes[4..6].try_into().ok()?),
+        });
+        self.offset = end;
+        Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rvt_schema::{ClassDefinition, TypeReference};
+
+    /// `class_by_index` addresses `classes` from this index.
+    const FIRST_CLASS_INDEX: u16 = rvt_schema::INITIAL_CLASS_INDEX;
+    /// An alternate integer in its two-byte form, and in its four-byte form.
+    const SHORT_FLAGS: u16 = 0x0004;
+    const LONG_FLAGS: u16 = 0x8204;
+
+    fn property(
+        name: &str,
+        field_type: FieldType,
+        loading_mode: u8,
+        item_mode: i8,
+        size: Option<i32>,
+    ) -> PropertyDefinition {
+        PropertyDefinition {
+            name: name.to_owned(),
+            name_bytes: name.as_bytes().to_vec(),
+            field_type,
+            raw_modes: loading_mode,
+            loading_mode,
+            item_mode,
+            unknown_word: 0,
+            size,
+            element: None,
+            static_type: None,
+            space_name_word: None,
+            offset: 0,
+        }
+    }
+
+    fn class(
+        index: u16,
+        name: &str,
+        parent: TypeReference,
+        properties: Vec<PropertyDefinition>,
+    ) -> ClassDefinition {
+        ClassDefinition {
+            index,
+            name: name.to_owned(),
+            name_bytes: name.as_bytes().to_vec(),
+            parent,
+            version: 1,
+            properties,
+            guids: Vec::new(),
+            unknown_word: 0,
+            inline: false,
+            offset: 0,
+            end_offset: 0,
+        }
+    }
+
+    /// A base class holding an inline object, and a derived class holding a
+    /// reference collection and a fixed tuple, mirroring `GNode`/`GGroup`.
+    fn schema() -> Schema {
+        let mut identifier = property("m_id", FieldType::Object, 0x00, 0, None);
+        identifier.static_type = Some(TypeReference::Reference {
+            index: FIRST_CLASS_INDEX,
+            name: "Identifier".to_owned(),
+        });
+        let mut coordinates = property("m_coord", FieldType::Tuple, 0x10, 1, Some(2));
+        coordinates.element = Some(Box::new(property(
+            "element",
+            FieldType::Float64,
+            0x10,
+            1,
+            Some(3),
+        )));
+        Schema {
+            classes: vec![
+                class(
+                    FIRST_CLASS_INDEX,
+                    "Identifier",
+                    TypeReference::None,
+                    vec![property("m_id", FieldType::Integer32, 0x00, 0, None)],
+                ),
+                class(
+                    FIRST_CLASS_INDEX + 1,
+                    "Base",
+                    TypeReference::None,
+                    vec![
+                        property("m_tag", FieldType::Integer32, 0x00, 0, None),
+                        identifier,
+                        property("m_flags", FieldType::Integer32Alternate, 0x00, 0, None),
+                    ],
+                ),
+                class(
+                    FIRST_CLASS_INDEX + 2,
+                    "Derived",
+                    TypeReference::Reference {
+                        index: FIRST_CLASS_INDEX + 1,
+                        name: "Base".to_owned(),
+                    },
+                    vec![
+                        property("m_subNodes", FieldType::Object, 0x51, 5, None),
+                        coordinates,
+                    ],
+                ),
+            ],
+            top_level_class_count: 3,
+            property_count: 6,
+            parsed_property_count: 6,
+            consumed_bytes: 0,
+            trailing_bytes: Vec::new(),
+            unresolved_references: Vec::new(),
+            inline_index_mismatches: Vec::new(),
+        }
+    }
+
+    fn derived_body(node_count: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(7_u32.to_le_bytes()); // Base.m_tag
+        body.extend((-1_i32).to_le_bytes()); // Base.m_id, one inline Identifier
+        body.extend(0x0008_u16.to_le_bytes()); // Base.m_flags, two bytes
+        body.extend(node_count.to_le_bytes());
+        for index in 0..node_count {
+            body.extend((index + 3).to_le_bytes());
+            body.extend(2_081_u16.to_le_bytes());
+        }
+        for value in [-1.0_f64, -2.0, -3.0, 1.0, 2.0, 3.0] {
+            body.extend(value.to_le_bytes());
+        }
+        body
+    }
+
+    #[test]
+    fn inherited_declarations_tile_a_body_exactly() {
+        let schema = schema();
+        let walk = walk_object(&schema, FIRST_CLASS_INDEX + 2, &derived_body(2));
+        assert_eq!(walk.stop, None);
+        assert!(walk.is_exact());
+        // 10 header bytes, a 4-byte count, two 6-byte references, six f64.
+        assert_eq!(walk.consumed, 10 + 4 + 12 + 48);
+        assert_eq!(
+            walk.references,
+            [
+                GElementNodeReference {
+                    object_id: 3,
+                    class_index: 2_081,
+                },
+                GElementNodeReference {
+                    object_id: 4,
+                    class_index: 2_081,
+                },
+            ]
+        );
+    }
+
+    /// A record shaped like the corpus: the root's declared properties, a
+    /// two-byte stream prefix, one node whose inline `GInfo` ends in the
+    /// variable-width flags word, and the length trailer.
+    fn record_schema() -> Schema {
+        let mut info = property("m_GInfo", FieldType::Object, 0x00, 0, None);
+        info.static_type = Some(TypeReference::Reference {
+            index: FIRST_CLASS_INDEX,
+            name: GINFO_CLASS_NAME.to_owned(),
+        });
+        let mut node_info = info.clone();
+        node_info.name = "m_GInfo".to_owned();
+        Schema {
+            classes: vec![
+                class(
+                    FIRST_CLASS_INDEX,
+                    GINFO_CLASS_NAME,
+                    TypeReference::None,
+                    vec![
+                        property("m_tag", FieldType::Integer32, 0x00, 0, None),
+                        property("m_flags", FieldType::Integer32Alternate, 0x00, 0, None),
+                    ],
+                ),
+                class(
+                    FIRST_CLASS_INDEX + 1,
+                    "Root",
+                    TypeReference::None,
+                    vec![
+                        info,
+                        property("m_subNodes", FieldType::Object, 0x51, 5, None),
+                    ],
+                ),
+                class(
+                    FIRST_CLASS_INDEX + 2,
+                    "Node",
+                    TypeReference::None,
+                    vec![
+                        node_info,
+                        property("m_endParams", FieldType::Float64, 0x10, 1, Some(2)),
+                    ],
+                ),
+            ],
+            top_level_class_count: 3,
+            property_count: 5,
+            parsed_property_count: 5,
+            consumed_bytes: 0,
+            trailing_bytes: Vec::new(),
+            unresolved_references: Vec::new(),
+            inline_index_mismatches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_record_is_its_properties_then_its_nodes_then_its_length() {
+        let node_class = FIRST_CLASS_INDEX + 2;
+        let mut body = Vec::new();
+        body.extend(6_i32.to_le_bytes()); // Root's inline GInfo
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(1_u32.to_le_bytes()); // one sub-node
+        body.extend(3_u32.to_le_bytes());
+        body.extend(node_class.to_le_bytes());
+        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
+        body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
+        body.extend(LONG_FLAGS.to_le_bytes()); // four bytes: top bit set
+        body.extend(0_u16.to_le_bytes());
+        body.extend(0.0_f64.to_le_bytes());
+        body.extend(287.5_f64.to_le_bytes());
+        let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+        body.extend(length.to_le_bytes());
+
+        let schema = record_schema();
+        let walk = walk_record(&schema, FIRST_CLASS_INDEX + 1, &body);
+        assert_eq!(walk.stop, None);
+        assert!(walk.length_trailer_matches);
+        assert_eq!(walk.nodes, 1);
+        assert_eq!(walk.pending_references, 0);
+        assert!(walk.is_exact());
+
+        // The trailer must repeat the body length, not merely be present.
+        let mut wrong_length = body.clone();
+        let last = wrong_length.len() - RECORD_LENGTH_TRAILER_BYTES;
+        wrong_length[last] = wrong_length[last].wrapping_add(1);
+        assert!(!walk_record(&schema, FIRST_CLASS_INDEX + 1, &wrong_length).is_exact());
+
+        // The same body with the node's flags word in its short form leaves
+        // two bytes unexplained: the width is read from the word, not fixed.
+        let mut short_form = body.clone();
+        let flags_at = body.len() - RECORD_LENGTH_TRAILER_BYTES - 16 - 4;
+        short_form[flags_at..flags_at + 2].copy_from_slice(&SHORT_FLAGS.to_le_bytes());
+        assert!(!walk_record(&schema, FIRST_CLASS_INDEX + 1, &short_form).is_exact());
+    }
+
+    #[test]
+    fn reference_width_follows_the_loading_mode_and_nulls_hold_no_body() {
+        let mut classes = record_schema().classes;
+        // A node holding one full reference, two identifier-only links, and a
+        // version-gated field that this data does not carry.
+        classes[2].properties = vec![
+            classes[2].properties[0].clone(),
+            property("m_pSurf", FieldType::Object, 0x01, 0, None),
+            property("m_pFace", FieldType::Object, 0x03, 1, Some(2)),
+            property(
+                "m_faceFlags_v9",
+                FieldType::Integer32Alternate,
+                0x00,
+                0,
+                None,
+            ),
+        ];
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+        let node_class = FIRST_CLASS_INDEX + 2;
+
+        let mut body = Vec::new();
+        body.extend(6_i32.to_le_bytes());
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(2_u32.to_le_bytes()); // two sub-nodes: one real, one null
+        body.extend(3_u32.to_le_bytes());
+        body.extend(node_class.to_le_bytes());
+        body.extend(0_u32.to_le_bytes());
+        body.extend(0_u16.to_le_bytes());
+        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
+        body.extend((-1_i32).to_le_bytes());
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(9_u32.to_le_bytes()); // m_pSurf: identifier and class
+        body.extend(565_u16.to_le_bytes());
+        body.extend(11_u32.to_le_bytes()); // m_pFace: two bare identifiers
+        body.extend(12_u32.to_le_bytes());
+        let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+        body.extend(length.to_le_bytes());
+
+        let walk = walk_record(&schema, FIRST_CLASS_INDEX + 1, &body);
+        assert_eq!(walk.stop, None);
+        assert_eq!(walk.remaining, 0);
+        assert!(walk.length_trailer_matches);
+        // One node was read, and the body ended there. The null reference and
+        // the surface this fixture points at are both left outside the body,
+        // so they stay pending rather than being read.
+        assert_eq!(walk.nodes, 1);
+        assert_eq!(walk.pending_references, 2);
+        assert_eq!(
+            walk.references.last(),
+            Some(&GElementNodeReference {
+                object_id: 9,
+                class_index: 565,
+            })
+        );
+    }
+
+    #[test]
+    fn a_document_handle_holds_two_bytes_instead_of_its_declaration() {
+        let mut classes = record_schema().classes;
+        let mut handle = property("m_cda", FieldType::Object, 0x00, 0, None);
+        handle.static_type = Some(TypeReference::Reference {
+            index: FIRST_CLASS_INDEX + 3,
+            name: DOCUMENT_HANDLE_CLASS_NAME.to_owned(),
+        });
+        classes[2].properties = vec![classes[2].properties[0].clone(), handle];
+        classes.push(class(
+            FIRST_CLASS_INDEX + 3,
+            DOCUMENT_HANDLE_CLASS_NAME,
+            TypeReference::None,
+            // Declared as an identifier reference, yet only two bytes are
+            // written: the handle points at a live document, not at data.
+            vec![property("m_pDoc", FieldType::Object, 0x03, 0, None)],
+        ));
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+
+        let mut body = Vec::new();
+        body.extend(6_i32.to_le_bytes());
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(1_u32.to_le_bytes());
+        body.extend(3_u32.to_le_bytes());
+        body.extend((FIRST_CLASS_INDEX + 2).to_le_bytes());
+        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
+        body.extend((-1_i32).to_le_bytes());
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend([0_u8; DOCUMENT_HANDLE_BYTES]);
+        let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+        body.extend(length.to_le_bytes());
+
+        let walk = walk_record(&schema, FIRST_CLASS_INDEX + 1, &body);
+        assert_eq!(walk.stop, None);
+        assert!(walk.is_exact());
+        assert_eq!(walk.nodes, 1);
+    }
+
+    #[test]
+    fn reads_the_version_a_property_was_introduced_in() {
+        assert_eq!(version_gate("m_faceFlags_v9"), Some(9));
+        assert_eq!(version_gate("m_flags_v12"), Some(12));
+        assert_eq!(version_gate("m_flags"), None);
+        assert_eq!(version_gate("m_pFace_vNext"), None);
+        assert_eq!(version_gate("_v9"), None);
+    }
+
+    #[test]
+    fn reports_a_body_that_the_declarations_do_not_explain() {
+        let schema = schema();
+        let mut short = derived_body(1);
+        short.truncate(short.len() - 1);
+        let walk = walk_object(&schema, FIRST_CLASS_INDEX + 2, &short);
+        assert!(!walk.is_exact());
+        assert!(matches!(walk.stop, Some(SerialStop::Truncated { .. })));
+
+        let mut padded = derived_body(1);
+        padded.extend([0_u8; 3]);
+        let walk = walk_object(&schema, FIRST_CLASS_INDEX + 2, &padded);
+        assert_eq!(walk.stop, None);
+        assert_eq!(walk.remaining, 3);
+        assert!(!walk.is_exact());
+    }
+}

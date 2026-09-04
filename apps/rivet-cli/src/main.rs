@@ -12,9 +12,9 @@ use std::{
 };
 
 use bim_core::{
-    BimCategory, BimElement, BimElementId, BimExternalId, BimGeometry, BimLevel, BimLineSegment,
-    BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue, BimSource,
-    BimSweptDisk, BimUnit,
+    BimBoundingBox, BimCategory, BimElement, BimElementId, BimElementType, BimExternalId,
+    BimGeometry, BimLevel, BimLineSegment, BimModel, BimNumber, BimPlacement, BimPoint3,
+    BimProperty, BimPropertyValue, BimSource, BimSweptDisk, BimUnit,
 };
 use clap::{Parser, Subcommand};
 use ifc_export::{MetadataOptions, element_type_for_source, metadata_ifc, uuid_v5};
@@ -26,7 +26,7 @@ use rvt_container::{
 };
 use rvt_model::{
     ELEMENT_TAIL_BYTES, ElemTable, ElementAnchor, ElementFields, ElementHeaderFields,
-    FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds,
+    FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds, GElementGraphFields,
     GInstanceTransformFields, LevelFields, MemberWalk, ParameterSetClassIndexes, ParameterSets,
     ParameterSpec, ParameterValue, PipeLineGeometryFields, RecordFraming, RecordHeader,
     RecordLayout, RecordString,
@@ -43,6 +43,9 @@ const SEQUENCE_STRIDES: [usize; 4] = [4, 8, 12, 16];
 /// Share of a class's records that must place their first readable string at
 /// the same offset before that offset is treated as the class's name field.
 const NAME_OFFSET_AGREEMENT: u64 = 90;
+/// Largest object identifier accepted when scanning a `GElement` body for
+/// nested node references. Top-level identifiers stay far below this.
+const NESTED_NODE_IDENTIFIER_LIMIT: u32 = 4_096;
 /// Schema class whose record body starts with the element's identifier block.
 const ELEMENT_HEADER_CLASS: &str = "ElementHeader";
 /// Descriptor format tag whose records carry the element's own class; the
@@ -220,6 +223,62 @@ enum Command {
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
     },
+    /// Walk record bodies of one class against the schema declarations and
+    /// report how much of each body the declared properties explain.
+    SerialProbe {
+        file: PathBuf,
+        /// Schema class whose records are walked.
+        #[arg(long, default_value = "GElement")]
+        class: String,
+        /// Keep walking the objects the record's references name, in order,
+        /// instead of stopping after the declared properties.
+        #[arg(long)]
+        stream: bool,
+        /// Read whole records: declared properties, the node stream, and the
+        /// trailing length word.
+        #[arg(long)]
+        record: bool,
+        /// Print this many rows of each histogram.
+        #[arg(long, default_value_t = 12)]
+        rows: usize,
+        /// Dump the bytes the declarations did not explain, for records whose
+        /// leftover is exactly this many bytes.
+        #[arg(long)]
+        dump_remaining: Option<usize>,
+        /// Print every property read for the record with this identifier.
+        #[arg(long)]
+        trace_id: Option<u32>,
+        /// Print the whole body of the record with this identifier as hex.
+        #[arg(long)]
+        dump_body: Option<u32>,
+        /// Report each record of this element separately instead of totals.
+        #[arg(long)]
+        element: Option<u32>,
+        /// Dump bytes around the stop of records whose stop description
+        /// contains this text.
+        #[arg(long)]
+        dump_stop: Option<String>,
+        /// Bytes shown either side of a dumped stop.
+        #[arg(long, default_value_t = 24)]
+        dump_window: usize,
+        /// Stop dumping after this many records.
+        #[arg(long, default_value_t = 8)]
+        dump_count: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+    /// Probe the `GElement` node graph: which node classes hang under it and
+    /// where their object identifiers resolve.
+    GeometryGraphProbe {
+        file: PathBuf,
+        /// Print this many rows of each histogram.
+        #[arg(long, default_value_t = 20)]
+        rows: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
     /// Export an IFC4 spatial tree, typed elements, and verified geometry.
     ExportIfc {
         file: PathBuf,
@@ -386,6 +445,40 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             limit,
             max_member_bytes,
         } => export_json(&file, output.as_deref(), limit, max_member_bytes),
+        Command::SerialProbe {
+            file,
+            class,
+            stream,
+            record,
+            rows,
+            dump_remaining,
+            dump_stop,
+            trace_id,
+            dump_body,
+            element,
+            dump_window,
+            dump_count,
+            max_member_bytes,
+        } => serial_probe(
+            &file,
+            &class,
+            stream,
+            record,
+            rows,
+            dump_remaining,
+            dump_stop.as_deref(),
+            trace_id,
+            dump_body,
+            element,
+            dump_window,
+            dump_count,
+            max_member_bytes,
+        ),
+        Command::GeometryGraphProbe {
+            file,
+            rows,
+            max_member_bytes,
+        } => geometry_graph_probe(&file, rows, max_member_bytes),
         Command::ExportIfc {
             file,
             output,
@@ -670,7 +763,23 @@ fn print_class_properties(schema: &Schema, class_name: &str) -> Result<(), Box<d
             .element
             .as_ref()
             .map_or_else(String::new, |element| {
-                format!("\telement={:?}", element.field_type)
+                format!(
+                    "\telement={:?}[modes={:#04x} item_mode={} size={}{}]",
+                    element.field_type,
+                    element.raw_modes,
+                    element.item_mode,
+                    element
+                        .size
+                        .map_or_else(|| "-".to_owned(), |size| size.to_string()),
+                    element
+                        .element
+                        .as_ref()
+                        .map_or_else(String::new, |inner| format!(
+                            " inner={:?}x{}",
+                            inner.field_type,
+                            inner.size.unwrap_or(1)
+                        ))
+                )
             });
         let static_type = property.static_type.as_ref().and_then(TypeReference::name);
         println!(
@@ -1671,13 +1780,21 @@ struct ExportedElement {
     family_instance_placement_candidates: Vec<FamilyInstancePlacementFields>,
     family_instance_placement: Option<FamilyInstancePlacementFields>,
     ginstance_transform: Option<GInstanceTransformFields>,
+    geometry_graph: Option<GElementGraphFields>,
     geometry_bounds: Option<GElementBounds>,
     placement_bounds: Option<GElementBounds>,
+    verified_symbol_bounds: Option<VerifiedSymbolBounds>,
     /// `m_moribund` from the `Element` tail: the element is marked deleted.
     moribund: bool,
     locked: bool,
     source: Option<(usize, usize, usize)>,
     record_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VerifiedSymbolBounds {
+    symbol_element_id: u32,
+    bounds: GElementBounds,
 }
 
 /// Per-class string calibration plus the identifiers of parameter elements.
@@ -1958,6 +2075,667 @@ fn names(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(), Box<d
     Ok(())
 }
 
+/// Walk every record of one class against the schema and report how far the
+/// declared properties explain the body. A body is only "exact" when the
+/// declarations tile it with nothing left over.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // One pass plus its report.
+fn serial_probe(
+    path: &Path,
+    class_name: &str,
+    stream: bool,
+    record_mode: bool,
+    rows: usize,
+    dump_remaining: Option<usize>,
+    dump_stop: Option<&str>,
+    trace_id: Option<u32>,
+    dump_body: Option<u32>,
+    element: Option<u32>,
+    dump_window: usize,
+    dump_count: usize,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the class schema is required for this probe",
+        )
+    })?;
+    let class_index = schema_class_index(Some(&schema), class_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("schema class not found: {class_name}"),
+        )
+    })?;
+    let partition_paths = partition_paths(&container);
+
+    let mut attempted = 0_usize;
+    let mut exact = 0_usize;
+    let mut trailing = 0_usize;
+    let mut stopped = 0_usize;
+    let mut stops: BTreeMap<String, usize> = BTreeMap::new();
+    let mut trailing_bytes: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut references = 0_usize;
+    let mut objects = 0_usize;
+    let mut pending = 0_usize;
+    let mut dumped = 0_usize;
+    let mut trailer_matches = 0_usize;
+    let mut boundary_records = 0_usize;
+    let mut boundary_exact = 0_usize;
+    let mut boundary_faces = 0_usize;
+    let mut boundary_exact_faces = 0_usize;
+
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, _, layout, walk, payload| {
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if header.class_index != class_index {
+                    continue;
+                }
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                attempted += 1;
+                let header_walk = rvt_model::walk_object(&schema, class_index, body);
+                if dump_remaining == Some(header_walk.remaining)
+                    && header_walk.stop.is_none()
+                    && dumped < dump_count
+                {
+                    dumped += 1;
+                    let mut named = String::new();
+                    for reference in &header_walk.references {
+                        if !named.is_empty() {
+                            named.push(' ');
+                        }
+                        let class = schema
+                            .class_by_index(reference.class_index)
+                            .map_or("<unknown>", |class| class.name.as_str());
+                        let _ = write!(named, "{}:{class}", reference.object_id);
+                    }
+                    let mut tail = String::new();
+                    for byte in body.get(header_walk.consumed..).unwrap_or_default() {
+                        let _ = write!(tail, "{byte:02x}");
+                    }
+                    println!(
+                        "  id={} len={} header={} refs=[{named}]",
+                        header.id,
+                        body.len(),
+                        header_walk.consumed
+                    );
+                    println!("    tail={tail}");
+                }
+                if dump_body == Some(header.id) {
+                    let mut hexed = String::new();
+                    for byte in body {
+                        let _ = write!(hexed, "{byte:02x}");
+                    }
+                    println!("body id={} len={} {hexed}", header.id, body.len());
+                }
+                if trace_id == Some(header.id) && dumped == 0 {
+                    dumped += 1;
+                    let (result, trace) = rvt_model::walk_record_traced(&schema, class_index, body);
+                    println!("Trace of record {} ({} bytes):", header.id, body.len());
+                    for entry in &trace {
+                        println!(
+                            "  {:6} +{:<4} {}.{}",
+                            entry.offset, entry.consumed, entry.class, entry.property
+                        );
+                    }
+                    println!(
+                        "  stop_at={} {}",
+                        result.stop_offset,
+                        result
+                            .stop
+                            .as_ref()
+                            .map_or_else(|| "none".to_owned(), describe_serial_stop)
+                    );
+                }
+                if element == Some(header.id) {
+                    let (result, objects) =
+                        rvt_model::walk_record_collecting(&schema, class_index, body);
+                    report_boundary_topology(&schema, header.id, body.len(), &result, &objects);
+                }
+                if record_mode {
+                    let result = rvt_model::walk_record(&schema, class_index, body);
+                    let faces = result
+                        .references
+                        .iter()
+                        .filter(|reference| {
+                            schema
+                                .class_by_index(reference.class_index)
+                                .is_some_and(|class| class.name == "Face")
+                        })
+                        .count();
+                    if faces > 0 {
+                        boundary_records += 1;
+                        boundary_faces += faces;
+                        if result.is_exact() {
+                            boundary_exact += 1;
+                            boundary_exact_faces += faces;
+                        }
+                    }
+                    objects += result.nodes;
+                    pending += result.pending_references;
+                    references += result.references.len();
+                    trailer_matches += usize::from(result.length_trailer_matches);
+                    if result.is_exact() {
+                        exact += 1;
+                    } else if let Some(stop) = &result.stop {
+                        stopped += 1;
+                        let described = describe_serial_stop(stop);
+                        if dump_stop.is_some_and(|wanted| described.contains(wanted))
+                            && dumped < dump_count
+                        {
+                            dumped += 1;
+                            let from = result.stop_offset.saturating_sub(dump_window);
+                            let to = (result.stop_offset + dump_window).min(body.len());
+                            let mut before = String::new();
+                            for byte in body.get(from..result.stop_offset).unwrap_or_default() {
+                                let _ = write!(before, "{byte:02x}");
+                            }
+                            let mut after = String::new();
+                            for byte in body.get(result.stop_offset..to).unwrap_or_default() {
+                                let _ = write!(after, "{byte:02x}");
+                            }
+                            println!(
+                                "  id={} len={} stop_at={} {described}",
+                                header.id,
+                                body.len(),
+                                result.stop_offset
+                            );
+                            println!("    before={before} | after={after}");
+                        }
+                        *stops.entry(described).or_default() += 1;
+                    } else {
+                        trailing += 1;
+                        *trailing_bytes.entry(result.remaining).or_default() += 1;
+                    }
+                    continue;
+                }
+                let (remaining, stop, found, read_objects) = if stream {
+                    let result = rvt_model::walk_object_stream(&schema, class_index, body);
+                    objects += result.objects;
+                    pending += result.pending_references;
+                    (
+                        result.remaining,
+                        result.stop,
+                        result.references.len(),
+                        result.objects,
+                    )
+                } else {
+                    let result = rvt_model::walk_object(&schema, class_index, body);
+                    (result.remaining, result.stop, result.references.len(), 0)
+                };
+                let _ = read_objects;
+                references += found;
+                match &stop {
+                    None if remaining == 0 => exact += 1,
+                    None => {
+                        trailing += 1;
+                        *trailing_bytes.entry(remaining).or_default() += 1;
+                    }
+                    Some(stop) => {
+                        stopped += 1;
+                        *stops.entry(describe_serial_stop(stop)).or_default() += 1;
+                    }
+                }
+            }
+        },
+    )?;
+
+    let share = |part: usize| {
+        if attempted == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                part as f64 * 100.0 / attempted as f64
+            }
+        }
+    };
+    println!("Class: {class_name} [{class_index}]");
+    println!("Records walked: {attempted}");
+    println!("  explained exactly: {exact} ({:.1}%)", share(exact));
+    println!(
+        "  declarations read, bytes left over: {trailing} ({:.1}%)",
+        share(trailing)
+    );
+    println!("  stopped early: {stopped} ({:.1}%)", share(stopped));
+    println!("  node references read: {references}");
+    if stream || record_mode {
+        println!("  referenced objects walked: {objects}");
+        println!("  references never reached: {pending}");
+    }
+    if record_mode {
+        println!(
+            "  records carrying boundary faces: {boundary_records} ({boundary_exact} explained exactly)"
+        );
+        println!("  faces in them: {boundary_faces} ({boundary_exact_faces} in explained records)");
+        println!(
+            "  trailing length word matches the body length: {trailer_matches} ({:.1}%)",
+            share(trailer_matches)
+        );
+    }
+    if !stops.is_empty() {
+        println!("Where the walk stopped:");
+        let mut ranked = stops.into_iter().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        for (reason, count) in ranked.iter().take(rows) {
+            println!("  {count:8}  {reason}");
+        }
+    }
+    if !trailing_bytes.is_empty() {
+        println!("Bytes left over:");
+        let mut ranked = trailing_bytes.into_iter().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        for (remaining, count) in ranked.iter().take(rows) {
+            println!("  {count:8} records  {remaining} bytes");
+        }
+    }
+    Ok(())
+}
+
+/// Summarize one record's node stream and check that its boundary topology
+/// closes: every edge naming two faces that exist, every loop naming a face,
+/// every face naming a loop. Nothing is inferred - only what was read.
+#[allow(clippy::too_many_lines)] // One pass over the objects plus its report.
+fn report_boundary_topology(
+    schema: &Schema,
+    id: u32,
+    body_bytes: usize,
+    walk: &rvt_model::SerialRecordWalk,
+    objects: &[rvt_model::SerialObject],
+) {
+    let name_of = |class_index: u16| {
+        schema
+            .class_by_index(class_index)
+            .map_or("<unknown>", |class| class.name.as_str())
+    };
+    let mut classes: BTreeMap<&str, usize> = BTreeMap::new();
+    for object in objects {
+        *classes.entry(name_of(object.class_index)).or_default() += 1;
+    }
+    let mut ranked = classes.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
+    let mut summary = String::new();
+    for (name, count) in ranked.iter().take(7) {
+        if !summary.is_empty() {
+            summary.push(' ');
+        }
+        let _ = write!(summary, "{name}x{count}");
+    }
+    println!(
+        "  record {id}: {body_bytes} bytes, exact={}, objects={}",
+        walk.is_exact(),
+        objects.len()
+    );
+    println!("    classes: {summary}");
+
+    let ids_of = |wanted: &str| {
+        objects
+            .iter()
+            .filter(|object| name_of(object.class_index) == wanted)
+            .map(|object| object.object_id)
+            .collect::<BTreeSet<_>>()
+    };
+    let faces = ids_of("Face");
+    let loops = ids_of("EdgeLoop");
+    if faces.is_empty() {
+        return;
+    }
+
+    let mut edges = 0_usize;
+    let mut edges_with_two_faces = 0_usize;
+    let mut edges_resolved = 0_usize;
+    let mut loops_resolved = 0_usize;
+    let mut faces_with_loop = 0_usize;
+    let mut faces_with_surface = 0_usize;
+    let mut surfaces: BTreeMap<&str, usize> = BTreeMap::new();
+    for object in objects {
+        match name_of(object.class_index) {
+            "Edge" => {
+                edges += 1;
+                let named = object.identifiers.iter().take(2).collect::<BTreeSet<_>>();
+                if named.len() == 2 {
+                    edges_with_two_faces += 1;
+                }
+                if named.iter().all(|id| faces.contains(id)) {
+                    edges_resolved += 1;
+                }
+            }
+            "EdgeLoop" => {
+                if object
+                    .identifiers
+                    .first()
+                    .is_some_and(|id| faces.contains(id))
+                {
+                    loops_resolved += 1;
+                }
+            }
+            "Face" => {
+                if object
+                    .references
+                    .first()
+                    .is_some_and(|reference| loops.contains(&reference.object_id))
+                {
+                    faces_with_loop += 1;
+                }
+                // `Face.m_pSurf` is the last reference the class declares.
+                if let Some(surface) = object
+                    .references
+                    .last()
+                    .filter(|reference| reference.object_id != 0)
+                {
+                    faces_with_surface += 1;
+                    *surfaces.entry(name_of(surface.class_index)).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    println!(
+        "    faces {} ({faces_with_loop} name a loop that exists, {faces_with_surface} name a surface)",
+        faces.len()
+    );
+    println!(
+        "    loops {} ({loops_resolved} name a face that exists)",
+        loops.len()
+    );
+    println!(
+        "    edges {edges} ({edges_with_two_faces} name two distinct faces, {edges_resolved} of those exist)"
+    );
+    // Surfaces carry their frame as plain numbers: an `Envelope` of four,
+    // then the axes. Checking the frame is orthonormal and the radius positive
+    // tests the decode itself, not just the topology.
+    let metres = |value: f64| revit_catalog::internal_feet_to_metres(value).unwrap_or(f64::NAN);
+    let unit = |v: &[f64]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let dot = |a: &[f64], b: &[f64]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let mut planes_checked = 0_usize;
+    let mut planes_orthonormal = 0_usize;
+    let mut cylinders_checked = 0_usize;
+    let mut cylinders_orthonormal = 0_usize;
+    let mut radii: Vec<f64> = Vec::new();
+    for object in objects {
+        let numbers = &object.numbers;
+        match name_of(object.class_index) {
+            // Envelope(4), origin(3), xVec(3), yVec(3)
+            "Plane" if numbers.len() >= 13 => {
+                planes_checked += 1;
+                let (x, y) = (&numbers[7..10], &numbers[10..13]);
+                if (unit(x) - 1.0).abs() < 1.0e-9
+                    && (unit(y) - 1.0).abs() < 1.0e-9
+                    && dot(x, y).abs() < 1.0e-9
+                {
+                    planes_orthonormal += 1;
+                }
+            }
+            // Envelope(4), center(3), xVec(3), yVec(3), zVec(3), radius(1)
+            "CylSurf" if numbers.len() >= 17 => {
+                cylinders_checked += 1;
+                let (x, y, z) = (&numbers[7..10], &numbers[10..13], &numbers[13..16]);
+                if (unit(x) - 1.0).abs() < 1.0e-9
+                    && (unit(y) - 1.0).abs() < 1.0e-9
+                    && (unit(z) - 1.0).abs() < 1.0e-9
+                    && dot(x, y).abs() < 1.0e-9
+                    && dot(x, z).abs() < 1.0e-9
+                {
+                    cylinders_orthonormal += 1;
+                }
+                radii.push(metres(numbers[16]) * 1000.0);
+            }
+            _ => {}
+        }
+    }
+    if planes_checked > 0 || cylinders_checked > 0 {
+        println!("    planes with an orthonormal frame: {planes_orthonormal} of {planes_checked}");
+        println!(
+            "    cylinders with an orthonormal frame: {cylinders_orthonormal} of {cylinders_checked}"
+        );
+        radii.sort_by(f64::total_cmp);
+        radii.dedup_by(|left, right| (*left - *right).abs() < 1.0e-6);
+        let mut listed = String::new();
+        for radius in radii.iter().take(12) {
+            if !listed.is_empty() {
+                listed.push(' ');
+            }
+            let _ = write!(listed, "{radius:.1}");
+        }
+        println!("    distinct cylinder radii, mm: {listed}");
+    }
+    let mut surface_summary = String::new();
+    for (name, count) in surfaces {
+        if !surface_summary.is_empty() {
+            surface_summary.push(' ');
+        }
+        let _ = write!(surface_summary, "{name}x{count}");
+    }
+    if !surface_summary.is_empty() {
+        println!("    surfaces: {surface_summary}");
+    }
+}
+
+fn describe_serial_stop(stop: &rvt_model::SerialStop) -> String {
+    match stop {
+        rvt_model::SerialStop::Truncated { class, property } => {
+            format!("truncated at {class}.{property}")
+        }
+        rvt_model::SerialStop::Unsupported {
+            class,
+            property,
+            reason,
+        } => format!("unsupported {reason} at {class}.{property}"),
+        rvt_model::SerialStop::UnknownClass { class_index } => {
+            format!("unknown class [{class_index}]")
+        }
+        rvt_model::SerialStop::TooDeep => "class chain too deep".to_owned(),
+    }
+}
+
+/// Walk every `GElement` record, decode its inherited `GGroup.m_subNodes`
+/// reference array, and report which node classes appear and whether their
+/// object identifiers resolve against the record identifiers in the file.
+/// Nothing here is exported; the probe only measures what is reachable.
+#[allow(clippy::too_many_lines)] // One streaming pass keeps large RVT payloads out of memory.
+fn geometry_graph_probe(
+    path: &Path,
+    rows: usize,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the class schema is required for this probe",
+        )
+    })?;
+    let geometry_element_class_index = schema_class_index(Some(&schema), "GElement")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this schema has no GElement"))?;
+    let gnode_class_index = schema_class_index(Some(&schema), "GNode");
+    let partition_paths = partition_paths(&container);
+
+    // Every distinct identifier/class pair and the member each identifier was
+    // written in, so a node reference can be tested against both.
+    let mut record_classes: BTreeSet<(u32, u16)> = BTreeSet::new();
+    let mut member_records: BTreeSet<(u64, u32)> = BTreeSet::new();
+    let mut graphs: Vec<(u64, Vec<rvt_model::GElementNodeReference>)> = Vec::new();
+    let mut geometry_element_records = 0_usize;
+    let mut strict_graphs = 0_usize;
+    let mut member_key = 0_u64;
+    // Bodies are large. Ranking every class by the bytes it occupies says
+    // where the payload actually is, independent of any structural guess.
+    let mut class_bytes: BTreeMap<u16, (usize, u64)> = BTreeMap::new();
+    let mut node_identifier_maximum = 0_u32;
+    // Node references are (u32 object id, u16 class index). Scanning whole
+    // GElement bodies for that shape reaches nodes nested below the top level.
+    // A random six bytes match only if the class index is one of the few dozen
+    // GNode subclasses and the identifier stays tiny, so the scan is quiet.
+    let mut nested_classes: BTreeMap<u16, usize> = BTreeMap::new();
+    let mut gnode_subclasses: BTreeSet<u16> = BTreeSet::new();
+    if let Some(gnode_class_index) = gnode_class_index {
+        for class in &schema.classes {
+            if schema_class_is_a(&schema, class.index, gnode_class_index) {
+                gnode_subclasses.insert(class.index);
+            }
+        }
+    }
+
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, _, layout, walk, payload| {
+            member_key += 1;
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                record_classes.insert((header.id, header.class_index));
+                member_records.insert((member_key, header.id));
+                let entry = class_bytes.entry(header.class_index).or_default();
+                entry.0 += 1;
+                entry.1 += u64::from(header.body_bytes);
+                if header.class_index != geometry_element_class_index {
+                    continue;
+                }
+                geometry_element_records += 1;
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                if let Some(gnode_class_index) = gnode_class_index {
+                    strict_graphs += usize::from(
+                        GElementGraphFields::parse(body, |class_index| {
+                            schema_class_is_a(&schema, class_index, gnode_class_index)
+                        })
+                        .is_some(),
+                    );
+                }
+                for window in body.windows(6) {
+                    let object_id =
+                        u32::from_le_bytes([window[0], window[1], window[2], window[3]]);
+                    let class_index = u16::from_le_bytes([window[4], window[5]]);
+                    if object_id > 0
+                        && object_id <= NESTED_NODE_IDENTIFIER_LIMIT
+                        && gnode_subclasses.contains(&class_index)
+                    {
+                        *nested_classes.entry(class_index).or_default() += 1;
+                    }
+                }
+                // The permissive rule accepts any class the schema knows, so
+                // the histogram is not narrowed by the GNode assumption.
+                if let Some(graph) = GElementGraphFields::parse(body, |class_index| {
+                    schema.class_by_index(class_index).is_some()
+                }) {
+                    graphs.push((member_key, graph.top_level_nodes));
+                }
+            }
+        },
+    )?;
+
+    let mut node_classes: BTreeMap<u16, usize> = BTreeMap::new();
+    let mut node_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut references = 0_usize;
+    let mut class_agreed = 0_usize;
+    let mut same_member = 0_usize;
+    for (member_key, nodes) in &graphs {
+        *node_counts.entry(nodes.len()).or_default() += 1;
+        for node in nodes {
+            references += 1;
+            node_identifier_maximum = node_identifier_maximum.max(node.object_id);
+            *node_classes.entry(node.class_index).or_default() += 1;
+            class_agreed +=
+                usize::from(record_classes.contains(&(node.object_id, node.class_index)));
+            same_member += usize::from(member_records.contains(&(*member_key, node.object_id)));
+        }
+    }
+
+    let share = |part: usize, whole: usize| {
+        if whole == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                part as f64 * 100.0 / whole as f64
+            }
+        }
+    };
+    println!("GElement records: {geometry_element_records}");
+    println!(
+        "  with a decodable node array and bounds: {} ({:.1}%)",
+        graphs.len(),
+        share(graphs.len(), geometry_element_records)
+    );
+    println!("  accepted by the strict GNode rule: {strict_graphs}");
+    println!("Top-level node references: {references}");
+    println!("Nodes per GElement:");
+    for (count, occurrences) in node_counts.iter().take(rows) {
+        println!("  {count:6} nodes  {occurrences} GElements");
+    }
+    println!("Node classes:");
+    let mut ranked = node_classes.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    for (class_index, count) in ranked.iter().take(rows) {
+        let name = schema
+            .class_by_index(*class_index)
+            .map_or("<unknown>", |class| class.name.as_str());
+        println!(
+            "  {count:8} ({:5.1}%)  {name} [{class_index}]",
+            share(*count, references)
+        );
+    }
+    println!("Record classes by total body bytes:");
+    let mut by_bytes = class_bytes.into_iter().collect::<Vec<_>>();
+    by_bytes.sort_by(|left, right| right.1.1.cmp(&left.1.1).then(left.0.cmp(&right.0)));
+    let total_bytes = by_bytes.iter().map(|(_, (_, bytes))| *bytes).sum::<u64>();
+    for (class_index, (count, bytes)) in by_bytes.iter().take(rows) {
+        let name = schema
+            .class_by_index(*class_index)
+            .map_or("<unknown>", |class| class.name.as_str());
+        #[allow(clippy::cast_precision_loss)]
+        let percent = if total_bytes == 0 {
+            0.0
+        } else {
+            *bytes as f64 * 100.0 / total_bytes as f64
+        };
+        println!(
+            "  {bytes:12} bytes ({percent:5.1}%) in {count:8} records  {name} [{class_index}]"
+        );
+    }
+    println!("Node-shaped references anywhere in GElement bodies:");
+    let mut nested = nested_classes.into_iter().collect::<Vec<_>>();
+    nested.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    let nested_total = nested.iter().map(|(_, count)| *count).sum::<usize>();
+    println!("  total: {nested_total}");
+    for (class_index, count) in nested.iter().take(rows) {
+        let name = schema
+            .class_by_index(*class_index)
+            .map_or("<unknown>", |class| class.name.as_str());
+        println!(
+            "  {count:8} ({:5.1}%)  {name} [{class_index}]",
+            share(*count, nested_total)
+        );
+    }
+    // Whether these identifiers are element identifiers is decided by their
+    // range and by whether they land on a record in the member that holds the
+    // GElement, not by a global lookup: every small integer exists as some
+    // record identifier, so a global hit rate says nothing.
+    println!("Node identifier space:");
+    println!("  largest top-level node object identifier: {node_identifier_maximum}");
+    println!(
+        "  also a record identifier in the same member: {same_member} ({:.1}%)",
+        share(same_member, references)
+    );
+    println!(
+        "  that record carries the declared class: {class_agreed} ({:.1}%)",
+        share(class_agreed, references)
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // One streaming pass keeps large RVT payloads out of memory.
 fn recover_elements(
     path: &Path,
@@ -1972,11 +2750,13 @@ fn recover_elements(
     let plane_class_index = schema_class_index(schema.as_ref(), "Plane");
     let pipe_curve_class_index = schema_class_index(schema.as_ref(), "RbsPipeCurve");
     let family_instance_class_index = schema_class_index(schema.as_ref(), "FamilyInstance");
+    let family_symbol_class_index = schema_class_index(schema.as_ref(), "FamilySymbol");
     let curve_driver_class_index = schema_class_index(schema.as_ref(), "RbsCurveDriver");
     let pipe_fitting_center_line_class_index =
         schema_class_index(schema.as_ref(), "PipeFittingCenterLine");
     let gline_class_index = schema_class_index(schema.as_ref(), "GLine");
     let ginstance_class_index = schema_class_index(schema.as_ref(), "GInstance");
+    let gnode_class_index = schema_class_index(schema.as_ref(), "GNode");
     let geometry_element_class_index = schema_class_index(schema.as_ref(), "GElement");
     let parameter_set_classes = parameter_set_class_indexes(schema.as_ref());
     let partition_paths = partition_paths(&container);
@@ -2014,11 +2794,20 @@ fn recover_elements(
 
                     if Some(header.class_index) == geometry_element_class_index {
                         let exact_bounds = GElementBounds::parse(body);
-                        let placement_bounds =
-                            exact_bounds.or_else(|| GElementBounds::parse_near_duplicate(body));
+                        let graph = gnode_class_index.and_then(|gnode_class_index| {
+                            GElementGraphFields::parse(body, |class_index| {
+                                schema.as_ref().is_some_and(|schema| {
+                                    schema_class_is_a(schema, class_index, gnode_class_index)
+                                })
+                            })
+                        });
+                        let placement_bounds = exact_bounds
+                            .or_else(|| graph.as_ref().map(|graph| graph.bounds))
+                            .or_else(|| GElementBounds::parse_near_duplicate(body));
                         if let Some(bounds) = exact_bounds {
                             entry.geometry_bounds = Some(bounds);
                         }
+                        entry.geometry_graph = graph;
                         if let Some(bounds) = placement_bounds {
                             entry.placement_bounds = Some(bounds);
                             if let Some(ginstance_class_index) = ginstance_class_index {
@@ -2111,6 +2900,7 @@ fn recover_elements(
         )?;
     }
 
+    attach_symbol_bounds(&mut elements, family_symbol_class_index);
     attach_fitting_axes(&mut elements, catalog);
     verify_family_instance_placements(&mut elements);
 
@@ -2143,6 +2933,56 @@ fn verify_family_instance_placements(elements: &mut BTreeMap<u32, ExportedElemen
         if inside.next().is_none() {
             element.family_instance_placement = Some(candidate);
         }
+    }
+}
+
+fn attach_symbol_bounds(
+    elements: &mut BTreeMap<u32, ExportedElement>,
+    family_symbol_class_index: Option<u16>,
+) {
+    let Some(family_symbol_class_index) = family_symbol_class_index else {
+        return;
+    };
+    let symbols = elements
+        .iter()
+        .filter_map(|(id, element)| {
+            if element.class_index != Some(family_symbol_class_index) {
+                return None;
+            }
+            let bounds = element.geometry_graph.as_ref()?.bounds;
+            // A symbol box that is flat on an axis carries no volume and cannot
+            // become an `IfcBoundingBox`, so it is refused here rather than
+            // counted and then silently dropped by the IFC writer.
+            bounds
+                .is_volumetric()
+                .then_some((*id, (element.category, bounds)))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for element in elements.values_mut() {
+        let Some(transform) = element.ginstance_transform else {
+            continue;
+        };
+        let Some(symbol_element_id) = transform.symbol_element_id else {
+            continue;
+        };
+        let Some((symbol_category, symbol_bounds)) = symbols.get(&symbol_element_id).copied()
+        else {
+            continue;
+        };
+        let Some(instance_bounds) = element.placement_bounds else {
+            continue;
+        };
+        if element.category.is_none()
+            || element.category != symbol_category
+            || !instance_bounds.matches_transformed(&symbol_bounds, &transform)
+        {
+            continue;
+        }
+        element.verified_symbol_bounds = Some(VerifiedSymbolBounds {
+            symbol_element_id,
+            bounds: symbol_bounds,
+        });
     }
 }
 
@@ -2308,6 +3148,10 @@ fn export_ifc(
         geometry_statistics.verified_ginstance_transforms
     );
     println!(
+        "Recovered transform-verified family-symbol bounds: {}",
+        geometry_statistics.verified_symbol_bounds
+    );
+    println!(
         "Mapped family instances with verified placement: {mapped_family_instance_placements} of {mapped_family_instances}"
     );
     println!("Recovered Revit properties: {included_properties}");
@@ -2323,15 +3167,10 @@ fn mapped_family_instance_placement_counts(
     model: &BimModel,
     recovered: &RecoveredElements,
 ) -> (usize, usize) {
-    let mapped = model.elements.iter().filter(|element| {
-        matches!(
-            element.element_type,
-            bim_core::BimElementType::PipeFitting
-                | bim_core::BimElementType::SanitaryTerminal
-                | bim_core::BimElementType::AirTerminal
-                | bim_core::BimElementType::FireSuppressionTerminal
-        )
-    });
+    let mapped = model
+        .elements
+        .iter()
+        .filter(|element| carries_family_symbol_geometry(element.element_type));
     let mut total = 0;
     let mut placed = 0;
     for element in mapped {
@@ -2456,6 +3295,7 @@ struct GeometryStatistics {
     family_instances_with_placement_candidates: usize,
     verified_family_instance_placements: usize,
     verified_ginstance_transforms: usize,
+    verified_symbol_bounds: usize,
 }
 
 fn geometry_statistics(elements: &BTreeMap<u32, ExportedElement>) -> GeometryStatistics {
@@ -2480,6 +3320,7 @@ fn geometry_statistics(elements: &BTreeMap<u32, ExportedElement>) -> GeometrySta
             usize::from(element.family_instance_placement.is_some());
         statistics.verified_ginstance_transforms +=
             usize::from(element.ginstance_transform.is_some());
+        statistics.verified_symbol_bounds += usize::from(element.verified_symbol_bounds.is_some());
     }
     statistics
 }
@@ -2632,6 +3473,24 @@ fn schema_class_index(schema: Option<&Schema>, name: &str) -> Option<u16> {
         .map(|class| class.index)
 }
 
+fn schema_class_is_a(schema: &Schema, class_index: u16, ancestor_index: u16) -> bool {
+    let mut current = Some(class_index);
+    let mut remaining = schema.classes.len();
+    while let Some(index) = current {
+        if index == ancestor_index {
+            return true;
+        }
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        current = schema
+            .class_by_index(index)
+            .and_then(|class| class.parent.index());
+    }
+    false
+}
+
 fn parameter_set_class_indexes(schema: Option<&Schema>) -> Option<ParameterSetClassIndexes> {
     Some(ParameterSetClassIndexes {
         double: schema_class_index(schema, "ParamValueSetDouble")?,
@@ -2696,13 +3555,14 @@ fn normalize_element(
         .iter()
         .map(|parameter| normalize_property(parameter, parameter_names, parameter_specs, catalog))
         .collect();
+    let element_type = element_type_for_source(
+        class_name.as_deref(),
+        category.as_ref().map(|category| category.name.as_str()),
+    );
 
     BimElement {
         id: BimElementId(id.to_string()),
-        element_type: element_type_for_source(
-            class_name.as_deref(),
-            category.as_ref().map(|category| category.name.as_str()),
-        ),
+        element_type,
         class_name,
         name: element.name.as_ref().map(|(name, _)| name.clone()),
         category,
@@ -2711,7 +3571,7 @@ fn normalize_element(
         // for every serialized class.
         type_id: None,
         placement: normalize_placement(element.ginstance_transform),
-        geometry: normalize_geometry(element),
+        geometry: normalize_geometry(element, element_type),
         properties,
     }
 }
@@ -2735,7 +3595,20 @@ fn normalize_placement(transform: Option<GInstanceTransformFields>) -> Option<Bi
     })
 }
 
-fn normalize_geometry(element: &ExportedElement) -> Option<BimGeometry> {
+/// Whether a mapped type is placed from a family symbol, and can therefore
+/// carry a verified symbol extent. An unclassified source stays without
+/// geometry, and a pipe segment is a swept curve rather than a placed symbol.
+fn carries_family_symbol_geometry(element_type: BimElementType) -> bool {
+    !matches!(
+        element_type,
+        BimElementType::Unknown | BimElementType::PipeSegment
+    )
+}
+
+fn normalize_geometry(
+    element: &ExportedElement,
+    element_type: BimElementType,
+) -> Option<BimGeometry> {
     let metres = |value| revit_catalog::internal_feet_to_metres(value);
     let point = |coordinates: [f64; 3]| {
         Some(BimPoint3 {
@@ -2761,10 +3634,19 @@ fn normalize_geometry(element: &ExportedElement) -> Option<BimGeometry> {
             }));
         }
     }
-    let line = element.fitting_axis_candidate?;
-    Some(BimGeometry::AxisLine(BimLineSegment {
-        start: point(line.start.coordinates_feet)?,
-        end: point(line.end.coordinates_feet)?,
+    if let Some(line) = element.fitting_axis_candidate {
+        return Some(BimGeometry::AxisLine(BimLineSegment {
+            start: point(line.start.coordinates_feet)?,
+            end: point(line.end.coordinates_feet)?,
+        }));
+    }
+    if !carries_family_symbol_geometry(element_type) {
+        return None;
+    }
+    let symbol = element.verified_symbol_bounds?;
+    Some(BimGeometry::BoundingBox(BimBoundingBox {
+        min: point(symbol.bounds.min)?,
+        max: point(symbol.bounds.max)?,
     }))
 }
 
@@ -2939,6 +3821,15 @@ fn write_geometry_json(writer: &mut impl Write, geometry: Option<&BimGeometry>) 
                 start[0], start[1], start[2], end[0], end[1], end[2]
             )
         }
+        Some(BimGeometry::BoundingBox(bounds)) => {
+            let min = bounds.min.coordinates;
+            let max = bounds.max.coordinates;
+            write!(
+                writer,
+                ",\"geometry\":{{\"kind\":\"bounding_box\",\"min_meters\":[{},{},{}],\"max_meters\":[{},{},{}]}}",
+                min[0], min[1], min[2], max[0], max[1], max[2]
+            )
+        }
         None => Ok(()),
     }
 }
@@ -2984,9 +3875,12 @@ fn write_ginstance_transform(
         return Ok(());
     };
     let [x, y, z] = transform.basis;
+    let symbol = transform
+        .symbol_element_id
+        .map_or_else(String::new, |id| format!(",\"symbol_element_id\":{id}"));
     write!(
         writer,
-        ",\"ginstance_transform\":{{\"origin_meters\":[{origin_x},{origin_y},{origin_z}],\"basis\":[[{},{},{}],[{},{},{}],[{},{},{}]]}}",
+        ",\"ginstance_transform\":{{\"origin_meters\":[{origin_x},{origin_y},{origin_z}],\"basis\":[[{},{},{}],[{},{},{}],[{},{},{}]]{symbol}}}",
         x[0], x[1], x[2], y[0], y[1], y[2], z[0], z[1], z[2]
     )
 }
@@ -3663,7 +4557,9 @@ mod tests {
             ..ExportedElement::default()
         };
 
-        let Some(BimGeometry::SweptDisk(geometry)) = normalize_geometry(&element) else {
+        let Some(BimGeometry::SweptDisk(geometry)) =
+            normalize_geometry(&element, BimElementType::PipeSegment)
+        else {
             panic!("verified pipe geometry was not promoted");
         };
         assert!((geometry.directrix.start.coordinates[0] - 3.6576).abs() < 1.0e-12);
@@ -3672,7 +4568,7 @@ mod tests {
 
         let mut mismatched = element;
         mismatched.geometry_bounds.as_mut().unwrap().max[2] += 1.0;
-        assert!(normalize_geometry(&mismatched).is_none());
+        assert!(normalize_geometry(&mismatched, BimElementType::PipeSegment).is_none());
     }
 
     #[test]
@@ -3689,7 +4585,9 @@ mod tests {
             }),
             ..ExportedElement::default()
         };
-        let Some(BimGeometry::AxisLine(line)) = normalize_geometry(&element) else {
+        let Some(BimGeometry::AxisLine(line)) =
+            normalize_geometry(&element, BimElementType::PipeFitting)
+        else {
             panic!("verified fitting axis was not promoted");
         };
         for (actual, expected) in line
@@ -3711,6 +4609,7 @@ mod tests {
             origin: rvt_model::RvtPoint3 {
                 coordinates_feet: [10.0, 20.0, 30.0],
             },
+            symbol_element_id: Some(417_391),
         };
         let placement = normalize_placement(Some(transform)).unwrap();
         for (actual, expected) in placement
@@ -3729,5 +4628,101 @@ mod tests {
         {
             assert!((actual - expected).abs() < f64::EPSILON);
         }
+    }
+
+    #[test]
+    fn attaches_symbol_bounds_only_when_the_symbol_box_has_volume() {
+        let symbol_bounds = |max: [f64; 3]| GElementBounds {
+            offset: 54,
+            min: [-1.0, -2.0, -3.0],
+            max,
+        };
+        let model = |max: [f64; 3]| {
+            let mut elements = BTreeMap::new();
+            elements.insert(
+                5,
+                ExportedElement {
+                    class_index: Some(7),
+                    category: Some(1),
+                    geometry_graph: Some(GElementGraphFields {
+                        top_level_nodes: Vec::new(),
+                        bounds: symbol_bounds(max),
+                    }),
+                    ..ExportedElement::default()
+                },
+            );
+            elements.insert(
+                9,
+                ExportedElement {
+                    class_index: Some(3),
+                    category: Some(1),
+                    ginstance_transform: Some(GInstanceTransformFields {
+                        offset: 0,
+                        basis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                        origin: rvt_model::RvtPoint3 {
+                            coordinates_feet: [10.0, 20.0, 30.0],
+                        },
+                        symbol_element_id: Some(5),
+                    }),
+                    placement_bounds: Some(GElementBounds {
+                        offset: 12,
+                        min: [9.0, 18.0, 27.0],
+                        max: [10.0 + max[0], 20.0 + max[1], 30.0 + max[2]],
+                    }),
+                    ..ExportedElement::default()
+                },
+            );
+            elements
+        };
+
+        let mut volumetric = model([1.0, 2.0, 3.0]);
+        attach_symbol_bounds(&mut volumetric, Some(7));
+        assert_eq!(
+            volumetric[&9].verified_symbol_bounds,
+            Some(VerifiedSymbolBounds {
+                symbol_element_id: 5,
+                bounds: symbol_bounds([1.0, 2.0, 3.0]),
+            })
+        );
+
+        let mut flat = model([1.0, 2.0, -3.0]);
+        attach_symbol_bounds(&mut flat, Some(7));
+        assert_eq!(flat[&9].verified_symbol_bounds, None);
+    }
+
+    #[test]
+    fn promotes_only_verified_mapped_symbol_bounds_as_a_box() {
+        let element = ExportedElement {
+            verified_symbol_bounds: Some(VerifiedSymbolBounds {
+                symbol_element_id: 417_391,
+                bounds: GElementBounds {
+                    offset: 54,
+                    min: [-1.0, -2.0, -3.0],
+                    max: [1.0, 2.0, 3.0],
+                },
+            }),
+            ..ExportedElement::default()
+        };
+        let Some(BimGeometry::BoundingBox(bounds)) =
+            normalize_geometry(&element, BimElementType::SanitaryTerminal)
+        else {
+            panic!("verified symbol bounds were not promoted");
+        };
+        for (actual, expected) in bounds
+            .min
+            .coordinates
+            .into_iter()
+            .chain(bounds.max.coordinates)
+            .zip([-0.3048, -0.6096, -0.9144, 0.3048, 0.6096, 0.9144])
+        {
+            assert!((actual - expected).abs() < 1.0e-12);
+        }
+        for refused in [BimElementType::Unknown, BimElementType::PipeSegment] {
+            assert!(normalize_geometry(&element, refused).is_none());
+        }
+        assert!(matches!(
+            normalize_geometry(&element, BimElementType::DistributionElement),
+            Some(BimGeometry::BoundingBox(_))
+        ));
     }
 }

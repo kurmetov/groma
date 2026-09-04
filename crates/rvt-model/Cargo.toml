@@ -5,5 +5,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+rvt-schema = { path = "../rvt-schema" }
+
 [lints]
 workspace = true

@@ -35,6 +35,38 @@ const SOURCE_MAPPINGS: &[SourceMapping] = &[
         category_name: "OST_Sprinklers",
         element_type: BimElementType::FireSuppressionTerminal,
     },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_FireAlarmDevices",
+        element_type: BimElementType::Alarm,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_CableTrayFitting",
+        element_type: BimElementType::CableCarrierFitting,
+    },
+    // The category names below identify the discipline but not the device, so
+    // they resolve to the IFC supertype instead of guessing a leaf entity.
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_ElectricalEquipment",
+        element_type: BimElementType::DistributionElement,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_PipeAccessory",
+        element_type: BimElementType::DistributionFlowElement,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_DuctAccessory",
+        element_type: BimElementType::DistributionFlowElement,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_MechanicalEquipment",
+        element_type: BimElementType::DistributionFlowElement,
+    },
 ];
 
 /// Infer a format-neutral element type from the source class/category pair.
@@ -104,6 +136,36 @@ mod tests {
                 "OST_Sprinklers",
                 BimElementType::FireSuppressionTerminal,
             ),
+            (
+                Some("FamilyInstance"),
+                "OST_FireAlarmDevices",
+                BimElementType::Alarm,
+            ),
+            (
+                Some("FamilyInstance"),
+                "OST_CableTrayFitting",
+                BimElementType::CableCarrierFitting,
+            ),
+            (
+                Some("FamilyInstance"),
+                "OST_ElectricalEquipment",
+                BimElementType::DistributionElement,
+            ),
+            (
+                Some("FamilyInstance"),
+                "OST_PipeAccessory",
+                BimElementType::DistributionFlowElement,
+            ),
+            (
+                Some("FamilyInstance"),
+                "OST_DuctAccessory",
+                BimElementType::DistributionFlowElement,
+            ),
+            (
+                Some("FamilyInstance"),
+                "OST_MechanicalEquipment",
+                BimElementType::DistributionFlowElement,
+            ),
         ] {
             assert_eq!(
                 element_type_for_source(class_name, Some(category_name)),
@@ -130,6 +192,14 @@ mod tests {
             element_type_for_source(Some("Wall"), Some("OST_Walls")),
             BimElementType::Unknown
         );
+        // A generic model carries no discipline, and a model group is not a
+        // product at all; neither may be typed from the category alone.
+        for category_name in ["OST_GenericModel", "OST_IOSModelGroups"] {
+            assert_eq!(
+                element_type_for_source(Some("FamilyInstance"), Some(category_name)),
+                BimElementType::Unknown
+            );
+        }
         assert_eq!(
             element_type_for_source(Some("RbsPipeCurve"), None),
             BimElementType::Unknown
