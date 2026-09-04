@@ -59,6 +59,72 @@ pub enum BimGeometry {
     /// An independently verified element-local extent. This is a bounding
     /// representation, not a claim about the element's body or topology.
     BoundingBox(BimBoundingBox),
+    /// A decoded boundary representation. May be a partial shell: faces the
+    /// source decoder could not resolve are omitted rather than guessed, so
+    /// this is not always a claim of a closed, watertight solid.
+    Brep(BimBrep),
+}
+
+/// A boundary representation in world coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BimBrep {
+    pub faces: Vec<BimBrepFace>,
+    /// `true` only when every face the source record declared was resolved
+    /// into `faces` - i.e. this is claimed to be a closed shell, not merely
+    /// whatever subset decoded cleanly. An exporter should not emit a closed
+    /// solid representation when this is `false`.
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BimBrepFace {
+    pub surface: BimBrepSurface,
+    /// The face's boundary loops: the first is the outer bound, any further
+    /// loops are holes.
+    pub loops: Vec<Vec<BimBrepEdge>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum BimBrepSurface {
+    Plane {
+        origin: BimPoint3,
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+    },
+    Cylinder {
+        center: BimPoint3,
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+        z_axis: [f64; 3],
+        radius: BimNumber,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BimBrepEdge {
+    pub start: BimPoint3,
+    pub end: BimPoint3,
+    pub curve: BimBrepCurve,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum BimBrepCurve {
+    Line,
+    Arc(BimBrepArc),
+}
+
+/// `point(angle) = center + radius * (cos(angle) * x_axis + sin(angle) *
+/// cross(z_axis, x_axis))`; the edge runs from `start_angle` to `end_angle`
+/// in that formula's increasing-angle direction whenever `end_angle >=
+/// start_angle`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BimBrepArc {
+    pub center: BimPoint3,
+    pub x_axis: [f64; 3],
+    pub z_axis: [f64; 3],
+    pub radius: BimNumber,
+    pub start_angle: f64,
+    pub end_angle: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

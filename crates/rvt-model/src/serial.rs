@@ -12,12 +12,30 @@ use crate::{geometry::GElementNodeReference, member::MAX_STRING_CHARS};
 
 /// A serialized reference to another node: identifier plus class index.
 const OBJECT_REFERENCE_BYTES: usize = 6;
-/// Width read for `Integer32Alternate`. The encoding is variable - four
-/// objects were measured whose lengths only resolve if the field is sometimes
-/// four bytes - but the condition that lengthens it is not established, and
-/// treating the lead word's top bit as the trigger collapses corpus coverage
-/// from 59% to 3%. The walk reads the common two bytes.
+/// Short width of an `Integer32Alternate`, which is variable. Only
+/// `GInfo.m_flags` is known to take this form, and only there is a trigger
+/// established: see [`ALTERNATE_CONTINUATION_BIT`]. It is also what the record
+/// header reads - see [`NODE_STREAM_PREFIX_BYTES`].
 const ALTERNATE_INTEGER32_BYTES: usize = 2;
+/// Long width of an `Integer32Alternate`, which is its declared width, and the
+/// width every alternate integer in the node stream other than `GInfo.m_flags`
+/// is written at.
+///
+/// Measured, not guessed. Reading them at the short width leaves the rest of
+/// the record shifted two bytes early, which the record's own length hides
+/// until the reference queue drains: the tail then reads as `0xffff_yyyy`
+/// where an object's `GInfo.m_tag` should hold `0xffff_ffff`. Reading the
+/// declared width instead lifts the share of face-bearing `GElement` records
+/// that tile exactly from 76.5% / 44.0% / 21.4% to 88.0% / 84.8% / 71.9%
+/// across the three corpus files, and the values it recovers corroborate it:
+/// `GFilling.m_fillColor` reads as colours - 0x01000000 for the great
+/// majority, then 0x0000ffff, 0x00fdfdfd, 0x0000bb00 - where the short read
+/// splits each colour across two fields.
+///
+/// The record's own header is left alone: there the same field reads two bytes
+/// followed by [`NODE_STREAM_PREFIX_BYTES`], and widening it to four with no
+/// prefix parses the corpus identically, so nothing here separates the two.
+const ALTERNATE_INTEGER32_LONG_BYTES: usize = 4;
 /// Width read for `Integer16Alternate`, by the same reasoning.
 const ALTERNATE_INTEGER16_BYTES: usize = 1;
 /// Inline object whose `m_flags` carries the variable width.
@@ -85,6 +103,7 @@ pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk
         references: Vec::new(),
         identifiers: Vec::new(),
         numbers: Vec::new(),
+        small_integers: Vec::new(),
         node_headers: false,
         node_flags: 0,
         trace: None,
@@ -112,6 +131,7 @@ pub fn walk_object_stream(schema: &Schema, class_index: u16, body: &[u8]) -> Ser
         references: Vec::new(),
         identifiers: Vec::new(),
         numbers: Vec::new(),
+        small_integers: Vec::new(),
         node_headers: false,
         node_flags: 0,
         trace: None,
@@ -156,12 +176,46 @@ pub struct SerialStreamWalk {
 /// `GRep.m_flags` lead word has its top bit clear still hold it.
 const NODE_STREAM_PREFIX_BYTES: usize = 2;
 /// Trailing `u32` that repeats the record's own body length.
-const RECORD_LENGTH_TRAILER_BYTES: usize = 4;
-/// Inline object that holds a live document handle rather than data. Measured
-/// on `InstanceInfo.m_cda`, which ends its object two bytes before the record
-/// ends, where walking the declared identifier would need four.
+pub const RECORD_LENGTH_TRAILER_BYTES: usize = 4;
+/// Inline object that holds a live document handle rather than data. Its one
+/// declared property, `m_pDoc`, is an identifier reference, which the
+/// declaration would make four bytes wide; the width is in fact variable and a
+/// null handle writes only a two-byte zero.
+///
+/// Measured, not guessed: reading the lead word and taking a zero as the whole
+/// handle explains 92.8% / 91.9% / 90.1% of `GElement` records across the three
+/// corpus files, against 91.4% / 82.0% / 83.7% for a fixed two bytes and
+/// 75.1% / 83.9% / 81.1% for a fixed four. Every handle in the corpus holds one
+/// of exactly two values - 0 written as two bytes (11 454 / 6 652 / 13 634
+/// occurrences) and 1 written as four (5 205 / 25 994 / 56 501) - so "the lead
+/// word is zero" and "the identifier is not 1" cannot be told apart here. The
+/// lead-word form is the one a stream reader can apply, and is what is used.
 const DOCUMENT_HANDLE_CLASS_NAME: &str = "ControlledConstDocAccess";
-const DOCUMENT_HANDLE_BYTES: usize = 2;
+/// Width of a null document handle, whose lead word is zero.
+const NULL_DOCUMENT_HANDLE_BYTES: usize = 2;
+/// Width of a handle that names a document.
+const DOCUMENT_HANDLE_BYTES: usize = 4;
+
+/// A `GFace` that names a filling carries two more bytes than its declarations
+/// account for, between `m_pGFilling` and `m_cutType`. Measured, not guessed:
+/// across 105 217 `GFace` objects whose alignment could be checked against the
+/// `Face.m_pSurf` reference that ends the object, the two bytes are present in
+/// all 10 802 whose `m_pGFilling` is a live reference and absent in all 94 415
+/// whose `m_pGFilling` is null, with no exception either way. The check used
+/// was independent of this rule: the alternative alignment has to leave
+/// `m_pSurf` naming a class derived from `Surface`, and only one of the two
+/// does. `m_cutType` corroborates it - it reads 4, 5 or 6 under this rule for
+/// every face, and a shifted `0x00040000`/`0x00060000` without it.
+///
+/// Which declaration owns the two bytes is *not* established. They sit between
+/// `m_pGFilling` and `m_cutType`, and `m_oBackgroundFilling` - the declaration
+/// in between - is a null reference in every face of the corpus, so no body
+/// here can separate "a live `m_pGFilling` is followed by two bytes" from "a
+/// background filling is written differently when a filling exists". The rule
+/// is applied at `m_pGFilling`, the field whose value predicts them.
+const FILLED_FACE_CLASS_NAME: &str = "GFace";
+const FILLED_FACE_FILLING_PROPERTY: &str = "m_pGFilling";
+const FILLED_FACE_FILLING_BYTES: usize = 2;
 
 /// Result of reading a whole record body: its own declared properties, then
 /// the serialized nodes its references name, then the length trailer.
@@ -215,6 +269,10 @@ pub struct SerialObject {
     pub identifiers: Vec<u32>,
     /// Every `Float64` this object read, in declaration order.
     pub numbers: Vec<f64>,
+    /// Every `Bool`, `Integer8` or `Integer16` this object read, in
+    /// declaration order and sign-extended to `i64`. Small flag/enum fields
+    /// such as `GEdge.m_flags` live here rather than in `numbers`.
+    pub small_integers: Vec<i64>,
 }
 
 /// Same as [`walk_record`], keeping each object the node stream held.
@@ -266,6 +324,7 @@ fn walk_record_inner(
         references: Vec::new(),
         identifiers: Vec::new(),
         numbers: Vec::new(),
+        small_integers: Vec::new(),
         node_headers: false,
         node_flags: 0,
         trace: trace.then(Vec::new),
@@ -299,6 +358,7 @@ fn walk_record_inner(
         let first_reference = reader.references.len();
         let first_identifier = reader.identifiers.len();
         let first_number = reader.numbers.len();
+        let first_small_integer = reader.small_integers.len();
         stop = reader.read_class(reference.class_index, 1).err();
         if collect {
             objects.push(SerialObject {
@@ -309,6 +369,7 @@ fn walk_record_inner(
                 references: reader.references[first_reference..].to_vec(),
                 identifiers: reader.identifiers[first_identifier..].to_vec(),
                 numbers: reader.numbers[first_number..].to_vec(),
+                small_integers: reader.small_integers[first_small_integer..].to_vec(),
             });
         }
     }
@@ -349,6 +410,8 @@ struct Reader<'a> {
     identifiers: Vec<u32>,
     /// Every `Float64` read, so a caller can recover coordinates.
     numbers: Vec<f64>,
+    /// Every `Bool`, `Integer8` or `Integer16` read, sign-extended to `i64`.
+    small_integers: Vec<i64>,
     /// Whether the walk is inside the node stream rather than the record's
     /// own declared properties.
     node_headers: bool,
@@ -453,6 +516,7 @@ impl Reader<'_> {
         result
     }
 
+    #[allow(clippy::too_many_lines)] // One exhaustive match over every field type.
     fn read_item_inner(
         &mut self,
         class_name: &str,
@@ -476,11 +540,22 @@ impl Reader<'_> {
             }
             FieldType::Object => {
                 if property.loading_mode & REFERENCE_LOADING_BIT != 0 {
-                    return if property.loading_mode & IDENTIFIER_ONLY_LOADING_BIT == 0 {
-                        self.take_reference().ok_or_else(truncated)
-                    } else {
-                        self.take_identifier().ok_or_else(truncated)
-                    };
+                    if property.loading_mode & IDENTIFIER_ONLY_LOADING_BIT != 0 {
+                        return self.take_identifier().ok_or_else(truncated);
+                    }
+                    self.take_reference().ok_or_else(&truncated)?;
+                    if class_name == FILLED_FACE_CLASS_NAME
+                        && property.name == FILLED_FACE_FILLING_PROPERTY
+                        && self
+                            .references
+                            .last()
+                            .is_some_and(|reference| reference.object_id != 0)
+                    {
+                        return self
+                            .advance(FILLED_FACE_FILLING_BYTES)
+                            .ok_or_else(truncated);
+                    }
+                    return Ok(());
                 }
                 let Some(static_index) =
                     property.static_type.as_ref().and_then(TypeReference::index)
@@ -496,7 +571,14 @@ impl Reader<'_> {
                     .class_by_index(static_index)
                     .is_some_and(|class| class.name == DOCUMENT_HANDLE_CLASS_NAME)
                 {
-                    return self.advance(DOCUMENT_HANDLE_BYTES).ok_or_else(truncated);
+                    {
+                        let width = if self.peek_u16().ok_or_else(&truncated)? == 0 {
+                            NULL_DOCUMENT_HANDLE_BYTES
+                        } else {
+                            DOCUMENT_HANDLE_BYTES
+                        };
+                        return self.advance(width).ok_or_else(truncated);
+                    }
                 }
                 self.read_class(static_index, depth + 1)
             }
@@ -518,8 +600,9 @@ impl Reader<'_> {
             }
             FieldType::Integer32Alternate => {
                 // Inside a node's `GInfo` this field is the one that varies:
-                // the lead word's top bit marks the four-byte form. Elsewhere
-                // the trigger is not established, so the common width is read.
+                // the lead word's top bit marks the four-byte form. Reading
+                // every `GInfo.m_flags` at four bytes instead explains no
+                // record at all, so the variation is real.
                 if self.node_headers && class_name == GINFO_CLASS_NAME {
                     let lead = self.peek_u16().ok_or_else(&truncated)?;
                     let long = lead & ALTERNATE_CONTINUATION_BIT != 0;
@@ -531,14 +614,20 @@ impl Reader<'_> {
                         u32::from(lead)
                     };
                     let width = if long {
-                        ALTERNATE_INTEGER32_BYTES + ALTERNATE_INTEGER32_BYTES
+                        ALTERNATE_INTEGER32_LONG_BYTES
                     } else {
                         ALTERNATE_INTEGER32_BYTES
                     };
                     return self.advance(width).ok_or_else(truncated);
                 }
-                self.advance(ALTERNATE_INTEGER32_BYTES)
-                    .ok_or_else(truncated)
+                // Every other alternate integer in the node stream is written
+                // at its declared four bytes.
+                let width = if self.node_headers {
+                    ALTERNATE_INTEGER32_LONG_BYTES
+                } else {
+                    ALTERNATE_INTEGER32_BYTES
+                };
+                self.advance(width).ok_or_else(truncated)
             }
             FieldType::Integer16Alternate => self
                 .advance(ALTERNATE_INTEGER16_BYTES)
@@ -551,6 +640,27 @@ impl Reader<'_> {
                 let value = f64::from_le_bytes(bytes.try_into().map_err(|_| truncated())?);
                 self.numbers.push(value);
                 self.offset += 8;
+                Ok(())
+            }
+            FieldType::Bool | FieldType::Integer8 => {
+                let byte = *self.body.get(self.offset).ok_or_else(&truncated)?;
+                let value = if property.field_type == FieldType::Bool {
+                    i64::from(byte)
+                } else {
+                    i64::from(i8::from_ne_bytes([byte]))
+                };
+                self.small_integers.push(value);
+                self.offset += 1;
+                Ok(())
+            }
+            FieldType::Integer16 => {
+                let bytes = self
+                    .body
+                    .get(self.offset..self.offset.saturating_add(2))
+                    .ok_or_else(&truncated)?;
+                let value = i16::from_le_bytes(bytes.try_into().map_err(|_| truncated())?);
+                self.small_integers.push(i64::from(value));
+                self.offset += 2;
                 Ok(())
             }
             other => {
@@ -852,6 +962,80 @@ mod tests {
     }
 
     #[test]
+    fn an_alternate_integer_outside_a_node_ginfo_is_read_at_its_declared_width() {
+        // A node shaped like `GFilling`: its inline `GInfo`, whose flags word
+        // keeps the short form, then a colour declared `Integer32Alternate`,
+        // which is written at the declared four bytes.
+        let mut classes = record_schema().classes;
+        classes[2].properties = vec![
+            classes[2].properties[0].clone(),
+            property("m_fillColor", FieldType::Integer32Alternate, 0x00, 0, None),
+        ];
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+        let node_class = FIRST_CLASS_INDEX + 2;
+
+        let mut body = Vec::new();
+        body.extend(6_i32.to_le_bytes()); // Root's inline GInfo
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(1_u32.to_le_bytes()); // one sub-node
+        body.extend(3_u32.to_le_bytes());
+        body.extend(node_class.to_le_bytes());
+        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
+        body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(0x0100_0000_u32.to_le_bytes()); // m_fillColor
+        let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+        body.extend(length.to_le_bytes());
+
+        let walk = walk_record(&schema, FIRST_CLASS_INDEX + 1, &body);
+        assert_eq!(walk.stop, None);
+        assert!(walk.is_exact());
+        assert_eq!(walk.nodes, 1);
+    }
+
+    #[test]
+    fn small_integer_fields_are_captured_in_declaration_order() {
+        // A node shaped like `GEdge`: its inline `GInfo`, then an `Integer8`
+        // flags byte (mirroring `GEdge.m_flags`) and a `Bool`.
+        let mut classes = record_schema().classes;
+        classes[2]
+            .properties
+            .push(property("m_flags", FieldType::Integer8, 0x00, 0, None));
+        classes[2]
+            .properties
+            .push(property("m_open", FieldType::Bool, 0x00, 0, None));
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+        let node_class = FIRST_CLASS_INDEX + 2;
+
+        let mut body = Vec::new();
+        body.extend(6_i32.to_le_bytes()); // Root's inline GInfo
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(1_u32.to_le_bytes()); // one sub-node
+        body.extend(3_u32.to_le_bytes());
+        body.extend(node_class.to_le_bytes());
+        body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
+        body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
+        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(0.0_f64.to_le_bytes());
+        body.extend(287.5_f64.to_le_bytes());
+        body.push((-2_i8).to_le_bytes()[0]); // m_flags: a negative Integer8
+        body.push(1_u8); // m_open: true
+        let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+        body.extend(length.to_le_bytes());
+
+        let (walk, objects) = walk_record_collecting(&schema, FIRST_CLASS_INDEX + 1, &body);
+        assert!(walk.is_exact());
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].small_integers, [-2, 1]);
+    }
+
+    #[test]
     fn reference_width_follows_the_loading_mode_and_nulls_hold_no_body() {
         let mut classes = record_schema().classes;
         // A node holding one full reference, two identifier-only links, and a
@@ -911,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn a_document_handle_holds_two_bytes_instead_of_its_declaration() {
+    fn a_document_handle_is_two_bytes_when_null_and_four_when_it_names_a_document() {
         let mut classes = record_schema().classes;
         let mut handle = property("m_cda", FieldType::Object, 0x00, 0, None);
         handle.static_type = Some(TypeReference::Reference {
@@ -923,8 +1107,9 @@ mod tests {
             FIRST_CLASS_INDEX + 3,
             DOCUMENT_HANDLE_CLASS_NAME,
             TypeReference::None,
-            // Declared as an identifier reference, yet only two bytes are
-            // written: the handle points at a live document, not at data.
+            // Declared as an identifier reference, yet a null handle writes
+            // only two bytes: the handle points at a live document, not at
+            // data.
             vec![property("m_pDoc", FieldType::Object, 0x03, 0, None)],
         ));
         let schema = Schema {
@@ -941,7 +1126,19 @@ mod tests {
         body.extend([0_u8; NODE_STREAM_PREFIX_BYTES]);
         body.extend((-1_i32).to_le_bytes());
         body.extend(SHORT_FLAGS.to_le_bytes());
-        body.extend([0_u8; DOCUMENT_HANDLE_BYTES]);
+        let prefix = body.clone();
+        body.extend([0_u8; NULL_DOCUMENT_HANDLE_BYTES]);
+        let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+        body.extend(length.to_le_bytes());
+
+        let walk = walk_record(&schema, FIRST_CLASS_INDEX + 1, &body);
+        assert_eq!(walk.stop, None);
+        assert!(walk.is_exact());
+        assert_eq!(walk.nodes, 1);
+
+        // The same node with a handle that names document 1 writes four bytes.
+        let mut body = prefix;
+        body.extend(1_u32.to_le_bytes());
         let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
         body.extend(length.to_le_bytes());
 

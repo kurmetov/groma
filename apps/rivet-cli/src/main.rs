@@ -12,9 +12,10 @@ use std::{
 };
 
 use bim_core::{
-    BimBoundingBox, BimCategory, BimElement, BimElementId, BimElementType, BimExternalId,
-    BimGeometry, BimLevel, BimLineSegment, BimModel, BimNumber, BimPlacement, BimPoint3,
-    BimProperty, BimPropertyValue, BimSource, BimSweptDisk, BimUnit,
+    BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepSurface,
+    BimCategory, BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel,
+    BimLineSegment, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
+    BimSource, BimSweptDisk, BimUnit,
 };
 use clap::{Parser, Subcommand};
 use ifc_export::{MetadataOptions, element_type_for_source, metadata_ifc, uuid_v5};
@@ -28,8 +29,8 @@ use rvt_model::{
     ELEMENT_TAIL_BYTES, ElemTable, ElementAnchor, ElementFields, ElementHeaderFields,
     FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds, GElementGraphFields,
     GInstanceTransformFields, LevelFields, MemberWalk, ParameterSetClassIndexes, ParameterSets,
-    ParameterSpec, ParameterValue, PipeLineGeometryFields, RecordFraming, RecordHeader,
-    RecordLayout, RecordString,
+    ParameterSpec, ParameterValue, PipeLineGeometryFields, RECORD_LENGTH_TRAILER_BYTES,
+    RecordFraming, RecordHeader, RecordLayout, RecordString,
 };
 use rvt_schema::{Schema, TypeReference};
 
@@ -110,6 +111,10 @@ enum Command {
         /// Print the property list of one exact class instead of the inventory.
         #[arg(long)]
         class: Option<String>,
+        /// List every declared property whose name contains this text, with the
+        /// class that declares it, instead of the inventory.
+        #[arg(long)]
+        property: Option<String>,
     },
     /// Decode the Global/ElemTable element-id index.
     ElemTable {
@@ -264,6 +269,9 @@ enum Command {
         /// Stop dumping after this many records.
         #[arg(long, default_value_t = 8)]
         dump_count: usize,
+        /// Restrict every tally to records that carry boundary faces.
+        #[arg(long)]
+        faces_only: bool,
         /// Maximum decoded bytes accepted from one member.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
@@ -391,7 +399,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 #[allow(clippy::too_many_lines)]
 fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
     match command {
-        Command::Schema { file, class } => schema(&file, class.as_deref()),
+        Command::Schema {
+            file,
+            class,
+            property,
+        } => schema(&file, class.as_deref(), property.as_deref()),
         Command::ElemTable { file, records } => elem_table(&file, records),
         Command::PartitionIdProbe { file } => partition_id_probe(&file),
         Command::SchemaPrefixProbe { file, class } => schema_prefix_probe(&file, &class),
@@ -458,6 +470,7 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             element,
             dump_window,
             dump_count,
+            faces_only,
             max_member_bytes,
         } => serial_probe(
             &file,
@@ -472,6 +485,7 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             element,
             dump_window,
             dump_count,
+            faces_only,
             max_member_bytes,
         ),
         Command::GeometryGraphProbe {
@@ -666,7 +680,11 @@ fn partitions(
     Ok(())
 }
 
-fn schema(path: &Path, class_name: Option<&str>) -> Result<(), Box<dyn Error>> {
+fn schema(
+    path: &Path,
+    class_name: Option<&str>,
+    property_text: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
     let container = RvtContainer::open(path)?;
     let Some(stream) = container.stream("Formats/Latest") else {
         println!("Schema stream: not present");
@@ -700,6 +718,10 @@ fn schema(path: &Path, class_name: Option<&str>) -> Result<(), Box<dyn Error>> {
     println!("Trailing bytes: {}", schema.trailing_bytes.len());
     if let Some(class_name) = class_name {
         return print_class_properties(&schema, class_name);
+    }
+    if let Some(text) = property_text {
+        print_matching_properties(&schema, text);
+        return Ok(());
     }
 
     println!();
@@ -799,6 +821,35 @@ fn print_class_properties(schema: &Schema, class_name: &str) -> Result<(), Box<d
         );
     }
     Ok(())
+}
+
+/// List every declared property whose name contains `text`, with the class that
+/// declares it and that class's own version. Written for questions that span the
+/// whole schema rather than one class - which classes carry a `_v<N>` property,
+/// for instance, and at which versions.
+fn print_matching_properties(schema: &Schema, text: &str) {
+    println!();
+    println!("Properties whose name contains {text:?}:");
+    let mut matches = 0_usize;
+    for class in &schema.classes {
+        for (index, property) in class.properties.iter().enumerate() {
+            if !property.name.contains(text) {
+                continue;
+            }
+            matches += 1;
+            println!(
+                "{}\t{}\tclass_version={}\t{index}\t{}\ttype={:?}\tmodes={:#04x}\titem_mode={}",
+                class.index,
+                escape_terminal_text(&class.name),
+                class.version,
+                escape_terminal_text(&property.name),
+                property.field_type,
+                property.raw_modes,
+                property.item_mode,
+            );
+        }
+    }
+    println!("Matching properties: {matches}");
 }
 
 fn escape_terminal_text(value: &str) -> String {
@@ -1784,6 +1835,11 @@ struct ExportedElement {
     geometry_bounds: Option<GElementBounds>,
     placement_bounds: Option<GElementBounds>,
     verified_symbol_bounds: Option<VerifiedSymbolBounds>,
+    /// The boundary representation decoded from this id's own `GElement`
+    /// record, in its own local frame and Revit internal feet. Populated for
+    /// any id that carries one - typically a `FamilySymbol` - and looked up
+    /// by an instance through its verified symbol id, not copied per instance.
+    brep: Option<rvt_model::SymbolBrep>,
     /// `m_moribund` from the `Element` tail: the element is marked deleted.
     moribund: bool,
     locked: bool,
@@ -2092,6 +2148,7 @@ fn serial_probe(
     element: Option<u32>,
     dump_window: usize,
     dump_count: usize,
+    faces_only: bool,
     max_member_bytes: u64,
 ) -> Result<(), Box<dyn Error>> {
     let container = RvtContainer::open(path)?;
@@ -2124,6 +2181,8 @@ fn serial_probe(
     let mut boundary_exact = 0_usize;
     let mut boundary_faces = 0_usize;
     let mut boundary_exact_faces = 0_usize;
+    let mut drained = 0_usize;
+    let mut drained_exact = 0_usize;
 
     for_each_member(
         &container,
@@ -2219,6 +2278,16 @@ fn serial_probe(
                             boundary_exact_faces += faces;
                         }
                     }
+                    // `--faces-only` narrows every tally below to the records
+                    // geometry is actually read out of, which tile exactly far
+                    // less often than the file average.
+                    if faces_only && faces == 0 {
+                        continue;
+                    }
+                    if result.pending_references == 0 {
+                        drained += 1;
+                        drained_exact += usize::from(result.is_exact());
+                    }
                     objects += result.nodes;
                     pending += result.pending_references;
                     references += result.references.len();
@@ -2253,6 +2322,34 @@ fn serial_probe(
                         *stops.entry(described).or_default() += 1;
                     } else {
                         trailing += 1;
+                        if dump_remaining == Some(result.remaining) && dumped < dump_count {
+                            dumped += 1;
+                            let mut tail = String::new();
+                            for byte in body
+                                .get(result.consumed..body.len() - RECORD_LENGTH_TRAILER_BYTES)
+                                .unwrap_or_default()
+                            {
+                                let _ = write!(tail, "{byte:02x}");
+                            }
+                            let (_, walked) =
+                                rvt_model::walk_record_collecting(&schema, class_index, body);
+                            let mut walked_classes = String::new();
+                            for object in walked.iter().rev().take(6).rev() {
+                                let class = schema
+                                    .class_by_index(object.class_index)
+                                    .map_or("<unknown>", |class| class.name.as_str());
+                                let _ = write!(walked_classes, " {class}/{}", object.bytes);
+                            }
+                            println!(
+                                "  id={} len={} consumed={} pending={} objects={} tail={tail}",
+                                header.id,
+                                body.len(),
+                                result.consumed,
+                                result.pending_references,
+                                walked.len()
+                            );
+                            println!("    last:{walked_classes}");
+                        }
                         *trailing_bytes.entry(result.remaining).or_default() += 1;
                     }
                     continue;
@@ -2288,6 +2385,12 @@ fn serial_probe(
         },
     )?;
 
+    if faces_only {
+        // The tallies below cover only face-bearing records; report their
+        // count, not the file's, so the percentages have the right base.
+        attempted = boundary_records;
+    }
+
     let share = |part: usize| {
         if attempted == 0 {
             0.0
@@ -2316,6 +2419,13 @@ fn serial_probe(
             "  records carrying boundary faces: {boundary_records} ({boundary_exact} explained exactly)"
         );
         println!("  faces in them: {boundary_faces} ({boundary_exact_faces} in explained records)");
+        // A record whose reference queue drains before its body does has read
+        // every object the body holds; one with references left over stopped
+        // because the body ended, and its last references name objects stored
+        // elsewhere. The two end differently, so tally them apart.
+        println!(
+            "  reference queue drained before the body: {drained} ({drained_exact} explained exactly)"
+        );
         println!(
             "  trailing length word matches the body length: {trailer_matches} ({:.1}%)",
             share(trailer_matches)
@@ -2759,6 +2869,15 @@ fn recover_elements(
     let gnode_class_index = schema_class_index(schema.as_ref(), "GNode");
     let geometry_element_class_index = schema_class_index(schema.as_ref(), "GElement");
     let parameter_set_classes = parameter_set_class_indexes(schema.as_ref());
+    let brep_classes = (|| {
+        Some(rvt_model::BrepClassIndexes {
+            face: schema_class_index(schema.as_ref(), "Face")?,
+            edge_loop: schema_class_index(schema.as_ref(), "EdgeLoop")?,
+            edge: schema_class_index(schema.as_ref(), "Edge")?,
+            plane: plane_class_index?,
+            cyl_surf: schema_class_index(schema.as_ref(), "CylSurf")?,
+        })
+    })();
     let partition_paths = partition_paths(&container);
     let (calibrations, parameter_ids) = calibrate_names(
         &container,
@@ -2816,6 +2935,14 @@ fn recover_elements(
                                     ginstance_class_index,
                                     &bounds,
                                 );
+                            }
+                        }
+                        if let (Some(schema), Some(classes)) = (schema.as_ref(), &brep_classes) {
+                            let (_walk, objects) =
+                                rvt_model::walk_record_collecting(schema, header.class_index, body);
+                            let brep = rvt_model::assemble_symbol_brep(&objects, classes);
+                            if !brep.is_empty() {
+                                entry.brep = Some(brep);
                             }
                         }
                     }
@@ -3246,6 +3373,7 @@ fn metadata_model(
             let mut normalized = normalize_element(
                 *id,
                 element,
+                &recovered.elements,
                 recovered.schema.as_ref(),
                 &recovered.parameter_names,
                 &recovered.parameter_specs,
@@ -3461,7 +3589,7 @@ fn write_exported_elements(
             break;
         }
         written += 1;
-        write_element_json(&mut writer, *id, element, metadata)?;
+        write_element_json(&mut writer, *id, element, elements, metadata)?;
     }
     writer.flush()?;
     Ok(written)
@@ -3528,6 +3656,7 @@ fn parameter_metadata(
 fn normalize_element(
     id: u32,
     element: &ExportedElement,
+    elements: &BTreeMap<u32, ExportedElement>,
     schema: Option<&Schema>,
     parameter_names: &BTreeMap<i32, String>,
     parameter_specs: &BTreeMap<i32, String>,
@@ -3560,6 +3689,19 @@ fn normalize_element(
         category.as_ref().map(|category| category.name.as_str()),
     );
 
+    let geometry = normalize_geometry(element, element_type, elements);
+    if let Some(BimGeometry::Brep(brep)) = &geometry {
+        if let Some(extent) = brep_extent_metres(brep) {
+            if extent < MIN_PLAUSIBLE_BREP_EXTENT_METRES {
+                let name = element.name.as_ref().map_or("<unnamed>", |(name, _)| name);
+                eprintln!(
+                    "warning: element {id} ({name}) has a boundary representation only {:.3} mm across - likely degenerate source geometry, not a decode error (both the Face/Edge reconstruction and the record's own declared bounding box agree on this size)",
+                    extent * 1000.0
+                );
+            }
+        }
+    }
+
     BimElement {
         id: BimElementId(id.to_string()),
         element_type,
@@ -3571,9 +3713,37 @@ fn normalize_element(
         // for every serialized class.
         type_id: None,
         placement: normalize_placement(element.ginstance_transform),
-        geometry: normalize_geometry(element, element_type),
+        geometry,
         properties,
     }
+}
+
+/// Below this, a `Brep` body is flagged as likely-degenerate source geometry
+/// rather than a real physical part (see `normalize_element`'s warning). Not
+/// a hard rule - chosen to be well under any real MEP fitting while still
+/// catching sub-millimetre slivers like a family authored with a units bug.
+const MIN_PLAUSIBLE_BREP_EXTENT_METRES: f64 = 0.005;
+
+/// The largest axis-aligned extent across every vertex the body's edges
+/// name, in metres. `None` for a body with no edges.
+fn brep_extent_metres(brep: &BimBrep) -> Option<f64> {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    let mut seen = false;
+    for face in &brep.faces {
+        for loop_edges in &face.loops {
+            for edge in loop_edges {
+                for point in [&edge.start, &edge.end] {
+                    seen = true;
+                    for axis in 0..3 {
+                        min[axis] = min[axis].min(point.coordinates[axis]);
+                        max[axis] = max[axis].max(point.coordinates[axis]);
+                    }
+                }
+            }
+        }
+    }
+    seen.then(|| (0..3).map(|axis| max[axis] - min[axis]).fold(0.0, f64::max))
 }
 
 fn normalize_placement(transform: Option<GInstanceTransformFields>) -> Option<BimPlacement> {
@@ -3608,6 +3778,7 @@ fn carries_family_symbol_geometry(element_type: BimElementType) -> bool {
 fn normalize_geometry(
     element: &ExportedElement,
     element_type: BimElementType,
+    elements: &BTreeMap<u32, ExportedElement>,
 ) -> Option<BimGeometry> {
     let metres = |value| revit_catalog::internal_feet_to_metres(value);
     let point = |coordinates: [f64; 3]| {
@@ -3644,10 +3815,115 @@ fn normalize_geometry(
         return None;
     }
     let symbol = element.verified_symbol_bounds?;
+    if let (Some(local_brep), Some(transform)) = (
+        elements
+            .get(&symbol.symbol_element_id)
+            .and_then(|symbol_element| symbol_element.brep.as_ref()),
+        element.ginstance_transform,
+    ) {
+        if let Some(brep) = normalize_brep(local_brep, &transform) {
+            return Some(BimGeometry::Brep(brep));
+        }
+    }
     Some(BimGeometry::BoundingBox(BimBoundingBox {
         min: point(symbol.bounds.min)?,
         max: point(symbol.bounds.max)?,
     }))
+}
+
+/// Place a symbol-local `SymbolBrep` (Revit internal feet) into world
+/// coordinates via the instance's own `GInstance` transform, and convert to
+/// metres. Reuses the same rigid transform
+/// [`GElementBounds::matches_transformed`] already applies to bounding-box
+/// corners: `world = origin + sum_i local[i] * basis[i]` for a point, and
+/// the same sum without `origin` for a direction.
+fn normalize_brep(
+    local: &rvt_model::SymbolBrep,
+    transform: &GInstanceTransformFields,
+) -> Option<BimBrep> {
+    let metres = |value: f64| revit_catalog::internal_feet_to_metres(value);
+    let world_point = |local_point: [f64; 3]| -> Option<BimPoint3> {
+        let mut world = transform.origin.coordinates_feet;
+        for (axis_local, value) in local_point.into_iter().enumerate() {
+            for (axis_world, component) in world.iter_mut().enumerate() {
+                *component += transform.basis[axis_local][axis_world] * value;
+            }
+        }
+        Some(BimPoint3 {
+            coordinates: [metres(world[0])?, metres(world[1])?, metres(world[2])?],
+            unit: metres_unit(),
+        })
+    };
+    let world_direction = |local_direction: [f64; 3]| -> [f64; 3] {
+        let mut world = [0.0; 3];
+        for (axis_local, value) in local_direction.into_iter().enumerate() {
+            for (axis_world, component) in world.iter_mut().enumerate() {
+                *component += transform.basis[axis_local][axis_world] * value;
+            }
+        }
+        world
+    };
+    let mut faces = Vec::with_capacity(local.faces.len());
+    for face in &local.faces {
+        let surface = match face.surface {
+            rvt_model::BrepSurface::Plane {
+                origin,
+                x_axis,
+                y_axis,
+            } => BimBrepSurface::Plane {
+                origin: world_point(origin)?,
+                x_axis: world_direction(x_axis),
+                y_axis: world_direction(y_axis),
+            },
+            rvt_model::BrepSurface::Cylinder {
+                center,
+                x_axis,
+                y_axis,
+                z_axis,
+                radius,
+            } => BimBrepSurface::Cylinder {
+                center: world_point(center)?,
+                x_axis: world_direction(x_axis),
+                y_axis: world_direction(y_axis),
+                z_axis: world_direction(z_axis),
+                radius: BimNumber {
+                    value: metres(radius)?,
+                    unit: Some(metres_unit()),
+                },
+            },
+        };
+        let mut loops = Vec::with_capacity(face.loops.len());
+        for loop_edges in &face.loops {
+            let mut edges = Vec::with_capacity(loop_edges.len());
+            for edge in loop_edges {
+                let curve = match edge.curve {
+                    rvt_model::BrepCurve::Line => BimBrepCurve::Line,
+                    rvt_model::BrepCurve::Arc(arc) => BimBrepCurve::Arc(BimBrepArc {
+                        center: world_point(arc.center)?,
+                        x_axis: world_direction(arc.x_axis),
+                        z_axis: world_direction(arc.z_axis),
+                        radius: BimNumber {
+                            value: metres(arc.radius)?,
+                            unit: Some(metres_unit()),
+                        },
+                        start_angle: arc.start_angle,
+                        end_angle: arc.end_angle,
+                    }),
+                };
+                edges.push(BimBrepEdge {
+                    start: world_point(edge.start)?,
+                    end: world_point(edge.end)?,
+                    curve,
+                });
+            }
+            loops.push(edges);
+        }
+        faces.push(BimBrepFace { surface, loops });
+    }
+    Some(BimBrep {
+        faces,
+        complete: local.excluded_faces.is_empty(),
+    })
 }
 
 fn metres_unit() -> BimUnit {
@@ -3717,11 +3993,13 @@ fn write_element_json(
     writer: &mut impl Write,
     id: u32,
     element: &ExportedElement,
+    elements: &BTreeMap<u32, ExportedElement>,
     metadata: &ExportMetadata<'_>,
 ) -> io::Result<()> {
     let normalized = normalize_element(
         id,
         element,
+        elements,
         metadata.schema,
         metadata.parameter_names,
         metadata.parameter_specs,
@@ -3828,6 +4106,26 @@ fn write_geometry_json(writer: &mut impl Write, geometry: Option<&BimGeometry>) 
                 writer,
                 ",\"geometry\":{{\"kind\":\"bounding_box\",\"min_meters\":[{},{},{}],\"max_meters\":[{},{},{}]}}",
                 min[0], min[1], min[2], max[0], max[1], max[2]
+            )
+        }
+        Some(BimGeometry::Brep(brep)) => {
+            let (mut lines, mut arcs) = (0_usize, 0_usize);
+            for edge in brep
+                .faces
+                .iter()
+                .flat_map(|face| face.loops.iter())
+                .flat_map(|edge_loop| edge_loop.iter())
+            {
+                match edge.curve {
+                    BimBrepCurve::Line => lines += 1,
+                    BimBrepCurve::Arc(_) => arcs += 1,
+                }
+            }
+            write!(
+                writer,
+                ",\"geometry\":{{\"kind\":\"brep\",\"faces\":{},\"complete\":{},\"line_edges\":{lines},\"arc_edges\":{arcs}}}",
+                brep.faces.len(),
+                brep.complete
             )
         }
         None => Ok(()),
@@ -4558,7 +4856,7 @@ mod tests {
         };
 
         let Some(BimGeometry::SweptDisk(geometry)) =
-            normalize_geometry(&element, BimElementType::PipeSegment)
+            normalize_geometry(&element, BimElementType::PipeSegment, &BTreeMap::new())
         else {
             panic!("verified pipe geometry was not promoted");
         };
@@ -4568,7 +4866,10 @@ mod tests {
 
         let mut mismatched = element;
         mismatched.geometry_bounds.as_mut().unwrap().max[2] += 1.0;
-        assert!(normalize_geometry(&mismatched, BimElementType::PipeSegment).is_none());
+        assert!(
+            normalize_geometry(&mismatched, BimElementType::PipeSegment, &BTreeMap::new())
+                .is_none()
+        );
     }
 
     #[test]
@@ -4586,7 +4887,7 @@ mod tests {
             ..ExportedElement::default()
         };
         let Some(BimGeometry::AxisLine(line)) =
-            normalize_geometry(&element, BimElementType::PipeFitting)
+            normalize_geometry(&element, BimElementType::PipeFitting, &BTreeMap::new())
         else {
             panic!("verified fitting axis was not promoted");
         };
@@ -4704,7 +5005,7 @@ mod tests {
             ..ExportedElement::default()
         };
         let Some(BimGeometry::BoundingBox(bounds)) =
-            normalize_geometry(&element, BimElementType::SanitaryTerminal)
+            normalize_geometry(&element, BimElementType::SanitaryTerminal, &BTreeMap::new())
         else {
             panic!("verified symbol bounds were not promoted");
         };
@@ -4718,10 +5019,14 @@ mod tests {
             assert!((actual - expected).abs() < 1.0e-12);
         }
         for refused in [BimElementType::Unknown, BimElementType::PipeSegment] {
-            assert!(normalize_geometry(&element, refused).is_none());
+            assert!(normalize_geometry(&element, refused, &BTreeMap::new()).is_none());
         }
         assert!(matches!(
-            normalize_geometry(&element, BimElementType::DistributionElement),
+            normalize_geometry(
+                &element,
+                BimElementType::DistributionElement,
+                &BTreeMap::new()
+            ),
             Some(BimGeometry::BoundingBox(_))
         ));
     }

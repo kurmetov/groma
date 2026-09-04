@@ -5,8 +5,9 @@ use std::{
 };
 
 use bim_core::{
-    BimBoundingBox, BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel,
-    BimLineSegment, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
+    BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepSurface, BimElement,
+    BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimModel,
+    BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
 };
 
 use crate::{EntityRef, IfcGuid, StepFile, StepHeader, StepValue, mapping::resolved_element_type};
@@ -677,7 +678,330 @@ fn push_geometry(
             ))
         }
         BimGeometry::BoundingBox(bounds) => push_bounding_box(file, bounds, representation_context),
+        BimGeometry::Brep(brep) => push_brep(
+            file,
+            brep,
+            representation_context,
+            placement_elevation,
+            metric_placement,
+        ),
     }
+}
+
+/// `IfcAdvancedBrep`/`IfcClosedShell` when [`BimBrep::complete`] holds, so a
+/// closed-solid claim always corresponds to every source face resolving;
+/// otherwise `IfcShellBasedSurfaceModel`/`IfcOpenShell` over whichever faces
+/// did resolve, which is schema-valid for a shell known to be incomplete.
+fn push_brep(
+    file: &mut StepFile,
+    brep: &BimBrep,
+    representation_context: EntityRef,
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    if brep.faces.is_empty() {
+        return None;
+    }
+    let mut faces = Vec::with_capacity(brep.faces.len());
+    for face in &brep.faces {
+        faces.push(push_advanced_face(
+            file,
+            face,
+            placement_elevation,
+            metric_placement,
+        )?);
+    }
+    let face_list = StepValue::List(faces.into_iter().map(reference).collect());
+    let (item, representation_type) = if brep.complete {
+        let shell = file.push("IFCCLOSEDSHELL", vec![face_list]);
+        (
+            file.push("IFCADVANCEDBREP", vec![reference(shell)]),
+            "AdvancedBrep",
+        )
+    } else {
+        let shell = file.push("IFCOPENSHELL", vec![face_list]);
+        (
+            file.push(
+                "IFCSHELLBASEDSURFACEMODEL",
+                vec![StepValue::List(vec![reference(shell)])],
+            ),
+            "SurfaceModel",
+        )
+    };
+    let body = file.push(
+        "IFCSHAPEREPRESENTATION",
+        vec![
+            reference(representation_context),
+            string("Body"),
+            string(representation_type),
+            StepValue::List(vec![reference(item)]),
+        ],
+    );
+    Some(file.push(
+        "IFCPRODUCTDEFINITIONSHAPE",
+        vec![omitted(), omitted(), StepValue::List(vec![reference(body)])],
+    ))
+}
+
+/// # Note on `SameSense`
+///
+/// Every `IfcAdvancedFace` here is written with `SameSense = TRUE`. Whether
+/// the source loop's winding actually agrees with the surface's own normal
+/// direction (which is what `SameSense` is meant to record) has not been
+/// checked against a real solid's outward orientation - it is a placeholder
+/// pending validation against `ifcopenshell`'s geometrization of an actual
+/// exported symbol, not a measured constant.
+fn push_advanced_face(
+    file: &mut StepFile,
+    face: &BimBrepFace,
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    let surface = push_brep_surface(file, &face.surface, placement_elevation, metric_placement)?;
+    if face.loops.is_empty() {
+        return None;
+    }
+    let mut bounds = Vec::with_capacity(face.loops.len());
+    for (index, loop_edges) in face.loops.iter().enumerate() {
+        let edge_loop = push_edge_loop(file, loop_edges, placement_elevation, metric_placement)?;
+        let entity = if index == 0 {
+            "IFCFACEOUTERBOUND"
+        } else {
+            "IFCFACEBOUND"
+        };
+        bounds.push(file.push(entity, vec![reference(edge_loop), StepValue::Boolean(true)]));
+    }
+    Some(file.push(
+        "IFCADVANCEDFACE",
+        vec![
+            StepValue::List(bounds.into_iter().map(reference).collect()),
+            reference(surface),
+            StepValue::Boolean(true),
+        ],
+    ))
+}
+
+fn push_brep_surface(
+    file: &mut StepFile,
+    surface: &BimBrepSurface,
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    match surface {
+        BimBrepSurface::Plane {
+            origin,
+            x_axis,
+            y_axis,
+        } => {
+            let normal = cross(*x_axis, *y_axis);
+            let axis = push_local_axis(
+                file,
+                origin,
+                normal,
+                *x_axis,
+                placement_elevation,
+                metric_placement,
+            )?;
+            Some(file.push("IFCPLANE", vec![reference(axis)]))
+        }
+        BimBrepSurface::Cylinder {
+            center,
+            x_axis,
+            y_axis: _,
+            z_axis,
+            radius,
+        } => {
+            if radius.unit.as_ref()?.id != "autodesk.unit.unit:meters-1.0.0"
+                || !radius.value.is_finite()
+                || radius.value <= 0.0
+            {
+                return None;
+            }
+            let axis = push_local_axis(
+                file,
+                center,
+                *z_axis,
+                *x_axis,
+                placement_elevation,
+                metric_placement,
+            )?;
+            Some(file.push(
+                "IFCCYLINDRICALSURFACE",
+                vec![reference(axis), StepValue::Real(radius.value)],
+            ))
+        }
+    }
+}
+
+/// `IfcEdgeLoop.IsContinuous` (`IfcLoopHeadToTail`) requires edge `i`'s
+/// `EdgeEnd` and edge `i+1`'s `EdgeStart` to be the *same* `IfcVertex`
+/// instance, not merely a numerically-equal one - confirmed the hard way:
+/// giving every edge its own fresh vertex, even at coordinates that agreed
+/// to full float precision, failed the rule on all 608 loops of a real
+/// export. So a loop's `N` distinct corners (edge `i`'s start, for `i` in
+/// `0..N`; `edges[i].end` is trusted to already equal `edges[i+1].start`,
+/// which is what closes a [`crate::brep`]-produced loop in the first place)
+/// are pushed once each and then shared by both edges that meet there.
+fn push_edge_loop(
+    file: &mut StepFile,
+    edges: &[BimBrepEdge],
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    if edges.is_empty() {
+        return None;
+    }
+    let mut vertices = Vec::with_capacity(edges.len());
+    for edge in edges {
+        let corner = local_coordinates(&edge.start, placement_elevation, metric_placement)?;
+        if corner.into_iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let point = push_cartesian_point(file, corner);
+        vertices.push(file.push("IFCVERTEXPOINT", vec![reference(point)]));
+    }
+    let mut oriented = Vec::with_capacity(edges.len());
+    for (index, edge) in edges.iter().enumerate() {
+        let start_vertex = vertices[index];
+        let end_vertex = vertices[(index + 1) % vertices.len()];
+        oriented.push(push_oriented_edge(
+            file,
+            edge,
+            start_vertex,
+            end_vertex,
+            placement_elevation,
+            metric_placement,
+        )?);
+    }
+    Some(file.push(
+        "IFCEDGELOOP",
+        vec![StepValue::List(
+            oriented.into_iter().map(reference).collect(),
+        )],
+    ))
+}
+
+fn push_oriented_edge(
+    file: &mut StepFile,
+    edge: &BimBrepEdge,
+    start_vertex: EntityRef,
+    end_vertex: EntityRef,
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    let start = local_coordinates(&edge.start, placement_elevation, metric_placement)?;
+    let end = local_coordinates(&edge.end, placement_elevation, metric_placement)?;
+    if start.into_iter().chain(end).any(|value| !value.is_finite()) {
+        return None;
+    }
+    let curve = match &edge.curve {
+        BimBrepCurve::Line => {
+            let delta = subtract(end, start);
+            let length = dot(delta, delta).sqrt();
+            if length <= f64::EPSILON {
+                return None;
+            }
+            let direction = delta.map(|value| value / length);
+            let direction_ref = push_direction(file, direction);
+            let vector = file.push(
+                "IFCVECTOR",
+                vec![reference(direction_ref), StepValue::Real(1.0)],
+            );
+            // `IfcLine.Pnt` describes the underlying infinite line, not a
+            // topological vertex, so it needs its own value, not the shared
+            // `IfcVertexPoint`'s.
+            let line_point = push_cartesian_point(file, start);
+            file.push("IFCLINE", vec![reference(line_point), reference(vector)])
+        }
+        BimBrepCurve::Arc(arc) => {
+            if arc.radius.unit.as_ref()?.id != "autodesk.unit.unit:meters-1.0.0"
+                || !arc.radius.value.is_finite()
+                || arc.radius.value <= 0.0
+            {
+                return None;
+            }
+            let axis = push_local_axis(
+                file,
+                &arc.center,
+                arc.z_axis,
+                arc.x_axis,
+                placement_elevation,
+                metric_placement,
+            )?;
+            file.push(
+                "IFCCIRCLE",
+                vec![reference(axis), StepValue::Real(arc.radius.value)],
+            )
+        }
+    };
+    let edge_curve = file.push(
+        "IFCEDGECURVE",
+        vec![
+            reference(start_vertex),
+            reference(end_vertex),
+            reference(curve),
+            StepValue::Boolean(true),
+        ],
+    );
+    Some(file.push(
+        "IFCORIENTEDEDGE",
+        vec![
+            StepValue::Derived,
+            StepValue::Derived,
+            reference(edge_curve),
+            StepValue::Boolean(true),
+        ],
+    ))
+}
+
+/// Build an `IfcAxis2Placement3D` from a world point and two world
+/// direction vectors, transformed into the same local frame
+/// [`local_coordinates`] and [`local_direction`] apply elsewhere.
+fn push_local_axis(
+    file: &mut StepFile,
+    origin: &BimPoint3,
+    axis_world: [f64; 3],
+    ref_direction_world: [f64; 3],
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    let point = local_coordinates(origin, placement_elevation, metric_placement)?;
+    let axis = local_direction(axis_world, metric_placement);
+    let ref_direction = local_direction(ref_direction_world, metric_placement);
+    if point
+        .into_iter()
+        .chain(axis)
+        .chain(ref_direction)
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    let point_ref = push_cartesian_point(file, point);
+    let axis_ref = push_direction(file, axis);
+    let ref_direction_ref = push_direction(file, ref_direction);
+    Some(file.push(
+        "IFCAXIS2PLACEMENT3D",
+        vec![
+            reference(point_ref),
+            reference(axis_ref),
+            reference(ref_direction_ref),
+        ],
+    ))
+}
+
+/// Rotate a world direction vector into the element's local placement basis,
+/// the same rotation [`local_coordinates`] applies to points - without the
+/// translation, since a direction has no position.
+fn local_direction(direction: [f64; 3], placement: Option<MetricPlacement>) -> [f64; 3] {
+    let Some(placement) = placement else {
+        return direction;
+    };
+    let local_y = cross(placement.axis, placement.reference_direction);
+    [
+        dot(direction, placement.reference_direction),
+        dot(direction, local_y),
+        dot(direction, placement.axis),
+    ]
 }
 
 fn push_bounding_box(
@@ -1281,6 +1605,131 @@ mod tests {
             text.contains("(-1.000000000000000e-1,-2.000000000000000e-1,-3.000000000000000e-1)")
         );
         assert!(text.contains(",2.000000000000000e-1,4.000000000000000e-1,6.000000000000000e-1)"));
+    }
+
+    fn metres_point(coordinates: [f64; 3]) -> BimPoint3 {
+        BimPoint3 {
+            coordinates,
+            unit: BimUnit {
+                id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
+                name: "Meters".to_owned(),
+            },
+        }
+    }
+
+    fn metres_number(value: f64) -> BimNumber {
+        BimNumber {
+            value,
+            unit: Some(BimUnit {
+                id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
+                name: "Meters".to_owned(),
+            }),
+        }
+    }
+
+    /// A quarter-disc: one planar face bounded by a quarter-circle arc and
+    /// two straight radii, at the model's storey elevation so the local
+    /// coordinates equal the world ones.
+    fn quarter_disc_brep(complete: bool) -> BimBrep {
+        let arc = BimBrepEdge {
+            start: metres_point([2.0, 0.0, 3.048]),
+            end: metres_point([0.0, 2.0, 3.048]),
+            curve: BimBrepCurve::Arc(bim_core::BimBrepArc {
+                center: metres_point([0.0, 0.0, 3.048]),
+                x_axis: [1.0, 0.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+                radius: metres_number(2.0),
+                start_angle: 0.0,
+                end_angle: std::f64::consts::FRAC_PI_2,
+            }),
+        };
+        let radius_a = BimBrepEdge {
+            start: metres_point([0.0, 2.0, 3.048]),
+            end: metres_point([0.0, 0.0, 3.048]),
+            curve: BimBrepCurve::Line,
+        };
+        let radius_b = BimBrepEdge {
+            start: metres_point([0.0, 0.0, 3.048]),
+            end: metres_point([2.0, 0.0, 3.048]),
+            curve: BimBrepCurve::Line,
+        };
+        BimBrep {
+            faces: vec![BimBrepFace {
+                surface: BimBrepSurface::Plane {
+                    origin: metres_point([0.0, 0.0, 3.048]),
+                    x_axis: [1.0, 0.0, 0.0],
+                    y_axis: [0.0, 1.0, 0.0],
+                },
+                loops: vec![vec![arc, radius_a, radius_b]],
+            }],
+            complete,
+        }
+    }
+
+    #[test]
+    fn writes_a_complete_brep_as_an_advanced_brep() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::SanitaryTerminal;
+        model.elements[0].geometry = Some(BimGeometry::Brep(quarter_disc_brep(true)));
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        for entity in [
+            "IFCADVANCEDBREP",
+            "IFCCLOSEDSHELL",
+            "IFCADVANCEDFACE",
+            "IFCPLANE",
+            "IFCCIRCLE",
+            "IFCLINE",
+            "IFCEDGECURVE",
+            "IFCORIENTEDEDGE",
+            "IFCEDGELOOP",
+            "IFCFACEOUTERBOUND",
+            "IFCVERTEXPOINT",
+        ] {
+            assert!(text.contains(&format!("={entity}(")), "missing {entity}");
+        }
+        assert!(!text.contains("=IFCOPENSHELL("));
+        assert!(!text.contains("=IFCSHELLBASEDSURFACEMODEL("));
+        assert!(text.contains("'Body','AdvancedBrep'"));
+        // World Z=3.048 m sits exactly at the storey elevation.
+        assert!(text.contains("(2.000000000000000e0,0.000000000000000e0,0.000000000000000e0)"));
+    }
+
+    #[test]
+    fn writes_an_incomplete_brep_as_an_open_shell() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::SanitaryTerminal;
+        model.elements[0].geometry = Some(BimGeometry::Brep(quarter_disc_brep(false)));
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("=IFCOPENSHELL("));
+        assert!(text.contains("=IFCSHELLBASEDSURFACEMODEL("));
+        assert!(!text.contains("=IFCADVANCEDBREP("));
+        assert!(!text.contains("=IFCCLOSEDSHELL("));
+        assert!(text.contains("'Body','SurfaceModel'"));
+    }
+
+    #[test]
+    fn omits_geometry_for_a_brep_with_no_resolved_faces() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::SanitaryTerminal;
+        model.elements[0].geometry = Some(BimGeometry::Brep(BimBrep {
+            faces: Vec::new(),
+            complete: false,
+        }));
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("=IFCADVANCEDBREP("));
+        assert!(!text.contains("=IFCSHELLBASEDSURFACEMODEL("));
     }
 
     #[test]

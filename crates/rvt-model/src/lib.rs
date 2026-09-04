@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod brep;
 mod elem_table;
 mod geometry;
 mod member;
 mod parameter;
 mod serial;
 
+pub use brep::{
+    BrepArc, BrepClassIndexes, BrepCurve, BrepEdge, BrepExclusion, BrepFace, BrepLoop, BrepSurface,
+    SymbolBrep, assemble as assemble_symbol_brep,
+};
 pub use elem_table::{
     ElemTable, ElemTableError, ElemTableHeader, ElemTableLayout, ElemTableRecord, RecordFraming,
 };
@@ -24,8 +29,9 @@ pub use parameter::{
     ParameterSets, ParameterSpec, ParameterValue,
 };
 pub use serial::{
-    SerialObject, SerialRecordWalk, SerialStop, SerialStreamWalk, SerialTraceEntry, SerialWalk,
-    walk_object, walk_object_stream, walk_record, walk_record_collecting, walk_record_traced,
+    RECORD_LENGTH_TRAILER_BYTES, SerialObject, SerialRecordWalk, SerialStop, SerialStreamWalk,
+    SerialTraceEntry, SerialWalk, walk_object, walk_object_stream, walk_record,
+    walk_record_collecting, walk_record_traced,
 };
 
 #[derive(Clone, Debug, Default, PartialEq)]
