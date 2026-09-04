@@ -1993,6 +1993,8 @@ fn parameters(
     let mut with_parameters = 0_u64;
     let mut bodies = 0_u64;
     let mut values = 0_u64;
+    let mut scanned_bodies = 0_u64;
+    let mut scanned_values = 0_u64;
 
     for_each_member(
         &container,
@@ -2016,7 +2018,7 @@ fn parameters(
                 let Some(fields) = ElementFields::parse(body, header.id) else {
                     continue;
                 };
-                let found = if let (Some(classes), Some(_)) = (parameter_set_classes, catalog) {
+                let scanned = if let (Some(classes), Some(_)) = (parameter_set_classes, catalog) {
                     ParameterSets::scan_schema_bound(
                         body,
                         fields.id_offset + 4 + ELEMENT_TAIL_BYTES,
@@ -2027,7 +2029,15 @@ fn parameters(
                 } else {
                     ParameterSets::scan(body, &accept)
                 };
-                let Some(found) = found else {
+                if let Some(found) = &scanned {
+                    scanned_bodies += 1;
+                    scanned_values += found.parameters.len() as u64;
+                }
+                let declared = (|| {
+                    let classes = parameter_set_classes?;
+                    ParameterSets::from_record(schema.as_ref()?, header.class_index, body, classes)
+                })();
+                let Some(found) = declared.or(scanned) else {
                     continue;
                 };
                 with_parameters += 1;
@@ -2068,6 +2078,7 @@ fn parameters(
         )
     );
     println!("Parameter values recovered: {values}");
+    println!("  bodies the scan alone explained: {scanned_bodies} ({scanned_values} values)");
     Ok(())
 }
 
@@ -2128,7 +2139,131 @@ fn names(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(), Box<d
     println!();
     println!("Classes seen: {}", calibrations.len());
     println!("Classes with a settled string offset: {settled}");
+
+    let Some(schema) = schema.as_ref() else {
+        return Ok(());
+    };
+    report_declared_names(
+        &container,
+        schema,
+        &partition_paths,
+        &calibrations,
+        &ordered,
+        classes,
+        max_member_bytes,
+    )
+}
+
+/// Measure the name the declarations give a record against the calibrated
+/// scan it replaces. The declarations say which property a string is the value
+/// of, so a name needs no offset agreement to be located.
+fn report_declared_names(
+    container: &RvtContainer,
+    schema: &Schema,
+    partition_paths: &[String],
+    calibrations: &BTreeMap<u16, NameCalibration>,
+    ordered: &[(&u16, &NameCalibration)],
+    classes: usize,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let mut declared: BTreeMap<u16, DeclaredNameTally> = BTreeMap::new();
+    for_each_member(
+        container,
+        partition_paths,
+        max_member_bytes,
+        |_, _, format_tag, layout, walk, payload| {
+            if format_tag != ELEMENT_CLASS_FORMAT_TAG {
+                return;
+            }
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if !calibrations.contains_key(&header.class_index) {
+                    continue;
+                }
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                let tally = declared.entry(header.class_index).or_default();
+                tally.bodies += 1;
+                let (_walk, strings) =
+                    rvt_model::walk_record_strings(schema, header.class_index, body);
+                let Some(first) = strings
+                    .iter()
+                    .filter(|string| string.property == "m_name" && !string.value.is_empty())
+                    .min_by_key(|string| (string.distance, string.offset))
+                else {
+                    continue;
+                };
+                tally.with_string += 1;
+                *tally
+                    .properties
+                    .entry(format!("{}.{}", first.class, first.property))
+                    .or_default() += 1;
+                let scanned = ElementFields::parse(body, header.id).and_then(|fields| {
+                    read_name(
+                        body,
+                        fields.id_offset + 4 + ELEMENT_TAIL_BYTES,
+                        calibrations
+                            .get(&header.class_index)
+                            .and_then(NameCalibration::settled_offset),
+                    )
+                });
+                if let Some((scanned, _)) = scanned {
+                    tally.comparable += 1;
+                    if scanned == first.value {
+                        tally.agreed += 1;
+                    }
+                }
+                if tally.samples.len() < 3 {
+                    tally.samples.push(first.value.clone());
+                }
+            }
+        },
+    )?;
+
+    println!();
+    println!("First string a property named m_name declares, by class:");
+    for (index, _) in ordered.iter().take(classes) {
+        let Some(tally) = declared.get(index) else {
+            continue;
+        };
+        let name = schema
+            .class_by_index(**index)
+            .map_or("?", |class| class.name.as_str());
+        let property = tally
+            .properties
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map_or_else(|| "-".to_owned(), |(property, _)| property.clone());
+        println!(
+            "{index}\t{}\tbodies={}\twith a string={}\tproperty={}\tagrees with the scan={}/{}\tsamples={:?}",
+            escape_terminal_text(name),
+            tally.bodies,
+            tally.with_string,
+            escape_terminal_text(&property),
+            tally.agreed,
+            tally.comparable,
+            tally.samples
+        );
+    }
     Ok(())
+}
+
+/// Where a class's records keep the first string their declarations read.
+#[derive(Default)]
+struct DeclaredNameTally {
+    bodies: usize,
+    with_string: usize,
+    /// The declaring `class.property`, counted so a class with more than one
+    /// answer shows it rather than hiding behind the first record.
+    properties: BTreeMap<String, usize>,
+    /// Records where the scan also returned a name.
+    comparable: usize,
+    /// Of those, records where the two agree.
+    agreed: usize,
+    samples: Vec<String>,
 }
 
 /// Walk every record of one class against the schema and report how far the
@@ -2955,6 +3090,36 @@ fn recover_elements(
                     } else if format_tag == ELEMENT_CLASS_FORMAT_TAG {
                         entry.class_index = Some(header.class_index);
                         entry.source = Some((partition_index, member.index, record.offset));
+                        // The declarations name the four parameter sets
+                        // outright, so they are read from the walk rather than
+                        // searched for, and without waiting on the heuristic
+                        // that locates the element's fixed tail.
+                        if entry.parameters.is_empty() {
+                            let declared = (|| {
+                                let classes = parameter_set_classes?;
+                                ParameterSets::from_record(
+                                    schema.as_ref()?,
+                                    header.class_index,
+                                    body,
+                                    classes,
+                                )
+                            })();
+                            if let Some(found) = declared {
+                                entry.parameters = found.parameters;
+                            }
+                        }
+                        // The declarations name the property a record's name
+                        // is the value of, so it is read rather than scanned
+                        // for. The scan stays as the fallback for a record
+                        // whose class declares no such property.
+                        if entry.name.is_none() {
+                            entry.name = schema
+                                .as_ref()
+                                .and_then(|schema| {
+                                    rvt_model::record_name(schema, header.class_index, body)
+                                })
+                                .map(|name| (name, "declared"));
+                        }
                         if let Some(fields) = ElementFields::parse(body, header.id) {
                             let tail_end = fields.id_offset + 4 + ELEMENT_TAIL_BYTES;
                             if entry.name.is_none() {
@@ -2966,6 +3131,8 @@ fn recover_elements(
                                         .and_then(NameCalibration::settled_offset),
                                 );
                             }
+                            // The scan stays as the fallback for a record the
+                            // walk cannot reach the sets in.
                             if entry.parameters.is_empty() {
                                 let found = if let (Some(classes), Some(_)) =
                                     (parameter_set_classes, catalog)
@@ -3030,6 +3197,7 @@ fn recover_elements(
     attach_symbol_bounds(&mut elements, family_symbol_class_index);
     attach_fitting_axes(&mut elements, catalog);
     verify_family_instance_placements(&mut elements);
+    inherit_symbol_names(&mut elements);
 
     let (parameter_names, parameter_specs) = parameter_metadata(&elements);
     Ok(RecoveredElements {
@@ -3042,6 +3210,38 @@ fn recover_elements(
         parameter_specs,
         elements,
     })
+}
+
+/// Give an instance the name of the symbol it was verified against.
+///
+/// An instance's own declarations carry no name property - in Revit its name is
+/// its type's - so `FamilySymbol`'s declared `SymbolInfo.m_name` is the one to
+/// use, and only for an instance whose symbol was verified by its bounds. It
+/// takes precedence over a scanned name, which for an instance is whatever
+/// string the body happened to hold first, and stands aside for a declared one.
+fn inherit_symbol_names(elements: &mut BTreeMap<u32, ExportedElement>) {
+    let symbol_names = elements
+        .iter()
+        .filter_map(|(id, element)| {
+            let (name, source) = element.name.as_ref()?;
+            (*source == "declared").then(|| (*id, name.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for element in elements.values_mut() {
+        if element
+            .name
+            .as_ref()
+            .is_some_and(|(_, source)| *source == "declared")
+        {
+            continue;
+        }
+        let Some(symbol) = element.verified_symbol_bounds else {
+            continue;
+        };
+        if let Some(name) = symbol_names.get(&symbol.symbol_element_id) {
+            element.name = Some((name.clone(), "symbol"));
+        }
+    }
 }
 
 fn verify_family_instance_placements(elements: &mut BTreeMap<u32, ExportedElement>) {

@@ -1,4 +1,7 @@
+use rvt_schema::Schema;
+
 use crate::member::RecordString;
+use crate::serial::{SerialObject, walk_record_collecting};
 
 /// Largest parameter count accepted from one stored set.
 pub const MAX_PARAMETERS_PER_SET: u32 = 4096;
@@ -110,6 +113,68 @@ pub struct ParameterSetClassIndexes {
 }
 
 impl ParameterSets {
+    /// Read the parameter sets a record's `Element` declarations name, from
+    /// the walked node stream rather than by scanning the body for them.
+    ///
+    /// `Element` declares the four typed sets as its first four properties, so
+    /// the walk meets their objects at the head of the node stream, before
+    /// anything a scan could confuse them with. Each set object holds one
+    /// counted collection of value objects, and each value object's declared
+    /// fields land in the walked object's collected values in declaration
+    /// order:
+    ///
+    /// * `ParamValueDouble` is `m_value` then `m_paramId`, so its doubles pair
+    ///   with its integers by position;
+    /// * `ParamValueInt` and `ParamValueElementId` are `m_paramId` then
+    ///   `m_value`, both `Integer32`, so their integers alternate;
+    /// * `ParamValueAString` is `m_paramId` then `m_value`, so its integers
+    ///   pair with its strings by position.
+    ///
+    /// Every one of those classes declares exactly those two fields and no
+    /// parent, so nothing else of the same kind can land in the same vector. A
+    /// set whose collected values do not pair up is dropped rather than guessed
+    /// at, and identifiers are reported as stored: this reads the declarations,
+    /// so there is nothing here for an allow-list to confirm.
+    #[must_use]
+    pub fn from_record(
+        schema: &Schema,
+        class_index: u16,
+        body: &[u8],
+        classes: ParameterSetClassIndexes,
+    ) -> Option<Self> {
+        let (_walk, objects) = walk_record_collecting(schema, class_index, body);
+        Self::from_objects(&objects, classes)
+    }
+
+    /// The set-reading half of [`ParameterSets::from_record`], for a node
+    /// stream that has already been walked.
+    #[must_use]
+    pub fn from_objects(
+        objects: &[SerialObject],
+        classes: ParameterSetClassIndexes,
+    ) -> Option<Self> {
+        let mut parameters = Vec::new();
+        let mut sets = 0_usize;
+        let mut first = None;
+        let mut last = 0_usize;
+        for object in objects {
+            let Some(read) = read_value_set(object, classes) else {
+                continue;
+            };
+            sets += 1;
+            first = Some(first.map_or(object.offset, |at: usize| at.min(object.offset)));
+            last = last.max(object.offset.saturating_add(object.bytes));
+            parameters.extend(read);
+        }
+        let offset = first?;
+        Some(Self {
+            offset,
+            encoded_bytes: last.saturating_sub(offset),
+            parameters,
+            sets,
+        })
+    }
+
     /// Read the one parameter run whose value kinds agree with the dynamic
     /// set classes referenced before the element's `m_id` field.
     ///
@@ -338,8 +403,168 @@ fn read_parameter(body: &[u8], offset: usize, kind: Kind) -> Option<(usize, Para
     }
 }
 
+/// Read one walked parameter-set object into its stored parameters, or `None`
+/// when the object is not a parameter set. A set whose collected values do not
+/// pair up returns an empty list: the object is a set, but nothing in it is
+/// read rather than half of it being guessed at.
+fn read_value_set(
+    object: &SerialObject,
+    classes: ParameterSetClassIndexes,
+) -> Option<Vec<Parameter>> {
+    let class = object.class_index;
+    if class == classes.double {
+        if object.numbers.len() != object.integers.len() {
+            return Some(Vec::new());
+        }
+        return Some(
+            object
+                .numbers
+                .iter()
+                .zip(&object.integers)
+                .map(|(value, id)| Parameter {
+                    id: *id,
+                    value: ParameterValue::Double(*value),
+                })
+                .collect(),
+        );
+    }
+    if class == classes.text {
+        if object.strings.len() != object.integers.len() {
+            return Some(Vec::new());
+        }
+        return Some(
+            object
+                .integers
+                .iter()
+                .zip(&object.strings)
+                .map(|(id, value)| Parameter {
+                    id: *id,
+                    value: ParameterValue::Text(value.clone()),
+                })
+                .collect(),
+        );
+    }
+    if class == classes.integer || class == classes.reference {
+        if object.integers.len() % 2 != 0 {
+            return Some(Vec::new());
+        }
+        let reference = class == classes.reference;
+        return Some(
+            object
+                .integers
+                .chunks_exact(2)
+                .map(|pair| Parameter {
+                    id: pair[0],
+                    value: if reference {
+                        ParameterValue::Reference(pair[1])
+                    } else {
+                        ParameterValue::Integer(pair[1])
+                    },
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    /// The four parameter-set classes, as a walk would report them.
+    fn set_classes() -> ParameterSetClassIndexes {
+        ParameterSetClassIndexes {
+            double: 2978,
+            integer: 2980,
+            text: 2977,
+            reference: 2979,
+        }
+    }
+
+    fn set_object(class_index: u16, offset: usize) -> SerialObject {
+        SerialObject {
+            object_id: 1,
+            class_index,
+            offset,
+            bytes: 8,
+            references: Vec::new(),
+            identifiers: Vec::new(),
+            numbers: Vec::new(),
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn declared_sets_pair_their_values_by_declaration_order() {
+        let classes = set_classes();
+        // `ParamValueDouble` writes its value before its identifier, the other
+        // three write the identifier first.
+        let mut doubles = set_object(classes.double, 10);
+        doubles.numbers = vec![1.5, 2.5];
+        doubles.integers = vec![-1_155_261, 221_296];
+        let mut integers = set_object(classes.integer, 30);
+        integers.integers = vec![-1_114_242, 0, 221_298, 7];
+        let mut text = set_object(classes.text, 50);
+        text.integers = vec![-1_001_203];
+        text.strings = vec!["153".to_owned()];
+        let mut references = set_object(classes.reference, 70);
+        references.integers = vec![-1_010_106, 417_563];
+
+        let found =
+            ParameterSets::from_objects(&[doubles, integers, text, references], classes).unwrap();
+        assert_eq!(found.sets, 4);
+        assert_eq!(found.offset, 10);
+        assert_eq!(
+            found.parameters,
+            [
+                Parameter {
+                    id: -1_155_261,
+                    value: ParameterValue::Double(1.5)
+                },
+                Parameter {
+                    id: 221_296,
+                    value: ParameterValue::Double(2.5)
+                },
+                Parameter {
+                    id: -1_114_242,
+                    value: ParameterValue::Integer(0)
+                },
+                Parameter {
+                    id: 221_298,
+                    value: ParameterValue::Integer(7)
+                },
+                Parameter {
+                    id: -1_001_203,
+                    value: ParameterValue::Text("153".to_owned())
+                },
+                Parameter {
+                    id: -1_010_106,
+                    value: ParameterValue::Reference(417_563)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_set_whose_values_do_not_pair_up_is_read_as_empty() {
+        let classes = set_classes();
+        let mut text = set_object(classes.text, 10);
+        text.integers = vec![-1_001_203, 221_298];
+        text.strings = vec!["153".to_owned()];
+        let found = ParameterSets::from_objects(&[text], classes).unwrap();
+        assert_eq!(found.sets, 1);
+        assert!(found.parameters.is_empty());
+    }
+
+    #[test]
+    fn a_record_with_no_parameter_set_object_has_no_run() {
+        let classes = set_classes();
+        assert_eq!(
+            ParameterSets::from_objects(&[set_object(1234, 10)], classes),
+            None
+        );
+    }
+
     use super::*;
 
     fn text_bytes(value: &str) -> Vec<u8> {

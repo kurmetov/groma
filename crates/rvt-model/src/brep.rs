@@ -626,6 +626,8 @@ mod tests {
             references: Vec::new(),
             identifiers: Vec::new(),
             numbers,
+            integers: Vec::new(),
+            strings: Vec::new(),
             small_integers: Vec::new(),
         }
     }
@@ -639,6 +641,8 @@ mod tests {
             references: vec![reference(first_loop, EDGE_LOOP), surface],
             identifiers: Vec::new(),
             numbers: Vec::new(),
+            integers: Vec::new(),
+            strings: Vec::new(),
             small_integers: Vec::new(),
         }
     }
@@ -652,6 +656,8 @@ mod tests {
             references: vec![reference(0, EDGE_LOOP)],
             identifiers: vec![face, first_edge, last_edge],
             numbers: Vec::new(),
+            integers: Vec::new(),
+            strings: Vec::new(),
             small_integers: Vec::new(),
         }
     }
@@ -681,6 +687,8 @@ mod tests {
             numbers: vec![
                 first_uv.0, first_uv.1, 0.0, 0.0, last_uv.0, last_uv.1, 0.0, 0.0,
             ],
+            integers: Vec::new(),
+            strings: Vec::new(),
             small_integers: vec![flags],
         }
     }
@@ -813,6 +821,8 @@ mod tests {
             references: Vec::new(),
             identifiers: Vec::new(),
             numbers: cyl_numbers,
+            integers: Vec::new(),
+            strings: Vec::new(),
             small_integers: Vec::new(),
         };
         let cap_face = face_object(1, 10, reference(900, PLANE));

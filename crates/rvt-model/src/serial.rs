@@ -141,12 +141,16 @@ pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk
         references: Vec::new(),
         identifiers: Vec::new(),
         numbers: Vec::new(),
+        integers: Vec::new(),
+        strings: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
         fixed_references: false,
         record_narrow_pending: true,
         node_flags: 0,
         trace: None,
+        kept_strings: None,
+        string_distance: 0,
     };
     let stop = reader.read_class(class_index, 0).err();
     let consumed = reader.offset;
@@ -171,12 +175,16 @@ pub fn walk_object_stream(schema: &Schema, class_index: u16, body: &[u8]) -> Ser
         references: Vec::new(),
         identifiers: Vec::new(),
         numbers: Vec::new(),
+        integers: Vec::new(),
+        strings: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
         fixed_references: false,
         record_narrow_pending: true,
         node_flags: 0,
         trace: None,
+        kept_strings: None,
+        string_distance: 0,
     };
     let mut stop = reader.read_class(class_index, 0).err();
     let mut objects = 0_usize;
@@ -284,6 +292,21 @@ impl SerialRecordWalk {
     }
 }
 
+/// One `String` a record's declarations read, with the declaration that read
+/// it. Where a scan has to decide which run of bytes looks like text, this says
+/// which property the string is the value of.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SerialString {
+    pub offset: usize,
+    pub class: String,
+    pub property: String,
+    pub value: String,
+    /// How far the string sits from the record's own declarations: `0` for the
+    /// record's own properties, `1` for an object one of them points at, and
+    /// `2` for anything deeper in the node stream.
+    pub distance: u8,
+}
+
 /// One property read, for diagnosing where a walk leaves the real layout.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SerialTraceEntry {
@@ -307,6 +330,12 @@ pub struct SerialObject {
     pub identifiers: Vec<u32>,
     /// Every `Float64` this object read, in declaration order.
     pub numbers: Vec<f64>,
+    /// Every `Integer32` this object read, in declaration order. An inline
+    /// `ElementId` resolves to one of these, so a stored parameter's
+    /// identifier lands here.
+    pub integers: Vec<i32>,
+    /// Every `String` this object read, in declaration order.
+    pub strings: Vec<String>,
     /// Every `Bool`, `Integer8` or `Integer16` this object read, in
     /// declaration order and sign-extended to `i64`. Small flag/enum fields
     /// such as `GEdge.m_flags` live here rather than in `numbers`.
@@ -320,8 +349,77 @@ pub fn walk_record_collecting(
     class_index: u16,
     body: &[u8],
 ) -> (SerialRecordWalk, Vec<SerialObject>) {
-    let (walk, _, objects) = walk_record_inner(schema, class_index, body, false, true);
+    let (walk, _, objects, _) = walk_record_inner(schema, class_index, body, false, true, false);
     (walk, objects)
+}
+
+/// Same as [`walk_record`], keeping every `String` the declarations read, in
+/// the order they were read, with the declaration that read each one.
+#[must_use]
+pub fn walk_record_strings(
+    schema: &Schema,
+    class_index: u16,
+    body: &[u8],
+) -> (SerialRecordWalk, Vec<SerialString>) {
+    let (walk, _, _, strings) = walk_record_inner(schema, class_index, body, false, false, true);
+    (walk, strings)
+}
+
+/// Property whose value is the name of the element a record describes.
+///
+/// Measured, not guessed. Across SMALL's record classes this is where the names
+/// actually live: `SymbolInfo.m_name` for every symbol class - `FamilySymbol`,
+/// `LeaderStyle`, `TextNoteAttributes`, `SectionAttributes`,
+/// `RbsWireInsulationType` and the rest - `FamilyBase.m_name` for a `Family`,
+/// `FamilySurrogateBase.m_name` for a surrogate, `Category.m_name`,
+/// `Font.m_name`, `LoadMiscBaseElem.m_name`. Where this and the offset scan it
+/// replaces disagree, the declaration is right and the scan is reading a
+/// neighbouring string: on `DimensionStyle` the scan returns the equality text
+/// "EQ" for all 7 695 records while the declaration returns the style's own
+/// name, and on `DBViewType` the scan returns the two-letter reference label
+/// for all 12 272 while the declaration returns "План этажа" and its kind.
+///
+/// Taking the first string of any name instead would pull in
+/// `ParamValueAString.m_value` - a stored parameter, not a name - for the
+/// 11 974 `FamilyInstance` records, which is the failure this replaces.
+const NAME_PROPERTY: &str = "m_name";
+/// How far from the record's own declarations a name may sit. Zero is the
+/// record's own properties, which is where `FamilyBase.m_name` and
+/// `LoadMiscBaseElem.m_name` live; one is an object those properties point at,
+/// which is where `SymbolInfo.m_name`, `Category.m_name` and `Font.m_name`
+/// live, `Symbol.m_symbolInfo` being a reference rather than an inline object.
+///
+/// Anything further out belongs to something the element merely contains, not
+/// to the element. Measured on the corpus: a `Family` whose own `m_name` is the
+/// empty string has a `FamilySizeTableColumn.m_name` deeper in its node stream,
+/// and taking that would name the family after a column of its size table.
+const NAME_MAX_DISTANCE: u8 = 1;
+
+/// The name a record's own declarations give it: the value of the first
+/// property named [`NAME_PROPERTY`] the walk reads, skipping empty ones.
+///
+/// The record's own class chain is preferred over its node stream, because
+/// both can declare the property and only the first is the record's own: a
+/// `Family` carries `FamilyBase.m_name` in its header while its nodes hold a
+/// `ParamDef.m_name` for every parameter the family defines. A record with no
+/// such property in its header falls back to its nodes, which is where a
+/// symbol keeps its name - `Symbol.m_symbolInfo` is a reference, so
+/// `SymbolInfo.m_name` is read from the node stream.
+///
+/// A record whose declarations carry no such property at all has no name of
+/// its own. A family instance is the common case: its name is its symbol's.
+#[must_use]
+pub fn record_name(schema: &Schema, class_index: u16, body: &[u8]) -> Option<String> {
+    let (_walk, strings) = walk_record_strings(schema, class_index, body);
+    strings
+        .into_iter()
+        .filter(|string| {
+            string.property == NAME_PROPERTY
+                && !string.value.is_empty()
+                && string.distance <= NAME_MAX_DISTANCE
+        })
+        .min_by_key(|string| (string.distance, string.offset))
+        .map(|string| string.value)
 }
 
 /// Same as [`walk_record`], recording every property read.
@@ -331,7 +429,7 @@ pub fn walk_record_traced(
     class_index: u16,
     body: &[u8],
 ) -> (SerialRecordWalk, Vec<SerialTraceEntry>) {
-    let (walk, trace, _) = walk_record_inner(schema, class_index, body, true, false);
+    let (walk, trace, _, _) = walk_record_inner(schema, class_index, body, true, false, false);
     (walk, trace)
 }
 
@@ -340,7 +438,7 @@ pub fn walk_record_traced(
 /// the references were read, and a trailing `u32` repeating the body length.
 #[must_use]
 pub fn walk_record(schema: &Schema, class_index: u16, body: &[u8]) -> SerialRecordWalk {
-    walk_record_inner(schema, class_index, body, false, false).0
+    walk_record_inner(schema, class_index, body, false, false, false).0
 }
 
 fn walk_record_inner(
@@ -349,7 +447,13 @@ fn walk_record_inner(
     body: &[u8],
     trace: bool,
     collect: bool,
-) -> (SerialRecordWalk, Vec<SerialTraceEntry>, Vec<SerialObject>) {
+    keep_strings: bool,
+) -> (
+    SerialRecordWalk,
+    Vec<SerialTraceEntry>,
+    Vec<SerialObject>,
+    Vec<SerialString>,
+) {
     let trailer_offset = body.len().saturating_sub(RECORD_LENGTH_TRAILER_BYTES);
     let length_trailer_matches = body
         .get(trailer_offset..)
@@ -362,14 +466,22 @@ fn walk_record_inner(
         references: Vec::new(),
         identifiers: Vec::new(),
         numbers: Vec::new(),
+        integers: Vec::new(),
+        strings: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
         fixed_references: false,
         record_narrow_pending: true,
         node_flags: 0,
         trace: trace.then(Vec::new),
+        kept_strings: keep_strings.then(Vec::new),
+        string_distance: 0,
     };
     let mut stop = reader.read_class(class_index, 0).err();
+    // References read so far are the record's own: the objects they name sit
+    // one step from the declarations, and everything they in turn name is
+    // further out. See [`SerialString::distance`].
+    let own_references = reader.references.len();
     reader.node_headers = true;
     let mut nodes = 0_usize;
     let mut next = 0_usize;
@@ -389,10 +501,13 @@ fn walk_record_inner(
         }
         nodes += 1;
         reader.fixed_references = reader.is_geometry_node(reference.class_index);
+        reader.string_distance = if next <= own_references { 1 } else { 2 };
         let began = reader.offset;
         let first_reference = reader.references.len();
         let first_identifier = reader.identifiers.len();
         let first_number = reader.numbers.len();
+        let first_integer = reader.integers.len();
+        let first_string = reader.strings.len();
         let first_small_integer = reader.small_integers.len();
         stop = reader.read_class(reference.class_index, 1).err();
         if collect {
@@ -404,6 +519,8 @@ fn walk_record_inner(
                 references: reader.references[first_reference..].to_vec(),
                 identifiers: reader.identifiers[first_identifier..].to_vec(),
                 numbers: reader.numbers[first_number..].to_vec(),
+                integers: reader.integers[first_integer..].to_vec(),
+                strings: reader.strings[first_string..].to_vec(),
                 small_integers: reader.small_integers[first_small_integer..].to_vec(),
             });
         }
@@ -422,6 +539,7 @@ fn walk_record_inner(
         },
         reader.trace.unwrap_or_default(),
         objects,
+        reader.kept_strings.unwrap_or_default(),
     )
 }
 
@@ -445,6 +563,10 @@ struct Reader<'a> {
     identifiers: Vec<u32>,
     /// Every `Float64` read, so a caller can recover coordinates.
     numbers: Vec<f64>,
+    /// Every `Integer32` read, in declaration order.
+    integers: Vec<i32>,
+    /// Every `String` read, in declaration order.
+    strings: Vec<String>,
     /// Every `Bool`, `Integer8` or `Integer16` read, sign-extended to `i64`.
     small_integers: Vec<i64>,
     /// Whether the walk is inside the node stream rather than the record's
@@ -461,6 +583,11 @@ struct Reader<'a> {
     /// properties for the rest of that object.
     node_flags: u32,
     trace: Option<Vec<SerialTraceEntry>>,
+    /// Every `String` read, with its declaration, when a caller asked for them.
+    kept_strings: Option<Vec<SerialString>>,
+    /// Distance of the object being read from the record's own declarations.
+    /// See [`SerialString::distance`].
+    string_distance: u8,
 }
 
 impl Reader<'_> {
@@ -644,6 +771,26 @@ impl Reader<'_> {
                     .ok()
                     .and_then(|count| count.checked_mul(2))
                     .ok_or_else(&truncated)?;
+                let units = self
+                    .body
+                    .get(self.offset..self.offset.saturating_add(bytes))
+                    .ok_or_else(&truncated)?
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect::<Vec<_>>();
+                let value = String::from_utf16_lossy(&units)
+                    .trim_end_matches('\0')
+                    .to_owned();
+                if let Some(kept) = self.kept_strings.as_mut() {
+                    kept.push(SerialString {
+                        offset: self.offset,
+                        class: class_name.to_owned(),
+                        property: property.name.clone(),
+                        value: value.clone(),
+                        distance: self.string_distance,
+                    });
+                }
+                self.strings.push(value);
                 self.advance(bytes).ok_or_else(truncated)
             }
             FieldType::Integer32Alternate => {
@@ -699,6 +846,16 @@ impl Reader<'_> {
                 };
                 self.small_integers.push(value);
                 self.offset += 1;
+                Ok(())
+            }
+            FieldType::Integer32 => {
+                let bytes = self
+                    .body
+                    .get(self.offset..self.offset.saturating_add(4))
+                    .ok_or_else(&truncated)?;
+                let value = i32::from_le_bytes(bytes.try_into().map_err(|_| truncated())?);
+                self.integers.push(value);
+                self.offset += 4;
                 Ok(())
             }
             FieldType::Integer16 => {
@@ -1299,6 +1456,78 @@ mod tests {
         assert!(walk_record(&schema, root, &record(geometry, OBJECT_REFERENCE_BYTES)).is_exact());
         assert!(
             !walk_record(&schema, root, &record(geometry, IDENTIFIER_REFERENCE_BYTES)).is_exact()
+        );
+    }
+
+    #[test]
+    fn a_name_is_the_record_s_own_before_the_objects_it_points_at() {
+        // Three classes each declaring `m_name`: the record's own, the object
+        // its declarations point at, and one a step further out.
+        let mut classes = record_schema().classes;
+        classes[1].properties = vec![
+            property("m_name", FieldType::String, 0x60, 6, None),
+            property("m_pChild", FieldType::Object, 0x01, 0, None),
+        ];
+        classes[2].properties = vec![
+            property("m_name", FieldType::String, 0x60, 6, None),
+            property("m_pGrandchild", FieldType::Object, 0x01, 0, None),
+        ];
+        classes.push(class(
+            FIRST_CLASS_INDEX + 3,
+            "Grandchild",
+            TypeReference::None,
+            vec![property("m_name", FieldType::String, 0x60, 6, None)],
+        ));
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+        let child_class = FIRST_CLASS_INDEX + 2;
+        let grandchild_class = FIRST_CLASS_INDEX + 3;
+
+        let utf16 = |text: &str| {
+            let mut bytes = Vec::new();
+            let units = text.encode_utf16().collect::<Vec<_>>();
+            bytes.extend(u32::try_from(units.len()).unwrap().to_le_bytes());
+            for unit in units {
+                bytes.extend(unit.to_le_bytes());
+            }
+            bytes
+        };
+
+        let record = |own: &str| {
+            let mut body = Vec::new();
+            body.extend(utf16(own)); // the record's own name
+            body.extend(0xffff_u16.to_le_bytes()); // m_pChild: a narrow identifier
+            body.extend(child_class.to_le_bytes());
+            body.extend(utf16("child")); // the child, one step out
+            body.extend(7_u32.to_le_bytes()); // its m_pGrandchild
+            body.extend(grandchild_class.to_le_bytes());
+            body.extend(utf16("grandchild")); // two steps out
+            let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+            body.extend(length.to_le_bytes());
+            body
+        };
+
+        let root = FIRST_CLASS_INDEX + 1;
+        assert!(walk_record(&schema, root, &record("")).is_exact());
+        // An empty own name is no name, so the object it points at answers -
+        // but never the one beyond that.
+        assert_eq!(
+            record_name(&schema, root, &record("")),
+            Some("child".to_owned())
+        );
+        assert_eq!(
+            record_name(&schema, root, &record("mine")),
+            Some("mine".to_owned())
+        );
+        let strings = walk_record_strings(&schema, root, &record("mine")).1;
+        assert_eq!(
+            strings
+                .iter()
+                .map(|string| (string.value.as_str(), string.distance))
+                .collect::<Vec<_>>(),
+            [("mine", 0), ("child", 1), ("grandchild", 2)]
         );
     }
 
