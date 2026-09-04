@@ -1,0 +1,2641 @@
+#![forbid(unsafe_code)]
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt::Write as _,
+    fs::File,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
+
+use clap::{Parser, Subcommand};
+use rvt_container::{
+    BasicFileInfo, DEFAULT_DECODE_LIMIT, MarkerEnvelope, MarkerEnvelopeOptions,
+    PartitionReadOptions, REVIT_STORED_PAGE_BYTES, RvtContainer, StreamFraming,
+    decode_known_framing, strip_revit_page_checksums,
+};
+use rvt_model::{
+    ELEMENT_TAIL_BYTES, ElemTable, ElementAnchor, ElementFields, ElementHeaderFields, MemberWalk,
+    ParameterSets, ParameterValue, RecordFraming, RecordHeader, RecordLayout, RecordString,
+};
+use rvt_schema::{Schema, TypeReference};
+
+/// Leading bytes summarized per envelope when looking for a record header.
+const LEADING_PATTERN_BYTES: usize = 8;
+/// Rows printed for each record-boundary histogram.
+const HISTOGRAM_ROWS: usize = 8;
+/// Strides tested when checking whether a marker is one element of an
+/// ascending little-endian `u32` sequence rather than a record boundary.
+const SEQUENCE_STRIDES: [usize; 4] = [4, 8, 12, 16];
+/// Share of a class's records that must place their first readable string at
+/// the same offset before that offset is treated as the class's name field.
+const NAME_OFFSET_AGREEMENT: u64 = 90;
+/// Schema class whose record body starts with the element's identifier block.
+const ELEMENT_HEADER_CLASS: &str = "ElementHeader";
+/// Descriptor format tag whose records carry the element's own class; the
+/// other tags carry a header record and a serialized/geometry record.
+const ELEMENT_CLASS_FORMAT_TAG: u32 = 102;
+/// Largest decoded member observed in the corpus; a record that runs past a
+/// member of exactly this size is the continuation candidate.
+const MEMBER_PAGE_LIMIT_BYTES: u64 = 128 * 1024;
+
+const KNOWN_STREAMS: [&str; 4] = [
+    "BasicFileInfo",
+    "Formats/Latest",
+    "Global/ElemTable",
+    "Global/Latest",
+];
+
+#[derive(Debug, Parser)]
+#[command(name = "rivet", version, about = "Read-only RVT inspection")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Show a concise container and release summary.
+    Info { file: PathBuf },
+    /// List every physical stream and its size.
+    Streams { file: PathBuf },
+    /// Copy one raw stream to stdout or a file.
+    DumpStream {
+        file: PathBuf,
+        stream: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Inventory compressed members in every Partitions/* stream.
+    Partitions {
+        file: PathBuf,
+        /// Print offsets and sizes for every validated member.
+        #[arg(long)]
+        members: bool,
+        /// Maximum decoded bytes accepted from one gzip member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_decoded_bytes: u64,
+        /// Maximum decoded bytes accepted from one partition.
+        #[arg(long, default_value_t = 8 * 1024 * 1024 * 1024)]
+        max_partition_decoded_bytes: u64,
+        /// Maximum gzip signatures retained while scanning one partition.
+        #[arg(long, default_value_t = 1_000_000)]
+        max_candidates: usize,
+    },
+    /// Decode and list the generic class schema.
+    Schema {
+        file: PathBuf,
+        /// Print the property list of one exact class instead of the inventory.
+        #[arg(long)]
+        class: Option<String>,
+    },
+    /// Decode the Global/ElemTable element-id index.
+    ElemTable {
+        file: PathBuf,
+        /// Print candidate element identifiers from every parsed record.
+        #[arg(long)]
+        records: bool,
+    },
+    /// Probe whether partition-member first words correlate with element IDs.
+    PartitionIdProbe { file: PathBuf },
+    /// Count schema-index/zero prefixes inside decoded partition members.
+    SchemaPrefixProbe {
+        file: PathBuf,
+        /// Exact schema class name whose index should be probed.
+        #[arg(long, default_value = "GElement")]
+        class: String,
+    },
+    /// Capture bounded byte context around schema-marker candidates.
+    MarkerEnvelopes {
+        file: PathBuf,
+        /// Exact schema class name whose marker is captured.
+        #[arg(long, default_value = "GElement")]
+        class: String,
+        /// Bytes retained before each marker.
+        #[arg(long, default_value_t = 32)]
+        leading: usize,
+        /// Bytes retained after each marker.
+        #[arg(long, default_value_t = 64)]
+        trailing: usize,
+        /// Envelopes retained per partition stream.
+        #[arg(long, default_value_t = 256)]
+        max_envelopes: usize,
+        /// Hex-dump this many captured envelopes.
+        #[arg(long, default_value_t = 0)]
+        dump: usize,
+    },
+    /// Validate member descriptors and the record array inside each member.
+    MemberFraming {
+        file: PathBuf,
+        /// Restrict the walk to one partition stream.
+        #[arg(long)]
+        partition: Option<String>,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+        /// Print per-record offsets for this many members.
+        #[arg(long, default_value_t = 0)]
+        dump: usize,
+        /// Print this many members whose body total disagrees with `+28`.
+        #[arg(long, default_value_t = 0)]
+        mismatches: usize,
+    },
+    /// Cross-check record headers with the Global/ElemTable candidate IDs.
+    Records {
+        file: PathBuf,
+        /// Restrict the walk to one partition stream.
+        #[arg(long)]
+        partition: Option<String>,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+        /// Print this many record headers as hex.
+        #[arg(long, default_value_t = 0)]
+        dump: usize,
+    },
+    /// List every record belonging to one element identifier.
+    Element {
+        file: PathBuf,
+        /// Element identifier, as reported by `records` or `elem-table`.
+        id: u32,
+        /// Print this many leading body bytes of each record as hex.
+        #[arg(long, default_value_t = 0)]
+        bytes: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+    /// Show the parameters stored on elements.
+    Parameters {
+        file: PathBuf,
+        /// Only elements of this exact schema class.
+        #[arg(long)]
+        class: Option<String>,
+        /// Stop after this many elements.
+        #[arg(long, default_value_t = 12)]
+        count: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+    /// Calibrate where each class keeps its first readable string.
+    Names {
+        file: PathBuf,
+        /// Print this many classes, most frequent first.
+        #[arg(long, default_value_t = 24)]
+        classes: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+    /// Export the recovered element records as JSON lines.
+    ExportJson {
+        file: PathBuf,
+        /// Write to this path instead of stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Stop after this many elements.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+    /// Print record bodies of one class as hex, for field analysis.
+    Bodies {
+        file: PathBuf,
+        /// Exact schema class name whose records are printed.
+        #[arg(long)]
+        class: String,
+        /// Stop after this many records.
+        #[arg(long, default_value_t = 64)]
+        count: usize,
+        /// Leading body bytes printed per record.
+        #[arg(long, default_value_t = 64)]
+        bytes: usize,
+        /// Restrict to one descriptor format tag.
+        #[arg(long)]
+        tag: Option<u32>,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+    /// Copy one inflated partition member to stdout or a file.
+    DumpMember {
+        file: PathBuf,
+        /// Partition stream, for example `Partitions/81`.
+        partition: String,
+        /// Member offset in the checksum-clean stream, from `partitions --members`.
+        logical_offset: u64,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Maximum decoded bytes accepted from the member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_bytes: u64,
+    },
+    /// Inventory streams and the recovered object records.
+    Inspect {
+        file: PathBuf,
+        /// Skip the partition walk and report streams only.
+        #[arg(long)]
+        streams_only: bool,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+}
+
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            let mut source = error.source();
+            while let Some(cause) = source {
+                eprintln!("  caused by: {cause}");
+                source = cause.source();
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    match cli.command {
+        Command::Info { file } => info(&file),
+        Command::Streams { file } => streams(&file),
+        Command::DumpStream {
+            file,
+            stream,
+            output,
+        } => dump_stream(&file, &stream, output.as_deref()),
+        Command::Partitions {
+            file,
+            members,
+            max_member_decoded_bytes,
+            max_partition_decoded_bytes,
+            max_candidates,
+        } => partitions(
+            &file,
+            members,
+            PartitionReadOptions {
+                max_candidates,
+                max_member_decoded_bytes,
+                max_total_decoded_bytes: max_partition_decoded_bytes,
+                class_prefix_range: None,
+                marker_envelope: None,
+            },
+        ),
+        other => run_model_command(other),
+    }
+}
+
+/// Commands that go past the container into schema, records, and export.
+fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
+    match command {
+        Command::Schema { file, class } => schema(&file, class.as_deref()),
+        Command::ElemTable { file, records } => elem_table(&file, records),
+        Command::PartitionIdProbe { file } => partition_id_probe(&file),
+        Command::SchemaPrefixProbe { file, class } => schema_prefix_probe(&file, &class),
+        Command::MarkerEnvelopes {
+            file,
+            class,
+            leading,
+            trailing,
+            max_envelopes,
+            dump,
+        } => marker_envelopes(&file, &class, leading, trailing, max_envelopes, dump),
+        Command::MemberFraming {
+            file,
+            partition,
+            max_member_bytes,
+            dump,
+            mismatches,
+        } => member_framing(
+            &file,
+            partition.as_deref(),
+            max_member_bytes,
+            dump,
+            mismatches,
+        ),
+        Command::Records {
+            file,
+            partition,
+            max_member_bytes,
+            dump,
+        } => records(&file, partition.as_deref(), max_member_bytes, dump),
+        Command::Element {
+            file,
+            id,
+            bytes,
+            max_member_bytes,
+        } => element(&file, id, bytes, max_member_bytes),
+        Command::Parameters {
+            file,
+            class,
+            count,
+            max_member_bytes,
+        } => parameters(&file, class.as_deref(), count, max_member_bytes),
+        Command::Names {
+            file,
+            classes,
+            max_member_bytes,
+        } => names(&file, classes, max_member_bytes),
+        Command::ExportJson {
+            file,
+            output,
+            limit,
+            max_member_bytes,
+        } => export_json(&file, output.as_deref(), limit, max_member_bytes),
+        Command::Bodies {
+            file,
+            class,
+            count,
+            bytes,
+            tag,
+            max_member_bytes,
+        } => bodies(&file, &class, count, bytes, tag, max_member_bytes),
+        Command::DumpMember {
+            file,
+            partition,
+            logical_offset,
+            output,
+            max_bytes,
+        } => dump_member(
+            &file,
+            &partition,
+            logical_offset,
+            output.as_deref(),
+            max_bytes,
+        ),
+        Command::Inspect {
+            file,
+            streams_only,
+            max_member_bytes,
+        } => inspect(&file, streams_only, max_member_bytes),
+        Command::Info { .. }
+        | Command::Streams { .. }
+        | Command::DumpStream { .. }
+        | Command::Partitions { .. } => unreachable!("handled by run"),
+    }
+}
+
+fn info(path: &Path) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let basic_info = read_basic_file_info(&container)?;
+
+    println!("File: {}", path.display());
+    println!("Container: CFB/OLE");
+    println!(
+        "Revit version: {}",
+        basic_info
+            .as_ref()
+            .and_then(|info| info.revit_version)
+            .map_or_else(|| "unknown".to_owned(), |year| year.to_string())
+    );
+    println!("Streams: {}", container.streams().len());
+    println!("Partitions: {}", container.partition_count());
+    println!();
+    println!("Known streams:");
+    for name in KNOWN_STREAMS {
+        if container.stream(name).is_some() {
+            println!("- {name}");
+        }
+    }
+    Ok(())
+}
+
+fn streams(path: &Path) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    for stream in container.streams() {
+        println!("{}\t{}", stream.len(), stream.path());
+    }
+    Ok(())
+}
+
+fn dump_stream(path: &Path, name: &str, output: Option<&Path>) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    if let Some(output) = output {
+        let mut writer = File::create(output)?;
+        container.copy_stream(name, &mut writer)?;
+        writer.flush()?;
+    } else {
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        container.copy_stream(name, &mut writer)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+/// Paths of the top-level `Partitions/*` streams, in container order.
+fn partition_paths(container: &RvtContainer) -> Vec<String> {
+    container
+        .streams()
+        .iter()
+        .filter(|stream| {
+            stream
+                .path()
+                .strip_prefix("Partitions/")
+                .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+        })
+        .map(|stream| stream.path().to_owned())
+        .collect()
+}
+
+fn partitions(
+    path: &Path,
+    show_members: bool,
+    options: PartitionReadOptions,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let partition_paths = partition_paths(&container);
+
+    let mut total_stored_bytes = 0_u64;
+    let mut total_logical_bytes = 0_u64;
+    let mut total_decoded_bytes = 0_u64;
+    let mut total_members = 0_usize;
+    let mut total_embedded_candidates = 0_usize;
+    let mut total_failures = 0_usize;
+    let mut incomplete_partitions = 0_usize;
+
+    for partition_path in &partition_paths {
+        let report = container.inspect_partition(partition_path, options)?;
+        println!(
+            "{}\tstored={}\tlogical={}\tpages={}\tcandidates={}\tembedded_candidates={}\tmembers={}\tdecoded={}\tfailures={}\tcomplete={}",
+            escape_terminal_text(&report.path),
+            report.stored_bytes,
+            report.logical_bytes,
+            report.full_checksum_pages,
+            report.gzip_candidates,
+            report.skipped_embedded_candidates,
+            report.members.len(),
+            report.total_decoded_bytes,
+            report.failures.len(),
+            !report.truncated_by_limit
+        );
+
+        if show_members {
+            for member in &report.members {
+                println!(
+                    "  member={}\tstored_offset={}\tlogical_offset={}\tcompressed={}\tdecoded={}",
+                    member.index,
+                    member.stored_offset,
+                    member.logical_offset,
+                    member.compressed_bytes,
+                    member.decoded_bytes
+                );
+            }
+        }
+        for failure in &report.failures {
+            println!(
+                "  failure\tstored_offset={}\tlogical_offset={}\treason={}",
+                failure.stored_offset,
+                failure.logical_offset,
+                escape_terminal_text(&failure.message)
+            );
+        }
+
+        total_stored_bytes = total_stored_bytes.saturating_add(report.stored_bytes);
+        total_logical_bytes = total_logical_bytes.saturating_add(report.logical_bytes);
+        total_decoded_bytes = total_decoded_bytes.saturating_add(report.total_decoded_bytes);
+        total_members = total_members.saturating_add(report.members.len());
+        total_embedded_candidates =
+            total_embedded_candidates.saturating_add(report.skipped_embedded_candidates);
+        total_failures = total_failures.saturating_add(report.failures.len());
+        incomplete_partitions += usize::from(report.truncated_by_limit);
+    }
+
+    println!();
+    println!("Partition summary:");
+    println!("Partitions: {}", partition_paths.len());
+    println!("Stored bytes: {total_stored_bytes}");
+    println!("Checksum-clean bytes: {total_logical_bytes}");
+    println!("Validated gzip members: {total_members}");
+    println!("Embedded gzip signatures skipped: {total_embedded_candidates}");
+    println!("Decoded bytes: {total_decoded_bytes}");
+    println!("Candidate failures: {total_failures}");
+    println!("Incomplete partitions: {incomplete_partitions}");
+    Ok(())
+}
+
+fn schema(path: &Path, class_name: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let Some(stream) = container.stream("Formats/Latest") else {
+        println!("Schema stream: not present");
+        return Ok(());
+    };
+
+    let raw = container.read_stream_with_limit(stream.path(), DEFAULT_DECODE_LIMIT as u64)?;
+    let (decoded, schema, stripped_page_checksums) = decode_schema_stream(&raw)?;
+
+    println!("Schema stream: {} ({} bytes)", stream.path(), stream.len());
+    match decoded.framing {
+        StreamFraming::Raw => println!("Framing: raw"),
+        StreamFraming::TruncatedGzip { gzip_offset } => {
+            println!("Framing: truncated gzip at byte {gzip_offset}");
+        }
+    }
+    println!("Checksum-page trailers stripped: {stripped_page_checksums}");
+    println!("Decoded bytes: {}", decoded.payload.len());
+    println!("Classes: {}", schema.classes.len());
+    println!("Top-level classes: {}", schema.top_level_class_count);
+    println!("Properties: {}", schema.property_count);
+    println!("Parsed property records: {}", schema.parsed_property_count);
+    println!(
+        "Unresolved references: {}",
+        schema.unresolved_references.len()
+    );
+    println!(
+        "Inline index mismatches: {}",
+        schema.inline_index_mismatches.len()
+    );
+    println!("Trailing bytes: {}", schema.trailing_bytes.len());
+    if let Some(class_name) = class_name {
+        return print_class_properties(&schema, class_name);
+    }
+
+    println!();
+    println!("Class inventory:");
+    for class in &schema.classes {
+        let parent = match &class.parent {
+            TypeReference::None => "-".to_owned(),
+            TypeReference::Inline { index, name, .. }
+            | TypeReference::Reference { index, name } => {
+                format!("{index}:{}", escape_terminal_text(name))
+            }
+            TypeReference::Unresolved { index } => format!("{index}:?"),
+        };
+        println!(
+            "{}\t{}\tparent={}\tversion={}\tproperties={}",
+            class.index,
+            escape_terminal_text(&class.name),
+            parent,
+            class.version,
+            class.properties.len()
+        );
+    }
+    Ok(())
+}
+
+/// Print one class's declared properties, with the width each fixed-size type
+/// occupies. Variable-width types are shown as such rather than guessed.
+fn print_class_properties(schema: &Schema, class_name: &str) -> Result<(), Box<dyn Error>> {
+    let class = schema.class_by_name(class_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "schema class not found: {}",
+                escape_terminal_text(class_name)
+            ),
+        )
+    })?;
+
+    println!();
+    println!(
+        "Class {}: {}",
+        class.index,
+        escape_terminal_text(&class.name)
+    );
+    let parent = match &class.parent {
+        TypeReference::None => "-".to_owned(),
+        TypeReference::Inline { index, name, .. } | TypeReference::Reference { index, name } => {
+            format!("{index}:{}", escape_terminal_text(name))
+        }
+        TypeReference::Unresolved { index } => format!("{index}:?"),
+    };
+    println!("Parent: {parent}");
+    println!("Version: {}", class.version);
+    println!("Properties: {}", class.properties.len());
+    for (index, property) in class.properties.iter().enumerate() {
+        let width = property
+            .field_type
+            .fixed_width()
+            .map_or_else(|| "variable".to_owned(), |bytes| bytes.to_string());
+        let element = property
+            .element
+            .as_ref()
+            .map_or_else(String::new, |element| {
+                format!("\telement={:?}", element.field_type)
+            });
+        let static_type = property.static_type.as_ref().and_then(TypeReference::name);
+        println!(
+            "{index}\t{}\ttype={:?}\twidth={width}\tmodes={:#04x}\titem_mode={}\tsize={}{}{}",
+            escape_terminal_text(&property.name),
+            property.field_type,
+            property.raw_modes,
+            property.item_mode,
+            property
+                .size
+                .map_or_else(|| "-".to_owned(), |size| size.to_string()),
+            element,
+            static_type.map_or_else(String::new, |name| format!(
+                "\tstatic={}",
+                escape_terminal_text(name)
+            ))
+        );
+    }
+    Ok(())
+}
+
+fn escape_terminal_text(value: &str) -> String {
+    value.escape_default().collect()
+}
+
+fn decode_schema_stream(
+    raw: &[u8],
+) -> Result<(rvt_container::DecodedStream, Schema, bool), Box<dyn Error>> {
+    match decode_schema_attempt(raw) {
+        Ok((decoded, schema)) => Ok((decoded, schema, false)),
+        Err(raw_error) if raw.len() >= REVIT_STORED_PAGE_BYTES => {
+            let stripped = strip_revit_page_checksums(raw);
+            match decode_schema_attempt(&stripped) {
+                Ok((decoded, schema)) => Ok((decoded, schema, true)),
+                Err(stripped_error) => Err(schema_retry_error(&raw_error, &stripped_error).into()),
+            }
+        }
+        Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error).into()),
+    }
+}
+
+fn decode_schema_attempt(stored: &[u8]) -> Result<(rvt_container::DecodedStream, Schema), String> {
+    let decoded =
+        decode_known_framing(stored, DEFAULT_DECODE_LIMIT).map_err(|error| error.to_string())?;
+    let schema = Schema::parse(&decoded.payload).map_err(|error| error.to_string())?;
+    Ok((decoded, schema))
+}
+
+fn elem_table(path: &Path, show_records: bool) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let Some(stream) = container.stream("Global/ElemTable") else {
+        println!("Element table stream: not present");
+        return Ok(());
+    };
+    let raw = container.read_stream_with_limit(stream.path(), DEFAULT_DECODE_LIMIT as u64)?;
+    let (decoded, table, stripped_page_checksums) = decode_elem_table_stream(&raw)?;
+
+    println!(
+        "Element table stream: {} ({} bytes)",
+        stream.path(),
+        stream.len()
+    );
+    match decoded.framing {
+        StreamFraming::Raw => println!("Framing: raw"),
+        StreamFraming::TruncatedGzip { gzip_offset } => {
+            println!("Framing: truncated gzip at byte {gzip_offset}");
+        }
+    }
+    println!("Checksum-page trailers stripped: {stripped_page_checksums}");
+    println!("Framing prefix bytes: {}", decoded.prefix.len());
+    println!("Decoded bytes: {}", decoded.payload.len());
+    println!("Declared elements: {}", table.header.element_count);
+    println!("Declared records: {}", table.header.record_count);
+    let framing = match table.layout.framing {
+        RecordFraming::Implicit => "implicit".to_owned(),
+        RecordFraming::Explicit { marker_bytes } => {
+            format!("explicit-{marker_bytes}-byte-marker")
+        }
+    };
+    println!("Record framing: {framing}");
+    println!("Record start: {}", table.layout.start);
+    println!("Record stride: {}", table.layout.stride);
+    println!("Marker offset: {}", table.layout.marker_offset);
+    println!("Records matching marker: {}", table.marker_match_count());
+    println!("Parsed records: {}", table.records.len());
+    println!("Unique primary IDs: {}", table.unique_primary_id_count());
+    println!(
+        "Primary/secondary mismatches: {}",
+        table.primary_secondary_mismatch_count()
+    );
+    println!("Preserved header bytes: {}", table.leading_bytes().len());
+    println!("Preserved trailing bytes: {}", table.trailing_bytes().len());
+
+    if show_records {
+        println!();
+        println!("Record inventory:");
+        for (index, record) in table.records.iter().enumerate() {
+            println!(
+                "{index}\toffset={}\tprimary={}\tsecondary={}",
+                record.offset, record.id_primary, record.id_secondary
+            );
+        }
+    }
+    Ok(())
+}
+
+fn decode_elem_table_stream(
+    raw: &[u8],
+) -> Result<(rvt_container::DecodedStream, ElemTable, bool), Box<dyn Error>> {
+    let has_complete_pages = raw.len() >= REVIT_STORED_PAGE_BYTES;
+    let prepared = if has_complete_pages {
+        strip_revit_page_checksums(raw)
+    } else {
+        raw.to_vec()
+    };
+    let (decoded, table) = decode_elem_table_attempt(&prepared)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok((decoded, table, has_complete_pages))
+}
+
+fn decode_elem_table_attempt(
+    stored: &[u8],
+) -> Result<(rvt_container::DecodedStream, ElemTable), String> {
+    let decoded =
+        decode_known_framing(stored, DEFAULT_DECODE_LIMIT).map_err(|error| error.to_string())?;
+    let table = ElemTable::parse(&decoded.payload).map_err(|error| error.to_string())?;
+    Ok((decoded, table))
+}
+
+/// Candidate element identifiers from `Global/ElemTable`, or `None` when the
+/// container has no such stream.
+fn elem_table_ids(container: &RvtContainer) -> Result<Option<BTreeSet<u32>>, Box<dyn Error>> {
+    if container.stream("Global/ElemTable").is_none() {
+        return Ok(None);
+    }
+    let raw = container.read_stream_with_limit("Global/ElemTable", DEFAULT_DECODE_LIMIT as u64)?;
+    let (_, table, _) = decode_elem_table_stream(&raw)?;
+    Ok(Some(
+        table
+            .records
+            .iter()
+            .flat_map(|record| [record.id_primary, record.id_secondary])
+            .filter(|id| *id != 0 && *id != u32::MAX)
+            .collect(),
+    ))
+}
+
+fn partition_id_probe(path: &Path) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let element_ids = elem_table_ids(&container)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Global/ElemTable is required for this probe",
+        )
+    })?;
+    let partition_paths = partition_paths(&container);
+
+    let mut total_members = 0_usize;
+    let mut prefix_members = 0_usize;
+    let mut member_id_hits = 0_usize;
+    let mut prefix_values = BTreeSet::new();
+    let mut overlapping_ids = BTreeSet::new();
+
+    println!("Partition first-word / element-ID probe:");
+    println!("Candidate element IDs: {}", element_ids.len());
+    for partition_path in &partition_paths {
+        let report =
+            container.inspect_partition(partition_path, PartitionReadOptions::default())?;
+        let mut partition_prefixes = BTreeSet::new();
+        let mut partition_hits = BTreeSet::new();
+        let mut partition_member_hits = 0_usize;
+        for member in &report.members {
+            let Some(prefix) = member.decoded_prefix().get(..4) else {
+                continue;
+            };
+            let value = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
+            prefix_members += 1;
+            partition_prefixes.insert(value);
+            prefix_values.insert(value);
+            if element_ids.contains(&value) {
+                partition_member_hits += 1;
+                member_id_hits += 1;
+                partition_hits.insert(value);
+                overlapping_ids.insert(value);
+            }
+        }
+        total_members += report.members.len();
+        println!(
+            "{}	members={}	prefixes={}	member_hits={}	distinct_words={}	distinct_id_hits={}",
+            escape_terminal_text(partition_path),
+            report.members.len(),
+            report
+                .members
+                .iter()
+                .filter(|member| member.decoded_prefix().len() >= 4)
+                .count(),
+            partition_member_hits,
+            partition_prefixes.len(),
+            partition_hits.len()
+        );
+    }
+
+    println!();
+    println!("Probe summary:");
+    println!("Partitions: {}", partition_paths.len());
+    println!("Validated members: {total_members}");
+    println!("Members with a first u32: {prefix_members}");
+    println!("Members whose first u32 is a candidate ID: {member_id_hits}");
+    println!("Distinct first-u32 values: {}", prefix_values.len());
+    println!("Distinct overlapping IDs: {}", overlapping_ids.len());
+    println!(
+        "Element-ID coverage: {}",
+        percentage(overlapping_ids.len(), element_ids.len())
+    );
+    println!(
+        "Distinct-word precision: {}",
+        percentage(overlapping_ids.len(), prefix_values.len())
+    );
+    println!(
+        "Member hit rate: {}",
+        percentage(member_id_hits, prefix_members)
+    );
+    Ok(())
+}
+
+fn percentage(numerator: usize, denominator: usize) -> String {
+    if denominator == 0 {
+        return "0.000%".to_owned();
+    }
+    let thousandths = (numerator as u128 * 100_000) / denominator as u128;
+    format!("{}.{:03}%", thousandths / 1000, thousandths % 1000)
+}
+
+fn schema_prefix_probe(path: &Path, class_name: &str) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let raw = container.read_stream_with_limit("Formats/Latest", DEFAULT_DECODE_LIMIT as u64)?;
+    let (_, schema, _) = decode_schema_stream(&raw)?;
+    let class = schema.class_by_name(class_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "schema class not found: {}",
+                escape_terminal_text(class_name)
+            ),
+        )
+    })?;
+    let class_index = class.index;
+    let options = PartitionReadOptions {
+        class_prefix_range: Some((class_index, class_index)),
+        ..PartitionReadOptions::default()
+    };
+    let partition_paths = partition_paths(&container);
+
+    let mut total_members = 0_usize;
+    let mut members_with_candidates = 0_usize;
+    let mut total_candidates = 0_u64;
+    for partition_path in &partition_paths {
+        let report = container.inspect_partition(partition_path, options)?;
+        total_members += report.members.len();
+        members_with_candidates += report
+            .members
+            .iter()
+            .filter(|member| member.class_prefix_candidates > 0)
+            .count();
+        total_candidates = total_candidates.saturating_add(
+            report
+                .class_prefix_counts
+                .get(&class_index)
+                .copied()
+                .unwrap_or(0),
+        );
+    }
+
+    println!("Schema-backed partition prefix probe:");
+    println!("Class: {}", escape_terminal_text(&class.name));
+    println!("Schema index: {class_index}");
+    println!("Partitions: {}", partition_paths.len());
+    println!("Validated members: {total_members}");
+    println!("Members with candidates: {members_with_candidates}");
+    println!("Candidate prefixes: {total_candidates}");
+    Ok(())
+}
+
+/// Aggregate record-boundary evidence collected from marker envelopes.
+#[derive(Debug, Default)]
+struct EnvelopeStatistics {
+    envelopes: usize,
+    /// Last `LEADING_PATTERN_BYTES` bytes before a marker.
+    leading_patterns: BTreeMap<Vec<u8>, usize>,
+    /// Distance between consecutive candidates inside one decoded member.
+    candidate_gaps: BTreeMap<u64, usize>,
+    /// Little-endian `u32` immediately after a marker.
+    following_words: BTreeMap<u32, usize>,
+    following_word_samples: usize,
+    /// Stride of the ascending `u32` run a marker sits inside, when one exists.
+    sequence_strides: BTreeMap<usize, usize>,
+}
+
+impl EnvelopeStatistics {
+    fn observe(&mut self, envelopes: &[MarkerEnvelope], marker_value: u32) {
+        let mut previous: Option<(usize, u64)> = None;
+        for envelope in envelopes {
+            self.envelopes += 1;
+            if let Some(stride) = sequence_stride(envelope, marker_value) {
+                *self.sequence_strides.entry(stride).or_default() += 1;
+            }
+
+            let leading = envelope.leading();
+            if leading.len() >= LEADING_PATTERN_BYTES {
+                let pattern = leading[leading.len() - LEADING_PATTERN_BYTES..].to_vec();
+                *self.leading_patterns.entry(pattern).or_default() += 1;
+            }
+            if let Some(word) = envelope.trailing().get(..4) {
+                let value = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+                *self.following_words.entry(value).or_default() += 1;
+                self.following_word_samples += 1;
+            }
+            // Captured envelopes are a prefix of the candidates in a member,
+            // so consecutive captures are consecutive candidates.
+            if let Some((member, offset)) = previous {
+                if member == envelope.member_index {
+                    let gap = envelope.decoded_offset.saturating_sub(offset);
+                    *self.candidate_gaps.entry(gap).or_default() += 1;
+                }
+            }
+            previous = Some((envelope.member_index, envelope.decoded_offset));
+        }
+    }
+}
+
+/// Smallest stride at which the marker is one element of a strictly ascending
+/// `u32` run. Such a marker is ordinary numeric data, not a record boundary.
+fn sequence_stride(envelope: &MarkerEnvelope, marker_value: u32) -> Option<usize> {
+    let leading = envelope.leading();
+    let trailing = envelope.trailing();
+    SEQUENCE_STRIDES.into_iter().find(|stride| {
+        let Some(before) = leading
+            .len()
+            .checked_sub(*stride)
+            .and_then(|start| leading.get(start..start + 4))
+        else {
+            return false;
+        };
+        let Some(after) = trailing.get(stride - 4..*stride) else {
+            return false;
+        };
+        read_u32(before) < marker_value && read_u32(after) > marker_value
+    })
+}
+
+fn read_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn top_counts<K: Clone + Ord, V: Copy + Ord>(counts: &BTreeMap<K, V>, limit: usize) -> Vec<(K, V)> {
+    let mut entries = counts
+        .iter()
+        .map(|(key, count)| (key.clone(), *count))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    entries.truncate(limit);
+    entries
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+fn marker_envelopes(
+    path: &Path,
+    class_name: &str,
+    leading_bytes: usize,
+    trailing_bytes: usize,
+    max_envelopes: usize,
+    dump: usize,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let raw = container.read_stream_with_limit("Formats/Latest", DEFAULT_DECODE_LIMIT as u64)?;
+    let (_, schema, _) = decode_schema_stream(&raw)?;
+    let class = schema.class_by_name(class_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "schema class not found: {}",
+                escape_terminal_text(class_name)
+            ),
+        )
+    })?;
+    let options = PartitionReadOptions {
+        marker_envelope: Some(MarkerEnvelopeOptions {
+            class_index: class.index,
+            leading_bytes,
+            trailing_bytes,
+            max_envelopes,
+        }),
+        ..PartitionReadOptions::default()
+    };
+    let element_ids = elem_table_ids(&container)?;
+    let partition_paths = partition_paths(&container);
+
+    println!("Marker envelope capture:");
+    println!("Class: {}", escape_terminal_text(&class.name));
+    println!("Schema index: {}", class.index);
+    println!("Leading/trailing context bytes: {leading_bytes}/{trailing_bytes}");
+    println!("Envelope budget per partition: {max_envelopes}");
+    match &element_ids {
+        Some(ids) => println!("Element-ID reference: Global/ElemTable ({} IDs)", ids.len()),
+        None => println!("Element-ID reference: Global/ElemTable not present"),
+    }
+    println!();
+
+    let mut statistics = EnvelopeStatistics::default();
+    let mut total_members = 0_usize;
+    let mut members_with_candidates = 0_usize;
+    let mut total_candidates = 0_u64;
+    let mut budgeted_partitions = 0_usize;
+    let mut dumped = Vec::new();
+
+    for partition_path in &partition_paths {
+        let report = container.inspect_partition(partition_path, options)?;
+        println!(
+            "{}\tmembers={}\tmembers_with_candidates={}\tcandidates={}\tenvelopes={}\tbudget_reached={}",
+            escape_terminal_text(partition_path),
+            report.members.len(),
+            report
+                .members
+                .iter()
+                .filter(|member| member.marker_candidates > 0)
+                .count(),
+            report.marker_candidates,
+            report.marker_envelopes.len(),
+            report.marker_envelopes_truncated
+        );
+
+        statistics.observe(&report.marker_envelopes, u32::from(class.index));
+        total_members += report.members.len();
+        members_with_candidates += report
+            .members
+            .iter()
+            .filter(|member| member.marker_candidates > 0)
+            .count();
+        total_candidates = total_candidates.saturating_add(report.marker_candidates);
+        budgeted_partitions += usize::from(report.marker_envelopes_truncated);
+        for envelope in report.marker_envelopes {
+            if dumped.len() >= dump {
+                break;
+            }
+            dumped.push((partition_path.clone(), envelope));
+        }
+    }
+
+    println!();
+    println!("Envelope summary:");
+    println!("Partitions: {}", partition_paths.len());
+    println!("Validated members: {total_members}");
+    println!("Members with candidates: {members_with_candidates}");
+    println!("Marker candidates: {total_candidates}");
+    println!("Captured envelopes: {}", statistics.envelopes);
+    println!("Partitions stopped by envelope budget: {budgeted_partitions}");
+
+    println!();
+    println!("Record-boundary evidence:");
+    print_leading_patterns(&statistics);
+    print_candidate_gaps(&statistics);
+    print_following_words(&statistics, element_ids.as_ref());
+    print_sequence_strides(&statistics);
+
+    if !dumped.is_empty() {
+        println!();
+        println!("Envelope dump:");
+        for (partition_path, envelope) in &dumped {
+            println!(
+                "{}\tmember={}\tdecoded_offset={}\tleading={}\tmarker={}\ttrailing={}",
+                escape_terminal_text(partition_path),
+                envelope.member_index,
+                envelope.decoded_offset,
+                hex(envelope.leading()),
+                hex(envelope.marker()),
+                hex(envelope.trailing())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_leading_patterns(statistics: &EnvelopeStatistics) {
+    let sampled = statistics.leading_patterns.values().sum::<usize>();
+    println!(
+        "Envelopes with {LEADING_PATTERN_BYTES} leading bytes: {sampled} (distinct patterns: {})",
+        statistics.leading_patterns.len()
+    );
+    for (pattern, count) in top_counts(&statistics.leading_patterns, HISTOGRAM_ROWS) {
+        println!(
+            "  leading={}\tcount={count}\tshare={}",
+            hex(&pattern),
+            percentage(count, sampled)
+        );
+    }
+}
+
+fn print_candidate_gaps(statistics: &EnvelopeStatistics) {
+    let sampled = statistics.candidate_gaps.values().sum::<usize>();
+    println!(
+        "Consecutive same-member candidate gaps: {sampled} (distinct gaps: {})",
+        statistics.candidate_gaps.len()
+    );
+    for (gap, count) in top_counts(&statistics.candidate_gaps, HISTOGRAM_ROWS) {
+        println!(
+            "  gap={gap}\tcount={count}\tshare={}",
+            percentage(count, sampled)
+        );
+    }
+}
+
+fn print_following_words(statistics: &EnvelopeStatistics, element_ids: Option<&BTreeSet<u32>>) {
+    println!(
+        "Post-marker u32 samples: {} (distinct values: {})",
+        statistics.following_word_samples,
+        statistics.following_words.len()
+    );
+    let Some(element_ids) = element_ids else {
+        println!("  ElemTable overlap: not evaluated");
+        return;
+    };
+    let matching_values = statistics
+        .following_words
+        .keys()
+        .filter(|value| element_ids.contains(value))
+        .count();
+    let matching_samples = statistics
+        .following_words
+        .iter()
+        .filter(|(value, _)| element_ids.contains(value))
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+    println!(
+        "  Samples whose u32 is a candidate ID: {matching_samples} ({})",
+        percentage(matching_samples, statistics.following_word_samples)
+    );
+    println!(
+        "  Distinct values that are candidate IDs: {matching_values} ({})",
+        percentage(matching_values, statistics.following_words.len())
+    );
+}
+
+fn print_sequence_strides(statistics: &EnvelopeStatistics) {
+    let sampled = statistics.sequence_strides.values().sum::<usize>();
+    println!(
+        "Markers inside an ascending u32 run: {sampled} ({})",
+        percentage(sampled, statistics.envelopes)
+    );
+    for (stride, count) in top_counts(&statistics.sequence_strides, HISTOGRAM_ROWS) {
+        println!(
+            "  run_stride={stride}\tcount={count}\tshare={}",
+            percentage(count, sampled)
+        );
+    }
+}
+
+/// Counters for the two member-level structures under test.
+#[derive(Debug, Default)]
+struct MemberFramingStatistics {
+    members: usize,
+    descriptors: usize,
+    stored_span_matches: usize,
+    chain_links: usize,
+    chain_links_checked: usize,
+    /// Distance between the end of the previous member and this descriptor.
+    descriptor_gaps: BTreeMap<u64, usize>,
+    walk_failures_at_page_limit: usize,
+    known_format_tags: usize,
+    format_tags: BTreeMap<u32, usize>,
+    walked: usize,
+    walk_failures: BTreeMap<String, usize>,
+    count_matches: usize,
+    body_matches: usize,
+    records: u64,
+    /// Members whose payload ends inside a record continuing into the next one.
+    continued_members: usize,
+    /// Members that resumed after a carried tail.
+    resumed_members: usize,
+    /// Carried tails consumed by a member that then ended on a record boundary.
+    continuations_closed: usize,
+    /// Carries abandoned because the next member could not be walked.
+    continuations_dropped: usize,
+}
+
+fn member_framing(
+    path: &Path,
+    partition: Option<&str>,
+    max_member_bytes: u64,
+    dump: usize,
+    mismatches: usize,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let partition_paths = match partition {
+        Some(name) => vec![name.to_owned()],
+        None => partition_paths(&container),
+    };
+    let mut statistics = MemberFramingStatistics::default();
+    let mut dumped = 0_usize;
+    let mut mismatches_printed = 0_usize;
+
+    println!("Member framing:");
+    for partition_path in &partition_paths {
+        let report =
+            container.inspect_partition(partition_path, PartitionReadOptions::default())?;
+        let mut previous: Option<&rvt_container::PartitionMember> = None;
+        // Bytes the previous member's last record still expects.
+        let mut carry = 0_u64;
+        for member in &report.members {
+            statistics.members += 1;
+            let Some(descriptor) = member.descriptor else {
+                previous = Some(member);
+                statistics.continuations_dropped += usize::from(carry > 0);
+                carry = 0;
+                continue;
+            };
+            statistics.descriptors += 1;
+            statistics.stored_span_matches +=
+                usize::from(descriptor.matches_stored_span(member.compressed_bytes));
+            if let Some(previous) = previous {
+                let gap = member
+                    .logical_offset
+                    .saturating_sub(previous.logical_offset + previous.compressed_bytes);
+                *statistics.descriptor_gaps.entry(gap).or_default() += 1;
+                statistics.chain_links_checked += 1;
+                let decoded_matches =
+                    u64::from(descriptor.previous_decoded_bytes) == previous.decoded_bytes;
+                let span_matches = previous
+                    .descriptor
+                    .is_some_and(|earlier| descriptor.previous_stored_span == earlier.stored_span);
+                statistics.chain_links += usize::from(decoded_matches && span_matches);
+            }
+            *statistics
+                .format_tags
+                .entry(descriptor.format_tag)
+                .or_default() += 1;
+
+            if let Some(layout) = RecordLayout::from_format_tag(descriptor.format_tag) {
+                statistics.known_format_tags += 1;
+                carry = walk_member(
+                    &container,
+                    partition_path,
+                    member,
+                    descriptor,
+                    layout,
+                    max_member_bytes,
+                    carry,
+                    dump,
+                    &mut dumped,
+                    (mismatches, &mut mismatches_printed),
+                    &mut statistics,
+                )?;
+            } else {
+                statistics.continuations_dropped += usize::from(carry > 0);
+                carry = 0;
+            }
+            previous = Some(member);
+        }
+    }
+    print_member_framing(&statistics, partition_paths.len());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_member(
+    container: &RvtContainer,
+    partition_path: &str,
+    member: &rvt_container::PartitionMember,
+    descriptor: rvt_container::MemberDescriptor,
+    layout: RecordLayout,
+    max_member_bytes: u64,
+    carry: u64,
+    dump: usize,
+    dumped: &mut usize,
+    (mismatch_limit, mismatches_printed): (usize, &mut usize),
+    statistics: &mut MemberFramingStatistics,
+) -> Result<u64, Box<dyn Error>> {
+    let payload = container.decode_partition_member(
+        partition_path,
+        member.logical_offset,
+        max_member_bytes,
+    )?;
+    let leading_carry = usize::try_from(carry).unwrap_or(usize::MAX);
+    match MemberWalk::parse(&payload, layout, leading_carry) {
+        Ok(walk) => {
+            statistics.walked += 1;
+            statistics.records = statistics.records.saturating_add(walk.records.len() as u64);
+            statistics.count_matches +=
+                usize::from(u64::from(descriptor.record_count) == walk.records.len() as u64);
+            let matches =
+                walk.matches_descriptor(descriptor.record_count, descriptor.record_body_bytes);
+            statistics.body_matches += usize::from(matches);
+            if !matches && *mismatches_printed < mismatch_limit {
+                *mismatches_printed += 1;
+                println!(
+                    "  mismatch\t{}\tmember={}\tpayload={}\tcarry={}\trecords={}\tdeficit={}\tbody_declared={}\tbody_in_member={}\tbody_started={}",
+                    escape_terminal_text(partition_path),
+                    member.index,
+                    payload.len(),
+                    walk.leading_carry,
+                    walk.records.len(),
+                    walk.trailing_deficit,
+                    descriptor.record_body_bytes,
+                    walk.body_bytes_in_member,
+                    walk.body_bytes
+                );
+            }
+            statistics.continued_members += usize::from(walk.trailing_deficit > 0);
+            if carry > 0 {
+                statistics.resumed_members += 1;
+                statistics.continuations_closed += usize::from(walk.trailing_deficit == 0);
+            }
+            if *dumped < dump {
+                *dumped += 1;
+                println!(
+                    "  {}\tmember={}\tformat={}\tcarry={}\trecords={}\tdeclared={}\tbody={}\tdeclared_body={}\tdeficit={}",
+                    escape_terminal_text(partition_path),
+                    member.index,
+                    descriptor.format_tag,
+                    walk.leading_carry,
+                    walk.records.len(),
+                    descriptor.record_count,
+                    walk.body_bytes_in_member,
+                    descriptor.record_body_bytes,
+                    walk.trailing_deficit
+                );
+                for record in walk.records.iter().take(4) {
+                    println!(
+                        "    record\toffset={}\theader={}\tbody={}",
+                        record.offset, record.header_bytes, record.body_bytes
+                    );
+                }
+            }
+            Ok(walk.trailing_deficit)
+        }
+        Err(error) => {
+            *statistics
+                .walk_failures
+                .entry(error.to_string())
+                .or_default() += 1;
+            statistics.walk_failures_at_page_limit +=
+                usize::from(member.decoded_bytes >= MEMBER_PAGE_LIMIT_BYTES);
+            statistics.continuations_dropped += usize::from(carry > 0);
+            Ok(0)
+        }
+    }
+}
+
+fn print_member_framing(statistics: &MemberFramingStatistics, partitions: usize) {
+    println!();
+    println!("Descriptor summary:");
+    println!("Partitions: {partitions}");
+    println!("Validated members: {}", statistics.members);
+    println!("Members with a descriptor: {}", statistics.descriptors);
+    println!(
+        "Stored span == compressed + 16: {} ({})",
+        statistics.stored_span_matches,
+        percentage(statistics.stored_span_matches, statistics.descriptors)
+    );
+    println!(
+        "Back-pointers matching the previous member: {} ({})",
+        statistics.chain_links,
+        percentage(statistics.chain_links, statistics.chain_links_checked)
+    );
+    print!("Descriptor gaps:");
+    for (gap, count) in &statistics.descriptor_gaps {
+        print!(" {gap}={count}");
+    }
+    println!();
+    print!("Format tags:");
+    for (tag, count) in &statistics.format_tags {
+        print!(" {tag}={count}");
+    }
+    println!();
+
+    println!();
+    println!("Record-array summary:");
+    println!(
+        "Members with a known format tag: {}",
+        statistics.known_format_tags
+    );
+    println!(
+        "Members walked without an error: {} ({})",
+        statistics.walked,
+        percentage(statistics.walked, statistics.known_format_tags)
+    );
+    println!(
+        "Members ending inside a record: {}",
+        statistics.continued_members
+    );
+    println!(
+        "Members resuming after a carried tail: {} (ending on a record boundary: {})",
+        statistics.resumed_members, statistics.continuations_closed
+    );
+    println!(
+        "Carries dropped at a walk failure: {}",
+        statistics.continuations_dropped
+    );
+    println!(
+        "Record count == descriptor count: {} ({})",
+        statistics.count_matches,
+        percentage(statistics.count_matches, statistics.walked)
+    );
+    println!(
+        "Body bytes == descriptor body bytes: {} ({})",
+        statistics.body_matches,
+        percentage(statistics.body_matches, statistics.walked)
+    );
+    println!("Records recovered: {}", statistics.records);
+    let failures = statistics.known_format_tags - statistics.walked;
+    println!(
+        "Walk failures on members at the {} KiB limit: {} of {failures}",
+        MEMBER_PAGE_LIMIT_BYTES / 1024,
+        statistics.walk_failures_at_page_limit
+    );
+    for (reason, count) in top_counts(&statistics.walk_failures, HISTOGRAM_ROWS) {
+        println!(
+            "  failure\tcount={count}\treason={}",
+            escape_terminal_text(&reason)
+        );
+    }
+}
+
+/// Counters for the record header under test.
+#[derive(Debug, Default)]
+struct RecordStatistics {
+    records: u64,
+    narrow_records: u64,
+    wide_records: u64,
+    /// First `u32` of every record header.
+    lead_values: BTreeSet<u32>,
+    lead_in_elem_table: u64,
+    lead_hits: BTreeSet<u32>,
+    /// Members whose record lead values are strictly ascending.
+    ascending_members: usize,
+    checked_members: usize,
+    tag_records: BTreeMap<u32, u64>,
+    tag_class_hits: BTreeMap<u32, u64>,
+    tag_class_counts: BTreeMap<(u32, u16), u64>,
+    class_counts: BTreeMap<u16, u64>,
+    /// The `u16` sharing the trailing word with the class index.
+    companion_words: BTreeMap<u16, u64>,
+    /// Second word of the wide header, which the narrow layout does not have.
+    wide_second_words: BTreeMap<u32, u64>,
+    body_min: u64,
+    body_max: u64,
+    empty_bodies: u64,
+}
+
+/// Visit every member that carries a usable descriptor, in partition order,
+/// threading the continuation carry between them.
+fn for_each_member(
+    container: &RvtContainer,
+    partition_paths: &[String],
+    max_member_bytes: u64,
+    mut visit: impl FnMut(&str, &rvt_container::PartitionMember, u32, RecordLayout, &MemberWalk, &[u8]),
+) -> Result<(), Box<dyn Error>> {
+    for partition_path in partition_paths {
+        let report =
+            container.inspect_partition(partition_path, PartitionReadOptions::default())?;
+        let mut carry = 0_u64;
+        for member in &report.members {
+            let Some(descriptor) = member.descriptor else {
+                carry = 0;
+                continue;
+            };
+            let Some(layout) = RecordLayout::from_format_tag(descriptor.format_tag) else {
+                carry = 0;
+                continue;
+            };
+            let payload = container.decode_partition_member(
+                partition_path,
+                member.logical_offset,
+                max_member_bytes,
+            )?;
+            let leading_carry = usize::try_from(carry).unwrap_or(usize::MAX);
+            let Ok(walk) = MemberWalk::parse(&payload, layout, leading_carry) else {
+                carry = 0;
+                continue;
+            };
+            visit(
+                partition_path,
+                member,
+                descriptor.format_tag,
+                layout,
+                &walk,
+                &payload,
+            );
+            carry = walk.trailing_deficit;
+        }
+    }
+    Ok(())
+}
+
+fn element(
+    path: &Path,
+    id: u32,
+    body_bytes: usize,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?;
+    let partition_paths = partition_paths(&container);
+    let header_class_index = schema
+        .as_ref()
+        .and_then(|schema| schema.class_by_name(ELEMENT_HEADER_CLASS))
+        .map(|class| class.index);
+    let mut found = 0_usize;
+
+    println!("Element {id}:");
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |partition_path, member, format_tag, layout, walk, payload| {
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if header.id != id {
+                    continue;
+                }
+                found += 1;
+                let class = schema
+                    .as_ref()
+                    .and_then(|schema| schema.class_by_index(header.class_index))
+                    .map_or_else(|| "?".to_owned(), |class| escape_terminal_text(&class.name));
+                println!(
+                    "  {}\tmember={}\toffset={}\tformat={format_tag}\tclass={} {class}\tbody={}\tcompanion={}",
+                    escape_terminal_text(partition_path),
+                    member.index,
+                    record.offset,
+                    header.class_index,
+                    header.body_bytes,
+                    header.companion
+                );
+                if header.class_index == header_class_index.unwrap_or(u16::MAX) {
+                    if let Some(fields) =
+                        ElementHeaderFields::parse(&payload[record.body_offset()..record.end()])
+                    {
+                        println!(
+                            "    category={}\tfamily={}",
+                            fields
+                                .category
+                                .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                            fields
+                                .family_id
+                                .map_or_else(|| "-".to_owned(), |value| value.to_string())
+                        );
+                    }
+                }
+                if body_bytes > 0 {
+                    let start = record.body_offset();
+                    let end = record.end().min(start + body_bytes).min(payload.len());
+                    if let Some(slice) = payload.get(start..end) {
+                        println!("    body={}", hex(slice));
+                    }
+                }
+            }
+        },
+    )?;
+
+    println!();
+    println!("Records: {found}");
+    if found == 0 {
+        println!("No record carries this identifier.");
+    }
+    Ok(())
+}
+
+/// One element as it is emitted to JSON.
+#[derive(Debug, Default)]
+struct ExportedElement {
+    class_index: Option<u16>,
+    category: Option<i32>,
+    header_family_id: Option<i32>,
+    level_id: Option<i32>,
+    family_id: Option<i32>,
+    owner_view_id: Option<i32>,
+    created_phase_id: Option<i32>,
+    design_option_id: Option<i32>,
+    /// First readable string in the body, with how it was located.
+    name: Option<(String, &'static str)>,
+    parameters: Vec<rvt_model::Parameter>,
+    /// `m_moribund` from the `Element` tail: the element is marked deleted.
+    moribund: bool,
+    locked: bool,
+    source: Option<(usize, usize, usize)>,
+    record_count: usize,
+}
+
+/// Per-class string calibration plus the identifiers of parameter elements.
+type ExportContext = (BTreeMap<u16, NameCalibration>, BTreeSet<i32>);
+
+/// Where one class keeps its first readable string, and how consistently.
+#[derive(Debug, Default)]
+struct NameCalibration {
+    /// Offsets relative to the end of the `Element` tail, and how often each
+    /// was the first readable string.
+    offsets: BTreeMap<usize, u64>,
+    bodies: u64,
+    samples: Vec<String>,
+}
+
+impl NameCalibration {
+    /// The offset the class agrees on, if the agreement is strong enough.
+    fn settled_offset(&self) -> Option<usize> {
+        let (offset, count) = self.offsets.iter().max_by_key(|(_, count)| **count)?;
+        (count * 100 >= self.bodies * NAME_OFFSET_AGREEMENT).then_some(*offset)
+    }
+
+    fn agreement(&self) -> u64 {
+        self.offsets
+            .values()
+            .max()
+            .map_or(0, |count| count * 100 / self.bodies.max(1))
+    }
+}
+
+/// Collect, in one pass, where each class keeps its string and which elements
+/// are parameter definitions.
+fn calibrate_names(
+    container: &RvtContainer,
+    schema: Option<&Schema>,
+    partition_paths: &[String],
+    max_member_bytes: u64,
+) -> Result<ExportContext, Box<dyn Error>> {
+    let parameter_classes = parameter_class_indexes(schema);
+    let mut parameter_ids = BTreeSet::new();
+    let mut calibrations: BTreeMap<u16, NameCalibration> = BTreeMap::new();
+    for_each_member(
+        container,
+        partition_paths,
+        max_member_bytes,
+        |_, _, format_tag, layout, walk, payload| {
+            if format_tag != ELEMENT_CLASS_FORMAT_TAG {
+                return;
+            }
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                if parameter_classes.contains(&header.class_index) {
+                    if let Ok(id) = i32::try_from(header.id) {
+                        parameter_ids.insert(id);
+                    }
+                }
+                let Some(fields) = ElementFields::parse(body, header.id) else {
+                    continue;
+                };
+                let tail_end = fields.id_offset + 4 + ELEMENT_TAIL_BYTES;
+                let entry = calibrations.entry(header.class_index).or_default();
+                entry.bodies += 1;
+                if let Some(found) = RecordString::scan_from(body, tail_end) {
+                    *entry.offsets.entry(found.offset - tail_end).or_default() += 1;
+                    if entry.samples.len() < 3 {
+                        entry.samples.push(found.value);
+                    }
+                }
+            }
+        },
+    )?;
+    Ok((calibrations, parameter_ids))
+}
+
+/// Schema classes whose elements define parameters.
+fn parameter_class_indexes(schema: Option<&Schema>) -> BTreeSet<u16> {
+    schema
+        .map(|schema| {
+            schema
+                .classes
+                .iter()
+                .filter(|class| class.name.starts_with("Param"))
+                .map(|class| class.index)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parameters(
+    path: &Path,
+    class_name: Option<&str>,
+    count: usize,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?;
+    let wanted = class_name
+        .map(|name| {
+            schema
+                .as_ref()
+                .and_then(|schema| schema.class_by_name(name))
+                .map(|class| class.index)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("schema class not found: {}", escape_terminal_text(name)),
+                    )
+                })
+        })
+        .transpose()?;
+    let partition_paths = partition_paths(&container);
+    let (_, parameter_ids) = calibrate_names(
+        &container,
+        schema.as_ref(),
+        &partition_paths,
+        max_member_bytes,
+    )?;
+    let accept = |id: i32| parameter_ids.contains(&id);
+
+    println!("Parameter sets:");
+    println!("Known parameter elements: {}", parameter_ids.len());
+    let mut shown = 0_usize;
+    let mut with_parameters = 0_u64;
+    let mut bodies = 0_u64;
+    let mut values = 0_u64;
+
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, format_tag, layout, walk, payload| {
+            if format_tag != ELEMENT_CLASS_FORMAT_TAG {
+                return;
+            }
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if wanted.is_some_and(|index| index != header.class_index) {
+                    continue;
+                }
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                bodies += 1;
+                let Some(found) = ParameterSets::scan(body, &accept) else {
+                    continue;
+                };
+                with_parameters += 1;
+                values += found.parameters.len() as u64;
+                if shown >= count {
+                    continue;
+                }
+                shown += 1;
+                let class = schema
+                    .as_ref()
+                    .and_then(|schema| schema.class_by_index(header.class_index))
+                    .map_or("?", |class| class.name.as_str());
+                println!(
+                    "  id={}\tclass={}\tsets={}\tparameters={}",
+                    header.id,
+                    escape_terminal_text(class),
+                    found.sets,
+                    found.parameters.len()
+                );
+                for parameter in found.parameters.iter().take(12) {
+                    println!(
+                        "    param={}\t{}",
+                        parameter.id,
+                        escape_terminal_text(&describe_parameter_value(&parameter.value))
+                    );
+                }
+            }
+        },
+    )?;
+
+    println!();
+    println!("Element bodies examined: {bodies}");
+    println!(
+        "Bodies with a parameter run: {with_parameters} ({})",
+        percentage(
+            usize::try_from(with_parameters).unwrap_or(usize::MAX),
+            usize::try_from(bodies).unwrap_or(usize::MAX)
+        )
+    );
+    println!("Parameter values recovered: {values}");
+    Ok(())
+}
+
+fn describe_parameter_value(value: &ParameterValue) -> String {
+    match value {
+        ParameterValue::Double(number) => format!("double={number}"),
+        ParameterValue::Integer(number) => format!("int={number}"),
+        ParameterValue::Text(text) => format!("text={text:?}"),
+        ParameterValue::Reference(id) => format!("ref={id}"),
+    }
+}
+
+fn names(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?;
+    let partition_paths = partition_paths(&container);
+    let (calibrations, _) = calibrate_names(
+        &container,
+        schema.as_ref(),
+        &partition_paths,
+        max_member_bytes,
+    )?;
+
+    let mut ordered = calibrations.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        right
+            .1
+            .bodies
+            .cmp(&left.1.bodies)
+            .then_with(|| left.0.cmp(right.0))
+    });
+
+    println!("String-offset calibration:");
+    println!(
+        "A class is accepted when at least {NAME_OFFSET_AGREEMENT}% of its records place their first readable string at the same offset after the Element tail."
+    );
+    println!();
+    let mut settled = 0_usize;
+    for (index, calibration) in ordered.iter().take(classes) {
+        let name = schema
+            .as_ref()
+            .and_then(|schema| schema.class_by_index(**index))
+            .map_or("?", |class| class.name.as_str());
+        let offset = calibration
+            .settled_offset()
+            .map_or_else(|| "-".to_owned(), |offset| format!("+{offset}"));
+        println!(
+            "{index}\t{}\tbodies={}\toffset={offset}\tagreement={}%\tsamples={:?}",
+            escape_terminal_text(name),
+            calibration.bodies,
+            calibration.agreement(),
+            calibration.samples
+        );
+    }
+    for calibration in calibrations.values() {
+        settled += usize::from(calibration.settled_offset().is_some());
+    }
+    println!();
+    println!("Classes seen: {}", calibrations.len());
+    println!("Classes with a settled string offset: {settled}");
+    Ok(())
+}
+
+fn export_json(
+    path: &Path,
+    output: Option<&Path>,
+    limit: Option<usize>,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?;
+    let header_class_index = schema
+        .as_ref()
+        .and_then(|schema| schema.class_by_name(ELEMENT_HEADER_CLASS))
+        .map(|class| class.index);
+    let partition_paths = partition_paths(&container);
+    let (calibrations, parameter_ids) = calibrate_names(
+        &container,
+        schema.as_ref(),
+        &partition_paths,
+        max_member_bytes,
+    )?;
+    let accept_parameter = |id: i32| parameter_ids.contains(&id);
+    let mut elements: BTreeMap<u32, ExportedElement> = BTreeMap::new();
+
+    for (partition_index, partition_path) in partition_paths.iter().enumerate() {
+        for_each_member(
+            &container,
+            std::slice::from_ref(partition_path),
+            max_member_bytes,
+            |_, member, format_tag, layout, walk, payload| {
+                for record in &walk.records {
+                    let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                        continue;
+                    };
+                    let entry = elements.entry(header.id).or_default();
+                    entry.record_count += 1;
+                    let body = payload
+                        .get(record.body_offset()..record.end())
+                        .unwrap_or_default();
+
+                    if Some(header.class_index) == header_class_index {
+                        if let Some(fields) = ElementHeaderFields::parse(body) {
+                            entry.category = entry.category.or(fields.category);
+                            entry.header_family_id = entry.header_family_id.or(fields.family_id);
+                        }
+                    } else if format_tag == ELEMENT_CLASS_FORMAT_TAG {
+                        entry.class_index = Some(header.class_index);
+                        entry.source = Some((partition_index, member.index, record.offset));
+                        if let Some(fields) = ElementFields::parse(body, header.id) {
+                            if entry.name.is_none() {
+                                entry.name = read_name(
+                                    body,
+                                    fields.id_offset + 4 + ELEMENT_TAIL_BYTES,
+                                    calibrations
+                                        .get(&header.class_index)
+                                        .and_then(NameCalibration::settled_offset),
+                                );
+                            }
+                            if entry.parameters.is_empty() {
+                                if let Some(found) = ParameterSets::scan(body, &accept_parameter) {
+                                    entry.parameters = found.parameters;
+                                }
+                            }
+                            entry.moribund |= fields.moribund;
+                            entry.locked |= fields.locked;
+                            entry.level_id = entry.level_id.or(fields.assoc_level_id);
+                            entry.family_id = entry.family_id.or(fields.family_id);
+                            entry.owner_view_id = entry.owner_view_id.or(fields.owner_view_id);
+                            entry.created_phase_id =
+                                entry.created_phase_id.or(fields.created_phase_id);
+                            entry.design_option_id =
+                                entry.design_option_id.or(fields.design_option_id);
+                        }
+                    }
+                }
+            },
+        )?;
+    }
+
+    let mut writer: Box<dyn Write> = match output {
+        Some(output) => Box::new(File::create(output)?),
+        None => Box::new(io::stdout().lock()),
+    };
+    // Parameter identifiers point at elements this same export already named.
+    let parameter_names = elements
+        .iter()
+        .filter_map(|(id, element)| {
+            let name = element.name.as_ref()?;
+            Some((i32::try_from(*id).ok()?, name.0.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut written = 0_usize;
+    for (id, element) in &elements {
+        if limit.is_some_and(|limit| written >= limit) {
+            break;
+        }
+        written += 1;
+        write_element_json(
+            &mut writer,
+            *id,
+            element,
+            schema.as_ref(),
+            &partition_paths,
+            &parameter_names,
+        )?;
+    }
+    writer.flush()?;
+    if output.is_some() {
+        println!("Elements written: {written} of {}", elements.len());
+    }
+    Ok(())
+}
+
+/// Emit one element as a JSON object on its own line. Fields that were not
+/// recovered are omitted rather than written as a guessed value.
+fn write_element_json(
+    writer: &mut impl Write,
+    id: u32,
+    element: &ExportedElement,
+    schema: Option<&Schema>,
+    partition_paths: &[String],
+    parameter_names: &BTreeMap<i32, String>,
+) -> io::Result<()> {
+    write!(writer, "{{\"id\":{id}")?;
+    if let Some(class_index) = element.class_index {
+        write!(writer, ",\"class_index\":{class_index}")?;
+        if let Some(name) = schema.and_then(|schema| schema.class_by_index(class_index)) {
+            write!(writer, ",\"class\":\"{}\"", json_escape(&name.name))?;
+        }
+    }
+    for (key, value) in [
+        ("category", element.category),
+        ("level_id", element.level_id),
+        ("family_id", element.family_id.or(element.header_family_id)),
+        ("owner_view_id", element.owner_view_id),
+        ("created_phase_id", element.created_phase_id),
+        ("design_option_id", element.design_option_id),
+    ] {
+        if let Some(value) = value {
+            write!(writer, ",\"{key}\":{value}")?;
+        }
+    }
+    if element.moribund {
+        write!(writer, ",\"moribund\":true")?;
+    }
+    if element.locked {
+        write!(writer, ",\"locked\":true")?;
+    }
+    if let Some((name, source)) = &element.name {
+        write!(
+            writer,
+            ",\"name\":\"{}\",\"name_source\":\"{source}\"",
+            json_escape(name)
+        )?;
+    }
+    if !element.parameters.is_empty() {
+        write!(writer, ",\"parameters\":[")?;
+        for (index, parameter) in element.parameters.iter().enumerate() {
+            if index > 0 {
+                write!(writer, ",")?;
+            }
+            write!(writer, "{{\"id\":{}", parameter.id)?;
+            if let Some(name) = parameter_names.get(&parameter.id) {
+                write!(writer, ",\"name\":\"{}\"", json_escape(name))?;
+            }
+            match &parameter.value {
+                ParameterValue::Double(number) => write!(writer, ",\"double\":{number}")?,
+                ParameterValue::Integer(number) => write!(writer, ",\"int\":{number}")?,
+                ParameterValue::Text(text) => {
+                    write!(writer, ",\"text\":\"{}\"", json_escape(text))?;
+                }
+                ParameterValue::Reference(reference) => write!(writer, ",\"ref\":{reference}")?,
+            }
+            write!(writer, "}}")?;
+        }
+        write!(writer, "]")?;
+    }
+    write!(writer, ",\"records\":{}", element.record_count)?;
+    if let Some((partition_index, member_index, offset)) = element.source {
+        if let Some(partition) = partition_paths.get(partition_index) {
+            write!(
+                writer,
+                ",\"source\":{{\"partition\":\"{}\",\"member\":{member_index},\"offset\":{offset}}}",
+                json_escape(partition)
+            )?;
+        }
+    }
+    writeln!(writer, "}}")
+}
+
+/// Read the element's name, preferring the offset the class agrees on and
+/// falling back to the first readable string after the `Element` tail.
+fn read_name(
+    body: &[u8],
+    tail_end: usize,
+    settled_offset: Option<usize>,
+) -> Option<(String, &'static str)> {
+    if let Some(offset) = settled_offset {
+        if let Some(found) = RecordString::parse_at(body, tail_end + offset) {
+            return Some((found.value, "offset"));
+        }
+    }
+    RecordString::scan_from(body, tail_end).map(|found| (found.value, "scan"))
+}
+
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            control if (control as u32) < 0x20 => {
+                let _ = write!(escaped, "\\u{:04x}", control as u32);
+            }
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+fn bodies(
+    path: &Path,
+    class_name: &str,
+    count: usize,
+    body_bytes: usize,
+    tag: Option<u32>,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "Formats/Latest is required here")
+    })?;
+    let class_index = schema
+        .class_by_name(class_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "schema class not found: {}",
+                    escape_terminal_text(class_name)
+                ),
+            )
+        })?
+        .index;
+    let partition_paths = partition_paths(&container);
+    let mut printed = 0_usize;
+
+    println!(
+        "Bodies of class {class_index} {}:",
+        escape_terminal_text(class_name)
+    );
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, format_tag, layout, walk, payload| {
+            if printed >= count || tag.is_some_and(|wanted| wanted != format_tag) {
+                return;
+            }
+            for record in &walk.records {
+                if printed >= count {
+                    return;
+                }
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if header.class_index != class_index {
+                    continue;
+                }
+                let start = record.body_offset();
+                let end = record.end().min(start + body_bytes).min(payload.len());
+                let Some(slice) = payload.get(start..end) else {
+                    continue;
+                };
+                printed += 1;
+                println!(
+                    "  id={}\ttag={format_tag}\tlen={}\tcompanion={}\tbody={}",
+                    header.id,
+                    header.body_bytes,
+                    header.companion,
+                    hex(slice)
+                );
+            }
+        },
+    )?;
+    println!();
+    println!("Records printed: {printed}");
+    Ok(())
+}
+
+fn read_schema(container: &RvtContainer) -> Result<Option<Schema>, Box<dyn Error>> {
+    if container.stream("Formats/Latest").is_none() {
+        return Ok(None);
+    }
+    let raw = container.read_stream_with_limit("Formats/Latest", DEFAULT_DECODE_LIMIT as u64)?;
+    Ok(Some(decode_schema_stream(&raw)?.1))
+}
+
+fn records(
+    path: &Path,
+    partition: Option<&str>,
+    max_member_bytes: u64,
+    dump: usize,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let element_ids = elem_table_ids(&container)?;
+    let schema = read_schema(&container)?;
+    let partition_paths = match partition {
+        Some(name) => vec![name.to_owned()],
+        None => partition_paths(&container),
+    };
+    let mut statistics = RecordStatistics {
+        body_min: u64::MAX,
+        ..RecordStatistics::default()
+    };
+    let mut dumped = 0_usize;
+
+    println!("Record headers:");
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |partition_path, member, format_tag, layout, walk, payload| {
+            observe_records(
+                payload,
+                walk,
+                layout,
+                format_tag,
+                element_ids.as_ref(),
+                schema.as_ref(),
+                &mut statistics,
+            );
+            if dumped < dump {
+                dumped += 1;
+                dump_record_headers(partition_path, member.index, payload, walk);
+            }
+        },
+    )?;
+    print_record_statistics(&statistics, element_ids.as_ref(), schema.as_ref());
+    Ok(())
+}
+
+fn observe_records(
+    payload: &[u8],
+    walk: &MemberWalk,
+    layout: RecordLayout,
+    format_tag: u32,
+    element_ids: Option<&BTreeSet<u32>>,
+    schema: Option<&Schema>,
+    statistics: &mut RecordStatistics,
+) {
+    let mut previous_lead: Option<u32> = None;
+    let mut ascending = true;
+    for record in &walk.records {
+        let Some(header) = payload.get(record.offset..record.offset + record.header_bytes) else {
+            continue;
+        };
+        statistics.records += 1;
+        *statistics.tag_records.entry(format_tag).or_default() += 1;
+        match layout {
+            RecordLayout::Narrow => statistics.narrow_records += 1,
+            RecordLayout::Wide => statistics.wide_records += 1,
+        }
+
+        let lead = read_u32(&header[..4]);
+        statistics.lead_values.insert(lead);
+        if element_ids.is_some_and(|ids| ids.contains(&lead)) {
+            statistics.lead_in_elem_table += 1;
+            statistics.lead_hits.insert(lead);
+        }
+        if previous_lead.is_some_and(|previous| previous >= lead) {
+            ascending = false;
+        }
+        previous_lead = Some(lead);
+
+        // The trailing word is [class index:u16][unknown:u16] in every format.
+        let tail_offset = match layout {
+            RecordLayout::Narrow => 8,
+            RecordLayout::Wide => 12,
+        };
+        let class_index = u16::from_le_bytes([header[tail_offset], header[tail_offset + 1]]);
+        let companion = u16::from_le_bytes([header[tail_offset + 2], header[tail_offset + 3]]);
+        if schema.is_some_and(|schema| schema.class_by_index(class_index).is_some()) {
+            *statistics.class_counts.entry(class_index).or_default() += 1;
+            *statistics
+                .tag_class_counts
+                .entry((format_tag, class_index))
+                .or_default() += 1;
+            *statistics.tag_class_hits.entry(format_tag).or_default() += 1;
+        }
+        *statistics.companion_words.entry(companion).or_default() += 1;
+        if layout == RecordLayout::Wide {
+            *statistics
+                .wide_second_words
+                .entry(read_u32(&header[4..8]))
+                .or_default() += 1;
+        }
+
+        let body = record.body_bytes as u64;
+        statistics.body_min = statistics.body_min.min(body);
+        statistics.body_max = statistics.body_max.max(body);
+        statistics.empty_bodies += u64::from(body == 0);
+    }
+
+    if !walk.records.is_empty() {
+        statistics.checked_members += 1;
+        statistics.ascending_members += usize::from(ascending);
+    }
+}
+
+fn dump_record_headers(
+    partition_path: &str,
+    member_index: usize,
+    payload: &[u8],
+    walk: &MemberWalk,
+) {
+    for record in walk.records.iter().take(4) {
+        let Some(header) = payload.get(record.offset..record.offset + record.header_bytes) else {
+            continue;
+        };
+        println!(
+            "  {}\tmember={}\toffset={}\theader={}\tbody={}",
+            escape_terminal_text(partition_path),
+            member_index,
+            record.offset,
+            hex(header),
+            record.body_bytes
+        );
+    }
+}
+
+fn print_record_statistics(
+    statistics: &RecordStatistics,
+    element_ids: Option<&BTreeSet<u32>>,
+    schema: Option<&Schema>,
+) {
+    println!();
+    println!("Record summary:");
+    println!("Records: {}", statistics.records);
+    println!(
+        "Narrow (12-byte) / wide (16-byte) headers: {} / {}",
+        statistics.narrow_records, statistics.wide_records
+    );
+    println!(
+        "Body bytes: min {} max {} (empty bodies: {})",
+        if statistics.body_min == u64::MAX {
+            0
+        } else {
+            statistics.body_min
+        },
+        statistics.body_max,
+        statistics.empty_bodies
+    );
+    println!(
+        "Members whose record lead values ascend: {} of {} ({})",
+        statistics.ascending_members,
+        statistics.checked_members,
+        percentage(statistics.ascending_members, statistics.checked_members)
+    );
+
+    println!();
+    println!("Lead u32 (+0):");
+    println!("Distinct values: {}", statistics.lead_values.len());
+    match element_ids {
+        Some(ids) => {
+            println!(
+                "Records whose lead is a candidate ID: {} ({})",
+                statistics.lead_in_elem_table,
+                percentage(
+                    usize::try_from(statistics.lead_in_elem_table).unwrap_or(usize::MAX),
+                    usize::try_from(statistics.records).unwrap_or(usize::MAX)
+                )
+            );
+            println!(
+                "Distinct leads that are candidate IDs: {} ({} of the table)",
+                statistics.lead_hits.len(),
+                percentage(statistics.lead_hits.len(), ids.len())
+            );
+        }
+        None => println!("Global/ElemTable not present; no cross-check"),
+    }
+
+    let Some(schema) = schema else {
+        return;
+    };
+    println!();
+    println!("Class index (u16 at +8 narrow / +12 wide):");
+    for (tag, records) in &statistics.tag_records {
+        let total = usize::try_from(*records).unwrap_or(usize::MAX);
+        let hits = statistics.tag_class_hits.get(tag).copied().unwrap_or(0);
+        println!(
+            "Format tag {tag}: {records} records, resolved {hits} ({})",
+            percentage(usize::try_from(hits).unwrap_or(usize::MAX), total)
+        );
+        let mut per_tag = statistics
+            .tag_class_counts
+            .iter()
+            .filter(|((entry_tag, _), _)| entry_tag == tag)
+            .map(|((_, index), count)| (*index, *count))
+            .collect::<Vec<_>>();
+        per_tag.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        for (index, count) in per_tag.into_iter().take(6) {
+            print_class_row(schema, index, count);
+        }
+    }
+
+    println!();
+    println!(
+        "Classes across every record: {}",
+        statistics.class_counts.len()
+    );
+    for (index, count) in top_counts(&statistics.class_counts, 20) {
+        print_class_row(schema, index, count);
+    }
+
+    println!();
+    println!("Companion u16 beside the class index:");
+    println!("Distinct values: {}", statistics.companion_words.len());
+    for (value, count) in top_counts(&statistics.companion_words, HISTOGRAM_ROWS) {
+        println!("  value={value}\tcount={count}");
+    }
+
+    println!();
+    println!("Wide header second word (+4):");
+    println!("Distinct values: {}", statistics.wide_second_words.len());
+    for (value, count) in top_counts(&statistics.wide_second_words, HISTOGRAM_ROWS) {
+        println!("  value={value}\tcount={count}");
+    }
+}
+
+fn print_class_row(schema: &Schema, index: u16, count: u64) {
+    let name = schema
+        .class_by_index(index)
+        .map_or("?", |class| class.name.as_str());
+    println!("  {index}\t{}\tcount={count}", escape_terminal_text(name));
+}
+
+fn dump_member(
+    path: &Path,
+    partition: &str,
+    logical_offset: u64,
+    output: Option<&Path>,
+    max_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let payload = container.decode_partition_member(partition, logical_offset, max_bytes)?;
+    if let Some(output) = output {
+        let mut writer = File::create(output)?;
+        writer.write_all(&payload)?;
+        writer.flush()?;
+    } else {
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        writer.write_all(&payload)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+fn schema_retry_error(raw: &str, stripped: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "schema parse failed before checksum-page cleanup ({raw}); retry also failed ({stripped})"
+        ),
+    )
+}
+
+/// Element-record inventory, counted over the whole container.
+#[derive(Debug, Default)]
+struct ObjectInventory {
+    records: u64,
+    resolved_classes: u64,
+    identifiers: BTreeSet<u32>,
+    identifiers_in_elem_table: BTreeSet<u32>,
+    /// Classes taken from format-tag 102 records, which carry the element type.
+    element_classes: BTreeMap<u16, u64>,
+    /// Category codes read from `ElementHeader` bodies.
+    categories: BTreeMap<i32, u64>,
+    headers_with_a_category: u64,
+    headers_with_a_family: u64,
+    element_headers: u64,
+    element_bodies: u64,
+    anchored_by_pointer_block: u64,
+    anchored_by_search: u64,
+    with_a_level: u64,
+}
+
+fn inspect(path: &Path, streams_only: bool, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    println!("File: {}", path.display());
+    println!("Container: valid CFB/OLE");
+    println!("Stream inventory:");
+    for name in KNOWN_STREAMS {
+        match container.stream(name) {
+            Some(stream) => println!("- {name}: present ({} bytes)", stream.len()),
+            None => println!("- {name}: missing"),
+        }
+    }
+    println!("- Partitions/*: {} stream(s)", container.partition_count());
+    if streams_only {
+        return Ok(());
+    }
+
+    let schema = read_schema(&container)?;
+    let element_ids = elem_table_ids(&container)?;
+    let partition_paths = partition_paths(&container);
+    let header_class_index = schema
+        .as_ref()
+        .and_then(|schema| schema.class_by_name(ELEMENT_HEADER_CLASS))
+        .map(|class| class.index);
+    let mut inventory = ObjectInventory::default();
+
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, format_tag, layout, walk, payload| {
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                inventory.records += 1;
+                inventory.identifiers.insert(header.id);
+                if element_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&header.id))
+                {
+                    inventory.identifiers_in_elem_table.insert(header.id);
+                }
+                let resolved = schema
+                    .as_ref()
+                    .is_some_and(|schema| schema.class_by_index(header.class_index).is_some());
+                inventory.resolved_classes += u64::from(resolved);
+                if resolved && format_tag == ELEMENT_CLASS_FORMAT_TAG {
+                    *inventory
+                        .element_classes
+                        .entry(header.class_index)
+                        .or_default() += 1;
+                }
+                if format_tag == ELEMENT_CLASS_FORMAT_TAG {
+                    let body = payload
+                        .get(record.body_offset()..record.end())
+                        .unwrap_or_default();
+                    if let Some(fields) = ElementFields::parse(body, header.id) {
+                        inventory.element_bodies += 1;
+                        match fields.anchor {
+                            ElementAnchor::PointerBlock => {
+                                inventory.anchored_by_pointer_block += 1;
+                            }
+                            ElementAnchor::IdentifierSearch => inventory.anchored_by_search += 1,
+                        }
+                        inventory.with_a_level += u64::from(fields.assoc_level_id.is_some());
+                    }
+                }
+                if Some(header.class_index) == header_class_index {
+                    inventory.element_headers += 1;
+                    if let Some(fields) =
+                        ElementHeaderFields::parse(&payload[record.body_offset()..record.end()])
+                    {
+                        if let Some(category) = fields.category {
+                            *inventory.categories.entry(category).or_default() += 1;
+                            inventory.headers_with_a_category += 1;
+                        }
+                        inventory.headers_with_a_family += u64::from(fields.family_id.is_some());
+                    }
+                }
+            }
+        },
+    )?;
+
+    print_object_inventory(&inventory, element_ids.as_ref(), schema.as_ref());
+    Ok(())
+}
+
+fn print_object_inventory(
+    inventory: &ObjectInventory,
+    element_ids: Option<&BTreeSet<u32>>,
+    schema: Option<&Schema>,
+) {
+    let records = usize::try_from(inventory.records).unwrap_or(usize::MAX);
+    println!();
+    println!("Objects discovered: {}", inventory.identifiers.len());
+    println!("Records: {}", inventory.records);
+    println!(
+        "Records with a resolved class: {} ({})",
+        inventory.resolved_classes,
+        percentage(
+            usize::try_from(inventory.resolved_classes).unwrap_or(usize::MAX),
+            records
+        )
+    );
+    match element_ids {
+        Some(ids) => println!(
+            "Identifiers also in Global/ElemTable: {} ({} of the table)",
+            inventory.identifiers_in_elem_table.len(),
+            percentage(inventory.identifiers_in_elem_table.len(), ids.len())
+        ),
+        None => println!("Global/ElemTable: missing; identifiers not cross-checked"),
+    }
+
+    let Some(schema) = schema else {
+        println!("Formats/Latest: missing; classes not resolved");
+        return;
+    };
+    println!();
+    println!(
+        "Element classes (format tag {ELEMENT_CLASS_FORMAT_TAG}): {}",
+        inventory.element_classes.len()
+    );
+    for (index, count) in top_counts(&inventory.element_classes, 20) {
+        print_class_row(schema, index, count);
+    }
+
+    if inventory.element_bodies > 0 {
+        let bodies = usize::try_from(inventory.element_bodies).unwrap_or(usize::MAX);
+        println!();
+        println!("Element bodies read: {}", inventory.element_bodies);
+        println!(
+            "Anchored by the pointer block: {} ({}); by identifier search: {}",
+            inventory.anchored_by_pointer_block,
+            percentage(
+                usize::try_from(inventory.anchored_by_pointer_block).unwrap_or(usize::MAX),
+                bodies
+            ),
+            inventory.anchored_by_search
+        );
+        println!(
+            "With a level reference: {} ({})",
+            inventory.with_a_level,
+            percentage(
+                usize::try_from(inventory.with_a_level).unwrap_or(usize::MAX),
+                bodies
+            )
+        );
+    }
+    if inventory.element_headers > 0 {
+        let headers = usize::try_from(inventory.element_headers).unwrap_or(usize::MAX);
+        println!();
+        println!(
+            "{ELEMENT_HEADER_CLASS} records: {}",
+            inventory.element_headers
+        );
+        println!(
+            "With a category: {} ({}); with a family reference: {} ({})",
+            inventory.headers_with_a_category,
+            percentage(
+                usize::try_from(inventory.headers_with_a_category).unwrap_or(usize::MAX),
+                headers
+            ),
+            inventory.headers_with_a_family,
+            percentage(
+                usize::try_from(inventory.headers_with_a_family).unwrap_or(usize::MAX),
+                headers
+            )
+        );
+        println!("Distinct category codes: {}", inventory.categories.len());
+        for (code, count) in top_counts(&inventory.categories, 12) {
+            println!("  category={code}\tcount={count}");
+        }
+    }
+}
+
+fn read_basic_file_info(container: &RvtContainer) -> Result<Option<BasicFileInfo>, Box<dyn Error>> {
+    if container.stream("BasicFileInfo").is_none() {
+        return Ok(None);
+    }
+    let bytes = container.read_stream_with_limit("BasicFileInfo", 16 * 1024 * 1024)?;
+    Ok(Some(BasicFileInfo::parse(&bytes)?))
+}

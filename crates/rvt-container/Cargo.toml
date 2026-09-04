@@ -1,0 +1,17 @@
+[package]
+name = "rvt-container"
+description = "Read-only access to the physical streams in Revit CFB containers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cfb.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

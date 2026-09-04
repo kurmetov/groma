@@ -1,0 +1,9 @@
+[package]
+name = "rvt-model"
+description = "Loss-preserving intermediate representation of serialized Revit objects"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

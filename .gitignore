@@ -1,0 +1,11 @@
+/target/
+
+# Confidential/local Revit corpora and any derived artifacts.
+/data/test/
+*.[rR][vV][tT]
+*.[rR][fF][aA]
+*.[rR][tT][eE]
+*.[rR][fF][tT]
+
+# Local working notes, not part of the project.
+/BRIEF.md

@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "apps/rivet-cli",
+    "crates/bim-core",
+    "crates/rvt-container",
+    "crates/rvt-model",
+    "crates/rvt-schema",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+cfb = "0.14.0"
+clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.1"
+thiserror = "2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -1,0 +1,24 @@
+[package]
+name = "rivet-cli"
+description = "Command-line inspection tools for Rivet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rivet"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+rvt-container = { path = "../../crates/rvt-container" }
+rvt-model = { path = "../../crates/rvt-model" }
+rvt-schema = { path = "../../crates/rvt-schema" }
+
+[dev-dependencies]
+cfb.workspace = true
+flate2.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true
