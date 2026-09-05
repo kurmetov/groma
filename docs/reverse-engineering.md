@@ -597,3 +597,62 @@ accounted for, but nothing in the corpus separates "a four-byte flags field"
 from "a two-byte flags field followed by two undeclared bytes", because no
 independent reading of the value exists to check it against. The walk reads the
 declaration as declared and does not interpret the value.
+
+## Attaching decoded bodies to elements
+
+### Result: three verification gates, not the decode, were withholding the geometry
+
+Observation. `rivet brep` resolved 12 330 / 7 222 / 8 945 bodies whose every
+face came out, but the IFC export carried 8 / 1 / 43 closed solids and SMALL's
+JSON put B-Rep faces on 136 elements. The bodies were decoded and not reaching
+any element.
+
+Hypothesis. The element -> symbol -> body -> placement hop is failing, and the
+failure is in one of its gates rather than in the decode.
+
+Experiment. Instrument the hop as a funnel, counting the instances that survive
+each gate in turn, and report it from `rivet export-ifc`
+(`report_symbol_link_funnel`). Then, for the gate that loses the most, measure
+what it is actually rejecting rather than assuming.
+
+Result. 6 956 / 2 549 / 571 instances name a symbol that carries a decoded
+body - the bodies were one hop away throughout. Three gates stood in front of
+them.
+
+The first was category equality between instance and symbol, which took SMALL
+from 6 956 to 416. Cross-tabulating (instance category, symbol category) over
+the links the *bounds* cross-check accepts settled what it was doing: every
+pair where both sides carry a category is equal - on BIG every accepted link
+without exception - and every rejection is a case where one side's category was
+not recovered. So the gate never fired on a real disagreement. Requiring only
+that the categories not *disagree* took verified links from 186 / 50 / 157 to
+2 677 / 1 972 / 354. The bounds cross-check is what carries the verification on
+its own: all six coordinates of the instance's independently decoded box must
+agree with the symbol's box carried through the instance's rigid transform to
+within 1e-8 feet, which chance does not do.
+
+The second was that 6 576 of SMALL's 7 014 placed family instances carry no
+category at all, and the exporter drops an element with no category, body and
+all. An instance now inherits its verified symbol's category - what Revit means
+by a family instance's category, and what the cross-tabulation above confirms
+independently - recorded as `category_source: "symbol"` in the JSON so it is
+never confused with a declared one.
+
+The third was that the exporter refused geometry to any element whose category
+it could not map to an IFC type. Classification and geometric verification are
+independent questions, and `IfcBuildingElementProxy` carries a shape
+representation, so that exclusion is gone.
+
+Together: SMALL goes from 168 to 2 586 elements with geometry and 8 to 695
+closed `IfcAdvancedBrep` solids; MEDIUM 1 to 40; BIG 43 to 68.
+`ifcopenshell.validate --rules` stays clean on all three and `create_shape`
+builds every emitted body, 772 / 40 / 68.
+
+One reading was deliberately refused. An incomplete body - a record where only
+some faces resolved - is schema-valid as an open `IfcShellBasedSurfaceModel`,
+and at the previous scale all 40 of them built. At corpus scale they do not: of
+SMALL's 1 771 incomplete shells IfcOpenShell builds 831 and fails on 940, while
+all 695 complete bodies build. Emitting a body the reference kernel refuses is
+not a result, so an incomplete body falls back to the symbol's verified box.
+Confidence high for the three gates, which are measured and independently
+cross-checked; the fallback is a deliberate conservatism, not a finding.

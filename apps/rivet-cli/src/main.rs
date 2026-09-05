@@ -1905,6 +1905,10 @@ const TYPE_ELEMENT_ID_PROPERTIES: &[&str] = &["m_masterSymbolId", "m_idType"];
 struct ExportedElement {
     class_index: Option<u16>,
     category: Option<i32>,
+    /// Where [`ExportedElement::category`] came from: `"declared"` when the
+    /// element's own record carried it, `"symbol"` when it was taken from the
+    /// symbol its bounds verified it against. See [`attach_symbol_bounds`].
+    category_source: Option<&'static str>,
     header_family_id: Option<i32>,
     level_id: Option<i32>,
     family_id: Option<i32>,
@@ -3697,7 +3701,10 @@ fn recover_elements(
 
                     if Some(header.class_index) == header_class_index {
                         if let Some(fields) = ElementHeaderFields::parse(body) {
-                            entry.category = entry.category.or(fields.category);
+                            if entry.category.is_none() && fields.category.is_some() {
+                                entry.category = fields.category;
+                                entry.category_source = Some("declared");
+                            }
                             entry.header_family_id = entry.header_family_id.or(fields.family_id);
                         }
                     } else if format_tag == ELEMENT_CLASS_FORMAT_TAG {
@@ -3971,16 +3978,52 @@ fn attach_symbol_bounds(
         let Some(instance_bounds) = element.placement_bounds else {
             continue;
         };
-        if element.category.is_none()
-            || element.category != symbol_category
-            || !instance_bounds.matches_transformed(&symbol_bounds, &transform)
-        {
+        // The bounds cross-check is the verification: all six coordinates of
+        // the instance's own independently decoded box must agree with the
+        // symbol's box carried through the instance's rigid transform, to
+        // within 1e-8 feet. Chance agreement is not a real possibility.
+        if !instance_bounds.matches_transformed(&symbol_bounds, &transform) {
             continue;
+        }
+        // The categories are required not to *disagree*, rather than required
+        // to be equal. Measured: among the links the cross-check accepts,
+        // every one where both sides carry a category has the same category on
+        // both - on BIG that is every accepted link without exception - so
+        // demanding equality only ever rejected links where one side's
+        // category was not recovered. That cost 2 491 / 1 983 / 199
+        // geometrically verified links across the corpus and refused nothing
+        // that was actually wrong. Kept as a disagreement guard because it is
+        // free and would catch a mislinked symbol in a file unlike these; it
+        // fires on nothing in this corpus.
+        if let (Some(instance_category), Some(symbol_category)) =
+            (element.category, symbol_category)
+        {
+            if instance_category != symbol_category {
+                continue;
+            }
         }
         element.verified_symbol_bounds = Some(VerifiedSymbolBounds {
             symbol_element_id,
             bounds: symbol_bounds,
         });
+        // An instance whose own record did not yield a category takes its
+        // symbol's. In Revit a family instance's category *is* its family's,
+        // and the corpus confirms that reading rather than assuming it: among
+        // the links this cross-check accepts, every one where both sides carry
+        // a category carries the same one, with no exception on any of the
+        // three files. Without this, 6 576 of SMALL's 7 014 placed family
+        // instances have no category and the exporter drops them, bodies and
+        // all, because an element with no category is not a candidate.
+        //
+        // Marked as inherited rather than silently merged: the JSON reports
+        // `category_source`, so a consumer can tell a declared category from
+        // one taken from the symbol.
+        if element.category.is_none() {
+            if let Some(symbol_category) = symbol_category {
+                element.category = Some(symbol_category);
+                element.category_source = Some("symbol");
+            }
+        }
     }
 }
 
@@ -4149,6 +4192,7 @@ fn export_ifc(
         "Recovered transform-verified family-symbol bounds: {}",
         geometry_statistics.verified_symbol_bounds
     );
+    report_symbol_link_funnel(&geometry_statistics);
     println!(
         "Mapped family instances with verified placement: {mapped_family_instance_placements} of {mapped_family_instances}"
     );
@@ -4304,6 +4348,58 @@ struct GeometryStatistics {
     verified_family_instance_placements: usize,
     verified_ginstance_transforms: usize,
     verified_symbol_bounds: usize,
+    /// Funnel from "an instance names a symbol" to "that body is placed in the
+    /// world", so a shortfall can be attributed to the gate that caused it
+    /// rather than guessed at. Each field counts the instances that passed
+    /// every gate up to and including its own.
+    instances_naming_a_symbol: usize,
+    instances_whose_symbol_has_a_body: usize,
+    instances_with_a_symbol_body_and_own_bounds: usize,
+    instances_whose_category_matches_the_symbol: usize,
+    instances_whose_bounds_match_the_symbol: usize,
+    /// The bounds cross-check on its own, with the category-equality gate not
+    /// applied, so the two gates can be told apart.
+    instances_whose_bounds_match_ignoring_category: usize,
+    /// Of the instances whose symbol has a body, how the category gate fails.
+    instances_whose_symbol_has_no_category: usize,
+    instances_whose_category_differs_from_the_symbol: usize,
+}
+
+/// Report the funnel from "an instance names a symbol" to "that body is
+/// placed in the world". A shortfall in exported geometry is almost always one
+/// of these gates, and reading which one is what stops the next change being a
+/// guess: it is how the category-equality gate was found to be costing
+/// thousands of geometrically verified links while refusing nothing wrong.
+fn report_symbol_link_funnel(statistics: &GeometryStatistics) {
+    println!(
+        "Instances naming a symbol through their GInstance transform: {}",
+        statistics.instances_naming_a_symbol
+    );
+    println!(
+        "  whose symbol carries a decoded body: {}",
+        statistics.instances_whose_symbol_has_a_body
+    );
+    println!(
+        "  and which carry their own bounds: {}",
+        statistics.instances_with_a_symbol_body_and_own_bounds
+    );
+    println!(
+        "  and whose category matches the symbol's: {}",
+        statistics.instances_whose_category_matches_the_symbol
+    );
+    println!(
+        "  and whose bounds match the transformed symbol box: {}",
+        statistics.instances_whose_bounds_match_the_symbol
+    );
+    println!(
+        "  bounds match with the category gate not applied: {}",
+        statistics.instances_whose_bounds_match_ignoring_category
+    );
+    println!(
+        "  category gate: symbol has none {}, differs {}",
+        statistics.instances_whose_symbol_has_no_category,
+        statistics.instances_whose_category_differs_from_the_symbol
+    );
 }
 
 fn geometry_statistics(elements: &BTreeMap<u32, ExportedElement>) -> GeometryStatistics {
@@ -4324,6 +4420,44 @@ fn geometry_statistics(elements: &BTreeMap<u32, ExportedElement>) -> GeometrySta
         statistics.verified_fitting_axes += usize::from(element.fitting_axis_candidate.is_some());
         statistics.family_instances_with_placement_candidates +=
             usize::from(!element.family_instance_placement_candidates.is_empty());
+        if let Some(symbol_id) = element
+            .ginstance_transform
+            .and_then(|transform| transform.symbol_element_id)
+        {
+            statistics.instances_naming_a_symbol += 1;
+            let symbol = elements.get(&symbol_id);
+            if symbol.is_some_and(|symbol| symbol.brep.is_some()) {
+                statistics.instances_whose_symbol_has_a_body += 1;
+                if element.placement_bounds.is_some() {
+                    statistics.instances_with_a_symbol_body_and_own_bounds += 1;
+                }
+                if element.category.is_some()
+                    && element.category == symbol.and_then(|symbol| symbol.category)
+                {
+                    statistics.instances_whose_category_matches_the_symbol += 1;
+                }
+                if element.verified_symbol_bounds.is_some() {
+                    statistics.instances_whose_bounds_match_the_symbol += 1;
+                }
+                let symbol_category = symbol.and_then(|symbol| symbol.category);
+                if symbol_category.is_none() {
+                    statistics.instances_whose_symbol_has_no_category += 1;
+                } else if element.category != symbol_category {
+                    statistics.instances_whose_category_differs_from_the_symbol += 1;
+                }
+                if let (Some(transform), Some(instance_bounds), Some(symbol_bounds)) = (
+                    element.ginstance_transform,
+                    element.placement_bounds,
+                    symbol
+                        .and_then(|symbol| symbol.geometry_graph.as_ref())
+                        .map(|graph| graph.bounds),
+                ) {
+                    if instance_bounds.matches_transformed(&symbol_bounds, &transform) {
+                        statistics.instances_whose_bounds_match_ignoring_category += 1;
+                    }
+                }
+            }
+        }
         statistics.verified_family_instance_placements +=
             usize::from(element.family_instance_placement.is_some());
         statistics.verified_ginstance_transforms +=
@@ -4654,13 +4788,20 @@ fn normalize_placement(transform: Option<GInstanceTransformFields>) -> Option<Bi
 }
 
 /// Whether a mapped type is placed from a family symbol, and can therefore
-/// carry a verified symbol extent. An unclassified source stays without
-/// geometry, and a pipe segment is a swept curve rather than a placed symbol.
+/// carry a verified symbol extent. A pipe segment is a swept curve rather than
+/// a placed symbol, and is handled before this.
+///
+/// An unclassified source is *not* excluded. Whether the exporter can name the
+/// kind of building element something is, and whether its geometry was
+/// verified, are independent questions: the symbol link is accepted only when
+/// the instance's own independently decoded box agrees with the symbol's box
+/// carried through its transform to within 1e-8 feet, which says nothing about
+/// the category and does not need to. Excluding `Unknown` discarded the body of
+/// every element whose category the mapping does not cover, which on this
+/// corpus is most of them, and `IfcBuildingElementProxy` - what an unclassified
+/// element is exported as - carries a shape representation perfectly well.
 fn carries_family_symbol_geometry(element_type: BimElementType) -> bool {
-    !matches!(
-        element_type,
-        BimElementType::Unknown | BimElementType::PipeSegment
-    )
+    !matches!(element_type, BimElementType::PipeSegment)
 }
 
 fn normalize_geometry(
@@ -4710,7 +4851,16 @@ fn normalize_geometry(
         element.ginstance_transform,
     ) {
         if let Some(brep) = normalize_brep(local_brep, &transform) {
-            return Some(BimGeometry::Brep(brep));
+            // Only a body whose every face resolved is emitted. An incomplete
+            // one is schema-valid as an open `IfcShellBasedSurfaceModel`, and
+            // for a handful of records it geometrizes, but at corpus scale it
+            // does not: of SMALL's 1 771 incomplete shells IfcOpenShell builds
+            // 831 and fails on 940, while all 695 complete bodies build. A
+            // body the reference kernel refuses is not something to ship, so
+            // an incomplete one falls back to the symbol's verified box.
+            if brep.complete {
+                return Some(BimGeometry::Brep(brep));
+            }
         }
     }
     Some(BimGeometry::BoundingBox(BimBoundingBox {
@@ -4902,6 +5052,9 @@ fn write_element_json(
         {
             write!(writer, ",\"class\":\"{}\"", json_escape(&name.name))?;
         }
+    }
+    if let Some(source) = element.category_source {
+        write!(writer, ",\"category_source\":\"{source}\"")?;
     }
     for (key, value) in [
         ("category", element.category),
@@ -5891,6 +6044,75 @@ mod tests {
     }
 
     #[test]
+    fn an_instance_without_a_category_takes_its_verified_symbol_s() {
+        // The bounds cross-check is the verification; the category is then
+        // inherited rather than required to match, because most placed family
+        // instances in the corpus carry no category of their own and the
+        // exporter drops a categoryless element with its body. A category that
+        // *disagrees* still refuses the link.
+        let symbol_bounds = GElementBounds {
+            offset: 54,
+            min: [-1.0, -2.0, -3.0],
+            max: [1.0, 2.0, 3.0],
+        };
+        let model = |instance_category: Option<i32>| {
+            let mut elements = BTreeMap::new();
+            elements.insert(
+                5,
+                ExportedElement {
+                    class_index: Some(7),
+                    category: Some(-2_008_049),
+                    geometry_graph: Some(GElementGraphFields {
+                        top_level_nodes: Vec::new(),
+                        bounds: symbol_bounds,
+                    }),
+                    ..ExportedElement::default()
+                },
+            );
+            elements.insert(
+                9,
+                ExportedElement {
+                    class_index: Some(3),
+                    category: instance_category,
+                    ginstance_transform: Some(GInstanceTransformFields {
+                        offset: 0,
+                        basis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                        origin: rvt_model::RvtPoint3 {
+                            coordinates_feet: [10.0, 20.0, 30.0],
+                        },
+                        symbol_element_id: Some(5),
+                    }),
+                    placement_bounds: Some(GElementBounds {
+                        offset: 12,
+                        min: [9.0, 18.0, 27.0],
+                        max: [11.0, 22.0, 33.0],
+                    }),
+                    ..ExportedElement::default()
+                },
+            );
+            elements
+        };
+
+        let mut inherited = model(None);
+        attach_symbol_bounds(&mut inherited, Some(7));
+        assert!(inherited[&9].verified_symbol_bounds.is_some());
+        assert_eq!(inherited[&9].category, Some(-2_008_049));
+        assert_eq!(inherited[&9].category_source, Some("symbol"));
+
+        // A category the element declared is kept, and its provenance with it.
+        let mut declared = model(Some(-2_008_049));
+        attach_symbol_bounds(&mut declared, Some(7));
+        assert!(declared[&9].verified_symbol_bounds.is_some());
+        assert_eq!(declared[&9].category_source, None);
+
+        // Two categories that disagree refuse the link outright.
+        let mut disagreeing = model(Some(-2_000_151));
+        attach_symbol_bounds(&mut disagreeing, Some(7));
+        assert_eq!(disagreeing[&9].verified_symbol_bounds, None);
+        assert_eq!(disagreeing[&9].category, Some(-2_000_151));
+    }
+
+    #[test]
     fn a_type_s_parameters_reach_its_instances_without_joining_their_own() {
         let parameter = |id: i32, value: &str| rvt_model::Parameter {
             id,
@@ -6002,16 +6224,19 @@ mod tests {
         {
             assert!((actual - expected).abs() < 1.0e-12);
         }
-        for refused in [BimElementType::Unknown, BimElementType::PipeSegment] {
-            assert!(normalize_geometry(&element, refused, &BTreeMap::new()).is_none());
+        // A pipe segment is a swept curve, not a placed symbol, so it takes no
+        // symbol extent. An unclassified source does: whether the exporter can
+        // name the kind of element something is has nothing to do with whether
+        // its geometry was verified, and refusing `Unknown` discarded the body
+        // of most of the corpus. See `carries_family_symbol_geometry`.
+        assert!(
+            normalize_geometry(&element, BimElementType::PipeSegment, &BTreeMap::new()).is_none()
+        );
+        for carried in [BimElementType::Unknown, BimElementType::DistributionElement] {
+            assert!(matches!(
+                normalize_geometry(&element, carried, &BTreeMap::new()),
+                Some(BimGeometry::BoundingBox(_))
+            ));
         }
-        assert!(matches!(
-            normalize_geometry(
-                &element,
-                BimElementType::DistributionElement,
-                &BTreeMap::new()
-            ),
-            Some(BimGeometry::BoundingBox(_))
-        ));
     }
 }
