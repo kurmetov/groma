@@ -19,9 +19,14 @@ def main() -> int:
     model = ifcopenshell.open(ifc_path)
     settings = ifcopenshell.geom.settings()
     settings.set(settings.USE_WORLD_COORDS, True)
+    # A product whose only shape is a verified symbol extent is written as a
+    # Box/BoundingBox, and IfcOpenShell refuses those unless asked - without
+    # this the export silently loses every one of them (284 of AR S1's 1 468).
+    settings.set("keep-bounding-boxes", True)
 
     vertex_offset = 0
     objects = 0
+    skipped = 0
     with open(obj_path, "w", encoding="utf-8") as out:
         out.write(f"# converted from {ifc_path}\n")
         for product in model.by_type("IfcProduct"):
@@ -30,11 +35,15 @@ def main() -> int:
             try:
                 shape = ifcopenshell.geom.create_shape(settings, product)
             except Exception:
+                skipped += 1
                 continue
             geometry = shape.geometry
             verts = geometry.verts
             faces = geometry.faces
             if not verts or not faces:
+                # A curve-only product (a pipe-fitting centreline) has vertices
+                # but no triangles; OBJ carries meshes, so it is not written.
+                skipped += 1
                 continue
             objects += 1
             name = f"{product.is_a()}_{product.id()}"
@@ -49,6 +58,8 @@ def main() -> int:
             vertex_offset += len(verts) // 3
 
     print(f"Wrote {objects} objects to {obj_path}")
+    if skipped:
+        print(f"Skipped {skipped} represented products that yielded no mesh")
     return 0
 
 
