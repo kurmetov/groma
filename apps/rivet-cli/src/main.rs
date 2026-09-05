@@ -4276,10 +4276,24 @@ fn metadata_model(
         .map(|level| level.id.clone())
         .collect::<BTreeSet<_>>();
     let candidates = recovered.elements.iter().filter(|(_, element)| {
+        // An element carrying verified geometry is a candidate whether or not
+        // its level was recovered. The default export otherwise requires a
+        // level so that everything lands in a storey, and on BIG that is what
+        // was hiding the model: of its 1 031 placed instances 461 have a level
+        // and 658 have a category but only 88 have both, so the 78 that got
+        // through were an unrepresentative slice whose transforms happened to
+        // be near the origin - the file looked like one pile at (0,0,0) while
+        // the decoded transforms actually spread over 108 x 141 x 33 m.
+        //
+        // Such an element is contained in the building rather than a storey,
+        // which is what `--include-unplaced` already does for everything; this
+        // extends it only to elements whose body and placement are verified,
+        // so the default export gains geometry without gaining 272 000 rows.
+        let verified_geometry = element.verified_symbol_bounds.is_some();
         !element.moribund
-            && element.category.is_some()
             && class_name(element) != Some("Level")
-            && (include_unplaced || element.level_id.is_some())
+            && (element.category.is_some() || verified_geometry)
+            && (include_unplaced || element.level_id.is_some() || verified_geometry)
     });
     let mut included_properties = 0_usize;
     let mut included_type_properties = 0_usize;

@@ -656,3 +656,41 @@ all 695 complete bodies build. Emitting a body the reference kernel refuses is
 not a result, so an incomplete body falls back to the symbol's verified box.
 Confidence high for the three gates, which are measured and independently
 cross-checked; the fallback is a deliberate conservatism, not a finding.
+
+### Result: BIG's "missing placement" was an export gate, not a placement failure
+
+Observation. BIG's 53 exported bodies all geometrized but their composed world
+origins spanned 0.05 x 0.19 x 0.00 m over 10 distinct positions - one pile at
+the world origin - while SMALL's spread 35.5 x 12.5 x 7.5 m over 71. The
+placement chain was three levels of identity and never reached a storey,
+although the file carries 21 `IfcBuildingStorey` entities with correct
+elevations.
+
+Hypothesis. BIG's `GInstance` transforms are not being decoded, or are decoded
+as identity.
+
+Experiment. Read the decoded transform origins straight out of the JSON export
+for both files, before any exporter logic touches them.
+
+Result. The hypothesis is refuted and the transforms were never the problem:
+843 of BIG's 1 031 transforms carry a non-zero origin (81.8%) and they span
+108 x 141 x 33 m, a real building footprint. What was wrong is which elements
+reached the export. Of BIG's 1 031 placed instances 461 have a recovered level
+and 658 have a category, but only **88 have both**, and the export candidate
+filter required a category *and* (by default) a level. The 53 that got through
+were an unrepresentative slice that happened to sit near the origin, so the
+file looked as though placement had failed everywhere.
+
+Admitting an element with verified geometry without a recovered level - it is
+contained in the building rather than a storey, which is what
+`--include-unplaced` already did for every element - gives BIG 392 elements
+with geometry over 268 distinct origins spanning 107 x 17 x 33 m, and MEDIUM
+1 989 over 1 971 origins spanning 192 x 217 x 29 m, up from 40. Confidence
+high: each placement is individually verified by the same 1e-8 foot bounds
+agreement, `ifcopenshell.validate --rules` stays clean on all three files, and
+`create_shape` builds every emitted body (772 / 1 721 / 174).
+
+The pattern is now established well enough to state as guidance: every geometry
+shortfall investigated in this project has turned out to be a verification or
+selection gate in the exporter, not a gap in the decode. Measure the funnel
+before touching the decoder.
