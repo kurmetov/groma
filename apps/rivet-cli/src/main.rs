@@ -5149,6 +5149,36 @@ fn normalize_property(
 
 /// Emit one element as a JSON object on its own line. Fields that were not
 /// recovered are omitted rather than written as a guessed value.
+/// Resolve the references that name something to that name. A consumer
+/// otherwise has to join the whole file to itself to answer "which storey is
+/// this on", and that join is exactly what a downstream index cannot do
+/// cheaply. The referenced element keeps its own record, so the name's
+/// provenance stays recoverable through the identifier written alongside.
+fn write_resolved_reference_names(
+    writer: &mut impl Write,
+    element: &ExportedElement,
+    elements: &BTreeMap<u32, ExportedElement>,
+) -> io::Result<()> {
+    for (key, referenced) in [
+        ("level_name", element.level_id),
+        ("type_name", element.type_element_id),
+        (
+            "family_name",
+            element.family_id.or(element.header_family_id),
+        ),
+    ] {
+        let Some(name) = referenced
+            .and_then(|id| u32::try_from(id).ok())
+            .and_then(|id| elements.get(&id))
+            .and_then(|referenced| referenced.name.as_ref())
+        else {
+            continue;
+        };
+        write!(writer, ",\"{key}\":\"{}\"", json_escape(&name.0))?;
+    }
+    Ok(())
+}
+
 fn write_element_json(
     writer: &mut impl Write,
     id: u32,
@@ -5191,6 +5221,7 @@ fn write_element_json(
             write!(writer, ",\"{key}\":{value}")?;
         }
     }
+    write_resolved_reference_names(writer, element, elements)?;
     if let Some(category) = &normalized.category {
         write!(
             writer,
@@ -6003,6 +6034,67 @@ fn read_basic_file_info(container: &RvtContainer) -> Result<Option<BasicFileInfo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_the_references_that_name_something_to_that_name() {
+        let named = |name: &str| ExportedElement {
+            name: Some((name.to_owned(), "declared")),
+            ..ExportedElement::default()
+        };
+        let mut elements = BTreeMap::new();
+        elements.insert(10, named("-01 Подвал"));
+        elements.insert(20, named("Basic Wall: 200mm"));
+        elements.insert(30, named("Отверстие (ниша)"));
+        // The referenced element that carries no name resolves to nothing
+        // rather than to a placeholder.
+        elements.insert(40, ExportedElement::default());
+        elements.insert(
+            1,
+            ExportedElement {
+                level_id: Some(10),
+                type_element_id: Some(20),
+                family_id: Some(30),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            2,
+            ExportedElement {
+                level_id: Some(40),
+                ..ExportedElement::default()
+            },
+        );
+
+        let metadata = ExportMetadata {
+            schema: None,
+            parameter_names: &BTreeMap::new(),
+            parameter_specs: &BTreeMap::new(),
+            catalog: None,
+            partition_paths: &[],
+        };
+        let render = |id: u32| {
+            let mut bytes = Vec::new();
+            write_element_json(&mut bytes, id, &elements[&id], &elements, &metadata).unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+
+        let line = render(1);
+        assert!(line.contains(r#""level_id":10"#), "{line}");
+        assert!(line.contains(r#""level_name":"-01 Подвал""#), "{line}");
+        assert!(
+            line.contains(r#""type_name":"Basic Wall: 200mm""#),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#""family_name":"Отверстие (ниша)""#),
+            "{line}"
+        );
+
+        // A reference whose target has no name keeps the identifier alone.
+        let line = render(2);
+        assert!(line.contains(r#""level_id":40"#), "{line}");
+        assert!(!line.contains("level_name"), "{line}");
+    }
 
     #[test]
     fn promotes_only_a_bounds_verified_pipe_to_metric_geometry() {
