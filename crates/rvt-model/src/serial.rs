@@ -263,6 +263,40 @@ const FILLED_FACE_CLASS_NAME: &str = "GFace";
 const FILLED_FACE_FILLING_PROPERTY: &str = "m_pGFilling";
 const FILLED_FACE_FILLING_BYTES: usize = 2;
 
+/// An entity-map entry costs thirty-six bytes where its declarations account
+/// for twenty-two. `ESEntityCell.m_entityMap` is a counted collection of
+/// `std::pair< GUIDvalue, ESEntity >`, declared as a sixteen-byte key GUID and
+/// one reference, `ESEntity.m_blob`. What is written is the key GUID, four
+/// bytes of `0xffff_ffff`, and the key GUID again.
+///
+/// Measured, not guessed. All 5 478 entries in SMALL - one per `FamilyInstance`
+/// record the walk could not explain, and the whole of that shortfall - hold a
+/// collection count of one, the key GUID `2b2a021b 22578747 928a4f29 ca9d8811`,
+/// the same four bytes, and a trailing GUID equal to the key in 5 478 of 5 478.
+/// The bytes after the entry corroborate the width rather than merely fitting
+/// it: at thirty-six the rest of the cell reads as its declarations say, with
+/// `m_oFittingData`, `m_nodes` and `m_segments` naming classes 2444, 2447 and
+/// 2448 - the classes those declarations name - and `m_baseElementId` holding a
+/// live element identifier. At the declared twenty-two every one of those lands
+/// mid-value.
+///
+/// The reading that the four bytes are a null identifier written the ordinary
+/// way is *refuted*, not merely unused: `MEPAnalyticalModelCell.m_oFittingData`,
+/// six bytes further into the same object, is also `0xffff_ffff` and *is*
+/// followed by a class index. Whatever makes this reference four bytes wide is
+/// not the identifier's value.
+///
+/// How the twenty unaccounted bytes divide is *not* established. "A four-byte
+/// reference followed by a sixteen-byte GUID" and "a twenty-byte blob whose
+/// tail happens to repeat the key" are byte-identical across the corpus,
+/// because it holds exactly one extensible-storage schema and one entry per
+/// map. The rule is applied at `m_blob`, the declaration the extra bytes
+/// follow, and the sixteen are skipped rather than interpreted.
+const ES_ENTITY_CLASS_NAME: &str = "ESEntity";
+const ES_ENTITY_BLOB_PROPERTY: &str = "m_blob";
+/// Bytes following `ESEntity.m_blob`'s identifier, holding the map key again.
+const ES_ENTITY_TRAILING_BYTES: usize = 16;
+
 /// Result of reading a whole record body: its own declared properties, then
 /// the serialized nodes its references name, then the length trailer.
 #[derive(Clone, Debug, PartialEq)]
@@ -712,6 +746,13 @@ impl Reader<'_> {
                 let identifier_only = property.loading_mode & IDENTIFIER_ONLY_LOADING_BIT != 0;
                 if reference && identifier_only {
                     return self.take_identifier().ok_or_else(truncated);
+                }
+                // An entity-map entry runs past what its declarations account
+                // for; the reference is four bytes wide and a repeat of the
+                // map key follows it. See [`ES_ENTITY_CLASS_NAME`].
+                if class_name == ES_ENTITY_CLASS_NAME && property.name == ES_ENTITY_BLOB_PROPERTY {
+                    self.take_identifier().ok_or_else(&truncated)?;
+                    return self.advance(ES_ENTITY_TRAILING_BYTES).ok_or_else(truncated);
                 }
                 if reference || identifier_only {
                     if self.fixed_references {
@@ -1457,6 +1498,85 @@ mod tests {
         assert!(
             !walk_record(&schema, root, &record(geometry, IDENTIFIER_REFERENCE_BYTES)).is_exact()
         );
+    }
+
+    #[test]
+    fn an_entity_map_entry_carries_a_repeat_of_its_key() {
+        // `ESEntityCell` shaped as the corpus declares it: a counted collection
+        // of `std::pair< GUIDvalue, ESEntity >`, where the entry occupies
+        // thirty-six bytes against the twenty-two the declarations account for.
+        // The integer after the collection is the alignment check: it only
+        // reads as its value when the entry is taken at its measured width.
+        let mut key = property("first", FieldType::Object, 0x00, 0, None);
+        key.static_type = Some(TypeReference::Reference {
+            index: FIRST_CLASS_INDEX + 3,
+            name: "GUIDvalue".to_owned(),
+        });
+        let mut value = property("second", FieldType::Object, 0x00, 0, None);
+        value.static_type = Some(TypeReference::Reference {
+            index: FIRST_CLASS_INDEX + 4,
+            name: ES_ENTITY_CLASS_NAME.to_owned(),
+        });
+        let mut entity_map = property("m_entityMap", FieldType::Object, 0x50, 5, None);
+        entity_map.static_type = Some(TypeReference::Reference {
+            index: FIRST_CLASS_INDEX + 5,
+            name: "std::pair< GUIDvalue, ESEntity >".to_owned(),
+        });
+
+        let mut classes = record_schema().classes;
+        classes[1].properties = vec![
+            entity_map,
+            property("m_id", FieldType::Integer32, 0x00, 0, None),
+        ];
+        classes.push(class(
+            FIRST_CLASS_INDEX + 3,
+            "GUIDvalue",
+            TypeReference::None,
+            vec![property("m_guid", FieldType::Guid, 0x00, 0, None)],
+        ));
+        classes.push(class(
+            FIRST_CLASS_INDEX + 4,
+            ES_ENTITY_CLASS_NAME,
+            TypeReference::None,
+            vec![property(
+                ES_ENTITY_BLOB_PROPERTY,
+                FieldType::Object,
+                0x01,
+                0,
+                None,
+            )],
+        ));
+        classes.push(class(
+            FIRST_CLASS_INDEX + 5,
+            "std::pair< GUIDvalue, ESEntity >",
+            TypeReference::None,
+            vec![key, value],
+        ));
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+
+        let guid = [0x2b_u8; 16];
+        let record = |trailing: &[u8]| {
+            let mut body = Vec::new();
+            body.extend(1_u32.to_le_bytes()); // one entry in the map
+            body.extend(guid); // the key
+            body.extend((-1_i32).to_le_bytes()); // ESEntity.m_blob
+            body.extend(trailing);
+            body.extend(0x0007_10cf_u32.to_le_bytes()); // the alignment check
+            let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+            body.extend(length.to_le_bytes());
+            body
+        };
+
+        let root = FIRST_CLASS_INDEX + 1;
+        let walk = walk_record(&schema, root, &record(&guid));
+        assert_eq!(walk.stop, None);
+        assert!(walk.is_exact());
+        // Without the repeat of the key the entry is the declared twenty-two
+        // bytes wide, and the walk runs off the end of the body instead.
+        assert!(!walk_record(&schema, root, &record(&[])).is_exact());
     }
 
     #[test]
