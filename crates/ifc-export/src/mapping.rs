@@ -7,6 +7,25 @@ struct SourceMapping {
     element_type: BimElementType,
 }
 
+/// Source classes that determine the element type on their own, without a
+/// category. These are Revit's architectural system families, and the mapping
+/// is not inferred: joining our decode to the IFC Revit itself exported from
+/// the same model on the Revit element id, each of these classes maps to one
+/// IFC entity with no spread at all - `SWall` is `IfcWall` for 7 610 of 7 610
+/// matched elements, `Floor` is `IfcSlab` for 527 of 527, and the stair and
+/// roof classes for every one of theirs. A loadable `FamilyInstance` is
+/// deliberately absent: it spreads across eight IFC entities in the same
+/// join, so its category is required and the class alone may not stand in.
+const CLASS_MAPPINGS: &[(&str, BimElementType)] = &[
+    ("SWall", BimElementType::Wall),
+    ("Floor", BimElementType::Slab),
+    // A stair landing is a slab in IFC, which is what Revit emits for it.
+    ("StairsLanding", BimElementType::Slab),
+    ("StairsRun", BimElementType::StairFlight),
+    ("StairsElement", BimElementType::Stair),
+    ("ProfileRoof", BimElementType::Roof),
+];
+
 /// Ordered, conservative source mapping. `class_name: None` means that the
 /// category is sufficient; a named class must match together with category.
 const SOURCE_MAPPINGS: &[SourceMapping] = &[
@@ -77,7 +96,18 @@ pub fn element_type_for_source(
     category_name: Option<&str>,
 ) -> BimElementType {
     let Some(category_name) = category_name else {
-        return BimElementType::Unknown;
+        // No declared category. For these classes that is the signal that the
+        // record is an instance rather than a type or definition - in the
+        // reference join not one of Revit's 11 518 products declares a
+        // category of its own - so the class alone establishes the type.
+        return class_name
+            .and_then(|class_name| {
+                CLASS_MAPPINGS
+                    .iter()
+                    .find(|(mapped, _)| *mapped == class_name)
+                    .map(|(_, element_type)| *element_type)
+            })
+            .unwrap_or(BimElementType::Unknown);
     };
     SOURCE_MAPPINGS
         .iter()
@@ -172,6 +202,49 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn types_an_architectural_system_family_from_its_class_alone() {
+        // Verified against the IFC Revit exported from the same model: joined
+        // on the Revit element id, each of these classes maps to exactly one
+        // IFC entity, with no spread.
+        for (class_name, expected) in [
+            ("SWall", BimElementType::Wall),
+            ("Floor", BimElementType::Slab),
+            ("StairsLanding", BimElementType::Slab),
+            ("StairsRun", BimElementType::StairFlight),
+            ("StairsElement", BimElementType::Stair),
+            ("ProfileRoof", BimElementType::Roof),
+        ] {
+            assert_eq!(element_type_for_source(Some(class_name), None), expected);
+        }
+    }
+
+    #[test]
+    fn refuses_the_class_shortcut_for_a_record_that_declares_a_category() {
+        // A record of one of those classes that declares its own category is a
+        // type or definition, not an instance - no product Revit exports
+        // declares one - so it must not be typed as the product.
+        assert_eq!(
+            element_type_for_source(Some("SWall"), Some("OST_Walls")),
+            BimElementType::Unknown
+        );
+        assert_eq!(
+            element_type_for_source(Some("Floor"), Some("OST_Floors")),
+            BimElementType::Unknown
+        );
+    }
+
+    #[test]
+    fn refuses_to_type_a_family_instance_from_its_class() {
+        // `FamilyInstance` spreads across eight IFC entities in the reference
+        // join - railing, column, window, door, member, plate, proxy and
+        // opening - so the class alone may not stand in for its category.
+        assert_eq!(
+            element_type_for_source(Some("FamilyInstance"), None),
+            BimElementType::Unknown
+        );
     }
 
     #[test]

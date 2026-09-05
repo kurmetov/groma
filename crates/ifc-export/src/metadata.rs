@@ -582,6 +582,12 @@ fn push_element(
         representation.map_or_else(omitted, reference),
         string(&element.id.0),
     ];
+    // A few entities declare their own attributes between `IfcElement`'s eight
+    // and `PredefinedType`; those are left unset rather than invented, but they
+    // must still be written or `PredefinedType` lands in the wrong slot.
+    for _ in 0..entity.attributes_before_predefined_type {
+        attributes.push(omitted());
+    }
     if entity.has_predefined_type {
         attributes.push(enumeration("NOTDEFINED"));
     }
@@ -593,9 +599,14 @@ fn push_element(
 struct ProductEntity {
     name: &'static str,
     has_predefined_type: bool,
+    /// Attributes the entity declares between `IfcElement.Tag` and its
+    /// `PredefinedType`. `IfcStairFlight` is the one in play here, with
+    /// `NumberOfRisers`, `NumberOfTreads`, `RiserHeight` and `TreadLength`.
+    attributes_before_predefined_type: usize,
 }
 
 fn product_entity(element_type: BimElementType) -> ProductEntity {
+    let mut attributes_before_predefined_type = 0;
     let (name, has_predefined_type) = match element_type {
         BimElementType::PipeSegment => ("IFCPIPESEGMENT", true),
         BimElementType::PipeFitting => ("IFCPIPEFITTING", true),
@@ -606,11 +617,20 @@ fn product_entity(element_type: BimElementType) -> ProductEntity {
         BimElementType::CableCarrierFitting => ("IFCCABLECARRIERFITTING", true),
         BimElementType::DistributionElement => ("IFCDISTRIBUTIONELEMENT", false),
         BimElementType::DistributionFlowElement => ("IFCDISTRIBUTIONFLOWELEMENT", false),
+        BimElementType::Wall => ("IFCWALL", true),
+        BimElementType::Slab => ("IFCSLAB", true),
+        BimElementType::Roof => ("IFCROOF", true),
+        BimElementType::Stair => ("IFCSTAIR", true),
+        BimElementType::StairFlight => {
+            attributes_before_predefined_type = 4;
+            ("IFCSTAIRFLIGHT", true)
+        }
         BimElementType::Unknown => ("IFCBUILDINGELEMENTPROXY", true),
     };
     ProductEntity {
         name,
         has_predefined_type,
+        attributes_before_predefined_type,
     }
 }
 
@@ -1605,6 +1625,40 @@ mod tests {
         let names = unique_property_names(&source);
         assert_eq!(names, ["Calculation Rules", "Calculation Rules (2)"]);
         assert_ne!(names[0], names[1]);
+    }
+
+    #[test]
+    fn writes_a_stair_flight_with_its_predefined_type_in_the_right_slot() {
+        // IfcStairFlight declares NumberOfRisers, NumberOfTreads, RiserHeight
+        // and TreadLength between IfcElement's eight attributes and its
+        // PredefinedType. Without those four placeholders the enumeration
+        // lands in TreadLength and the file fails schema validation.
+        let mut model = model();
+        let mut element = model.elements[0].clone();
+        element.element_type = BimElementType::StairFlight;
+        model.elements = vec![element];
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        let line = text
+            .lines()
+            .find(|line| line.contains("=IFCSTAIRFLIGHT("))
+            .expect("no stair flight written");
+        assert!(line.ends_with("$,$,$,$,.NOTDEFINED.);"), "{line}");
+        // A wall keeps the plain shape: PredefinedType straight after Tag.
+        model.elements[0].element_type = BimElementType::Wall;
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("=IFCWALL("))
+            .expect("no wall written");
+        assert!(line.ends_with(",.NOTDEFINED.);"), "{line}");
+        assert!(!line.contains("$,$,$,$,.NOTDEFINED."), "{line}");
     }
 
     #[test]

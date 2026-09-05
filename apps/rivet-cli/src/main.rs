@@ -4227,31 +4227,67 @@ fn mapped_family_instance_placement_counts(
     (total, placed)
 }
 
-fn metadata_model(
+/// Source classes whose records are building elements of the model rather than
+/// annotation, a type definition or a view artefact. `FamilyInstance` is here
+/// because it carries the doors, windows, columns and railings; the class does
+/// not say *which*, so it is typed from its category and falls back to a proxy.
+fn is_building_element_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "SWall"
+            | "Floor"
+            | "StairsLanding"
+            | "StairsRun"
+            | "StairsElement"
+            | "ProfileRoof"
+            | "FamilyInstance"
+    )
+}
+
+/// The storeys of *this* model, and the map that folds every recovered `Level`
+/// onto the one that represents it.
+fn building_storeys(
     recovered: &RecoveredElements,
-    include_unplaced: bool,
-    limit: Option<usize>,
-) -> (BimModel, usize, usize, usize) {
-    let class_name = |element: &ExportedElement| {
-        element.class_index.and_then(|index| {
+    is_model_element: &dyn Fn(&ExportedElement) -> bool,
+) -> (Vec<BimLevel>, BTreeMap<BimElementId, BimElementId>) {
+    let is_level = |element: &ExportedElement| {
+        element.class_index.is_some_and(|index| {
             recovered
                 .schema
                 .as_ref()
                 .and_then(|schema| schema.class_by_index(index))
-                .map(|class| class.name.as_str())
+                .is_some_and(|class| class.name == "Level")
         })
     };
+    // A storey is a storey of *this* model only if something the export emits
+    // stands on it. The record walk recovers every `Level` the file mentions,
+    // including those a linked model or another section contributes, and they
+    // are not distinguishable by any field on the level itself: AR S1 yields
+    // 163 of them for 15 real storeys, the same name repeated at two
+    // elevations, and KJ files reach 1 236. Asking which levels the exported
+    // elements actually reference settles it against the reference export
+    // exactly - 12 levels, 12 distinct (name, elevation) pairs, every one of
+    // them a storey Revit also emits and none that it does not. The three of
+    // Revit's 15 not reached are storeys nothing we export stands on.
+    let occupied_levels = recovered
+        .elements
+        .values()
+        .filter(|element| is_model_element(element))
+        .filter_map(|element| element.level_id)
+        .collect::<BTreeSet<_>>();
+
     let levels = recovered
         .elements
         .iter()
-        .filter(|(_, element)| {
+        .filter(|(id, element)| {
             !element.moribund
-                && class_name(element) == Some("Level")
+                && is_level(element)
                 // Family documents contribute their own reference levels to
                 // the project database. In the corpus those carry a family
                 // reference; top-level project storeys do not.
                 && element.family_id.is_none()
                 && element.header_family_id.is_none()
+                && i32::try_from(**id).is_ok_and(|id| occupied_levels.contains(&id))
         })
         .map(|(id, element)| BimLevel {
             id: BimElementId(id.to_string()),
@@ -4267,11 +4303,60 @@ fn metadata_model(
             }),
         })
         .collect::<Vec<_>>();
-    let level_ids = levels
+
+    // Two `Level` records with the same name at the same elevation are one
+    // storey, however many times the file repeats them: AR S1 keeps 55 records
+    // for 15 distinct (name, elevation) pairs, one of them eleven times over.
+    // The first record of each pair is the storey and the rest are folded into
+    // it, so an element standing on any of them still lands somewhere.
+    let mut canonical_level = BTreeMap::new();
+    let mut seen_storeys: BTreeMap<(Option<&str>, Option<u64>), BimElementId> = BTreeMap::new();
+    for level in &levels {
+        let key = (
+            level.name.as_deref(),
+            level.elevation.as_ref().map(|value| value.value.to_bits()),
+        );
+        let canonical = seen_storeys.entry(key).or_insert_with(|| level.id.clone());
+        canonical_level.insert(level.id.clone(), canonical.clone());
+    }
+    let levels = levels
         .iter()
-        .map(|level| level.id.clone())
-        .collect::<BTreeSet<_>>();
-    let candidates = recovered.elements.iter().filter(|(_, element)| {
+        .filter(|level| canonical_level.get(&level.id) == Some(&level.id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    (levels, canonical_level)
+}
+
+fn metadata_model(
+    recovered: &RecoveredElements,
+    include_unplaced: bool,
+    limit: Option<usize>,
+) -> (BimModel, usize, usize, usize) {
+    let class_name = |element: &ExportedElement| {
+        element.class_index.and_then(|index| {
+            recovered
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.class_by_index(index))
+                .map(|class| class.name.as_str())
+        })
+    };
+    // A model element of a building class, as against a type definition, an
+    // annotation or a view artefact of the same class. Each clause is
+    // independently meaningful and the three together keep every product Revit
+    // exports - 100% recall on `SWall`, `Floor` and `FamilyInstance` alike.
+    let is_model_element = |element: &ExportedElement| {
+        class_name(element).is_some_and(is_building_element_class)
+            // Owned by a view, so annotation or a detail item, not the model.
+            && element.owner_view_id.is_none()
+            // A model element is placed in a phase.
+            && element.created_phase_id.is_some()
+            // A record that declares its own category is a type or definition,
+            // not an instance; the instances declare none.
+            && element.category.is_none()
+    };
+    let is_candidate = |element: &ExportedElement| {
         // An element carrying verified geometry is a candidate whether or not
         // its level was recovered. The default export otherwise requires a
         // level so that everything lands in a storey, and on BIG that is what
@@ -4285,12 +4370,42 @@ fn metadata_model(
         // which is what `--include-unplaced` already does for everything; this
         // extends it only to elements whose body and placement are verified,
         // so the default export gains geometry without gaining 272 000 rows.
+        //
+        // A third way in: the element is a *model* element of a building class,
+        // which is how the real products reach the export at all. Joining our
+        // decode to the IFC Revit itself exported from AR S1 on the Revit
+        // element id showed the category test above selects almost exactly
+        // against the truth - of Revit's 11 518 products we decode 11 332
+        // (98.4%) but exported only 382 (3.3%), because a real instance keeps
+        // its category on its type and declares none of its own. Not one of
+        // the 11 332 carries a declared category, while 31-44% of the records
+        // of the same classes that Revit does *not* export do.
+        //
+        // Each clause of `is_model_element` is independently meaningful and the
+        // three together keep every one of the products Revit emits - 100%
+        // recall on `SWall`, `Floor` and `FamilyInstance` alike - while
+        // dropping the records of those classes that are not model elements:
+        // precision rises from 57.8% to 69.3% on `SWall`, 44.5% to 58.8% on
+        // `Floor` and 28.2% to 56.9% on `FamilyInstance`. What remains
+        // over-selected is not separable by any field this decode recovers.
+        let is_model_element = is_model_element(element);
         let verified_geometry = element.verified_symbol_bounds.is_some();
         !element.moribund
             && class_name(element) != Some("Level")
-            && (element.category.is_some() || verified_geometry)
-            && (include_unplaced || element.level_id.is_some() || verified_geometry)
-    });
+            && (element.category.is_some() || verified_geometry || is_model_element)
+            && (include_unplaced
+                || element.level_id.is_some()
+                || verified_geometry
+                || is_model_element)
+    };
+
+    let (levels, canonical_level) = building_storeys(recovered, &is_model_element);
+
+    let candidates = recovered
+        .elements
+        .iter()
+        .filter(|(_, element)| is_candidate(element));
+
     let mut included_properties = 0_usize;
     let mut included_type_properties = 0_usize;
     let mut omitted_properties = 0_usize;
@@ -4306,13 +4421,10 @@ fn metadata_model(
                 &recovered.parameter_specs,
                 recovered.catalog,
             );
-            if normalized
+            normalized.level_id = normalized
                 .level_id
                 .as_ref()
-                .is_some_and(|level_id| !level_ids.contains(level_id))
-            {
-                normalized.level_id = None;
-            }
+                .and_then(|level_id| canonical_level.get(level_id).cloned());
             let mut properties = trusted_source_properties(&normalized);
             // The type's values come from the same reader as the element's own
             // and carry the same risk of an unverified parameter code, so they

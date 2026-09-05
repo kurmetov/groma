@@ -815,3 +815,79 @@ about placement without it. An earlier note here claimed a Box cannot be
 geometrized at all; that was wrong. With all three set, every product the
 exporter emits builds: 11 868 across AR/KJ/ВК/ОВ, zero failures, and
 `validate --rules` clean on all four.
+
+### Result: the export was selecting almost exactly against the truth
+
+Observation. Adding architecture rows to `SOURCE_MAPPINGS` was going to be the
+obvious fix for "0 typed products". Before writing any, join our decode to the
+reference export on the Revit element id and ask what the categories we recover
+actually map to.
+
+Result, and it refuted the plan. Of the 187 131 elements that carry a category
+in our decode of AR S1, **not one** is a product Revit exports. The join is
+empty. Yet 11 332 of Revit's 11 518 products (98.4%) are in our decode - they
+simply carry no category, because a real instance keeps its category on its
+type and declares none of its own. The exporter's candidate test was
+`category.is_some() || verified_geometry`, so of those 11 518 products it
+exported **382, or 3.3%**, while 99.8% of the 187 127 rows it did emit were not
+products at all. Adding mapping rows would have typed nothing, because the
+elements to type were never selected.
+
+The inversion is measurable in both directions: 0% of the products Revit
+exports declare a category, against 31-44% of the records of the same classes
+that Revit does not export.
+
+*What the class alone establishes.* Joined on the element id, six source
+classes map to exactly one IFC entity each, with no spread at all: `SWall` is
+`IfcWall` 7 610 / 7 610, `Floor` is `IfcSlab` 527 / 527, `StairsLanding` is
+`IfcSlab` 12 / 12, `StairsRun` `IfcStairFlight` 22 / 22, `StairsElement`
+`IfcStair` 11 / 11, `ProfileRoof` `IfcRoof` 3 / 3. `FamilyInstance` is
+deliberately excluded: it spreads across eight entities - railing, opening,
+proxy, column, window, member, plate, door - so its category is required and
+the class may not stand in for it. That category is reachable through the
+element's type for only 552 of 3 084, which is the gap that remains.
+
+*Which records are model elements.* Three clauses, each independently
+meaningful, keep **100% recall** on `SWall`, `Floor` and `FamilyInstance`
+alike while dropping records of those classes that are not model elements: no
+`owner_view_id` (a view-owned record is annotation or a detail item), a
+`created_phase_id` (a model element is placed in a phase), and no declared
+category (that marks a type or definition). Precision goes 57.8 -> 69.3% on
+`SWall`, 44.5 -> 58.8% on `Floor`, 28.2 -> 56.9% on `FamilyInstance`. What is
+still over-selected is not separable by any field this decode recovers.
+
+Against the reference export, AR S1 now: products Revit emits that we also
+emit **11 291 of 11 518 (98.0%, from 3.3%)**, and of those **77.2% carry the
+same IFC entity Revit chose**. `IfcWall`, `IfcSlab`, `IfcStair`,
+`IfcStairFlight` and `IfcRoof` each have 100% recall, at precision 69.1%,
+59.4%, 100%, 100%, 100%. Every remaining disagreement is a `FamilyInstance`
+falling back to a proxy: 1 188 railings, 746 openings, 248 columns, 186
+windows, 134 members, 37 plates, 13 doors.
+
+One schema trap on the way: `IfcStairFlight` declares `NumberOfRisers`,
+`NumberOfTreads`, `RiserHeight` and `TreadLength` between `IfcElement`'s eight
+attributes and its `PredefinedType`, so the generic writer put the enumeration
+in `TreadLength` and `validate --rules` failed. Those four are written unset
+rather than invented.
+
+### Result: a storey is a level something stands on
+
+The 163 storeys were not separable by any field on the level record itself.
+They are separable by what stands on them: taking the levels that the model
+elements above actually reference gives 55 records covering 15 distinct
+(name, elevation) pairs, and folding records that share a name and elevation -
+two such records are one storey however often the file repeats them, one of
+them appearing eleven times - gives **15 storeys, which is Revit's count
+exactly**. Twelve are an exact (name, elevation) match.
+
+The three that differ are the same names at a second elevation, each exactly
+0.9 m above the matched one - "02 Этаж" at 3.3 and 4.2, "03 Этаж" at 6.3 and
+7.2, "05 Этаж" at 12.3 and 13.2 - which is a linked model inserted at an
+offset, not a decode error. The three of Revit's that we do not reach
+("01 ПромЭтаж", "25 Кровля 5", "25 Кровля 6") are storeys no element we export
+stands on.
+
+Across disciplines: KJ S1 goes 565 -> 14 storeys, AR S1 163 -> 15, while ВК S1
+stays at 12, which it already had right - the rule costs nothing where nothing
+was wrong. `validate --rules` is clean on all three and every emitted product
+still builds.

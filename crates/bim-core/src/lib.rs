@@ -54,6 +54,14 @@ pub enum BimElementType {
     /// Source category that is certainly a flow element (a valve, strainer,
     /// meter, pump or air handler) without naming which one.
     DistributionFlowElement,
+    // Architectural system families. Unlike the categories above, these are
+    // established by the source *class* alone: Revit's own IFC export of the
+    // reference model maps each of them one-to-one, with no spread.
+    Wall,
+    Slab,
+    Roof,
+    Stair,
+    StairFlight,
 }
 
 #[derive(Clone, Debug, PartialEq)]
