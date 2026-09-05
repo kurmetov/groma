@@ -205,6 +205,16 @@ enum Command {
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
     },
+    /// Tally what the boundary-representation assembly resolves and excludes.
+    Brep {
+        file: PathBuf,
+        /// Print this many excluded-face reasons, most frequent first.
+        #[arg(long, default_value_t = 12)]
+        reasons: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
     /// Calibrate where each class keeps its first readable string.
     Names {
         file: PathBuf,
@@ -446,6 +456,11 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             count,
             max_member_bytes,
         } => parameters(&file, class.as_deref(), count, max_member_bytes),
+        Command::Brep {
+            file,
+            reasons,
+            max_member_bytes,
+        } => brep(&file, reasons, max_member_bytes),
         Command::Names {
             file,
             classes,
@@ -2143,6 +2158,110 @@ fn describe_parameter_value(value: &ParameterValue) -> String {
         ParameterValue::Text(text) => format!("text={text:?}"),
         ParameterValue::Reference(id) => format!("ref={id}"),
     }
+}
+
+/// Tally what the boundary-representation assembly gets and what it drops,
+/// over every record of a file.
+///
+/// The bar for a geometry rule is not that a hand-picked record improves: it is
+/// that the corpus-wide face and body counts rise with no new exclusion reason
+/// appearing. This reports exactly those, so a change can be diffed rather than
+/// argued, and it is the cheap half of the check - the other half is
+/// `ifcopenshell.geom.create_shape` on every emitted body.
+fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?;
+    let classes = (|| {
+        Some(rvt_model::BrepClassIndexes {
+            face: schema_class_index(schema.as_ref(), "Face")?,
+            edge_loop: schema_class_index(schema.as_ref(), "EdgeLoop")?,
+            edge: schema_class_index(schema.as_ref(), "Edge")?,
+            plane: schema_class_index(schema.as_ref(), "Plane")?,
+            cyl_surf: schema_class_index(schema.as_ref(), "CylSurf")?,
+        })
+    })();
+    // The solid lives in a `GElement` record, and only there. Reading every
+    // record that merely contains a `Face` object instead would tally tens of
+    // thousands of truncated node streams as exclusions and measure nothing.
+    let geometry_element_class_index = schema_class_index(schema.as_ref(), "GElement");
+    let (Some(schema), Some(classes), Some(geometry_element_class_index)) =
+        (schema.as_ref(), classes, geometry_element_class_index)
+    else {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the schema does not declare the boundary-representation classes",
+        )));
+    };
+    let partition_paths = partition_paths(&container);
+
+    let mut records = 0_u64;
+    let mut complete = 0_u64;
+    let mut faces = 0_u64;
+    let mut excluded = 0_u64;
+    let mut loops = 0_u64;
+    let mut edges = 0_u64;
+    let mut arcs = 0_u64;
+    let mut why: BTreeMap<&'static str, u64> = BTreeMap::new();
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, _, layout, walk, payload| {
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if header.class_index != geometry_element_class_index {
+                    continue;
+                }
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                let (_walk, objects) =
+                    rvt_model::walk_record_collecting(schema, header.class_index, body);
+                if !objects
+                    .iter()
+                    .any(|object| object.class_index == classes.face)
+                {
+                    continue;
+                }
+                let assembled = rvt_model::assemble_symbol_brep(&objects, &classes);
+                if assembled.is_empty() && assembled.excluded_faces.is_empty() {
+                    continue;
+                }
+                records += 1;
+                complete += u64::from(assembled.excluded_faces.is_empty());
+                faces += assembled.faces.len() as u64;
+                excluded += assembled.excluded_faces.len() as u64;
+                for face in &assembled.faces {
+                    loops += face.loops.len() as u64;
+                    for face_loop in &face.loops {
+                        edges += face_loop.len() as u64;
+                        arcs += face_loop
+                            .iter()
+                            .filter(|edge| matches!(edge.curve, rvt_model::BrepCurve::Arc(_)))
+                            .count() as u64;
+                    }
+                }
+                for exclusion in &assembled.excluded_faces {
+                    *why.entry(exclusion.reason).or_default() += 1;
+                }
+            }
+        },
+    )?;
+
+    println!("Boundary representations assembled from face-bearing records:");
+    println!("Records producing a body: {records}");
+    println!("  every face resolved: {complete}");
+    println!("Faces resolved: {faces}");
+    println!("  loops: {loops}, edges: {edges}, of which arcs: {arcs}");
+    println!("Faces excluded: {excluded}");
+    let mut ordered = why.into_iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    for (reason, count) in ordered.into_iter().take(reasons) {
+        println!("  {count}\t{}", escape_terminal_text(reason));
+    }
+    Ok(())
 }
 
 fn names(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
