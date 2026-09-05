@@ -12,6 +12,14 @@
 //! that record bound `SurfRev` faces, which this module does not evaluate.
 //! Coordinates stay in the symbol's own local frame and Revit internal feet;
 //! callers apply the instance's `GInstance` transform afterward.
+//!
+//! What one record could not settle, `rivet brep FILE` measures over all of
+//! them: faces resolved, bodies whose every face resolved, and each excluded
+//! face grouped by the reason given here. Reading an edge from both adjacent
+//! cylinders rather than dropping it was accepted on that - faces resolved
+//! 32 083 / 17 513 / 42 563 -> 74 187 / 28 825 / 47 187 across the three corpus
+//! files, bodies fully resolved 1 986 / 3 755 / 6 745 -> 12 065 / 6 536 / 7 535,
+//! with the emitted IFC still geometrizing on every body and validating clean.
 
 use std::collections::HashMap;
 
@@ -313,23 +321,50 @@ fn resolve_edge(
         point_for(1, last_pnt),
     )?;
 
-    let cyl_side = match (surfaces[0], surfaces[1]) {
-        (Some(BrepSurface::Cylinder { .. }), Some(BrepSurface::Cylinder { .. })) => {
-            return Err("edge lies between two curved faces");
-        }
-        (Some(BrepSurface::Cylinder { .. }), _) => Some(0),
-        (_, Some(BrepSurface::Cylinder { .. })) => Some(1),
-        _ => None,
-    };
-    let raw_curve = match cyl_side {
-        Some(side) => classify_cylinder_edge(
-            surfaces[side].expect("cyl_side names a resolved surface"),
+    let classify = |side: usize| {
+        classify_cylinder_edge(
+            surfaces[side].expect("caller checked this side is a cylinder"),
             (first_pnt[side * 2], first_pnt[side * 2 + 1]),
             (last_pnt[side * 2], last_pnt[side * 2 + 1]),
             raw_start,
             raw_end,
-        )?,
-        None => straight_line(raw_start, raw_end)?,
+        )
+    };
+    let raw_curve = match (surfaces[0], surfaces[1]) {
+        // An edge between two cylinders is read from both parameterisations
+        // and only accepted when they describe the same 3D curve. Neither side
+        // is privileged and neither is guessed at: the file stores this edge's
+        // `u`/`v` on each adjacent face, so each says on its own what the curve
+        // is, and the two are an oracle for each other.
+        //
+        // The geometry says the two must agree. The only circles lying on a
+        // right circular cylinder are its cross-sections, and the only straight
+        // lines are its rulings; so a circle here is constant-`v` on *both*
+        // cylinders and a line is constant-`u` on both. A tee's seam, where a
+        // branch meets a run, is a quartic that is neither on either side, and
+        // is still excluded rather than approximated by its endpoints.
+        (Some(BrepSurface::Cylinder { .. }), Some(BrepSurface::Cylinder { .. })) => {
+            match (classify(0), classify(1)) {
+                (Ok(first), Ok(second)) => {
+                    if curves_agree(first, second) {
+                        first
+                    } else {
+                        return Err("the two cylinders disagree on the edge's curve");
+                    }
+                }
+                // Asymmetry is a contradiction, not a partial success: a curve
+                // that is a cross-section or a ruling of one cylinder is one of
+                // the other too. Taking the side that answered would be reading
+                // through a disagreement.
+                (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
+                    return Err("only one of the two cylinders gives the edge a curve");
+                }
+                (Err(reason), Err(_)) => return Err(reason),
+            }
+        }
+        (Some(BrepSurface::Cylinder { .. }), _) => classify(0)?,
+        (_, Some(BrepSurface::Cylinder { .. })) => classify(1)?,
+        _ => straight_line(raw_start, raw_end)?,
     };
 
     Ok(ResolvedEdge {
@@ -420,6 +455,31 @@ fn classify_cylinder_edge(
     }
     let _ = y_axis;
     Err("cylinder edge parametrization is neither a constant-v arc nor a constant-u line")
+}
+
+/// Whether two curves derived independently over the same endpoints describe
+/// the same 3D curve.
+///
+/// Compared geometrically rather than field by field: each side's angles and
+/// axes are expressed in its own cylinder's frame, so two correct readings of
+/// one circle need not share a single number. The endpoints already agree - a
+/// resolved edge is built from `raw_start`/`raw_end`, which both sides
+/// evaluated - so what is left to check is the path between them, and sampling
+/// the midpoint catches the case the endpoints cannot: the same circle traced
+/// the long way round instead of the short.
+fn curves_agree(first: BrepCurve, second: BrepCurve) -> bool {
+    match (first, second) {
+        (BrepCurve::Line, BrepCurve::Line) => true,
+        (BrepCurve::Arc(first), BrepCurve::Arc(second)) => {
+            (first.radius - second.radius).abs() <= CLOSURE_TOLERANCE_FEET
+                && distance(first.center, second.center) <= CLOSURE_TOLERANCE_FEET
+                && distance(
+                    arc_point(first, first.start_angle.midpoint(first.end_angle)),
+                    arc_point(second, second.start_angle.midpoint(second.end_angle)),
+                ) <= CLOSURE_TOLERANCE_FEET
+        }
+        (BrepCurve::Line, BrepCurve::Arc(_)) | (BrepCurve::Arc(_), BrepCurve::Line) => false,
+    }
 }
 
 fn arc_point(arc: BrepArc, angle: f64) -> [f64; 3] {
@@ -632,6 +692,28 @@ mod tests {
         }
     }
 
+    /// A cylinder of `radius` about the +Z axis through `center`.
+    fn cylinder_object(id: u32, center: [f64; 3], radius: f64) -> SerialObject {
+        let mut numbers = vec![0.0; 4];
+        numbers.extend(center);
+        numbers.extend([1.0, 0.0, 0.0]); // x_axis
+        numbers.extend([0.0, 1.0, 0.0]); // y_axis
+        numbers.extend([0.0, 0.0, 1.0]); // z_axis
+        numbers.push(radius);
+        SerialObject {
+            object_id: id,
+            class_index: CYL_SURF,
+            offset: 0,
+            bytes: 0,
+            references: Vec::new(),
+            identifiers: Vec::new(),
+            numbers,
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+        }
+    }
+
     fn face_object(id: u32, first_loop: u32, surface: GElementNodeReference) -> SerialObject {
         SerialObject {
             object_id: id,
@@ -691,6 +773,157 @@ mod tests {
             strings: Vec::new(),
             small_integers: vec![flags],
         }
+    }
+
+    /// An edge carrying a real `(u, v)` pair on *both* adjacent faces, which
+    /// is what a cylinder-to-cylinder edge needs: `line_edge` leaves side 1's
+    /// pair at zero because its fixtures only ever resolve side 0.
+    #[allow(clippy::too_many_arguments)]
+    fn two_sided_edge(
+        id: u32,
+        faces: [u32; 2],
+        next: [u32; 2],
+        prev: [u32; 2],
+        flags: i64,
+        first_uv: [(f64, f64); 2],
+        last_uv: [(f64, f64); 2],
+    ) -> SerialObject {
+        SerialObject {
+            object_id: id,
+            class_index: EDGE,
+            offset: 0,
+            bytes: 0,
+            references: Vec::new(),
+            identifiers: vec![faces[0], faces[1], next[0], next[1], prev[0], prev[1]],
+            numbers: vec![
+                first_uv[0].0,
+                first_uv[0].1,
+                first_uv[1].0,
+                first_uv[1].1,
+                last_uv[0].0,
+                last_uv[0].1,
+                last_uv[1].0,
+                last_uv[1].1,
+            ],
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: vec![flags],
+        }
+    }
+
+    /// A tube of radius 2 running from z=0 to z=5, split lengthwise into two
+    /// half-cylinder faces that meet along the rulings at u=0 and u=pi. Face 1
+    /// is the u in [0, pi] half; face 2 carries the other half and is left
+    /// without a loop, so only face 1 is assembled. Both rulings are
+    /// cylinder-to-cylinder edges - the shape this module used to drop
+    /// wholesale - while the two arcs close against unmodeled caps (face 3).
+    ///
+    /// `seam` replaces the v=5 arc's side-1 parametrization, which is how the
+    /// disagreement case is built.
+    fn split_tube(seam: Option<[(f64, f64); 2]>) -> Vec<SerialObject> {
+        let pi = std::f64::consts::PI;
+        let arc_side_one = seam.unwrap_or([(0.0, 5.0), (pi, 5.0)]);
+        let arc_face_one = if seam.is_some() { 2 } else { 3 };
+        vec![
+            cylinder_object(u32::MAX, [0.0, 0.0, 0.0], 2.0),
+            cylinder_object(u32::MAX, [0.0, 0.0, 0.0], 2.0),
+            face_object(1, 10, reference(u32::MAX, CYL_SURF)),
+            face_object(2, 0, reference(u32::MAX, CYL_SURF)),
+            loop_object(10, 1, 300, 303),
+            // The u=0 ruling, shared by the two halves: constant u on both.
+            two_sided_edge(
+                300,
+                [1, 2],
+                [301, 0],
+                [10, 0],
+                0,
+                [(0.0, 0.0), (0.0, 0.0)],
+                [(0.0, 5.0), (0.0, 5.0)],
+            ),
+            // The v=5 arc.
+            two_sided_edge(
+                301,
+                [1, arc_face_one],
+                [302, 0],
+                [300, 0],
+                0,
+                [(0.0, 5.0), arc_side_one[0]],
+                [(pi, 5.0), arc_side_one[1]],
+            ),
+            // The u=pi ruling, again shared by the two halves.
+            two_sided_edge(
+                302,
+                [1, 2],
+                [303, 0],
+                [301, 0],
+                0,
+                [(pi, 5.0), (pi, 5.0)],
+                [(pi, 0.0), (pi, 0.0)],
+            ),
+            // The v=0 arc, back to the start.
+            two_sided_edge(
+                303,
+                [1, 3],
+                [10, 0],
+                [302, 0],
+                0,
+                [(pi, 0.0), (0.0, 0.0)],
+                [(0.0, 0.0), (0.0, 0.0)],
+            ),
+        ]
+    }
+
+    #[test]
+    fn reads_an_edge_between_two_cylinders_from_both_parametrizations() {
+        let brep = assemble(&split_tube(None), &classes());
+        let tube = brep
+            .faces
+            .iter()
+            .find(|face| matches!(face.surface, BrepSurface::Cylinder { .. }))
+            .expect("the half-tube face resolved");
+        let edges = &tube.loops[0];
+        assert_eq!(edges.len(), 4);
+
+        // The two rulings are cylinder-to-cylinder edges and now resolve;
+        // before, either one excluded the whole face.
+        assert_eq!(edges[0].curve, BrepCurve::Line);
+        assert_eq!(edges[2].curve, BrepCurve::Line);
+        assert!(distance(edges[0].start, [2.0, 0.0, 0.0]) < 1.0e-9);
+        assert!(distance(edges[0].end, [2.0, 0.0, 5.0]) < 1.0e-9);
+        assert!(distance(edges[2].start, [-2.0, 0.0, 5.0]) < 1.0e-9);
+        assert!(distance(edges[2].end, [-2.0, 0.0, 0.0]) < 1.0e-9);
+
+        // The arcs against the unmodeled caps are unaffected.
+        for index in [1, 3] {
+            match edges[index].curve {
+                BrepCurve::Arc(arc) => assert!((arc.radius - 2.0).abs() < 1.0e-9),
+                BrepCurve::Line => panic!("edge {index} should be an arc"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_a_cylinder_edge_the_two_faces_read_as_different_arcs() {
+        // The same seam, but side 1 sweeps u from 0 to -pi where side 0 sweeps
+        // 0 to +pi. Both readings share the edge's endpoints exactly - (2,0,5)
+        // and (-2,0,5) - and both reconstruct against them, so nothing short of
+        // comparing the path between them tells the two apart. They are
+        // opposite halves of one circle.
+        let pi = std::f64::consts::PI;
+        let brep = assemble(&split_tube(Some([(0.0, 5.0), (-pi, 5.0)])), &classes());
+        assert!(
+            brep.faces.is_empty(),
+            "a face resolved through a disagreement: {:?}",
+            brep.faces
+        );
+        assert!(
+            brep.excluded_faces
+                .iter()
+                .any(|exclusion| exclusion.face_id == 1
+                    && exclusion.reason == "the two cylinders disagree on the edge's curve"),
+            "{:?}",
+            brep.excluded_faces
+        );
     }
 
     #[test]
