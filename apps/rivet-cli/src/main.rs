@@ -2168,6 +2168,7 @@ fn describe_parameter_value(value: &ParameterValue) -> String {
 /// appearing. This reports exactly those, so a change can be diffed rather than
 /// argued, and it is the cheap half of the check - the other half is
 /// `ifcopenshell.geom.create_shape` on every emitted body.
+#[allow(clippy::too_many_lines)] // One streaming pass plus its report.
 fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
     let container = RvtContainer::open(path)?;
     let schema = read_schema(&container)?;
@@ -2202,6 +2203,14 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
     let mut edges = 0_u64;
     let mut arcs = 0_u64;
     let mut why: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut exact_why: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut edge_why: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut exact_edge_why: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut gaps: Vec<f64> = Vec::new();
+    let mut gaps_with_a_cylinder = 0_u64;
+    let mut gaps_in_exact_records = 0_u64;
+    let mut exact_records = 0_u64;
+    let mut exact_complete = 0_u64;
     for_each_member(
         &container,
         &partition_paths,
@@ -2217,7 +2226,7 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
                 let body = payload
                     .get(record.body_offset()..record.end())
                     .unwrap_or_default();
-                let (_walk, objects) =
+                let (record_walk, objects) =
                     rvt_model::walk_record_collecting(schema, header.class_index, body);
                 if !objects
                     .iter()
@@ -2225,12 +2234,20 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
                 {
                     continue;
                 }
+                // Whether the record's declarations tiled its body exactly. A
+                // walk that drifted hands this module bytes that are not the
+                // fields it thinks they are, so every number after the drift is
+                // arbitrary - which is a different failure from a geometry rule
+                // being wrong, and has to be counted apart from one.
+                let exact = record_walk.is_exact();
                 let assembled = rvt_model::assemble_symbol_brep(&objects, &classes);
                 if assembled.is_empty() && assembled.excluded_faces.is_empty() {
                     continue;
                 }
                 records += 1;
+                exact_records += u64::from(exact);
                 complete += u64::from(assembled.excluded_faces.is_empty());
+                exact_complete += u64::from(exact && assembled.excluded_faces.is_empty());
                 faces += assembled.faces.len() as u64;
                 excluded += assembled.excluded_faces.len() as u64;
                 for face in &assembled.faces {
@@ -2245,6 +2262,37 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
                 }
                 for exclusion in &assembled.excluded_faces {
                     *why.entry(exclusion.reason).or_default() += 1;
+                    if exact {
+                        *exact_why.entry(exclusion.reason).or_default() += 1;
+                    }
+                }
+                // Whether a record holds any cylinder at all is the control for
+                // the one place a face's surface is *inferred* rather than
+                // read: `CylSurf` objects share one identifier, so they are
+                // paired to faces by encounter order. If that pairing slips, a
+                // face is evaluated against a surface that is not its own -
+                // which is exactly what a cross-face disagreement looks like.
+                // A record with no cylinder cannot suffer from it.
+                let cylindrical =
+                    assembled.faces.iter().any(|face| {
+                        matches!(face.surface, rvt_model::BrepSurface::Cylinder { .. })
+                    }) || objects
+                        .iter()
+                        .any(|object| object.class_index == classes.cyl_surf);
+                for failure in &assembled.failed_edges {
+                    *edge_why.entry(failure.reason).or_default() += 1;
+                    if exact {
+                        *exact_edge_why.entry(failure.reason).or_default() += 1;
+                    }
+                    if let Some(gap) = failure.gap_feet {
+                        gaps.push(gap);
+                        if cylindrical {
+                            gaps_with_a_cylinder += 1;
+                        }
+                        if exact {
+                            gaps_in_exact_records += 1;
+                        }
+                    }
                 }
             }
         },
@@ -2252,14 +2300,104 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
 
     println!("Boundary representations assembled from face-bearing records:");
     println!("Records producing a body: {records}");
+    println!("  whose declarations tiled the body exactly: {exact_records}");
     println!("  every face resolved: {complete}");
+    println!("    of those, in an exactly-tiled record: {exact_complete}");
     println!("Faces resolved: {faces}");
     println!("  loops: {loops}, edges: {edges}, of which arcs: {arcs}");
-    println!("Faces excluded: {excluded}");
+    println!(
+        "Faces excluded: {excluded} (in an exactly-tiled record: {})",
+        exact_why.values().sum::<u64>()
+    );
     let mut ordered = why.into_iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
     for (reason, count) in ordered.into_iter().take(reasons) {
-        println!("  {count}\t{}", escape_terminal_text(reason));
+        println!(
+            "  {count}\t(exact: {})\t{}",
+            exact_why.get(reason).copied().unwrap_or(0),
+            escape_terminal_text(reason)
+        );
+    }
+
+    // Edges, not faces. A face is excluded by the first failing edge its loop
+    // reaches, so face counts say how much was lost and these say how much is
+    // actually wrong.
+    println!(
+        "Edges that did not resolve: {} (in an exactly-tiled record: {})",
+        edge_why.values().sum::<u64>(),
+        exact_edge_why.values().sum::<u64>()
+    );
+    let mut ordered = edge_why.into_iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    for (reason, count) in ordered.into_iter().take(reasons) {
+        println!(
+            "  {count}\t(exact: {})\t{}",
+            exact_edge_why.get(reason).copied().unwrap_or(0),
+            escape_terminal_text(reason)
+        );
+    }
+
+    if !gaps.is_empty() {
+        // How far apart the two faces put a shared endpoint separates a
+        // tolerance that is too tight from a face evaluated against the wrong
+        // surface. Reported in millimetres, which is the scale the answer
+        // matters at - except that a non-finite gap is neither: it means an
+        // evaluated point is infinite or NaN, so some number feeding it is not
+        // a coordinate at all, and the two are counted apart.
+        let total = gaps.len();
+        let non_finite = gaps.iter().filter(|gap| !gap.is_finite()).count();
+        let share = |part: u64| {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                part as f64 * 100.0 / total as f64
+            }
+        };
+        gaps.retain(|gap| gap.is_finite());
+        gaps.sort_by(f64::total_cmp);
+        let millimetres = |feet: f64| feet * 304.8;
+        println!("Cross-face endpoint disagreements: {total}");
+        println!(
+            "  in a record that holds a cylinder: {gaps_with_a_cylinder} ({:.1}%)",
+            share(gaps_with_a_cylinder)
+        );
+        println!(
+            "  in a record whose declarations tiled it exactly: {gaps_in_exact_records} ({:.1}%)",
+            share(gaps_in_exact_records)
+        );
+        println!(
+            "  the evaluated point is infinite or NaN: {non_finite} ({:.1}%)",
+            share(non_finite as u64)
+        );
+        if !gaps.is_empty() {
+            for (label, bound_mm) in [
+                ("under 0.01 mm", 0.01),
+                ("under 0.1 mm", 0.1),
+                ("under 1 mm", 1.0),
+                ("under 10 mm", 10.0),
+                ("under 1 m", 1000.0),
+            ] {
+                let count = gaps
+                    .iter()
+                    .filter(|gap| millimetres(**gap) < bound_mm)
+                    .count();
+                println!("  finite and {label}: {count}");
+            }
+            let quantile = |q: f64| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let index = ((gaps.len() - 1) as f64 * q).round() as usize;
+                millimetres(gaps[index])
+            };
+            println!(
+                "  finite: median {:.4} mm, 90th {:.4} mm, max {:.4} mm",
+                quantile(0.5),
+                quantile(0.9),
+                millimetres(*gaps.last().unwrap_or(&0.0))
+            );
+        }
     }
     Ok(())
 }

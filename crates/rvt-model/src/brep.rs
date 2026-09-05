@@ -56,6 +56,10 @@ pub struct SymbolBrep {
     /// Preserved rather than discarded, per the project's "mark unknown
     /// structure explicitly" rule.
     pub excluded_faces: Vec<BrepExclusion>,
+    /// Every edge the record declares that did not resolve. A face is excluded
+    /// by the *first* failing edge its loop reaches, so face exclusions
+    /// undercount and cannot say how badly a reading missed; these can.
+    pub failed_edges: Vec<BrepEdgeFailure>,
 }
 
 impl SymbolBrep {
@@ -69,6 +73,22 @@ impl SymbolBrep {
 pub struct BrepExclusion {
     pub face_id: u32,
     pub reason: &'static str,
+}
+
+/// One edge that did not resolve, with the size of the discrepancy where the
+/// failure has one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BrepEdgeFailure {
+    pub edge_id: u32,
+    pub reason: &'static str,
+    /// How far apart the two adjacent faces placed a shared endpoint, in feet.
+    /// `None` for a failure that is not a disagreement between two readings.
+    ///
+    /// This is the number that separates a tolerance problem from a wrong
+    /// surface: a fraction of a millimetre means the two readings agree and the
+    /// tolerance is too tight, while feet means one of the two faces is being
+    /// evaluated against a surface that is not its own.
+    pub gap_feet: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +144,22 @@ pub enum BrepSurface {
     },
 }
 
+/// Why one edge did not resolve, before it is attributed to an edge id.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EdgeFailure {
+    reason: &'static str,
+    gap_feet: Option<f64>,
+}
+
+impl From<&'static str> for EdgeFailure {
+    fn from(reason: &'static str) -> Self {
+        Self {
+            reason,
+            gap_feet: None,
+        }
+    }
+}
+
 /// One `Edge` object's data needed by every loop that uses it, resolved once
 /// regardless of how many faces reference it.
 struct ResolvedEdge {
@@ -153,6 +189,17 @@ pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolB
 
     let face_surfaces = resolve_face_surfaces(objects, classes);
     let edges = resolve_edges(objects, classes, &face_surfaces);
+    let mut failed_edges = edges
+        .iter()
+        .filter_map(|(id, resolved)| {
+            resolved.as_ref().err().map(|failure| BrepEdgeFailure {
+                edge_id: *id,
+                reason: failure.reason,
+                gap_feet: failure.gap_feet,
+            })
+        })
+        .collect::<Vec<_>>();
+    failed_edges.sort_by_key(|failure| failure.edge_id);
 
     let mut faces = Vec::new();
     let mut excluded_faces = Vec::new();
@@ -171,6 +218,7 @@ pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolB
     SymbolBrep {
         faces,
         excluded_faces,
+        failed_edges,
     }
 }
 
@@ -276,7 +324,7 @@ fn resolve_edges(
     objects: &[SerialObject],
     classes: &BrepClassIndexes,
     face_surfaces: &HashMap<u32, Option<BrepSurface>>,
-) -> HashMap<u32, Result<ResolvedEdge, &'static str>> {
+) -> HashMap<u32, Result<ResolvedEdge, EdgeFailure>> {
     objects
         .iter()
         .filter(|object| object.class_index == classes.edge)
@@ -287,15 +335,15 @@ fn resolve_edges(
 fn resolve_edge(
     edge: &SerialObject,
     face_surfaces: &HashMap<u32, Option<BrepSurface>>,
-) -> Result<ResolvedEdge, &'static str> {
+) -> Result<ResolvedEdge, EdgeFailure> {
     if edge.identifiers.len() != 6 {
-        return Err("edge does not declare six identifiers");
+        return Err("edge does not declare six identifiers".into());
     }
     let Some(&flags) = edge.small_integers.first() else {
-        return Err("edge has no m_flags");
+        return Err("edge has no m_flags".into());
     };
     if edge.numbers.len() < 8 {
-        return Err("edge has no first/last EdgePnt");
+        return Err("edge has no first/last EdgePnt".into());
     }
     let tail = &edge.numbers[edge.numbers.len() - 8..];
     let (first_pnt, last_pnt) = (&tail[0..4], &tail[4..8]);
@@ -349,7 +397,7 @@ fn resolve_edge(
                     if curves_agree(first, second) {
                         first
                     } else {
-                        return Err("the two cylinders disagree on the edge's curve");
+                        return Err("the two cylinders disagree on the edge's curve".into());
                     }
                 }
                 // Asymmetry is a contradiction, not a partial success: a curve
@@ -357,14 +405,14 @@ fn resolve_edge(
                 // the other too. Taking the side that answered would be reading
                 // through a disagreement.
                 (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
-                    return Err("only one of the two cylinders gives the edge a curve");
+                    return Err("only one of the two cylinders gives the edge a curve".into());
                 }
-                (Err(reason), Err(_)) => return Err(reason),
+                (Err(reason), Err(_)) => return Err(reason.into()),
             }
         }
-        (Some(BrepSurface::Cylinder { .. }), _) => classify(0)?,
-        (_, Some(BrepSurface::Cylinder { .. })) => classify(1)?,
-        _ => straight_line(raw_start, raw_end)?,
+        (Some(BrepSurface::Cylinder { .. }), _) => classify(0).map_err(EdgeFailure::from)?,
+        (_, Some(BrepSurface::Cylinder { .. })) => classify(1).map_err(EdgeFailure::from)?,
+        _ => straight_line(raw_start, raw_end).map_err(EdgeFailure::from)?,
     };
 
     Ok(ResolvedEdge {
@@ -383,23 +431,29 @@ fn pick_agreeing_endpoints(
     start1: Option<[f64; 3]>,
     end0: Option<[f64; 3]>,
     end1: Option<[f64; 3]>,
-) -> Result<([f64; 3], [f64; 3]), &'static str> {
+) -> Result<([f64; 3], [f64; 3]), EdgeFailure> {
     let start = agree(start0, start1)?;
     let end = agree(end0, end1)?;
     Ok((start, end))
 }
 
-fn agree(a: Option<[f64; 3]>, b: Option<[f64; 3]>) -> Result<[f64; 3], &'static str> {
+fn agree(a: Option<[f64; 3]>, b: Option<[f64; 3]>) -> Result<[f64; 3], EdgeFailure> {
     match (a, b) {
         (Some(a), Some(b)) => {
-            if distance(a, b) <= CLOSURE_TOLERANCE_FEET {
+            let gap = distance(a, b);
+            if gap <= CLOSURE_TOLERANCE_FEET {
                 Ok(a)
             } else {
-                Err("cross-face EdgePnt evaluation disagreed")
+                Err(EdgeFailure {
+                    reason: "cross-face EdgePnt evaluation disagreed",
+                    gap_feet: Some(gap),
+                })
             }
         }
         (Some(point), None) | (None, Some(point)) => Ok(point),
-        (None, None) => Err("neither adjacent face has a usable surface"),
+        (None, None) => Err(EdgeFailure::from(
+            "neither adjacent face has a usable surface",
+        )),
     }
 }
 
@@ -498,7 +552,7 @@ fn assemble_face(
     face: &SerialObject,
     classes: &BrepClassIndexes,
     by_id: &HashMap<u32, &SerialObject>,
-    edges: &HashMap<u32, Result<ResolvedEdge, &'static str>>,
+    edges: &HashMap<u32, Result<ResolvedEdge, EdgeFailure>>,
     face_surfaces: &HashMap<u32, Option<BrepSurface>>,
 ) -> Result<BrepFace, &'static str> {
     let surface = face_surfaces
@@ -539,7 +593,7 @@ fn walk_loop(
     loop_object: &SerialObject,
     by_id: &HashMap<u32, &SerialObject>,
     classes: &BrepClassIndexes,
-    edges: &HashMap<u32, Result<ResolvedEdge, &'static str>>,
+    edges: &HashMap<u32, Result<ResolvedEdge, EdgeFailure>>,
 ) -> Result<BrepLoop, &'static str> {
     if loop_object.identifiers.len() != 3 {
         return Err("loop does not declare pFace/next/prev");
@@ -564,7 +618,7 @@ fn walk_loop(
             .get(&cur)
             .ok_or("loop edge is not an Edge object")?
             .as_ref()
-            .map_err(|reason| *reason)?;
+            .map_err(|failure| failure.reason)?;
         let side = if resolved.pface[0] == face_id {
             0
         } else if resolved.pface[1] == face_id {
