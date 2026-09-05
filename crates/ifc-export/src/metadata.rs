@@ -1190,9 +1190,11 @@ fn push_named_property_set(
     key: &str,
     relation_key: &str,
 ) {
+    let names = unique_property_names(source);
     let properties = source
         .iter()
-        .filter_map(|property| push_property(file, property))
+        .zip(&names)
+        .filter_map(|(property, name)| push_property(file, property, name))
         .map(reference)
         .collect::<Vec<_>>();
     if properties.is_empty() {
@@ -1221,12 +1223,52 @@ fn push_named_property_set(
     );
 }
 
-fn push_property(file: &mut StepFile, property: &BimProperty) -> Option<EntityRef> {
+/// `IfcPropertySet.UniquePropertyNames` requires the names within one set to
+/// be unique, but distinct Revit built-in parameters share a display name -
+/// `ALL_MODEL_DESCRIPTION` and `PROPERTY_SET_DESCRIPTION` are both
+/// "Description", and the four `STAIRS_ATTR_CALC_*` are all "Calculation
+/// Rules". Their values differ, so dropping the duplicates would lose data.
+/// Every member of a colliding group is therefore qualified by the parameter
+/// identifier that distinguishes it; a name that does not collide is left
+/// exactly as it was declared.
+fn unique_property_names(source: &[BimProperty]) -> Vec<String> {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for property in source {
+        *counts.entry(property.name.as_str()).or_default() += 1;
+    }
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    source
+        .iter()
+        .map(|property| {
+            let mut name = property.name.clone();
+            if counts.get(property.name.as_str()).copied().unwrap_or(0) > 1 {
+                if let Some(id) = property.id.as_ref() {
+                    name = format!("{} [{}]", property.name, id.value);
+                }
+            }
+            // Two parameters may share both name and identifier; an occurrence
+            // suffix is the last resort that keeps the set schema-valid.
+            if used.contains(&name) {
+                let base = name.clone();
+                for occurrence in 2.. {
+                    name = format!("{base} ({occurrence})");
+                    if !used.contains(&name) {
+                        break;
+                    }
+                }
+            }
+            used.insert(name.clone());
+            name
+        })
+        .collect()
+}
+
+fn push_property(file: &mut StepFile, property: &BimProperty, name: &str) -> Option<EntityRef> {
     let nominal = nominal_value(property)?;
     Some(file.push(
         "IFCPROPERTYSINGLEVALUE",
         vec![
-            string(&property.name),
+            string(name),
             optional_string(property.id.as_ref().map(external_id).as_deref()),
             nominal,
             omitted(),
@@ -1493,6 +1535,76 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text.matches("=IFCPROPERTYSET(").count(), 1);
         assert!(!text.contains("'Rivet Type Properties'"));
+    }
+
+    #[test]
+    fn qualifies_property_names_that_collide_within_one_set() {
+        let mut model = model();
+        let mut element = model.elements[0].clone();
+        // Two distinct Revit built-ins that share the display name
+        // "Description", plus one name that does not collide.
+        element.properties = vec![
+            BimProperty {
+                id: Some(BimExternalId {
+                    system: "autodesk.revit.builtInParameter".to_owned(),
+                    value: "-1010103".to_owned(),
+                }),
+                name: "Description".to_owned(),
+                specification: None,
+                value: BimPropertyValue::Text("\u{412}25".to_owned()),
+            },
+            BimProperty {
+                id: Some(BimExternalId {
+                    system: "autodesk.revit.builtInParameter".to_owned(),
+                    value: "-1150481".to_owned(),
+                }),
+                name: "Description".to_owned(),
+                specification: None,
+                value: BimPropertyValue::Text(String::new()),
+            },
+            BimProperty {
+                id: None,
+                name: "Manufacturer".to_owned(),
+                specification: None,
+                value: BimPropertyValue::Text("SANEXT".to_owned()),
+            },
+        ];
+        model.elements = vec![element];
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        // Both colliding parameters survive under names that tell them apart,
+        // and neither keeps the bare colliding name.
+        assert!(text.contains("'Description [-1010103]'"));
+        assert!(text.contains("'Description [-1150481]'"));
+        assert!(!text.contains("('Description',"));
+        // A name that does not collide is left exactly as declared.
+        assert!(text.contains("('Manufacturer',"));
+    }
+
+    #[test]
+    fn keeps_colliding_property_names_unique_without_an_identifier() {
+        // Nothing distinguishes these but their order, so the occurrence
+        // suffix is what keeps the set schema-valid.
+        let source = vec![
+            BimProperty {
+                id: None,
+                name: "Calculation Rules".to_owned(),
+                specification: None,
+                value: BimPropertyValue::Integer(1),
+            },
+            BimProperty {
+                id: None,
+                name: "Calculation Rules".to_owned(),
+                specification: None,
+                value: BimPropertyValue::Integer(2),
+            },
+        ];
+        let names = unique_property_names(&source);
+        assert_eq!(names, ["Calculation Rules", "Calculation Rules (2)"]);
+        assert_ne!(names[0], names[1]);
     }
 
     #[test]

@@ -694,3 +694,111 @@ The pattern is now established well enough to state as guidance: every geometry
 shortfall investigated in this project has turned out to be a verification or
 selection gate in the exporter, not a gap in the decode. Measure the funnel
 before touching the decoder.
+
+### Result: a 50-file corpus, and the first ground truth we have ever had
+
+Observation. Seven archives arrived holding 50 real `.rvt` files across four
+disciplines - AR (architecture, 14 files), KJ (structural, 10), ВК (plumbing,
+13), ОВ (HVAC, 13), 11 GB inflated, all Revit format 2023, build
+`20250724_1515`. Two of them came with something the project has never had: the
+IFC that **Revit itself** exported from the same models,
+`AR_S1.ifc`, written by
+`Autodesk - Revit 26.4.0.32` through `ODA SDAI 25.12`. That is a reference
+answer, not another reading of ours.
+
+The corpus is also the first time the reader met architecture at all: the three
+files it grew up on are ВК, ЭОМ and КЖ.
+
+Result, the parts that held. All 50 files open as CFB/OLE and report their
+release. `inspect` resolves a class for 99.75-99.88% of records on every file,
+anchors 90.6-93.0% of element bodies by the pointer block, and finds
+94.1-100.0% of `Global/ElemTable`'s identifiers - on files up to 400 MB and
+2.0 M objects, in 1-8 s at 28 MB resident, so the streaming design holds at
+five times the old corpus's size.
+
+Two defects fell out, both now fixed with tests:
+
+- **All 10 KJ files panicked.** `inspect` and `element` sliced
+  `payload[record.body_offset()..record.end()]` raw, and a record may be
+  continued into the following member, so a declared end past this payload is
+  an expected condition. `MemberRecord::body_in` now returns the guarded slice
+  and all four call sites go through it. This is the `BRIEF.md` rule about
+  `unwrap()` in parser code, in the form of an index.
+- **`ifcopenshell.validate --rules` failed `IfcPropertySet.UniquePropertyNames`
+  on 54 of AR S1's 189 098 property sets.** Distinct Revit built-ins share a
+  display name - `ALL_MODEL_DESCRIPTION` and `PROPERTY_SET_DESCRIPTION` are
+  both "Description", the four `STAIRS_ATTR_CALC_*` are all "Calculation
+  Rules" - and their values differ, so dropping duplicates would lose data.
+  Every member of a colliding group is now qualified by its parameter id
+  (`Description [-1150481]`); a name that does not collide is untouched.
+
+### Result: the placement chain is right, verified against Revit's own export
+
+Observation. Our AR S1 bodies span X ∈ [-7.9, 38.6] m where Revit's whole
+export spans X ∈ [-18.8, 0.2]. A 1 184-body subset cannot be wider than the
+17 070-body whole, so something had to be wrong.
+
+Experiment. Both files carry the Revit element id - ours in `Tag`, Revit's in
+`Tag` - so match products by it and solve for the rigid transform between the
+two sets of body centroids (Kabsch). 180 ids are common to both.
+
+Result. One rigid transform explains all 180: a rotation of **-88.52° about
+Z** and a translation of (-17.08, 30.47, 0.52) m, median residual 0.22 m over a
+47 m model. Not a bug - Revit's header declares
+`CoordinateBase: Общие координаты`, Shared Coordinates, so its export carries
+the survey-point base and the project rotation while we emit internal project
+coordinates. Z agrees directly, which is why only X and Y looked wrong.
+
+Reproduced on the second reference file. AR S2, 122 common ids, gives
+**-88.39°** about Z - the same rotation to within 0.13° - with a *different*
+translation, (-18.15, 69.24, 0.09) m, median residual 0.38 m. That is exactly
+what a shared-coordinate base predicts and no other explanation does: the
+rotation is the project's true north, one value for the whole project, while
+each section model's own origin sits somewhere else in the survey frame. Had
+our transforms been wrong, two independently decoded files would not agree on
+one angle.
+
+This is the strongest confirmation the transform decode has had: it is checked
+against Autodesk's own answer, by a route that is not ours, on two files, and
+the residual is 0.5% of the model's extent. Confidence high. Composing the
+shared-coordinate base is now a known, bounded piece of work rather than an
+open question.
+
+### Result: what the reference answer says is still missing
+
+With the reference in hand the gaps stop being guesses. On AR S1, ours vs
+Revit's:
+
+| | ours | Revit | note |
+|---|---|---|---|
+| `IfcBuildingStorey` | 163 | 15 | 29 distinct (name, elevation), **15 distinct names** |
+| products with a shape | 1 468 | 17 070 | 8.6% |
+| detailed bodies (`Body`) | 1 184 | 17 070 | 6.9% |
+| typed products | **0** | 16 404 | everything we emit is `IfcBuildingElementProxy` |
+| `IfcWall` | 0 | 7 617 | we recover 13 208 `SWall` elements, 2 197 with a category |
+
+Two selection gates, in the exporter, of the kind the previous entry predicted:
+
+*Typing.* `SOURCE_MAPPINGS` covers only MEP categories - pipes, ducts,
+plumbing, electrical - because ВК/ЭОМ/КЖ is what the reader grew up on, and a
+test pins `Wall`/`OST_Walls` to `Unknown` deliberately. The data is there:
+`OST_Walls` 2 325, `OST_Columns` 702, `OST_Windows` 715, `OST_Doors` 345,
+`OST_Floors` 294, `OST_StairsRailing` 285 on this one file. Nothing is decoded
+wrongly; the table simply has no architecture rows.
+
+*Storeys.* 163 emitted collapse to 29 distinct (name, elevation) pairs and 15
+distinct names, and Revit emits exactly 15. Our first 13 match its names and
+elevations exactly; the excess is the same level repeated - "01 Этаж" at
+elevation 0 is emitted 37 times - at times with a second elevation for one name
+(3.3 m and 4.2 m for "02 Этаж"), which is what levels reached through links or
+other sections would look like. We emit one storey per recovered `Level`
+element and never ask whether two of them are the same storey.
+
+Also corrected, a verification method rather than a finding: `create_shape`
+refuses a `Box`-only product without `keep-bounding-boxes` and an `Axis`-only
+one without `dimensionality = 2`, and returns **local** coordinates unless
+`use-world-coords` is set - so an aggregate over products measures nothing
+about placement without it. An earlier note here claimed a Box cannot be
+geometrized at all; that was wrong. With all three set, every product the
+exporter emits builds: 11 868 across AR/KJ/ВК/ОВ, zero failures, and
+`validate --rules` clean on all four.

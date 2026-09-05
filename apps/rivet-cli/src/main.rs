@@ -1832,9 +1832,7 @@ fn element(
                     header.companion
                 );
                 if header.class_index == header_class_index.unwrap_or(u16::MAX) {
-                    if let Some(fields) =
-                        ElementHeaderFields::parse(&payload[record.body_offset()..record.end()])
-                    {
+                    if let Some(fields) = ElementHeaderFields::parse(record.body_in(payload)) {
                         println!(
                             "    category={}\tfamily={}",
                             fields
@@ -3659,9 +3657,7 @@ fn recover_elements(
                     };
                     let entry = elements.entry(header.id).or_default();
                     entry.record_count += 1;
-                    let body = payload
-                        .get(record.body_offset()..record.end())
-                        .unwrap_or_default();
+                    let body = record.body_in(payload);
 
                     if Some(header.class_index) == geometry_element_class_index {
                         let exact_bounds = GElementBounds::parse(body);
@@ -5766,9 +5762,7 @@ fn inspect(path: &Path, streams_only: bool, max_member_bytes: u64) -> Result<(),
                         .or_default() += 1;
                 }
                 if format_tag == ELEMENT_CLASS_FORMAT_TAG {
-                    let body = payload
-                        .get(record.body_offset()..record.end())
-                        .unwrap_or_default();
+                    let body = record.body_in(payload);
                     if let Some(fields) = ElementFields::parse(body, header.id) {
                         inventory.element_bodies += 1;
                         match fields.anchor {
@@ -5782,9 +5776,7 @@ fn inspect(path: &Path, streams_only: bool, max_member_bytes: u64) -> Result<(),
                 }
                 if Some(header.class_index) == header_class_index {
                     inventory.element_headers += 1;
-                    if let Some(fields) =
-                        ElementHeaderFields::parse(&payload[record.body_offset()..record.end()])
-                    {
+                    if let Some(fields) = ElementHeaderFields::parse(record.body_in(payload)) {
                         if let Some(category) = fields.category {
                             *inventory.categories.entry(category).or_default() += 1;
                             inventory.headers_with_a_category += 1;

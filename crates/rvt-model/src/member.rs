@@ -64,6 +64,20 @@ impl MemberRecord {
     pub const fn end(&self) -> usize {
         self.offset + self.header_bytes + self.body_bytes
     }
+
+    /// The record's body bytes within `payload`, or the empty slice when the
+    /// record is not wholly present.
+    ///
+    /// A record may be continued into the following member, so a declared
+    /// `end()` past the end of one member's payload is an expected condition
+    /// rather than corruption. Reading the body through this accessor keeps
+    /// that case from becoming a panic.
+    #[must_use]
+    pub fn body_in<'a>(&self, payload: &'a [u8]) -> &'a [u8] {
+        payload
+            .get(self.body_offset()..self.end())
+            .unwrap_or_default()
+    }
 }
 
 /// A record walk that allows a record to continue into the next member.
@@ -1170,5 +1184,30 @@ mod tests {
             MemberRecords::parse(&bytes, RecordLayout::Wide),
             Err(MemberRecordError::TruncatedHeader { offset: 24 })
         );
+    }
+
+    #[test]
+    fn body_in_reads_a_record_wholly_inside_the_payload() {
+        let record = MemberRecord {
+            offset: 2,
+            header_bytes: 4,
+            body_bytes: 3,
+        };
+        let payload = [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        assert_eq!(record.body_in(&payload), &[6, 7, 8]);
+    }
+
+    #[test]
+    fn body_in_yields_nothing_for_a_record_continued_past_the_payload() {
+        // A record may be continued into the following member, so a declared
+        // end past this payload is expected. It must read as empty, not panic.
+        let record = MemberRecord {
+            offset: 2,
+            header_bytes: 4,
+            body_bytes: 500_000,
+        };
+        let payload = [0u8; 10];
+        assert!(record.body_in(&payload).is_empty());
+        assert!(record.end() > payload.len());
     }
 }
