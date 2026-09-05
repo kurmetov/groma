@@ -1723,6 +1723,26 @@ mod tests {
             record_declared_id(&schema, root, &record(217_275, 999), "m_hostId"),
             None
         );
+
+        // No one property names an element's type across every class - a
+        // loadable family calls it `m_masterSymbolId`, a system family
+        // `m_idType` - so callers try candidates in order. That is only sound
+        // because a class declaring one of them yields nothing for the others,
+        // whatever the bytes at that offset happen to say.
+        let mut system = Schema {
+            classes: schema.classes.clone(),
+            ..record_schema()
+        };
+        system.classes[1].properties[1].name = "m_idType".to_owned();
+        system.classes[1].properties[1].name_bytes = b"m_idType".to_vec();
+        assert_eq!(
+            record_declared_id(&system, root, &record(310_493, 999), "m_masterSymbolId"),
+            None
+        );
+        assert_eq!(
+            record_declared_id(&system, root, &record(310_493, 999), "m_idType"),
+            Some(310_493)
+        );
     }
 
     #[test]

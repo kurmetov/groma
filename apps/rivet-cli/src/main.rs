@@ -1807,7 +1807,15 @@ fn element(
     Ok(())
 }
 
-/// Property naming the type an element is an instance of.
+/// Properties naming the type an element is an instance of, tried in order.
+///
+/// There is no one such property: `Element` declares none, and a class names
+/// its type under whatever its own chain calls it. `m_masterSymbolId` is a
+/// `FamilyInstance` property and covers loadable families; a system family
+/// carries its own - `RbsCurve.m_idType` for a pipe or duct. Each is read by
+/// [`rvt_model::record_declared_id`] out of the record's own header, so a class
+/// that declares none of them simply has no type reference and a class that
+/// declares one cannot pick up another's.
 ///
 /// Measured, not guessed, on SMALL. All 10 011 `FamilyInstance` records that
 /// carry a value name an element that is a `FamilySymbol` - 10 011 of 10 011,
@@ -1829,7 +1837,10 @@ fn element(
 /// instantiated from a nested symbol rather than from the instance's own type.
 /// Only on the bounds-verified subset, where the `GInstance` symbol is proven
 /// to be this instance's, do they agree everywhere.
-const TYPE_ELEMENT_ID_PROPERTY: &str = "m_masterSymbolId";
+///
+/// `RbsCurve.m_idType` was measured the same way; see the working notes for its
+/// numbers.
+const TYPE_ELEMENT_ID_PROPERTIES: &[&str] = &["m_masterSymbolId", "m_idType"];
 
 /// One element as it is emitted to JSON.
 #[derive(Debug, Default)]
@@ -1879,7 +1890,7 @@ struct ExportedElement {
 impl ExportedElement {
     /// The element this one is an instance of: its declared type reference,
     /// or - for a record whose declarations did not yield one - the symbol its
-    /// bounds were verified against. See [`TYPE_ELEMENT_ID_PROPERTY`].
+    /// bounds were verified against. See [`TYPE_ELEMENT_ID_PROPERTIES`].
     fn type_element_reference(&self) -> Option<u32> {
         self.type_element_id
             .and_then(|id| u32::try_from(id).ok())
@@ -3188,15 +3199,17 @@ fn recover_elements(
                         }
                         // The type an element is an instance of is a declared
                         // property, so it is read rather than inferred from
-                        // geometry. See `TYPE_ELEMENT_ID_PROPERTY`.
+                        // geometry. See `TYPE_ELEMENT_ID_PROPERTIES`.
                         if entry.type_element_id.is_none() {
                             entry.type_element_id = schema.as_ref().and_then(|schema| {
-                                rvt_model::record_declared_id(
-                                    schema,
-                                    header.class_index,
-                                    body,
-                                    TYPE_ELEMENT_ID_PROPERTY,
-                                )
+                                TYPE_ELEMENT_ID_PROPERTIES.iter().find_map(|property| {
+                                    rvt_model::record_declared_id(
+                                        schema,
+                                        header.class_index,
+                                        body,
+                                        property,
+                                    )
+                                })
                             });
                         }
                         if let Some(fields) = ElementFields::parse(body, header.id) {
@@ -3297,7 +3310,7 @@ fn recover_elements(
 /// An instance's own declarations carry no name property - in Revit its name is
 /// its type's - so `FamilySymbol`'s declared `SymbolInfo.m_name` is the one to
 /// use, reached through the instance's declared type reference (see
-/// [`TYPE_ELEMENT_ID_PROPERTY`]) or, failing that, the symbol its bounds were
+/// [`TYPE_ELEMENT_ID_PROPERTIES`]) or, failing that, the symbol its bounds were
 /// verified against. It takes precedence over a scanned name, which for an
 /// instance is whatever string the body happened to hold first, and stands
 /// aside for a declared one.
