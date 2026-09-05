@@ -864,6 +864,12 @@ same IFC entity Revit chose**. `IfcWall`, `IfcSlab`, `IfcStair`,
 falling back to a proxy: 1 188 railings, 746 openings, 248 columns, 186
 windows, 134 members, 37 plates, 13 doors.
 
+Reproduced on the second reference file without touching anything: AR S2
+exports **10 918 of its 11 121 products (98.2%)**, **81.1%** of them as the
+same IFC entity, 15 storeys against Revit's 13 with 12 exact matches, and 100%
+recall on all five typed entities again (`IfcWall` 7 733, `IfcSlab` 556,
+`IfcStair` 11, `IfcStairFlight` 22, `IfcRoof` 3).
+
 One schema trap on the way: `IfcStairFlight` declares `NumberOfRisers`,
 `NumberOfTreads`, `RiserHeight` and `TreadLength` between `IfcElement`'s eight
 attributes and its `PredefinedType`, so the generic writer put the enumeration
@@ -891,3 +897,9 @@ Across disciplines: KJ S1 goes 565 -> 14 storeys, AR S1 163 -> 15, while ВК S1
 stays at 12, which it already had right - the rule costs nothing where nothing
 was wrong. `validate --rules` is clean on all three and every emitted product
 still builds.
+
+Confirmed over the whole corpus, 50 files, zero failures. Mean storeys per file
+by discipline, before -> after: **AR 129 -> 14** (max 236 -> 19), **KJ 598 ->
+16** (max 1 236 -> 24), ОВ 13 -> 11, ВК 11 -> 10. The two disciplines that
+carry links to the project's other sections are the two that collapse; the two
+that were already right barely move. 10 364 925 elements exported in total.
