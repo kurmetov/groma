@@ -903,3 +903,56 @@ by discipline, before -> after: **AR 129 -> 14** (max 236 -> 19), **KJ 598 ->
 16** (max 1 236 -> 24), ОВ 13 -> 11, ВК 11 -> 10. The two disciplines that
 carry links to the project's other sections are the two that collapse; the two
 that were already right barely move. 10 364 925 elements exported in total.
+
+### Result: what the JSON export was missing, and what it cannot know
+
+*References resolved.* `level_id`, `type_id` and `family_id` were bare
+identifiers, so answering "which storey is this wall on" meant joining an
+800 133-line file to itself. Each now carries the referenced element's name
+too. They resolve well: `level_name` 20 015 / 20 015 (100%), `type_name`
+10 826 / 10 934 (99.0%), `family_name` 480 420 / 501 005 (95.9%). A reference
+whose target has no name keeps the identifier alone rather than gaining a
+placeholder.
+
+*Units are not in the file, and this is now settled rather than assumed.* Of
+460 028 parameter values on AR S1, 94.6% are built-in parameters and **none**
+carries a Forge spec, while project parameters do - 78.3% of them - because
+their spec is scanned out of the parameter-definition element. Three places
+were checked and none holds the built-in mapping: `Global/Latest` decodes to
+1 061 registry objects, all of them unit, symbol, quantity, dimension and spec
+*definitions*, with nothing naming a parameter; `Formats/Latest` contains no
+`autodesk.spec` identifier at all; and the value record is `[id, value]` with
+no room for one. It is Revit's own definition and has to come from Autodesk's
+published tables, exactly as the built-in *name* table already does.
+
+The reference export can verify such a table once there is one, but cannot
+supply it. Matching elements by Revit element id and dividing Revit's exported
+quantity by our raw value identifies a dimension wherever the two describe the
+same thing: `-1001101` hits exactly 304.8 - feet to millimetres - on 7 476 of
+7 632 samples, and `WALL_USER_HEIGHT_PARAM` on 295, being the wall's own height
+only where it is not level-bound. That locked 3 parameters of the 256 the file
+uses, because it can only speak for the ones Revit exports as quantities.
+
+Also worth knowing: 249 of those 256 built-in identifiers have a catalogue
+name. The 7 that do not are not a catalogue gap to fill by guessing - two of
+them, `-1001101` and `-1001111`, sit on all 13 208 walls and account for
+26 416 of the 26 731 unnamed values, and neither appears in Autodesk's
+published enumeration. They stay `param_-1001101`, which is rule 12 working.
+
+### Observation: rooms are decoded and go nowhere
+
+`RoomElem` yields **554** elements on AR S1 against the reference export's
+**553 `IfcSpace`**, and they are not thin: every one carries a level (and now
+its name) and a `ROOM_NAME`, and 553 of them carry the project's own schedule
+parameters - `Number`, `SP_назначение`, `SP_количество_комнат`, `SP_этаж`,
+`SP_подъезд`, `SP_тип_помещения` and four area parameters. That is the data
+behind "what equipment belongs to room 204", which `BRIEF.md` names as a target
+query.
+
+They are already complete in the JSON. What they never reach is the IFC: a
+`RoomElem` declares no category, is not a building-element class and has no
+verified geometry, so the candidate filter drops all 554 and the export
+carries **0 `IfcSpace`** against Revit's 553. Emitting them needs a spatial
+boundary or, failing that, a space with a placement and no shape - not
+attempted here, but it is a bounded gap with a reference answer to check
+against.
