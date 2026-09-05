@@ -5,53 +5,74 @@
 //! body by following those declarations instead of hunting for offsets. The
 //! walk asserts nothing on its own: a body is only accepted when the declared
 //! properties tile it exactly, the same standard the member walk already uses.
+//!
+//! # Three readings that only work together
+//!
+//! Geometry records used to tile exactly 88.0% / 84.8% / 71.9% of the time on
+//! the three corpus files, counting the face-bearing `GElement` records
+//! geometry is actually read out of. They now tile **100%** - 13 886 / 7 712 /
+//! 10 534 of 13 886 / 7 712 / 10 534 - and what closed the gap was dropping
+//! three special cases rather than adding a fourth:
+//!
+//! 1. `GInfo.m_flags` was read at two bytes when the lead word's top bit was
+//!    clear. It is read at its declared four bytes, like every other alternate
+//!    integer.
+//! 2. A reference inside an object rooted at `GNode` was read at a fixed six
+//!    bytes, writing a class index even after a null identifier. It is read at
+//!    the same variable width as every other reference: four bytes for a null.
+//! 3. A `GFace` naming a filling was given two extra unexplained bytes, and
+//!    `m_faceFlags_v9` - a property whose name carries a version gate - was
+//!    skipped. The gated property is written, and it is those two bytes plus
+//!    the two that reading nulls at six bytes was absorbing.
+//!
+//! All eight combinations were measured on BIG's face-bearing records. Each of
+//! the three *alone* takes 71.9% to **0%**, as do two of the three pairs; the
+//! third pair reaches 21.9%, still well below leaving everything alone. Only
+//! the three together reach 100%. That is the shape of the thing: the old
+//! readings were mutually compensating, each paying for another's two-byte
+//! error, so every one of them measured worse in isolation than the wrong
+//! reading it replaced - and no discriminator was ever going to rescue them
+//! one at a time. The switch that measured the eight combinations was
+//! temporary and is gone; `rivet flags-probe` is what remains, and it checks
+//! the width the walk reads against the width the following bytes prove.
+//!
+//! What is *not* established is how to interpret `GInfo.m_flags`. Its four
+//! bytes are accounted for, but nothing in the corpus separates "a four-byte
+//! flags field" from "a two-byte flags field followed by two bytes belonging
+//! to something undeclared", because no independent reading of the value
+//! exists to check. The walk reads the declaration as declared, which is the
+//! reading that needs no extra rule, and does not interpret the value.
 
 use rvt_schema::{FieldType, PropertyDefinition, Schema, TypeReference};
 
 use crate::{geometry::GElementNodeReference, member::MAX_STRING_CHARS};
 
-/// A serialized reference written by a geometry-graph node: identifier plus
-/// class index, both always present. See [`GEOMETRY_NODE_ROOT_CLASS_NAME`].
+/// A reference that names an object: identifier plus class index. A null
+/// reference stops after the identifier and costs
+/// [`IDENTIFIER_REFERENCE_BYTES`].
 const OBJECT_REFERENCE_BYTES: usize = 6;
-/// Short width of an `Integer32Alternate`. Two fields take it: `GInfo.m_flags`,
-/// where the lead word's top bit is the trigger (see
-/// [`ALTERNATE_CONTINUATION_BIT`]), and whichever variable-width field opens a
-/// record body (see [`FIRST_RECORD_IDENTIFIER_BYTES`]).
+/// Short width of an `Integer32Alternate`. One field takes it: whichever
+/// variable-width field opens a record body. See
+/// [`FIRST_RECORD_IDENTIFIER_BYTES`].
 const ALTERNATE_INTEGER32_BYTES: usize = 2;
-/// Long width of an `Integer32Alternate`, which is its declared width, and the
-/// width every alternate integer other than those two is written at.
+/// Long width of an `Integer32Alternate`, which is its declared width and the
+/// width every alternate integer but the record-opening one is written at.
 ///
 /// Measured, not guessed. Reading them at the short width leaves the rest of
 /// the record shifted two bytes early, which the record's own length hides
 /// until the reference queue drains: the tail then reads as `0xffff_yyyy`
-/// where an object's `GInfo.m_tag` should hold `0xffff_ffff`. Reading the
-/// declared width instead lifts the share of face-bearing `GElement` records
-/// that tile exactly from 76.5% / 44.0% / 21.4% to 88.0% / 84.8% / 71.9%
-/// across the three corpus files, and the values it recovers corroborate it:
-/// `GFilling.m_fillColor` reads as colours - 0x01000000 for the great
-/// majority, then 0x0000ffff, 0x00fdfdfd, 0x0000bb00 - where the short read
-/// splits each colour across two fields.
+/// where an object's `GInfo.m_tag` should hold `0xffff_ffff`. The values the
+/// declared width recovers corroborate it: `GFilling.m_fillColor` reads as
+/// colours - 0x01000000 for the great majority, then 0x0000ffff, 0x00fdfdfd,
+/// 0x0000bb00 - where the short read splits each colour across two fields.
+///
+/// `GInfo.m_flags` was read narrower than this for a while, on the reading
+/// that the lead word's top bit marks a longer form. It does not: see
+/// [`FlagWidthSample`] for the labelling that refuted it, and the module
+/// header for what the three readings it was entangled with cost together.
 const ALTERNATE_INTEGER32_LONG_BYTES: usize = 4;
 /// Width read for `Integer16Alternate`, by the same reasoning.
 const ALTERNATE_INTEGER16_BYTES: usize = 1;
-/// Inline object whose `m_flags` carries the variable width.
-const GINFO_CLASS_NAME: &str = "GInfo";
-/// Root of the geometry graph's class chain. Objects rooted here write a
-/// reference's class index even when the identifier is null; every other object
-/// stops after a null identifier, so a null costs four bytes rather than six.
-///
-/// Measured, not guessed, and the split is real rather than a convenience:
-/// reading every reference at the fixed six bytes explains 97.4% of SMALL's
-/// `GElement` records and 0% of its `FamilyInstance` records; reading every
-/// reference variably explains 54.3% of the `FamilyInstance` records and drops
-/// `GElement` to 79.1%; splitting on the class chain's root holds both at once,
-/// 97.4% and 54.3%, with `FamilySymbol` going from 0% to 72.9%. Single records
-/// corroborate both forms: `GeomTable.m_bigTableOwner`, a null in a
-/// `FamilyInstance` record, is followed four bytes later by the next property's
-/// value, while a `GFace` node's null filling is followed six bytes later.
-const GEOMETRY_NODE_ROOT_CLASS_NAME: &str = "GNode";
-/// Top bit of an alternate integer's lead word, marking the longer form.
-const ALTERNATE_CONTINUATION_BIT: u16 = 0x8000;
 /// Bit of the loading mode that marks a property holding references rather
 /// than an inline object.
 const REFERENCE_LOADING_BIT: u8 = 0x01;
@@ -147,12 +168,12 @@ pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk
         strings: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
-        fixed_references: false,
         record_narrow_pending: true,
-        node_flags: 0,
         trace: None,
         kept_strings: None,
         string_distance: 0,
+        node_class: 0,
+        flag_samples: None,
     };
     let stop = reader.read_class(class_index, 0).err();
     let consumed = reader.offset;
@@ -181,12 +202,12 @@ pub fn walk_object_stream(schema: &Schema, class_index: u16, body: &[u8]) -> Ser
         strings: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
-        fixed_references: false,
         record_narrow_pending: true,
-        node_flags: 0,
         trace: None,
         kept_strings: None,
         string_distance: 0,
+        node_class: 0,
+        flag_samples: None,
     };
     let mut stop = reader.read_class(class_index, 0).err();
     let mut objects = 0_usize;
@@ -244,26 +265,14 @@ const NULL_DOCUMENT_HANDLE_BYTES: usize = 2;
 /// Width of a handle that names a document.
 const DOCUMENT_HANDLE_BYTES: usize = 4;
 
-/// A `GFace` that names a filling carries two more bytes than its declarations
-/// account for, between `m_pGFilling` and `m_cutType`. Measured, not guessed:
-/// across 105 217 `GFace` objects whose alignment could be checked against the
-/// `Face.m_pSurf` reference that ends the object, the two bytes are present in
-/// all 10 802 whose `m_pGFilling` is a live reference and absent in all 94 415
-/// whose `m_pGFilling` is null, with no exception either way. The check used
-/// was independent of this rule: the alternative alignment has to leave
-/// `m_pSurf` naming a class derived from `Surface`, and only one of the two
-/// does. `m_cutType` corroborates it - it reads 4, 5 or 6 under this rule for
-/// every face, and a shifted `0x00040000`/`0x00060000` without it.
-///
-/// Which declaration owns the two bytes is *not* established. They sit between
-/// `m_pGFilling` and `m_cutType`, and `m_oBackgroundFilling` - the declaration
-/// in between - is a null reference in every face of the corpus, so no body
-/// here can separate "a live `m_pGFilling` is followed by two bytes" from "a
-/// background filling is written differently when a filling exists". The rule
-/// is applied at `m_pGFilling`, the field whose value predicts them.
-const FILLED_FACE_CLASS_NAME: &str = "GFace";
-const FILLED_FACE_FILLING_PROPERTY: &str = "m_pGFilling";
-const FILLED_FACE_FILLING_BYTES: usize = 2;
+/// Inline object every geometry-graph node inherits, whose `m_flags` closes
+/// its header. The name is needed only by the width instrument, which samples
+/// a node's own `GInfo` and nothing nested deeper.
+const GINFO_CLASS_NAME: &str = "GInfo";
+/// Class whose first declaration after the inherited `GNode.m_GInfo` names an
+/// edge loop, which is what makes it checkable by the width oracle. See
+/// [`flag_width_oracle`].
+const FACE_CLASS_NAME: &str = "GFace";
 
 /// An entity-map entry costs thirty-six bytes where its declarations account
 /// for twenty-two. `ESEntityCell.m_entityMap` is a counted collection of
@@ -385,7 +394,11 @@ pub fn walk_record_collecting(
     class_index: u16,
     body: &[u8],
 ) -> (SerialRecordWalk, Vec<SerialObject>) {
-    let (walk, _, objects, _) = walk_record_inner(schema, class_index, body, false, true, false);
+    let options = RecordWalkOptions {
+        collect: true,
+        ..RecordWalkOptions::default()
+    };
+    let (walk, _, objects, _, _) = walk_record_inner(schema, class_index, body, options);
     (walk, objects)
 }
 
@@ -397,7 +410,11 @@ pub fn walk_record_strings(
     class_index: u16,
     body: &[u8],
 ) -> (SerialRecordWalk, Vec<SerialString>) {
-    let (walk, _, _, strings) = walk_record_inner(schema, class_index, body, false, false, true);
+    let options = RecordWalkOptions {
+        keep_strings: true,
+        ..RecordWalkOptions::default()
+    };
+    let (walk, _, _, strings, _) = walk_record_inner(schema, class_index, body, options);
     (walk, strings)
 }
 
@@ -540,12 +557,12 @@ pub fn record_declared_id(
         strings: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
-        fixed_references: false,
         record_narrow_pending: true,
-        node_flags: 0,
         trace: Some(Vec::new()),
         kept_strings: None,
         string_distance: 0,
+        node_class: 0,
+        flag_samples: None,
     };
     let _stop = reader.read_class(class_index, 0).err();
     let offset = reader
@@ -566,7 +583,11 @@ pub fn walk_record_traced(
     class_index: u16,
     body: &[u8],
 ) -> (SerialRecordWalk, Vec<SerialTraceEntry>) {
-    let (walk, trace, _, _) = walk_record_inner(schema, class_index, body, true, false, false);
+    let options = RecordWalkOptions {
+        trace: true,
+        ..RecordWalkOptions::default()
+    };
+    let (walk, trace, _, _, _) = walk_record_inner(schema, class_index, body, options);
     (walk, trace)
 }
 
@@ -575,22 +596,141 @@ pub fn walk_record_traced(
 /// the references were read, and a trailing `u32` repeating the body length.
 #[must_use]
 pub fn walk_record(schema: &Schema, class_index: u16, body: &[u8]) -> SerialRecordWalk {
-    walk_record_inner(schema, class_index, body, false, false, false).0
+    walk_record_inner(schema, class_index, body, RecordWalkOptions::default()).0
+}
+
+/// One node `GInfo` met while walking a record, with everything its header
+/// carries and - where the object's next declaration can be checked - the
+/// width of `m_flags` that the bytes themselves prove.
+///
+/// This is an instrument, not a rule, and it labels a site without assuming
+/// any rule: the width is read off the bytes that follow, so a reading can be
+/// scored against the label rather than against itself. That is what refuted
+/// taking the lead word's top bit as a width marker. It labels 108 136 /
+/// 50 543 / 123 473 sites across the corpus at four bytes and not one site at
+/// two, and every header field that reading would have needed a discriminator
+/// in (`m_tag`, `m_controlCommand`, `m_categoryId`, and both words of
+/// `m_flags` itself) is byte-identical between the loops it read correctly and
+/// the 711 it did not. There was no discriminator to find.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlagWidthSample {
+    /// Class of the node whose `GInfo` this is.
+    pub node_class: u16,
+    /// Offset of the `GInfo`'s first byte within the record body.
+    pub offset: usize,
+    pub tag: u32,
+    pub control_command: u32,
+    /// `GInfo.m_categoryId`, an inline `ElementId` holding one `Integer32`.
+    pub category_id: i32,
+    /// First word of `m_flags`. Its top bit was once read as a width marker;
+    /// it is an ordinary flag bit, set on `Face` and `Edge` and clear on
+    /// `EdgeLoop` and `GFilling`, which is the correlation that made the
+    /// reading look right for as long as it did.
+    pub lead: u16,
+    /// Second word of `m_flags`, the half the narrow reading dropped.
+    pub second: u16,
+    /// The words from `m_flags` onwards, so a caller can read the object's
+    /// next declaration under either width without a second walk. Words the
+    /// body is too short for read zero.
+    pub words: [u16; FLAG_SAMPLE_WORDS],
+    /// Whether this object's next declaration is one the oracle can check.
+    /// An unchecked object is still sampled, so a report can say how much of
+    /// the corpus the check reaches rather than only what it found.
+    pub checkable: bool,
+    /// Whether reading `m_flags` at two bytes lands the object's next
+    /// declaration on a live reference of the class the schema fixes.
+    pub short_legal: bool,
+    /// The same test with `m_flags` read at four bytes.
+    pub long_legal: bool,
+    /// Width the bytes prove, when exactly one of the two lands the object's
+    /// next declaration on a legal reference. `None` when neither does or both
+    /// do - an unlabelled sample, not a two-byte one.
+    pub proved: Option<usize>,
+    /// Width the walk read here, which is the declared four for every node
+    /// `GInfo` in the corpus. Kept so a caller can report disagreement rather
+    /// than assume there is none.
+    pub read: usize,
+}
+
+/// Whether the reference following `GInfo` in a node of `node_class` can be
+/// checked, and the class its target must descend from.
+///
+/// Two node classes qualify, and both for the same reason: their first
+/// declaration after the inherited `GNode.m_GInfo` is a full reference - an
+/// identifier and a class index - whose target class the schema fixes.
+/// `GEdgeLoop.m_nextLoop` and `GFace.m_pFirstLoop` both name an edge loop, so
+/// a correct read lands on one class index out of the schema's 4 418 and a
+/// two-byte misread lands on whatever the following bytes happen to be.
+/// `GEdge`'s six links are bare identifiers with no class index, so nothing
+/// there separates a right read from a wrong one; edges are not sampled.
+fn flag_width_oracle(schema: &Schema, node_class: u16) -> Option<&'static str> {
+    if descends_from(schema, node_class, EDGE_LOOP_CLASS_NAME)
+        || descends_from(schema, node_class, FACE_CLASS_NAME)
+    {
+        Some(EDGE_LOOP_CLASS_NAME)
+    } else {
+        None
+    }
+}
+
+/// Class both checkable declarations name: `GEdgeLoop.m_nextLoop` and
+/// `GFace.m_pFirstLoop`.
+const EDGE_LOOP_CLASS_NAME: &str = "GEdgeLoop";
+/// Depth at which a node's own `GInfo` properties are read: the node is read
+/// at depth 1 and its inline `GInfo` one step in. A `GInfo` deeper than this
+/// belongs to something the node contains, whose following declaration the
+/// oracle does not know, so it is not sampled.
+const NODE_GINFO_DEPTH: usize = 2;
+/// Bytes of `GInfo` ahead of `m_flags`: `m_tag`, `m_controlCommand` and
+/// `m_categoryId`, four each.
+const GINFO_HEADER_BYTES: usize = 12;
+/// Words kept from `m_flags` onwards: enough for the four-byte form and the
+/// six-byte reference that may follow it, plus one either side.
+pub const FLAG_SAMPLE_WORDS: usize = 6;
+
+/// Walk a record exactly as [`walk_record`] does, sampling every node
+/// `GInfo.m_flags` on the way so a caller can check the width the walk took
+/// against the width the following bytes prove. See [`FlagWidthSample`].
+#[must_use]
+pub fn walk_record_flag_widths(
+    schema: &Schema,
+    class_index: u16,
+    body: &[u8],
+) -> (SerialRecordWalk, Vec<FlagWidthSample>) {
+    let options = RecordWalkOptions {
+        flag_widths: true,
+        ..RecordWalkOptions::default()
+    };
+    let (walk, _, _, _, samples) = walk_record_inner(schema, class_index, body, options);
+    (walk, samples)
+}
+
+/// What one record walk should keep beyond the walk result itself.
+#[derive(Clone, Copy, Debug, Default)]
+// One independent switch per kind of output a caller can ask to keep.
+#[allow(clippy::struct_excessive_bools)]
+struct RecordWalkOptions {
+    trace: bool,
+    collect: bool,
+    keep_strings: bool,
+    /// Sample every node `GInfo.m_flags` against the width oracle. See
+    /// [`FlagWidthSample`].
+    flag_widths: bool,
 }
 
 fn walk_record_inner(
     schema: &Schema,
     class_index: u16,
     body: &[u8],
-    trace: bool,
-    collect: bool,
-    keep_strings: bool,
+    options: RecordWalkOptions,
 ) -> (
     SerialRecordWalk,
     Vec<SerialTraceEntry>,
     Vec<SerialObject>,
     Vec<SerialString>,
+    Vec<FlagWidthSample>,
 ) {
+    let (trace, collect, keep_strings) = (options.trace, options.collect, options.keep_strings);
     let trailer_offset = body.len().saturating_sub(RECORD_LENGTH_TRAILER_BYTES);
     let length_trailer_matches = body
         .get(trailer_offset..)
@@ -607,12 +747,12 @@ fn walk_record_inner(
         strings: Vec::new(),
         small_integers: Vec::new(),
         node_headers: false,
-        fixed_references: false,
         record_narrow_pending: true,
-        node_flags: 0,
         trace: trace.then(Vec::new),
         kept_strings: keep_strings.then(Vec::new),
         string_distance: 0,
+        node_class: 0,
+        flag_samples: options.flag_widths.then(Vec::new),
     };
     let mut stop = reader.read_class(class_index, 0).err();
     // References read so far are the record's own: the objects they name sit
@@ -637,7 +777,7 @@ fn walk_record_inner(
             continue;
         }
         nodes += 1;
-        reader.fixed_references = reader.is_geometry_node(reference.class_index);
+        reader.node_class = reference.class_index;
         reader.string_distance = if next <= own_references { 1 } else { 2 };
         let began = reader.offset;
         let first_reference = reader.references.len();
@@ -677,18 +817,8 @@ fn walk_record_inner(
         reader.trace.unwrap_or_default(),
         objects,
         reader.kept_strings.unwrap_or_default(),
+        reader.flag_samples.unwrap_or_default(),
     )
-}
-
-/// The object version a property named `_v<N>` was introduced in, if its name
-/// carries one. Measured on `GFace.m_faceFlags_v9`, which a version-8 face
-/// omits and a later face writes.
-fn version_gate(name: &str) -> Option<u32> {
-    let (head, digits) = name.rsplit_once("_v")?;
-    if head.is_empty() || digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
 }
 
 struct Reader<'a> {
@@ -709,22 +839,21 @@ struct Reader<'a> {
     /// Whether the walk is inside the node stream rather than the record's
     /// own declared properties.
     node_headers: bool,
-    /// Whether the object being read writes a class index after a null
-    /// identifier. See [`GEOMETRY_NODE_ROOT_CLASS_NAME`].
-    fixed_references: bool,
     /// Whether the record body's first variable-width field is still to come.
     /// That field is written two bytes narrower than its declared width; every
     /// later one takes the declared width. See [`FIRST_RECORD_IDENTIFIER_BYTES`].
     record_narrow_pending: bool,
-    /// Flags of the `GInfo` most recently read, which gate later-version
-    /// properties for the rest of that object.
-    node_flags: u32,
     trace: Option<Vec<SerialTraceEntry>>,
     /// Every `String` read, with its declaration, when a caller asked for them.
     kept_strings: Option<Vec<SerialString>>,
     /// Distance of the object being read from the record's own declarations.
     /// See [`SerialString::distance`].
     string_distance: u8,
+    /// Class of the node stream object being read, which decides whether the
+    /// `GInfo` width oracle applies. See [`flag_width_oracle`].
+    node_class: u16,
+    /// Samples collected by the width instrument, when one is running.
+    flag_samples: Option<Vec<FlagWidthSample>>,
 }
 
 impl Reader<'_> {
@@ -759,14 +888,6 @@ impl Reader<'_> {
         property: &PropertyDefinition,
         depth: usize,
     ) -> Result<(), SerialStop> {
-        // A property named `_v<N>` belongs to a later object version. Whether
-        // one is written varies inside a single file - two `GFace` objects
-        // differ by exactly this field - but no discriminator has been found:
-        // gating on the version carried in the node flags, or on the bit that
-        // separates those two faces, both score below simply skipping it.
-        if version_gate(&property.name).is_some() {
-            return Ok(());
-        }
         match property.item_mode {
             // A single value, and a string, which is one value however the
             // item mode is written.
@@ -858,23 +979,7 @@ impl Reader<'_> {
                     return self.advance(ES_ENTITY_TRAILING_BYTES).ok_or_else(truncated);
                 }
                 if reference || identifier_only {
-                    if self.fixed_references {
-                        self.take_reference().ok_or_else(&truncated)?;
-                    } else {
-                        self.take_record_reference().ok_or_else(&truncated)?;
-                    }
-                    if class_name == FILLED_FACE_CLASS_NAME
-                        && property.name == FILLED_FACE_FILLING_PROPERTY
-                        && self
-                            .references
-                            .last()
-                            .is_some_and(|reference| reference.object_id != 0)
-                    {
-                        return self
-                            .advance(FILLED_FACE_FILLING_BYTES)
-                            .ok_or_else(truncated);
-                    }
-                    return Ok(());
+                    return self.take_reference().ok_or_else(truncated);
                 }
                 let Some(static_index) =
                     property.static_type.as_ref().and_then(TypeReference::index)
@@ -938,34 +1043,24 @@ impl Reader<'_> {
                 self.advance(bytes).ok_or_else(truncated)
             }
             FieldType::Integer32Alternate => {
-                // Inside a node's `GInfo` this field is the one that varies:
-                // the lead word's top bit marks the four-byte form. Reading
-                // every `GInfo.m_flags` at four bytes instead explains no
-                // record at all, so the variation is real.
-                if self.node_headers && class_name == GINFO_CLASS_NAME {
-                    let lead = self.peek_u16().ok_or_else(&truncated)?;
-                    let long = lead & ALTERNATE_CONTINUATION_BIT != 0;
-                    // The flags value gates the properties a later version
-                    // added, so it is kept for the rest of this object.
-                    self.node_flags = if long {
-                        self.peek_u32().unwrap_or_default()
-                    } else {
-                        u32::from(lead)
-                    };
-                    let width = if long {
-                        ALTERNATE_INTEGER32_LONG_BYTES
-                    } else {
-                        ALTERNATE_INTEGER32_BYTES
-                    };
-                    return self.advance(width).ok_or_else(truncated);
-                }
-                // Every other alternate integer is written at its declared
-                // four bytes, except the one that opens a record body.
+                // Every alternate integer takes its declared width, except
+                // the one that opens a record body.
                 let width = if self.take_narrow() {
                     ALTERNATE_INTEGER32_BYTES
                 } else {
                     ALTERNATE_INTEGER32_LONG_BYTES
                 };
+                if self.flag_samples.is_some()
+                    && self.node_headers
+                    && class_name == GINFO_CLASS_NAME
+                    && depth == NODE_GINFO_DEPTH
+                {
+                    if let Some(sample) = self.sample_flag_width(width) {
+                        if let Some(samples) = self.flag_samples.as_mut() {
+                            samples.push(sample);
+                        }
+                    }
+                }
                 self.advance(width).ok_or_else(truncated)
             }
             FieldType::Integer16Alternate => self
@@ -1030,11 +1125,6 @@ impl Reader<'_> {
         })
     }
 
-    fn peek_u32(&self) -> Option<u32> {
-        let bytes = self.body.get(self.offset..self.offset.checked_add(4)?)?;
-        Some(u32::from_le_bytes(bytes.try_into().ok()?))
-    }
-
     fn peek_u16(&self) -> Option<u16> {
         let bytes = self.body.get(self.offset..self.offset.checked_add(2)?)?;
         Some(u16::from_le_bytes(bytes.try_into().ok()?))
@@ -1056,11 +1146,6 @@ impl Reader<'_> {
         Some(())
     }
 
-    /// Whether `class_index` descends from the geometry graph's root class.
-    fn is_geometry_node(&self, class_index: u16) -> bool {
-        descends_from(self.schema, class_index, GEOMETRY_NODE_ROOT_CLASS_NAME)
-    }
-
     /// Whether this is the record body's first variable-width field, which is
     /// written narrow. Claims the narrow form, so only one field gets it.
     fn take_narrow(&mut self) -> bool {
@@ -1069,10 +1154,11 @@ impl Reader<'_> {
         narrow
     }
 
-    /// Read a reference in a record's own header, where the identifier is
-    /// four bytes - two if it opens the body - and the class index follows only
-    /// when the identifier names an object.
-    fn take_record_reference(&mut self) -> Option<()> {
+    /// Read a reference: an identifier of four bytes - two if it opens the
+    /// record body - followed by a class index only when the identifier names
+    /// an object. One encoding, everywhere; see the module header for the
+    /// geometry-graph exception this used to carry.
+    fn take_reference(&mut self) -> Option<()> {
         let identifier_bytes = if self.take_narrow() {
             FIRST_RECORD_IDENTIFIER_BYTES
         } else {
@@ -1101,15 +1187,72 @@ impl Reader<'_> {
         Some(())
     }
 
-    fn take_reference(&mut self) -> Option<()> {
-        let end = self.offset.checked_add(OBJECT_REFERENCE_BYTES)?;
-        let bytes = self.body.get(self.offset..end)?;
-        self.references.push(GElementNodeReference {
-            object_id: u32::from_le_bytes(bytes[0..4].try_into().ok()?),
-            class_index: u16::from_le_bytes(bytes[4..6].try_into().ok()?),
+    fn u32_at(&self, at: usize) -> Option<u32> {
+        let bytes = self.body.get(at..at.checked_add(4)?)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    fn i32_at(&self, at: usize) -> Option<i32> {
+        let bytes = self.body.get(at..at.checked_add(4)?)?;
+        Some(i32::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    fn u16_at(&self, at: usize) -> Option<u16> {
+        let bytes = self.body.get(at..at.checked_add(2)?)?;
+        Some(u16::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    /// Whether the six bytes at `at` read as a live reference to a class
+    /// descending from `ancestor`. This is the oracle's whole test: a null
+    /// identifier is not counted, because a null is legal wherever it lands
+    /// and so separates nothing.
+    fn names_a(&self, at: usize, ancestor: &str) -> bool {
+        if self.body.len() < at.saturating_add(OBJECT_REFERENCE_BYTES) {
+            return false;
+        }
+        let Some(object_id) = self.u32_at(at) else {
+            return false;
+        };
+        if object_id == 0 {
+            return false;
+        }
+        self.u16_at(at.saturating_add(IDENTIFIER_REFERENCE_BYTES))
+            .is_some_and(|class_index| descends_from(self.schema, class_index, ancestor))
+    }
+
+    /// Sample this node's `GInfo` header and, where the object's next
+    /// declaration is checkable, the width the bytes prove. See
+    /// [`FlagWidthSample`].
+    fn sample_flag_width(&self, read: usize) -> Option<FlagWidthSample> {
+        let ancestor = flag_width_oracle(self.schema, self.node_class);
+        let header = self.offset.checked_sub(GINFO_HEADER_BYTES)?;
+        let short_legal = ancestor.is_some_and(|ancestor| {
+            self.names_a(self.offset + ALTERNATE_INTEGER32_BYTES, ancestor)
         });
-        self.offset = end;
-        Some(())
+        let long_legal = ancestor.is_some_and(|ancestor| {
+            self.names_a(self.offset + ALTERNATE_INTEGER32_LONG_BYTES, ancestor)
+        });
+        Some(FlagWidthSample {
+            checkable: ancestor.is_some(),
+            node_class: self.node_class,
+            offset: header,
+            tag: self.u32_at(header)?,
+            control_command: self.u32_at(header + 4)?,
+            category_id: self.i32_at(header + 8)?,
+            lead: self.peek_u16()?,
+            second: self.u16_at(self.offset + 2)?,
+            words: std::array::from_fn(|word| {
+                self.u16_at(self.offset + word * 2).unwrap_or_default()
+            }),
+            short_legal,
+            long_legal,
+            proved: match (short_legal, long_legal) {
+                (true, false) => Some(ALTERNATE_INTEGER32_BYTES),
+                (false, true) => Some(ALTERNATE_INTEGER32_LONG_BYTES),
+                _ => None,
+            },
+            read,
+        })
     }
 }
 
@@ -1120,9 +1263,12 @@ mod tests {
 
     /// `class_by_index` addresses `classes` from this index.
     const FIRST_CLASS_INDEX: u16 = rvt_schema::INITIAL_CLASS_INDEX;
-    /// An alternate integer in its two-byte form, and in its four-byte form.
-    const SHORT_FLAGS: u16 = 0x0004;
-    const LONG_FLAGS: u16 = 0x8204;
+    /// The variable-width field that opens a record body, written narrow.
+    const NARROW_FLAGS: u16 = 0x0004;
+    /// An alternate integer anywhere else, at its declared four bytes. The
+    /// value is one the corpus holds for a node `GInfo.m_flags`, whose lead
+    /// word has the top bit clear: that bit is a flag, not a width marker.
+    const FLAGS: u32 = 0x0008_0004;
 
     fn property(
         name: &str,
@@ -1321,13 +1467,12 @@ mod tests {
         let node_class = FIRST_CLASS_INDEX + 2;
         let mut body = Vec::new();
         body.extend(6_i32.to_le_bytes()); // Root's inline GInfo
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(NARROW_FLAGS.to_le_bytes()); // narrow: it opens the body
         body.extend(1_u32.to_le_bytes()); // one sub-node
         body.extend(3_u32.to_le_bytes());
         body.extend(node_class.to_le_bytes());
         body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
-        body.extend(LONG_FLAGS.to_le_bytes()); // four bytes: top bit set
-        body.extend(0_u16.to_le_bytes());
+        body.extend(FLAGS.to_le_bytes());
         body.extend(0.0_f64.to_le_bytes());
         body.extend(287.5_f64.to_le_bytes());
         let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
@@ -1347,19 +1492,24 @@ mod tests {
         wrong_length[last] = wrong_length[last].wrapping_add(1);
         assert!(!walk_record(&schema, FIRST_CLASS_INDEX + 1, &wrong_length).is_exact());
 
-        // The same body with the node's flags word in its short form leaves
-        // two bytes unexplained: the width is read from the word, not fixed.
+        // The same body with the node's flags word written at two bytes is
+        // not explained. The walk reads that field at its declared four
+        // wherever it appears but the record's opening field, and a node's
+        // `GInfo` is never the opening field.
         let mut short_form = body.clone();
         let flags_at = body.len() - RECORD_LENGTH_TRAILER_BYTES - 16 - 4;
-        short_form[flags_at..flags_at + 2].copy_from_slice(&SHORT_FLAGS.to_le_bytes());
+        short_form.drain(flags_at..flags_at + 2);
+        let length = u32::try_from(short_form.len()).unwrap();
+        let last = short_form.len() - RECORD_LENGTH_TRAILER_BYTES;
+        short_form[last..].copy_from_slice(&length.to_le_bytes());
         assert!(!walk_record(&schema, FIRST_CLASS_INDEX + 1, &short_form).is_exact());
     }
 
     #[test]
-    fn an_alternate_integer_outside_a_node_ginfo_is_read_at_its_declared_width() {
-        // A node shaped like `GFilling`: its inline `GInfo`, whose flags word
-        // keeps the short form, then a colour declared `Integer32Alternate`,
-        // which is written at the declared four bytes.
+    fn every_alternate_integer_but_the_record_opening_one_takes_its_declared_width() {
+        // A node shaped like `GFilling`: its inline `GInfo`, then a colour
+        // declared `Integer32Alternate`. Both take the declared four bytes;
+        // only the field that opens the record body is narrow.
         let mut classes = record_schema().classes;
         classes[2].properties = vec![
             classes[2].properties[0].clone(),
@@ -1373,12 +1523,12 @@ mod tests {
 
         let mut body = Vec::new();
         body.extend(6_i32.to_le_bytes()); // Root's inline GInfo
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(NARROW_FLAGS.to_le_bytes()); // narrow: it opens the body
         body.extend(1_u32.to_le_bytes()); // one sub-node
         body.extend(3_u32.to_le_bytes());
         body.extend(node_class.to_le_bytes());
         body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(FLAGS.to_le_bytes());
         body.extend(0x0100_0000_u32.to_le_bytes()); // m_fillColor
         let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
         body.extend(length.to_le_bytes());
@@ -1408,12 +1558,12 @@ mod tests {
 
         let mut body = Vec::new();
         body.extend(6_i32.to_le_bytes()); // Root's inline GInfo
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(NARROW_FLAGS.to_le_bytes()); // narrow: it opens the body
         body.extend(1_u32.to_le_bytes()); // one sub-node
         body.extend(3_u32.to_le_bytes());
         body.extend(node_class.to_le_bytes());
         body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(FLAGS.to_le_bytes());
         body.extend(0.0_f64.to_le_bytes());
         body.extend(287.5_f64.to_le_bytes());
         body.push((-2_i8).to_le_bytes()[0]); // m_flags: a negative Integer8
@@ -1431,7 +1581,9 @@ mod tests {
     fn reference_width_follows_the_loading_mode_and_nulls_hold_no_body() {
         let mut classes = record_schema().classes;
         // A node holding one full reference, two identifier-only links, and a
-        // version-gated field that this data does not carry.
+        // property whose name carries a version gate. The gated property is
+        // written like any other: skipping it was one of the three readings
+        // that only balanced each other. See the module header.
         classes[2].properties = vec![
             classes[2].properties[0].clone(),
             property("m_pSurf", FieldType::Object, 0x01, 0, None),
@@ -1452,23 +1604,33 @@ mod tests {
 
         let mut body = Vec::new();
         body.extend(6_i32.to_le_bytes());
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(NARROW_FLAGS.to_le_bytes());
         body.extend(2_u32.to_le_bytes()); // two sub-nodes: one real, one null
         body.extend(3_u32.to_le_bytes());
         body.extend(node_class.to_le_bytes());
         body.extend(0_u32.to_le_bytes()); // the null: identifier only
         body.extend((-1_i32).to_le_bytes());
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(FLAGS.to_le_bytes());
         body.extend(9_u32.to_le_bytes()); // m_pSurf: identifier and class
         body.extend(565_u16.to_le_bytes());
         body.extend(11_u32.to_le_bytes()); // m_pFace: two bare identifiers
         body.extend(12_u32.to_le_bytes());
+        body.extend(FLAGS.to_le_bytes()); // m_faceFlags_v9, written
         let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
         body.extend(length.to_le_bytes());
 
         let walk = walk_record(&schema, FIRST_CLASS_INDEX + 1, &body);
         assert_eq!(walk.stop, None);
         assert_eq!(walk.remaining, 0);
+
+        // Omitting the gated field leaves the record four bytes short.
+        let mut without = body.clone();
+        let gated_at = body.len() - RECORD_LENGTH_TRAILER_BYTES - 4;
+        without.drain(gated_at..gated_at + 4);
+        let length = u32::try_from(without.len()).unwrap();
+        let last = without.len() - RECORD_LENGTH_TRAILER_BYTES;
+        without[last..].copy_from_slice(&length.to_le_bytes());
+        assert!(!walk_record(&schema, FIRST_CLASS_INDEX + 1, &without).is_exact());
         assert!(walk.length_trailer_matches);
         // One node was read, and the body ended there. The null reference and
         // the surface this fixture points at are both left outside the body,
@@ -1504,7 +1666,7 @@ mod tests {
         body.extend(node_class.to_le_bytes());
         body.extend(0_u32.to_le_bytes()); // m_pTail: null, identifier only
         body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(FLAGS.to_le_bytes());
         body.extend(0.0_f64.to_le_bytes());
         body.extend(287.5_f64.to_le_bytes());
         let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
@@ -1539,10 +1701,94 @@ mod tests {
     }
 
     #[test]
-    fn a_geometry_node_writes_a_class_index_after_a_null_identifier() {
-        // Two nodes of the same shape, one rooted at the geometry graph and one
-        // not. The null reference costs six bytes in the first and four in the
-        // second.
+    fn the_width_instrument_labels_an_edge_loop_from_the_reference_that_follows() {
+        // An `EdgeLoop`-shaped node: `GNode.m_GInfo`, then `m_nextLoop`, a
+        // full reference the schema fixes the class of, then `m_pFace`.
+        //
+        // The bytes are the corpus's own. A loop that names a next loop reads
+        // `0004 0008 <live reference>`, and a terminal one reads
+        // `0004 0008 0000 0000 <m_pFace>`, where two-byte flags would make
+        // `m_nextLoop` the nonsense `id=8 class=0`. Both are read at the
+        // declared four bytes, and the instrument proves four for the first
+        // and declines to label the second, which is what the corpus shows:
+        // 108 136 / 50 543 / 123 473 sites proving four and none proving two.
+        let mut classes = record_schema().classes;
+        classes.push(class(
+            FIRST_CLASS_INDEX + 3,
+            "GNode",
+            TypeReference::None,
+            Vec::new(),
+        ));
+        let loop_class = FIRST_CLASS_INDEX + 4;
+        let mut edge_loop = classes[2].clone();
+        edge_loop.index = loop_class;
+        edge_loop.name = EDGE_LOOP_CLASS_NAME.to_owned();
+        edge_loop.parent = TypeReference::Reference {
+            index: FIRST_CLASS_INDEX + 3,
+            name: "GNode".to_owned(),
+        };
+        edge_loop.properties = vec![
+            classes[2].properties[0].clone(),
+            property("m_nextLoop", FieldType::Object, 0x01, 0, None),
+            property("m_pFace", FieldType::Object, 0x03, 0, None),
+        ];
+        classes.push(edge_loop);
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+
+        let record = |next_loop: u32| {
+            let mut body = Vec::new();
+            body.extend(6_i32.to_le_bytes()); // Root's inline GInfo
+            body.extend(NARROW_FLAGS.to_le_bytes());
+            body.extend(1_u32.to_le_bytes()); // one sub-node
+            body.extend(3_u32.to_le_bytes());
+            body.extend(loop_class.to_le_bytes());
+            body.extend((-1_i32).to_le_bytes()); // the loop's inline GInfo
+            body.extend(FLAGS.to_le_bytes());
+            body.extend(next_loop.to_le_bytes());
+            if next_loop != 0 {
+                body.extend(loop_class.to_le_bytes());
+            }
+            body.extend(4_u32.to_le_bytes()); // m_pFace, a bare identifier
+            let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+            body.extend(length.to_le_bytes());
+            body
+        };
+
+        let root = FIRST_CLASS_INDEX + 1;
+        let (walk, samples) = walk_record_flag_widths(&schema, root, &record(50));
+        assert!(walk.is_exact());
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].checkable);
+        assert_eq!(samples[0].proved, Some(ALTERNATE_INTEGER32_LONG_BYTES));
+        assert_eq!(samples[0].read, ALTERNATE_INTEGER32_LONG_BYTES);
+        assert_eq!(samples[0].lead, NARROW_FLAGS);
+        assert_eq!(samples[0].second, 0x0008);
+
+        // A terminal loop cannot be labelled: a null identifier is legal
+        // wherever it lands, so it separates nothing. The instrument reports
+        // that rather than counting it as a two-byte site.
+        let (walk, samples) = walk_record_flag_widths(&schema, root, &record(0));
+        assert!(walk.is_exact());
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].checkable);
+        assert_eq!(samples[0].proved, None);
+        assert!(!samples[0].short_legal);
+        assert!(!samples[0].long_legal);
+    }
+
+    #[test]
+    fn a_null_reference_stops_after_its_identifier_in_a_geometry_node_too() {
+        // Two nodes of the same shape, one rooted at the geometry graph and
+        // one not. The null reference costs four bytes in both: the class
+        // index is written only when the identifier names an object.
+        //
+        // The geometry root used to be an exception here, and that reading is
+        // what made a null `GEdgeLoop.m_nextLoop` cost the same six bytes as
+        // a two-byte `m_flags` plus a four-byte null - the coincidence that
+        // hid the flags width for as long as it did. See the module header.
         let mut classes = record_schema().classes;
         classes[2].properties = vec![
             classes[2].properties[0].clone(),
@@ -1550,16 +1796,16 @@ mod tests {
         ];
         classes.push(class(
             FIRST_CLASS_INDEX + 3,
-            GEOMETRY_NODE_ROOT_CLASS_NAME,
+            "GNode",
             TypeReference::None,
             Vec::new(),
         ));
         let mut geometry_node = classes[2].clone();
         geometry_node.index = FIRST_CLASS_INDEX + 4;
-        geometry_node.name = "GFace".to_owned();
+        geometry_node.name = FACE_CLASS_NAME.to_owned();
         geometry_node.parent = TypeReference::Reference {
             index: FIRST_CLASS_INDEX + 3,
-            name: GEOMETRY_NODE_ROOT_CLASS_NAME.to_owned(),
+            name: "GNode".to_owned(),
         };
         classes.push(geometry_node);
         let schema = Schema {
@@ -1570,12 +1816,12 @@ mod tests {
         let record = |node_class: u16, null_bytes: usize| {
             let mut body = Vec::new();
             body.extend(6_i32.to_le_bytes()); // Root's inline GInfo
-            body.extend(SHORT_FLAGS.to_le_bytes());
+            body.extend(NARROW_FLAGS.to_le_bytes());
             body.extend(1_u32.to_le_bytes()); // one sub-node
             body.extend(3_u32.to_le_bytes());
             body.extend(node_class.to_le_bytes());
             body.extend((-1_i32).to_le_bytes()); // the node's inline GInfo
-            body.extend(SHORT_FLAGS.to_le_bytes());
+            body.extend(FLAGS.to_le_bytes());
             body.extend(vec![0_u8; null_bytes]); // m_pSurf: null
             let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
             body.extend(length.to_le_bytes());
@@ -1583,14 +1829,12 @@ mod tests {
         };
 
         let root = FIRST_CLASS_INDEX + 1;
-        let plain = FIRST_CLASS_INDEX + 2;
-        let geometry = FIRST_CLASS_INDEX + 4;
-        assert!(walk_record(&schema, root, &record(plain, IDENTIFIER_REFERENCE_BYTES)).is_exact());
-        assert!(!walk_record(&schema, root, &record(plain, OBJECT_REFERENCE_BYTES)).is_exact());
-        assert!(walk_record(&schema, root, &record(geometry, OBJECT_REFERENCE_BYTES)).is_exact());
-        assert!(
-            !walk_record(&schema, root, &record(geometry, IDENTIFIER_REFERENCE_BYTES)).is_exact()
-        );
+        for node in [FIRST_CLASS_INDEX + 2, FIRST_CLASS_INDEX + 4] {
+            assert!(
+                walk_record(&schema, root, &record(node, IDENTIFIER_REFERENCE_BYTES)).is_exact()
+            );
+            assert!(!walk_record(&schema, root, &record(node, OBJECT_REFERENCE_BYTES)).is_exact());
+        }
     }
 
     #[test]
@@ -1701,7 +1945,7 @@ mod tests {
 
         let record = |own: i32, node: i32| {
             let mut body = Vec::new();
-            body.extend(SHORT_FLAGS.to_le_bytes()); // the narrow opening field
+            body.extend(NARROW_FLAGS.to_le_bytes()); // the narrow opening field
             body.extend(own.to_le_bytes());
             body.extend(1_u32.to_le_bytes()); // one sub-node
             body.extend(3_u32.to_le_bytes());
@@ -1919,12 +2163,12 @@ mod tests {
 
         let mut body = Vec::new();
         body.extend(6_i32.to_le_bytes());
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(NARROW_FLAGS.to_le_bytes());
         body.extend(1_u32.to_le_bytes());
         body.extend(3_u32.to_le_bytes());
         body.extend((FIRST_CLASS_INDEX + 2).to_le_bytes());
         body.extend((-1_i32).to_le_bytes());
-        body.extend(SHORT_FLAGS.to_le_bytes());
+        body.extend(FLAGS.to_le_bytes());
         let prefix = body.clone();
         body.extend([0_u8; NULL_DOCUMENT_HANDLE_BYTES]);
         let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
@@ -1945,15 +2189,6 @@ mod tests {
         assert_eq!(walk.stop, None);
         assert!(walk.is_exact());
         assert_eq!(walk.nodes, 1);
-    }
-
-    #[test]
-    fn reads_the_version_a_property_was_introduced_in() {
-        assert_eq!(version_gate("m_faceFlags_v9"), Some(9));
-        assert_eq!(version_gate("m_flags_v12"), Some(12));
-        assert_eq!(version_gate("m_flags"), None);
-        assert_eq!(version_gate("m_pFace_vNext"), None);
-        assert_eq!(version_gate("_v9"), None);
     }
 
     #[test]

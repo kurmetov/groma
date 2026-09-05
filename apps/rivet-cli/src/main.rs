@@ -286,6 +286,32 @@ enum Command {
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
     },
+    /// Label the width of every checkable `GInfo.m_flags` from the bytes that
+    /// follow it, and correlate the label against the header's candidate
+    /// discriminators.
+    FlagsProbe {
+        file: PathBuf,
+        /// Schema class whose records are walked.
+        #[arg(long, default_value = "GElement")]
+        class: String,
+        /// Print this many rows of each histogram.
+        #[arg(long, default_value_t = 12)]
+        rows: usize,
+        /// Restrict every tally to records that carry boundary faces.
+        #[arg(long)]
+        faces_only: bool,
+        /// Keep samples from every record, not only from records the
+        /// oracle-driven walk explained exactly.
+        #[arg(long)]
+        every_record: bool,
+        /// Report only the objects of this node class, and add a histogram of
+        /// the raw words from `m_flags` onwards.
+        #[arg(long)]
+        node_class: Option<String>,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
     /// Probe the `GElement` node graph: which node classes hang under it and
     /// where their object identifiers resolve.
     GeometryGraphProbe {
@@ -501,6 +527,23 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             dump_window,
             dump_count,
             faces_only,
+            max_member_bytes,
+        ),
+        Command::FlagsProbe {
+            file,
+            class,
+            rows,
+            faces_only,
+            every_record,
+            node_class,
+            max_member_bytes,
+        } => flags_probe(
+            &file,
+            &class,
+            rows,
+            faces_only,
+            every_record,
+            node_class.as_deref(),
             max_member_bytes,
         ),
         Command::GeometryGraphProbe {
@@ -2917,6 +2960,242 @@ fn serial_probe(
         }
     }
     Ok(())
+}
+
+/// Check the width the walk reads `GInfo.m_flags` at against the width the
+/// bytes that follow prove, over every node the corpus holds.
+///
+/// The check assumes no rule: for a node whose first declaration after the
+/// inherited `GNode.m_GInfo` is a reference the schema fixes the class of, the
+/// width is read off the following bytes, and the walk's own reading is scored
+/// against it. This is what refuted the reading that took the lead word's top
+/// bit as a width marker - it labelled 73 354 sites four bytes and not one
+/// site two - and it is what would catch a regression the record tallies
+/// cannot see, since a record can tile with a compensating pair of errors.
+///
+/// `--node-class` narrows the report to one class and adds the raw words from
+/// `m_flags` on. That is how the `EdgeLoop` question was settled: under the old
+/// reading its `m_nextLoop` read as the nonsense `id=8 class=0` in all 67 691
+/// loops of an exactly-explained record, harmless only because class 0 does not
+/// resolve, where the declared width gives a null identifier followed directly
+/// by `m_pFace`.
+#[allow(clippy::too_many_lines)] // One pass over the corpus plus its tables.
+fn flags_probe(
+    path: &Path,
+    class_name: &str,
+    rows: usize,
+    faces_only: bool,
+    every_record: bool,
+    node_class: Option<&str>,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the class schema is required for this probe",
+        )
+    })?;
+    let class_index = schema_class_index(Some(&schema), class_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("schema class not found: {class_name}"),
+        )
+    })?;
+    let partition_paths = partition_paths(&container);
+
+    let mut records = 0_usize;
+    let mut exact = 0_usize;
+    let mut sampled_records = 0_usize;
+    let mut samples_seen = 0_usize;
+    let mut samples: Vec<rvt_model::FlagWidthSample> = Vec::new();
+
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, _, layout, walk, payload| {
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if header.class_index != class_index {
+                    continue;
+                }
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                let (result, found) =
+                    rvt_model::walk_record_flag_widths(&schema, class_index, body);
+                if faces_only && !carries_faces(&schema, &result) {
+                    continue;
+                }
+                records += 1;
+                exact += usize::from(result.is_exact());
+                samples_seen += found.len();
+                // A site inside a record that did not tile may sit at an
+                // offset the walk got wrong, and then its label is a label of
+                // the wrong bytes. Exactly-explained records are the ones
+                // whose offsets are known good.
+                if every_record || result.is_exact() {
+                    sampled_records += 1;
+                    samples.extend(found);
+                }
+            }
+        },
+    )?;
+
+    let share = |part: usize, whole: usize| {
+        if whole == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                part as f64 * 100.0 / whole as f64
+            }
+        }
+    };
+    println!("Class: {class_name} [{class_index}]");
+    println!("Records walked: {records}");
+    println!(
+        "  explained exactly: {exact} ({:.1}%)",
+        share(exact, records)
+    );
+    println!("Node GInfo objects met: {samples_seen}");
+    println!(
+        "  kept from {sampled_records} records{}: {}",
+        if every_record {
+            ""
+        } else {
+            " explained exactly"
+        },
+        samples.len()
+    );
+
+    let mut dataset: Vec<(rvt_model::FlagWidthSample, usize)> = Vec::new();
+    let mut checkable = 0_usize;
+    let mut ambiguous = 0_usize;
+    for sample in &samples {
+        if sample.checkable {
+            checkable += 1;
+        }
+        match sample.proved {
+            Some(proved) => dataset.push((*sample, proved)),
+            None if sample.checkable => ambiguous += 1,
+            None => {}
+        }
+    }
+    let proved_short = dataset.iter().filter(|(_, width)| *width == 2).count();
+    let proved_long = dataset.iter().filter(|(_, width)| *width == 4).count();
+    let disagreed = dataset
+        .iter()
+        .filter(|(sample, width)| sample.read != *width)
+        .count();
+    println!("Of them checkable by the reference oracle: {checkable}");
+    println!("  the bytes prove four: {proved_long}");
+    println!("  the bytes prove two: {proved_short}");
+    println!("  unlabelled, neither width or both land on a legal reference: {ambiguous}");
+    println!(
+        "  where the walk read a different width: {disagreed} ({:.2}%)",
+        share(disagreed, dataset.len())
+    );
+
+    if let Some(wanted) = node_class {
+        dataset.retain(|(sample, _)| {
+            schema
+                .class_by_index(sample.node_class)
+                .is_some_and(|class| class.name == wanted)
+        });
+        println!(
+            "Restricted to {wanted} objects: {} labelled sites",
+            dataset.len()
+        );
+    }
+
+    let split = |key: &dyn Fn(&rvt_model::FlagWidthSample) -> String| {
+        let mut table: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for (sample, width) in &dataset {
+            let entry = table.entry(key(sample)).or_default();
+            if *width == 4 {
+                entry.1 += 1;
+            } else {
+                entry.0 += 1;
+            }
+        }
+        table
+    };
+    let report = |title: &str, table: &BTreeMap<String, (usize, usize)>| {
+        let mixed: usize = table
+            .values()
+            .map(|(short, long)| short.min(long))
+            .sum::<usize>();
+        println!(
+            "{title}: {} values, {mixed} of them holding both widths",
+            table.len()
+        );
+        let mut ranked = table.iter().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            (right.1.0 + right.1.1)
+                .cmp(&(left.1.0 + left.1.1))
+                .then(left.0.cmp(right.0))
+        });
+        for (value, (short, long)) in ranked.iter().take(rows) {
+            println!("  {value:>30}  two={short:<8} four={long}");
+        }
+    };
+
+    report(
+        "By the node's class",
+        &split(&|sample| {
+            schema.class_by_index(sample.node_class).map_or_else(
+                || format!("{}", sample.node_class),
+                |class| class.name.clone(),
+            )
+        }),
+    );
+    if node_class.is_some() {
+        // The raw words, so the two readings can be compared byte for byte:
+        // under two bytes the object's next declaration starts at word 1,
+        // under the declared four at word 2.
+        report(
+            "By the words from m_flags on",
+            &split(&|sample| {
+                let mut shown = String::new();
+                for word in sample.words {
+                    let _ = write!(shown, "{word:04x} ");
+                }
+                shown.trim_end().to_owned()
+            }),
+        );
+        let reference_at = |sample: &rvt_model::FlagWidthSample, word: usize| {
+            let class = sample.words[word + 2];
+            format!(
+                "id={} {}",
+                u32::from(sample.words[word]) | (u32::from(sample.words[word + 1]) << 16),
+                schema
+                    .class_by_index(class)
+                    .map_or_else(|| format!("class {class}"), |class| class.name.clone())
+            )
+        };
+        report(
+            "By the reference a two-byte read lands on",
+            &split(&|sample| reference_at(sample, 1)),
+        );
+        report(
+            "By the reference the declared width lands on",
+            &split(&|sample| reference_at(sample, 2)),
+        );
+    }
+    Ok(())
+}
+
+/// Whether a walked record named any boundary face.
+fn carries_faces(schema: &Schema, walk: &rvt_model::SerialRecordWalk) -> bool {
+    walk.references.iter().any(|reference| {
+        schema
+            .class_by_index(reference.class_index)
+            .is_some_and(|class| class.name == "Face")
+    })
 }
 
 /// Summarize one record's node stream and check that its boundary topology

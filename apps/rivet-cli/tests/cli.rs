@@ -337,6 +337,32 @@ fn schema_prefix_probe_counts_candidates_during_streaming_decode() {
     assert!(stdout.contains("Candidate prefixes: 1"));
 }
 
+#[test]
+fn flags_probe_reports_the_width_check_over_a_walked_class() {
+    let mut payload = [12_u16.to_le_bytes(), 0_u16.to_le_bytes()].concat();
+    payload.extend(b"member payload");
+    let partition = truncated_gzip(&payload);
+    let fixture = fixture_with_schema_and_partition(&schema_fixture(), &partition);
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "flags-probe",
+            fixture.path().to_str().unwrap(),
+            "--class",
+            "Element",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Class: Element"));
+    assert!(stdout.contains("Records walked:"));
+    assert!(stdout.contains("Node GInfo objects met:"));
+    // The check reports the disagreement count even when it is zero, so a
+    // regression shows up as a number rather than as a missing line.
+    assert!(stdout.contains("where the walk read a different width:"));
+}
+
 /// Two markers 32 bytes apart, each followed by an ID the fixture's
 /// `Global/ElemTable` also declares.
 fn marker_payload() -> Vec<u8> {

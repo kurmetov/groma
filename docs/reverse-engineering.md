@@ -535,3 +535,65 @@ the default export. Those transforms now become storey-relative
 to their element-local frame; IfcOpenShell reconstructs all 108 world shapes
 with every represented axis endpoint matching the pre-placement reference
 export in world coordinates within `1e-9`.
+
+## Three entangled readings in the record walk
+
+### Result: the walk had three compensating two-byte errors, and each one measured worse alone
+
+Observation. Face-bearing `GElement` records tiled exactly 88.0% / 84.8% /
+71.9% of the time on SMALL / MEDIUM / BIG, and `rivet brep` showed that
+97.5% / 99.97% / 99.8% of every excluded B-Rep face sat in a record that had
+not tiled. The framing, not the geometry, was the whole of the gap. One
+misread was located by hand: record 635645's tenth face named a first loop
+whose `GInfo` header read `ffffffff 00000000 ffffffff 0400 0800`, where the
+walk took `m_flags` as the two bytes `0400` because the lead word's top bit
+was clear, and `m_nextLoop` then read as identifier 3276808 of class 0 rather
+than identifier 50 of class 1311, an `EdgeLoop`.
+
+Hypothesis. `GInfo.m_flags` has a width discriminator somewhere in its header
+that the top-bit reading is missing.
+
+Experiment. Label the width without assuming any rule. For a node whose first
+declaration after the inherited `GNode.m_GInfo` is a reference whose target
+class the schema fixes - `GEdgeLoop.m_nextLoop` and `GFace.m_pFirstLoop`, both
+naming an edge loop - read six bytes at both candidate offsets and keep the one
+that lands on a live reference of that class: one class index out of 4 418, so a
+two-byte misread has no way to pass. Then cross-tabulate the label against every
+candidate the header carries. `rivet flags-probe` is that instrument.
+
+Result. The hypothesis is refuted, and there is nothing to find: across 73 354
+labelled sites on SMALL and 123 473 on BIG, **every** one proves four bytes and
+not one proves two. Within `EdgeLoop`, `m_tag`, `m_controlCommand`,
+`m_categoryId` and both words of `m_flags` are byte-identical between the loops
+the top-bit reading handled and the 711 it did not - `0xffffffff`,
+`0x00000000`, `-1`, `0x0004`, `0x0008` in both groups. The lead word's top bit
+is an ordinary flag, set on `Face` and `Edge` and clear on `EdgeLoop` and
+`GFilling`, which is why a width rule built on it looked right.
+
+The reason "read every `GInfo.m_flags` at four bytes" had previously explained
+no record at all is that two other readings were absorbing the error. Under the
+old rules a null `GEdgeLoop.m_nextLoop` cost six bytes, so two-byte flags plus a
+six-byte null and four-byte flags plus a four-byte null both consumed the same
+eight bytes and both tiled - the coincidence that hid the width. The raw words
+show which is right: in all 67 691 loops of an exactly-tiled record on SMALL the
+bytes read `0004 0008 0000 0000 <m_pFace>`, so at two bytes `m_nextLoop` is the
+nonsense `id=8 class=0`, harmless only because class 0 does not resolve, while
+at four it is a null identifier followed directly by `m_pFace`. Likewise a
+`GFace` naming a filling had been given two extra unexplained bytes, and
+`m_faceFlags_v9` had been skipped as a version-gated property; four bytes of
+written `m_faceFlags_v9` plus two four-byte nulls is exactly two six-byte nulls
+plus the two-byte skip.
+
+All eight combinations of the three readings were measured on BIG's
+face-bearing records. Each alone takes 71.9% to 0%, as do two of the three
+pairs; the third pair reaches 21.9%. The three together reach **100%** -
+13 886 / 7 712 / 10 534 of 13 886 / 7 712 / 10 534 across the corpus. Confidence
+high: the change is a net deletion of three special cases, the width instrument
+finds no site where the reading it takes disagrees with what the bytes prove,
+and the 60-pair regression sweep moves no class down.
+
+What is not established is how to interpret `GInfo.m_flags`. Its four bytes are
+accounted for, but nothing in the corpus separates "a four-byte flags field"
+from "a two-byte flags field followed by two undeclared bytes", because no
+independent reading of the value exists to check it against. The walk reads the
+declaration as declared and does not interpret the value.
