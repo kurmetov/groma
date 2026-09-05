@@ -2230,12 +2230,9 @@ fn report_declared_names(
                     .unwrap_or_default();
                 let tally = declared.entry(header.class_index).or_default();
                 tally.bodies += 1;
-                let (_walk, strings) =
-                    rvt_model::walk_record_strings(schema, header.class_index, body);
-                let Some(first) = strings
-                    .iter()
-                    .filter(|string| string.property == "m_name" && !string.value.is_empty())
-                    .min_by_key(|string| (string.distance, string.offset))
+                // The reader itself answers, so the report cannot drift from
+                // what the export actually uses.
+                let Some(first) = rvt_model::record_name_string(schema, header.class_index, body)
                 else {
                     continue;
                 };
@@ -2257,6 +2254,22 @@ fn report_declared_names(
                     tally.comparable += 1;
                     if scanned == first.value {
                         tally.agreed += 1;
+                    } else {
+                        // A disagreement is only evidence once it says what
+                        // the scan was reading instead. Name the declaration
+                        // whose value the scan returned, so "the scan is one
+                        // string early" can be told apart from "the two
+                        // readings found unrelated bytes".
+                        let (_walk, strings) =
+                            rvt_model::walk_record_strings(schema, header.class_index, body);
+                        let matched = strings
+                            .iter()
+                            .find(|string| string.value == scanned)
+                            .map_or_else(
+                                || "(no declared string)".to_owned(),
+                                |string| format!("{}.{}", string.class, string.property),
+                            );
+                        *tally.scanned_properties.entry(matched).or_default() += 1;
                     }
                 }
                 if tally.samples.len() < 3 {
@@ -2267,7 +2280,7 @@ fn report_declared_names(
     )?;
 
     println!();
-    println!("First string a property named m_name declares, by class:");
+    println!("The name a record's declarations give it, by class:");
     for (index, _) in ordered.iter().take(classes) {
         let Some(tally) = declared.get(index) else {
             continue;
@@ -2290,6 +2303,14 @@ fn report_declared_names(
             tally.comparable,
             tally.samples
         );
+        let mut scanned = tally.scanned_properties.iter().collect::<Vec<_>>();
+        scanned.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        for (property, count) in scanned.iter().take(3) {
+            println!(
+                "\t\tthe scan read {} instead in {count}",
+                escape_terminal_text(property)
+            );
+        }
     }
     Ok(())
 }
@@ -2306,6 +2327,8 @@ struct DeclaredNameTally {
     comparable: usize,
     /// Of those, records where the two agree.
     agreed: usize,
+    /// Of the rest, the declaration whose value the scan returned instead.
+    scanned_properties: BTreeMap<String, usize>,
     samples: Vec<String>,
 }
 

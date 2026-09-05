@@ -431,6 +431,30 @@ const NAME_PROPERTY: &str = "m_name";
 /// and taking that would name the family after a column of its size table.
 const NAME_MAX_DISTANCE: u8 = 1;
 
+/// Root of the class chain of a record that *is* a parameter's definition. Such
+/// a record declares no [`NAME_PROPERTY`]; its name is
+/// [`PARAMETER_CAPTION_CLASS`]`.`[`PARAMETER_CAPTION_PROPERTY`], reached through
+/// `ParamElem.m_pParamDef`, which is a reference and so lands one step out.
+const PARAMETER_ELEMENT_CLASS: &str = "ParamElem";
+/// Class declaring the caption a parameter is displayed under.
+const PARAMETER_CAPTION_CLASS: &str = "ParamDef";
+/// Property whose value is a parameter's display name.
+///
+/// Measured, not guessed, and it corrects a real misreading. A parameter
+/// element writes two strings and the *first* is not its name: `ParamElem`
+/// declares `m_description` ahead of the `ParamDef` its `m_pParamDef` points
+/// at, so the offset scan this replaces returned the description wherever one
+/// was filled in - "Этаж, на котором располагается элемент" for the parameter
+/// captioned "Этаж" (15 917 values on SMALL, the file's most-used project
+/// parameter), "Вписывается назначение вида (План кладочный,
+/// маркировочный...)", "Раздел проекта (АР, КЖ, ОВ и т.д.)". Those strings are
+/// the tooltip Revit shows, not the name a specification is written under.
+///
+/// The class is pinned as well as the property because `m_caption` is declared
+/// three times in the schema - also by `ColorFillData` and `ScheduleHeader` -
+/// and only `ParamDef`'s is a parameter's name.
+const PARAMETER_CAPTION_PROPERTY: &str = "m_caption";
+
 /// The name a record's own declarations give it: the value of the first
 /// property named [`NAME_PROPERTY`] the walk reads, skipping empty ones.
 ///
@@ -444,18 +468,49 @@ const NAME_MAX_DISTANCE: u8 = 1;
 ///
 /// A record whose declarations carry no such property at all has no name of
 /// its own. A family instance is the common case: its name is its symbol's.
+///
+/// A parameter definition is the one class that names itself elsewhere; see
+/// [`PARAMETER_CAPTION_PROPERTY`].
 #[must_use]
 pub fn record_name(schema: &Schema, class_index: u16, body: &[u8]) -> Option<String> {
+    record_name_string(schema, class_index, body).map(|string| string.value)
+}
+
+/// Same as [`record_name`], keeping the declaration the name came from so a
+/// caller measuring the reading can report which property answered.
+#[must_use]
+pub fn record_name_string(schema: &Schema, class_index: u16, body: &[u8]) -> Option<SerialString> {
     let (_walk, strings) = walk_record_strings(schema, class_index, body);
+    let parameter = descends_from(schema, class_index, PARAMETER_ELEMENT_CLASS);
     strings
         .into_iter()
         .filter(|string| {
-            string.property == NAME_PROPERTY
-                && !string.value.is_empty()
-                && string.distance <= NAME_MAX_DISTANCE
+            let declares_the_name = if parameter {
+                string.class == PARAMETER_CAPTION_CLASS
+                    && string.property == PARAMETER_CAPTION_PROPERTY
+            } else {
+                string.property == NAME_PROPERTY
+            };
+            declares_the_name && !string.value.is_empty() && string.distance <= NAME_MAX_DISTANCE
         })
         .min_by_key(|string| (string.distance, string.offset))
-        .map(|string| string.value)
+}
+
+/// Whether `class_index` has `ancestor` anywhere in its class chain, itself
+/// included.
+#[must_use]
+pub fn descends_from(schema: &Schema, class_index: u16, ancestor: &str) -> bool {
+    let mut current = Some(class_index);
+    for _ in 0..MAX_WALK_DEPTH {
+        let Some(class) = current.and_then(|index| schema.class_by_index(index)) else {
+            return false;
+        };
+        if class.name == ancestor {
+            return true;
+        }
+        current = class.parent.index();
+    }
+    false
 }
 
 /// The value of one identifier-shaped property of a record's own header.
@@ -1003,17 +1058,7 @@ impl Reader<'_> {
 
     /// Whether `class_index` descends from the geometry graph's root class.
     fn is_geometry_node(&self, class_index: u16) -> bool {
-        let mut current = Some(class_index);
-        for _ in 0..MAX_WALK_DEPTH {
-            let Some(class) = current.and_then(|index| self.schema.class_by_index(index)) else {
-                return false;
-            };
-            if class.name == GEOMETRY_NODE_ROOT_CLASS_NAME {
-                return true;
-            }
-            current = class.parent.index();
-        }
-        false
+        descends_from(self.schema, class_index, GEOMETRY_NODE_ROOT_CLASS_NAME)
     }
 
     /// Whether this is the record body's first variable-width field, which is
@@ -1749,6 +1794,83 @@ mod tests {
                 .map(|string| (string.value.as_str(), string.distance))
                 .collect::<Vec<_>>(),
             [("mine", 0), ("child", 1), ("grandchild", 2)]
+        );
+    }
+
+    #[test]
+    fn a_parameter_element_is_named_by_its_definition_s_caption_not_its_description() {
+        // The real layout: `ParamElem` writes its description first and then a
+        // reference to the `ParamDef` that carries the caption. Anything
+        // reading the record's first string returns the description.
+        let mut classes = record_schema().classes;
+        classes[1].name = PARAMETER_ELEMENT_CLASS.to_owned();
+        classes[1].properties = vec![
+            property("m_description", FieldType::String, 0x60, 6, None),
+            property("m_pParamDef", FieldType::Object, 0x01, 0, None),
+        ];
+        classes[2].name = PARAMETER_CAPTION_CLASS.to_owned();
+        classes[2].properties = vec![
+            property("m_dynamicGroupName", FieldType::String, 0x60, 6, None),
+            property(PARAMETER_CAPTION_PROPERTY, FieldType::String, 0x60, 6, None),
+            // A parameter element declares no `m_name` anywhere, so the rule
+            // that names every other class cannot answer here.
+            property("m_name", FieldType::String, 0x60, 6, None),
+        ];
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+        let definition_class = FIRST_CLASS_INDEX + 2;
+
+        let utf16 = |text: &str| {
+            let mut bytes = Vec::new();
+            let units = text.encode_utf16().collect::<Vec<_>>();
+            bytes.extend(u32::try_from(units.len()).unwrap().to_le_bytes());
+            for unit in units {
+                bytes.extend(unit.to_le_bytes());
+            }
+            bytes
+        };
+        let record = |description: &str| {
+            let mut body = Vec::new();
+            body.extend(utf16(description));
+            body.extend(0xffff_u16.to_le_bytes()); // m_pParamDef, narrow: opens the body
+            body.extend(definition_class.to_le_bytes());
+            body.extend(utf16("Текст")); // m_dynamicGroupName
+            body.extend(utf16("Этаж")); // m_caption
+            body.extend(utf16("не имя")); // m_name, one step out and not the name
+            let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+            body.extend(length.to_le_bytes());
+            body
+        };
+
+        let root = FIRST_CLASS_INDEX + 1;
+        let description = "Этаж, на котором располагается элемент";
+        assert!(walk_record(&schema, root, &record(description)).is_exact());
+        assert_eq!(
+            record_name(&schema, root, &record(description)),
+            Some("Этаж".to_owned())
+        );
+        // The caption answers whether or not a description was filled in, so
+        // the name does not change shape between two parameters of one file.
+        assert_eq!(
+            record_name(&schema, root, &record("")),
+            Some("Этаж".to_owned())
+        );
+        assert_eq!(
+            record_name_string(&schema, root, &record(description)).map(|string| string.class),
+            Some(PARAMETER_CAPTION_CLASS.to_owned())
+        );
+        // Only a parameter element is named this way: the same body read as a
+        // class that does not descend from `ParamElem` falls back to `m_name`.
+        let mut other = Schema {
+            classes: schema.classes.clone(),
+            ..record_schema()
+        };
+        other.classes[1].name = "Root".to_owned();
+        assert_eq!(
+            record_name(&other, root, &record(description)),
+            Some("не имя".to_owned())
         );
     }
 
