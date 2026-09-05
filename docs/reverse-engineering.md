@@ -790,9 +790,22 @@ wrongly; the table simply has no architecture rows.
 distinct names, and Revit emits exactly 15. Our first 13 match its names and
 elevations exactly; the excess is the same level repeated - "01 Этаж" at
 elevation 0 is emitted 37 times - at times with a second elevation for one name
-(3.3 m and 4.2 m for "02 Этаж"), which is what levels reached through links or
-other sections would look like. We emit one storey per recovered `Level`
+(3.3 m and 4.2 m for "02 Этаж"). We emit one storey per recovered `Level`
 element and never ask whether two of them are the same storey.
+
+The corpus-wide export sweep says this is not uniform, and the split is the
+diagnostic: mean storeys per file are **ВК 11** (max 12) and **ОВ 13** (max
+18) - sane, matching what a single-discipline model holds - against **AR 129**
+(max 236) and **KJ 598** (max 1 236). The models that explode are exactly the
+ones that carry links to the project's other sections (S1..S12), and the
+duplicate-with-a-second-elevation pattern is what a linked model's own level
+set looks like. So the fix is not a blanket dedup of identical pairs, which
+would still leave the linked sets: it is to establish which levels belong to
+the host model. Revit's export answers that too - it emits the host's 15.
+
+Whole-corpus totals from that sweep, all 50 files, zero failures:
+10 030 518 elements exported, 89 979 with verified geometry, 8 095 storeys.
+Mean wall-clock per file 16 s (ВК) to 81 s (ОВ).
 
 Also corrected, a verification method rather than a finding: `create_shape`
 refuses a `Box`-only product without `keep-bounding-boxes` and an `Axis`-only
