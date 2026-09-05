@@ -30,8 +30,9 @@ pub use parameter::{
 };
 pub use serial::{
     RECORD_LENGTH_TRAILER_BYTES, SerialObject, SerialRecordWalk, SerialStop, SerialStreamWalk,
-    SerialString, SerialTraceEntry, SerialWalk, record_name, walk_object, walk_object_stream,
-    walk_record, walk_record_collecting, walk_record_strings, walk_record_traced,
+    SerialString, SerialTraceEntry, SerialWalk, record_declared_id, record_name, walk_object,
+    walk_object_stream, walk_record, walk_record_collecting, walk_record_strings,
+    walk_record_traced,
 };
 
 #[derive(Clone, Debug, Default, PartialEq)]

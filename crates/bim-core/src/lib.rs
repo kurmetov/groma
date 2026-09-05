@@ -30,6 +30,11 @@ pub struct BimElement {
     pub placement: Option<BimPlacement>,
     pub geometry: Option<BimGeometry>,
     pub properties: Vec<BimProperty>,
+    /// Properties the element's type carries rather than the element itself.
+    /// Kept apart from `properties` because they are read from another record
+    /// and hold for every element of that type, which a consumer that merged
+    /// the two could no longer tell.
+    pub type_properties: Vec<BimProperty>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]

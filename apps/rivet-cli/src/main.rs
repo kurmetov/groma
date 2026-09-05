@@ -1807,6 +1807,30 @@ fn element(
     Ok(())
 }
 
+/// Property naming the type an element is an instance of.
+///
+/// Measured, not guessed, on SMALL. All 10 011 `FamilyInstance` records that
+/// carry a value name an element that is a `FamilySymbol` - 10 011 of 10 011,
+/// where a misread field would land on one class or another at random - and
+/// they name only 226 distinct ones, the type-to-instance ratio a real type
+/// reference has. Two independent checks agree with it: on the 70 instances
+/// whose symbol was separately verified by matching the instance's bounds
+/// against the symbol's transformed box, the declared property names that same
+/// symbol in 70 of 70; and every instance shares a family with the type it
+/// names, 250 of 250 where both carry one.
+///
+/// Reading it replaces inferring the type from geometry, which covered only the
+/// 198 instances whose bounds could be matched. The bounds-verified symbol
+/// stays as the fallback, and where both are present they agree.
+///
+/// It is *not* the same thing as `GInstance`'s symbol, which is the symbol
+/// whose geometry a record instantiates: across all 7 055 records carrying one
+/// the two agree in only 7.4% of cases, because a record's geometry is usually
+/// instantiated from a nested symbol rather than from the instance's own type.
+/// Only on the bounds-verified subset, where the `GInstance` symbol is proven
+/// to be this instance's, do they agree everywhere.
+const TYPE_ELEMENT_ID_PROPERTY: &str = "m_masterSymbolId";
+
 /// One element as it is emitted to JSON.
 #[derive(Debug, Default)]
 struct ExportedElement {
@@ -1823,6 +1847,11 @@ struct ExportedElement {
     /// First readable string in the body, with how it was located.
     name: Option<(String, &'static str)>,
     parameters: Vec<rvt_model::Parameter>,
+    /// The element this one is an instance of, from its own declarations.
+    type_element_id: Option<i32>,
+    /// Parameters read from the record of this element's type. See
+    /// `inherit_symbol_parameters`.
+    type_parameters: Vec<rvt_model::Parameter>,
     /// Forge spec carried by this element when it defines a parameter.
     parameter_spec: Option<String>,
     pipe_line_candidate: Option<PipeLineGeometryFields>,
@@ -1845,6 +1874,20 @@ struct ExportedElement {
     locked: bool,
     source: Option<(usize, usize, usize)>,
     record_count: usize,
+}
+
+impl ExportedElement {
+    /// The element this one is an instance of: its declared type reference,
+    /// or - for a record whose declarations did not yield one - the symbol its
+    /// bounds were verified against. See [`TYPE_ELEMENT_ID_PROPERTY`].
+    fn type_element_reference(&self) -> Option<u32> {
+        self.type_element_id
+            .and_then(|id| u32::try_from(id).ok())
+            .or_else(|| {
+                self.verified_symbol_bounds
+                    .map(|symbol| symbol.symbol_element_id)
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3120,6 +3163,19 @@ fn recover_elements(
                                 })
                                 .map(|name| (name, "declared"));
                         }
+                        // The type an element is an instance of is a declared
+                        // property, so it is read rather than inferred from
+                        // geometry. See `TYPE_ELEMENT_ID_PROPERTY`.
+                        if entry.type_element_id.is_none() {
+                            entry.type_element_id = schema.as_ref().and_then(|schema| {
+                                rvt_model::record_declared_id(
+                                    schema,
+                                    header.class_index,
+                                    body,
+                                    TYPE_ELEMENT_ID_PROPERTY,
+                                )
+                            });
+                        }
                         if let Some(fields) = ElementFields::parse(body, header.id) {
                             let tail_end = fields.id_offset + 4 + ELEMENT_TAIL_BYTES;
                             if entry.name.is_none() {
@@ -3198,6 +3254,7 @@ fn recover_elements(
     attach_fitting_axes(&mut elements, catalog);
     verify_family_instance_placements(&mut elements);
     inherit_symbol_names(&mut elements);
+    inherit_symbol_parameters(&mut elements);
 
     let (parameter_names, parameter_specs) = parameter_metadata(&elements);
     Ok(RecoveredElements {
@@ -3216,9 +3273,11 @@ fn recover_elements(
 ///
 /// An instance's own declarations carry no name property - in Revit its name is
 /// its type's - so `FamilySymbol`'s declared `SymbolInfo.m_name` is the one to
-/// use, and only for an instance whose symbol was verified by its bounds. It
-/// takes precedence over a scanned name, which for an instance is whatever
-/// string the body happened to hold first, and stands aside for a declared one.
+/// use, reached through the instance's declared type reference (see
+/// [`TYPE_ELEMENT_ID_PROPERTY`]) or, failing that, the symbol its bounds were
+/// verified against. It takes precedence over a scanned name, which for an
+/// instance is whatever string the body happened to hold first, and stands
+/// aside for a declared one.
 fn inherit_symbol_names(elements: &mut BTreeMap<u32, ExportedElement>) {
     let symbol_names = elements
         .iter()
@@ -3235,12 +3294,52 @@ fn inherit_symbol_names(elements: &mut BTreeMap<u32, ExportedElement>) {
         {
             continue;
         }
-        let Some(symbol) = element.verified_symbol_bounds else {
+        let Some(symbol) = element.type_element_reference() else {
             continue;
         };
-        if let Some(name) = symbol_names.get(&symbol.symbol_element_id) {
+        if let Some(name) = symbol_names.get(&symbol) {
             element.name = Some((name.clone(), "symbol"));
         }
+    }
+}
+
+/// Give an instance the parameters stored on the symbol it was verified
+/// against.
+///
+/// An element's own record carries only what was set on the instance - around
+/// three values for a typical family instance in the corpus. The rest are
+/// stored once on its type, and the symbol verified by bounds is the same link
+/// `inherit_symbol_names` already trusts for the name.
+///
+/// They are kept in their own list rather than merged into the element's, so
+/// that "this element carries this value" and "every element of this type
+/// carries this value" stay distinguishable downstream. A parameter the
+/// element already sets is not inherited: an instance value overrides its
+/// type's, and no corpus body was found where both are written, so the rule
+/// only guards against a duplicate rather than resolving a measured conflict.
+fn inherit_symbol_parameters(elements: &mut BTreeMap<u32, ExportedElement>) {
+    let symbol_parameters = elements
+        .iter()
+        .filter(|(_, element)| !element.parameters.is_empty())
+        .map(|(id, element)| (*id, element.parameters.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for element in elements.values_mut() {
+        let Some(symbol) = element.type_element_reference() else {
+            continue;
+        };
+        let Some(parameters) = symbol_parameters.get(&symbol) else {
+            continue;
+        };
+        let own = element
+            .parameters
+            .iter()
+            .map(|parameter| parameter.id)
+            .collect::<BTreeSet<_>>();
+        element.type_parameters = parameters
+            .iter()
+            .filter(|parameter| !own.contains(&parameter.id))
+            .cloned()
+            .collect();
     }
 }
 
@@ -3424,7 +3523,7 @@ fn export_ifc(
         .filter(|name| !name.is_empty())
         .unwrap_or("Rivet Project")
         .to_owned();
-    let (model, included_properties, omitted_properties) =
+    let (model, included_properties, included_type_properties, omitted_properties) =
         metadata_model(&recovered, include_unplaced, limit);
     let level_count = model.levels.len();
     let element_count = model.elements.len();
@@ -3482,6 +3581,7 @@ fn export_ifc(
         "Mapped family instances with verified placement: {mapped_family_instance_placements} of {mapped_family_instances}"
     );
     println!("Recovered Revit properties: {included_properties}");
+    println!("Recovered Revit properties from the element's type: {included_type_properties}");
     if omitted_properties > 0 {
         println!(
             "Unverified parameter candidates omitted for this Revit release: {omitted_properties}"
@@ -3519,7 +3619,7 @@ fn metadata_model(
     recovered: &RecoveredElements,
     include_unplaced: bool,
     limit: Option<usize>,
-) -> (BimModel, usize, usize) {
+) -> (BimModel, usize, usize, usize) {
     let class_name = |element: &ExportedElement| {
         element.class_index.and_then(|index| {
             recovered
@@ -3566,6 +3666,7 @@ fn metadata_model(
             && (include_unplaced || element.level_id.is_some())
     });
     let mut included_properties = 0_usize;
+    let mut included_type_properties = 0_usize;
     let mut omitted_properties = 0_usize;
     let elements = candidates
         .take(limit.unwrap_or(usize::MAX))
@@ -3587,11 +3688,17 @@ fn metadata_model(
                 normalized.level_id = None;
             }
             let mut properties = trusted_source_properties(&normalized);
+            // The type's values come from the same reader as the element's own
+            // and carry the same risk of an unverified parameter code, so they
+            // are held to the same catalogue check rather than to none.
             if recovered.parameter_values_schema_bound {
                 included_properties += normalized.properties.len();
                 properties.append(&mut normalized.properties);
+                included_type_properties += normalized.type_properties.len();
             } else {
                 omitted_properties += normalized.properties.len();
+                omitted_properties += normalized.type_properties.len();
+                normalized.type_properties.clear();
             }
             normalized.properties = properties;
             normalized
@@ -3609,6 +3716,7 @@ fn metadata_model(
             relations: Vec::new(),
         },
         included_properties,
+        included_type_properties,
         omitted_properties,
     )
 }
@@ -3884,6 +3992,11 @@ fn normalize_element(
         .iter()
         .map(|parameter| normalize_property(parameter, parameter_names, parameter_specs, catalog))
         .collect();
+    let type_properties = element
+        .type_parameters
+        .iter()
+        .map(|parameter| normalize_property(parameter, parameter_names, parameter_specs, catalog))
+        .collect();
     let element_type = element_type_for_source(
         class_name.as_deref(),
         category.as_ref().map(|category| category.name.as_str()),
@@ -3909,12 +4022,15 @@ fn normalize_element(
         name: element.name.as_ref().map(|(name, _)| name.clone()),
         category,
         level_id: element.level_id.map(|id| BimElementId(id.to_string())),
-        // The recovered family reference is not proven to be a type reference
-        // for every serialized class.
-        type_id: None,
+        // The declared type reference, or the symbol verified by bounds; the
+        // family reference the header carries is neither.
+        type_id: element
+            .type_element_reference()
+            .map(|id| BimElementId(id.to_string())),
         placement: normalize_placement(element.ginstance_transform),
         geometry,
         properties,
+        type_properties,
     }
 }
 
@@ -4219,6 +4335,7 @@ fn write_element_json(
         ("category", element.category),
         ("level_id", element.level_id),
         ("family_id", element.family_id.or(element.header_family_id)),
+        ("type_id", element.type_element_id),
         ("owner_view_id", element.owner_view_id),
         ("created_phase_id", element.created_phase_id),
         ("design_option_id", element.design_option_id),
@@ -4262,6 +4379,16 @@ fn write_element_json(
             writer,
             &element.parameters,
             &normalized.properties,
+            metadata.catalog,
+        )?;
+        write!(writer, "]")?;
+    }
+    if !element.type_parameters.is_empty() {
+        write!(writer, ",\"type_parameters\":[")?;
+        write_parameters_json(
+            writer,
+            &element.type_parameters,
+            &normalized.type_properties,
             metadata.catalog,
         )?;
         write!(writer, "]")?;
@@ -5189,6 +5316,91 @@ mod tests {
         let mut flat = model([1.0, 2.0, -3.0]);
         attach_symbol_bounds(&mut flat, Some(7));
         assert_eq!(flat[&9].verified_symbol_bounds, None);
+    }
+
+    #[test]
+    fn a_type_s_parameters_reach_its_instances_without_joining_their_own() {
+        let parameter = |id: i32, value: &str| rvt_model::Parameter {
+            id,
+            value: ParameterValue::Text(value.to_owned()),
+        };
+        let mut elements = BTreeMap::new();
+        elements.insert(
+            5,
+            ExportedElement {
+                parameters: vec![
+                    parameter(214_890, "SANEXT"),
+                    parameter(214_891, "\u{448}\u{442}."),
+                ],
+                ..ExportedElement::default()
+            },
+        );
+        // One instance reaches its type through the declared reference, one
+        // through bounds, and one names a type that stores nothing.
+        elements.insert(
+            9,
+            ExportedElement {
+                type_element_id: Some(5),
+                parameters: vec![parameter(214_891, "\u{43c}")],
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            11,
+            ExportedElement {
+                verified_symbol_bounds: Some(VerifiedSymbolBounds {
+                    symbol_element_id: 5,
+                    bounds: GElementBounds {
+                        offset: 0,
+                        min: [0.0; 3],
+                        max: [1.0; 3],
+                    },
+                }),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            13,
+            ExportedElement {
+                type_element_id: Some(7),
+                ..ExportedElement::default()
+            },
+        );
+        inherit_symbol_parameters(&mut elements);
+
+        // The instance sets 214891 itself, so only the type's other value is
+        // inherited, and the element's own list is untouched either way.
+        assert_eq!(
+            elements[&9].type_parameters,
+            vec![parameter(214_890, "SANEXT")]
+        );
+        assert_eq!(elements[&9].parameters, vec![parameter(214_891, "\u{43c}")]);
+        assert_eq!(elements[&11].type_parameters.len(), 2);
+        assert!(elements[&13].type_parameters.is_empty());
+        // A type carries none of its own instances' values.
+        assert!(elements[&5].type_parameters.is_empty());
+    }
+
+    #[test]
+    fn a_declared_type_reference_is_preferred_over_a_bounds_verified_one() {
+        let bounds = VerifiedSymbolBounds {
+            symbol_element_id: 5,
+            bounds: GElementBounds {
+                offset: 0,
+                min: [0.0; 3],
+                max: [1.0; 3],
+            },
+        };
+        let element = |declared: Option<i32>| ExportedElement {
+            type_element_id: declared,
+            verified_symbol_bounds: Some(bounds),
+            ..ExportedElement::default()
+        };
+        assert_eq!(element(Some(9)).type_element_reference(), Some(9));
+        assert_eq!(element(None).type_element_reference(), Some(5));
+        // A negative identifier is not an element, and must not wrap round.
+        assert_eq!(element(Some(-2)).type_element_reference(), Some(5));
+        assert_eq!(ExportedElement::default().type_element_reference(), None);
     }
 
     #[test]

@@ -1153,8 +1153,44 @@ fn push_property_set(
     options: &MetadataOptions,
     owner: EntityRef,
 ) {
-    let properties = element
-        .properties
+    push_named_property_set(
+        file,
+        &element.properties,
+        product,
+        options,
+        owner,
+        "Rivet Properties",
+        &format!("properties:{}", element.id.0),
+        &format!("properties-relation:{}", element.id.0),
+    );
+    // The type's values go in a set of their own. Both sets hang off the same
+    // product - the element's type is not itself exported as an
+    // `IfcTypeProduct` - so the set name is what keeps "set on this element"
+    // and "set on its type" apart for a reader.
+    push_named_property_set(
+        file,
+        &element.type_properties,
+        product,
+        options,
+        owner,
+        "Rivet Type Properties",
+        &format!("type-properties:{}", element.id.0),
+        &format!("type-properties-relation:{}", element.id.0),
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // Two identifiers and a name, all distinct.
+fn push_named_property_set(
+    file: &mut StepFile,
+    source: &[BimProperty],
+    product: EntityRef,
+    options: &MetadataOptions,
+    owner: EntityRef,
+    name: &str,
+    key: &str,
+    relation_key: &str,
+) {
+    let properties = source
         .iter()
         .filter_map(|property| push_property(file, property))
         .map(reference)
@@ -1165,9 +1201,9 @@ fn push_property_set(
     let pset = file.push(
         "IFCPROPERTYSET",
         vec![
-            global_id(options, &format!("properties:{}", element.id.0)),
+            global_id(options, key),
             reference(owner),
-            string("Rivet Properties"),
+            string(name),
             omitted(),
             StepValue::List(properties),
         ],
@@ -1175,7 +1211,7 @@ fn push_property_set(
     file.push(
         "IFCRELDEFINESBYPROPERTIES",
         vec![
-            global_id(options, &format!("properties-relation:{}", element.id.0)),
+            global_id(options, relation_key),
             reference(owner),
             omitted(),
             omitted(),
@@ -1376,6 +1412,7 @@ mod tests {
                         }),
                     }),
                 }],
+                type_properties: Vec::new(),
             }],
             relations: Vec::new(),
         }
@@ -1396,6 +1433,7 @@ mod tests {
             placement: None,
             geometry: None,
             properties: Vec::new(),
+            type_properties: Vec::new(),
         }
     }
 
@@ -1421,6 +1459,40 @@ mod tests {
         assert!(text.contains("=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)"));
         assert!(text.contains("=IFCOWNERHISTORY(#3,#4,$,.ADDED.,1788506400,#3,#4,1788506400)"));
         assert!(text.contains("'\\X2\\042D04420430043600200031\\X0\\'"));
+    }
+
+    #[test]
+    fn a_type_s_properties_go_in_a_set_of_their_own() {
+        let mut model = model();
+        let mut element = model.elements[0].clone();
+        element.type_properties = vec![BimProperty {
+            id: None,
+            name: "Manufacturer".to_owned(),
+            specification: None,
+            value: BimPropertyValue::Text("SANEXT".to_owned()),
+        }];
+        model.elements = vec![element];
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        // Both sets are written, under names that keep them apart, and the
+        // type's value is not merged into the element's own set.
+        assert!(text.contains("'Rivet Properties'"));
+        assert!(text.contains("'Rivet Type Properties'"));
+        assert_eq!(text.matches("=IFCPROPERTYSET(").count(), 2);
+        assert_eq!(text.matches("=IFCRELDEFINESBYPROPERTIES(").count(), 2);
+        assert!(text.contains("'SANEXT'"));
+
+        // An element whose type stores nothing gets no second set.
+        model.elements[0].type_properties.clear();
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches("=IFCPROPERTYSET(").count(), 1);
+        assert!(!text.contains("'Rivet Type Properties'"));
     }
 
     #[test]

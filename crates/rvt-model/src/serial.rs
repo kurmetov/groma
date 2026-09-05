@@ -61,6 +61,8 @@ const REFERENCE_LOADING_BIT: u8 = 0x01;
 const IDENTIFIER_ONLY_LOADING_BIT: u8 = 0x02;
 /// A bare identifier reference.
 const IDENTIFIER_REFERENCE_BYTES: usize = 4;
+/// Revit's invalid element identifier, which an unset `ElementId` field holds.
+const INVALID_ELEMENT_ID: i32 = -1;
 /// Width of the variable-width field that opens a record body, which is written
 /// two bytes narrower than its declared four.
 ///
@@ -454,6 +456,52 @@ pub fn record_name(schema: &Schema, class_index: u16, body: &[u8]) -> Option<Str
         })
         .min_by_key(|string| (string.distance, string.offset))
         .map(|string| string.value)
+}
+
+/// The value of one identifier-shaped property of a record's own header.
+///
+/// Only the record's own declarations are read - not the node stream - so the
+/// answer is the record's own field and not a like-named one belonging to
+/// something it merely contains. The property is located by name rather than by
+/// offset, so the same call works for every class that declares it.
+///
+/// `None` when the class chain declares no such property, when the walk stops
+/// before reaching it, or when the value is Revit's invalid identifier, `-1`.
+#[must_use]
+pub fn record_declared_id(
+    schema: &Schema,
+    class_index: u16,
+    body: &[u8],
+    property: &str,
+) -> Option<i32> {
+    let mut reader = Reader {
+        schema,
+        body,
+        offset: 0,
+        references: Vec::new(),
+        identifiers: Vec::new(),
+        numbers: Vec::new(),
+        integers: Vec::new(),
+        strings: Vec::new(),
+        small_integers: Vec::new(),
+        node_headers: false,
+        fixed_references: false,
+        record_narrow_pending: true,
+        node_flags: 0,
+        trace: Some(Vec::new()),
+        kept_strings: None,
+        string_distance: 0,
+    };
+    let _stop = reader.read_class(class_index, 0).err();
+    let offset = reader
+        .trace
+        .as_ref()?
+        .iter()
+        .find(|entry| entry.property == property && entry.consumed == IDENTIFIER_REFERENCE_BYTES)
+        .map(|entry| entry.offset)?;
+    let bytes = body.get(offset..offset.checked_add(IDENTIFIER_REFERENCE_BYTES)?)?;
+    let value = i32::from_le_bytes(bytes.try_into().ok()?);
+    (value != INVALID_ELEMENT_ID).then_some(value)
 }
 
 /// Same as [`walk_record`], recording every property read.
@@ -1577,6 +1625,59 @@ mod tests {
         // Without the repeat of the key the entry is the declared twenty-two
         // bytes wide, and the walk runs off the end of the body instead.
         assert!(!walk_record(&schema, root, &record(&[])).is_exact());
+    }
+
+    #[test]
+    fn a_declared_identifier_is_found_by_name_in_the_record_s_own_header() {
+        // A record declaring an inline `ElementId` after the narrow opening
+        // field, and a node whose class declares a property of the same name.
+        let mut type_id = property("m_masterSymbolId", FieldType::Object, 0x00, 0, None);
+        type_id.static_type = Some(TypeReference::Reference {
+            index: FIRST_CLASS_INDEX + 3,
+            name: "ElementId".to_owned(),
+        });
+        let mut classes = record_schema().classes;
+        classes[1].properties = vec![
+            property("m_flags", FieldType::Integer32Alternate, 0x00, 0, None),
+            type_id.clone(),
+            property("m_subNodes", FieldType::Object, 0x51, 5, None),
+        ];
+        classes[2].properties = vec![type_id];
+        classes.push(class(
+            FIRST_CLASS_INDEX + 3,
+            "ElementId",
+            TypeReference::None,
+            vec![property("m_id", FieldType::Integer32, 0x00, 0, None)],
+        ));
+        let schema = Schema {
+            classes,
+            ..record_schema()
+        };
+
+        let record = |own: i32, node: i32| {
+            let mut body = Vec::new();
+            body.extend(SHORT_FLAGS.to_le_bytes()); // the narrow opening field
+            body.extend(own.to_le_bytes());
+            body.extend(1_u32.to_le_bytes()); // one sub-node
+            body.extend(3_u32.to_le_bytes());
+            body.extend((FIRST_CLASS_INDEX + 2).to_le_bytes());
+            body.extend(node.to_le_bytes());
+            let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+            body.extend(length.to_le_bytes());
+            body
+        };
+
+        let root = FIRST_CLASS_INDEX + 1;
+        let read = |body: &[u8]| record_declared_id(&schema, root, body, "m_masterSymbolId");
+        // The record's own value, not the like-named one its node carries.
+        assert_eq!(read(&record(217_275, 999)), Some(217_275));
+        // Revit's invalid identifier is not an element.
+        assert_eq!(read(&record(-1, 999)), None);
+        // A property the class chain does not declare has no value here.
+        assert_eq!(
+            record_declared_id(&schema, root, &record(217_275, 999), "m_hostId"),
+            None
+        );
     }
 
     #[test]
