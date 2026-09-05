@@ -80,6 +80,22 @@ type definitions are left out, so AR S1 yields **17 946** documents from
 800 133 records: 17 377 elements, 554 rooms and 15 storeys. `source` locates
 the record in the `.rvt` for anything that needs checking against the file.
 
+## Wiring it to an agent
+
+`agent-tools.json` holds one tool definition per route, in the Anthropic
+Messages API shape. Paste its `tools` array into the request and let the
+executor build the URL - `_routes` in the same file maps each tool to its GET.
+The descriptions carry the two data rules below, because those are what an
+agent gets wrong unprompted: it will quote a raw internal-unit number as
+metres, and it will filter instances by category when instances carry none.
+
+```python
+tools = json.load(open("apps/rivet-api/agent-tools.json"))["tools"]
+```
+
+Drop `"strict": true` from a tool if your client rejects a schema whose
+optional properties are absent from `required`.
+
 ## Two things to know about the data
 
 **Numbers are in Revit's internal units unless told otherwise.** A parameter's

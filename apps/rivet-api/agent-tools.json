@@ -1,0 +1,111 @@
+{
+  "_comment": "Tool definitions for the Anthropic Messages API, one per rivet-api route. Paste the `tools` array into client.messages.create(tools=...). Each tool maps to a GET on the base URL (default http://127.0.0.1:8787) and your executor only has to build the URL and return the JSON body verbatim. `strict: true` guarantees the arguments validate against the schema.",
+  "tools": [
+    {
+      "name": "list_models",
+      "description": "List the Revit models available to query. Returns their ids, which every other tool takes as `model`. Call this first when you do not already know the model id.",
+      "strict": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "model_summary",
+      "description": "Overview of one Revit model: how many elements it holds, how many are model elements (real building elements rather than annotation or type definitions), how many carry geometry, how many rooms and storeys, and the most frequent Revit classes and categories. Call this before querying elements so you know which class and category values exist in this model.",
+      "strict": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Model id from list_models." }
+        },
+        "required": ["model"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "query_elements",
+      "description": "Search the elements of one Revit model. All filters combine with AND and any may be omitted. Returns a page of elements plus `total`, the number of matches, which is usually larger than the page - use `total` to answer counting questions such as 'how many doors are on Level 2' rather than counting the returned page. Numeric parameter values are in Revit's internal units (feet, square feet, radians) unless the parameter also carries `storage_value` with a `unit_name`; when it does, quote that converted value, and when it does not, do not present the raw number as metres or millimetres.",
+      "strict": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Model id from list_models." },
+          "class": {
+            "type": "string",
+            "description": "Exact Revit class, case-insensitive. Common values: SWall (walls), Floor, FamilyInstance (doors, windows, columns, railings and other placed families), RoomElem, Level, StairsRun. Use model_summary to see what this model has."
+          },
+          "category": {
+            "type": "string",
+            "description": "Exact Revit category, case-insensitive, e.g. OST_Walls, OST_Doors, OST_Windows. Note that real placed instances usually carry NO category of their own - it lives on their type - so filter instances by `class` and use `category` mainly for type definitions."
+          },
+          "level": { "type": "string", "description": "Exact storey name as returned by list_levels, e.g. '02 Этаж'." },
+          "name": { "type": "string", "description": "Substring of the element's own name." },
+          "q": {
+            "type": "string",
+            "description": "Free-text substring searched across name, class, category, level, type, family and every text parameter. Use this when you do not know which field holds the term."
+          },
+          "model_elements": {
+            "type": "boolean",
+            "description": "Keep only real building elements of the model, excluding type definitions, annotation and view artefacts. Set this true for almost any question about the building itself."
+          },
+          "with_geometry": { "type": "boolean", "description": "Keep only elements whose geometry was recovered." },
+          "offset": { "type": "integer", "description": "Elements to skip, for paging. Default 0." },
+          "limit": { "type": "integer", "description": "Page size, default 50, maximum 1000." }
+        },
+        "required": ["model"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_element",
+      "description": "Fetch one element of a Revit model by its Revit element id, with every recovered field: class, category, the storey it is on, its type and family, all parameters, geometry if any, and `source`, which locates the record inside the .rvt file.",
+      "strict": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Model id from list_models." },
+          "id": { "type": "integer", "description": "Revit element id, as returned in the `id` field by query_elements." }
+        },
+        "required": ["model", "id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "list_rooms",
+      "description": "Every room in a Revit model, with the storey it sits on and its full parameter set - room number, name, purpose, areas and any project-specific schedule parameters. Room parameters are usually project parameters, so their numeric values do carry a converted `storage_value` and `unit_name` (for example square metres). Use this for questions about rooms, apartments, areas or what a space is for.",
+      "strict": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Model id from list_models." }
+        },
+        "required": ["model"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "list_levels",
+      "description": "The storeys of a Revit model, lowest first, with their elevation in metres. A storey here is a level that model elements actually stand on, with duplicates folded together, so this list matches what the model really has rather than every Level record in the file. Use the returned names verbatim as the `level` filter of query_elements.",
+      "strict": true,
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "Model id from list_models." }
+        },
+        "required": ["model"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "_routes": {
+    "list_models": "GET /models",
+    "model_summary": "GET /models/{model}/summary",
+    "query_elements": "GET /models/{model}/elements?class=&category=&level=&name=&q=&model_elements=&with_geometry=&offset=&limit=",
+    "get_element": "GET /models/{model}/elements/{id}",
+    "list_rooms": "GET /models/{model}/rooms",
+    "list_levels": "GET /models/{model}/levels"
+  }
+}
