@@ -4520,20 +4520,14 @@ const BODY_BOUNDS_TOLERANCE_FEET: f64 = 1e-6;
 
 /// Whether a body is already placed, by reproducing the bounds block carried
 /// by the same `GElement` record.
-///
-/// Only a body whose every face is planar can answer: an arc bulges past its
-/// endpoints, so the extent of a curved body understates its own box and
-/// would read as a disagreement. Such a body is left unplaced rather than
-/// admitted on a weaker test.
 fn body_is_placed_in(brep: &rvt_model::SymbolBrep, bounds: &GElementBounds) -> bool {
-    let Some((min, max, planar)) = body_extent_feet(brep) else {
+    let Some((min, max)) = body_extent_feet(brep) else {
         return false;
     };
     // A box flat on an axis holds no volume, and its "body" is a region or a
     // sketch rather than a solid - AR S1 carries 9 873 `FilledRegion` records
     // that would otherwise pass this test on a single face.
     bounds.is_volumetric()
-        && planar
         && min
             .into_iter()
             .chain(max)
@@ -4566,13 +4560,11 @@ struct ClassGeometry {
     /// Bodies with no excluded face, which is what the exporter emits.
     complete_bodies: usize,
     faces: usize,
-    /// Bodies whose owning record also carried an exact bounds block, and -
-    /// of the planar ones, whose extent an arc cannot understate - how many
-    /// reproduce that block. Agreement says the body is in the same frame as
-    /// the bounds the placement chain already trusts.
+    /// Bodies whose owning record also carried an exact bounds block, and how
+    /// many reproduce it. Agreement says the body is in the same frame as the
+    /// bounds the placement chain already trusts.
     bodies_with_bounds: usize,
-    planar_bodies_with_bounds: usize,
-    planar_bodies_matching_their_bounds: usize,
+    bodies_matching_their_bounds: usize,
     /// Bodies whose centre is more than a foot from the origin, i.e. already
     /// carrying a position rather than sitting in a symbol's local frame.
     bodies_away_from_the_origin: usize,
@@ -4591,34 +4583,87 @@ struct ClassGeometry {
     model_elements_with_a_verified_symbol_body: usize,
 }
 
-/// A body's axis-aligned extent from its edge endpoints, in Revit internal
-/// feet, and whether every face of it is planar. An arc bulges past its
-/// endpoints, so a body carrying a cylinder can understate its own extent by
-/// up to the sagitta and is counted apart rather than called a mismatch.
-fn body_extent_feet(brep: &rvt_model::SymbolBrep) -> Option<([f64; 3], [f64; 3], bool)> {
+/// A body's axis-aligned extent, in Revit internal feet.
+///
+/// Exact for every surface this decoder produces. The endpoints of the edges
+/// bound a planar face, and they bound a cylindrical one too: its generators
+/// are straight lines between boundary points, so nothing on the patch lies
+/// outside its boundary. What the endpoints alone miss is the bulge of an arc
+/// between them, and that is added analytically rather than left as an
+/// approximation - a curved body could otherwise never be told from one in
+/// the wrong frame.
+fn body_extent_feet(brep: &rvt_model::SymbolBrep) -> Option<([f64; 3], [f64; 3])> {
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
-    let mut planar = true;
+    let include = |point: [f64; 3], min: &mut [f64; 3], max: &mut [f64; 3]| {
+        for (axis, value) in point.into_iter().enumerate() {
+            if !value.is_finite() {
+                return false;
+            }
+            min[axis] = min[axis].min(value);
+            max[axis] = max[axis].max(value);
+        }
+        true
+    };
     for face in &brep.faces {
-        planar &= matches!(face.surface, rvt_model::BrepSurface::Plane { .. });
         for face_loop in &face.loops {
             for edge in face_loop {
-                planar &= matches!(edge.curve, rvt_model::BrepCurve::Line);
                 for point in [edge.start, edge.end] {
-                    for (axis, value) in point.into_iter().enumerate() {
-                        if !value.is_finite() {
+                    if !include(point, &mut min, &mut max) {
+                        return None;
+                    }
+                }
+                if let rvt_model::BrepCurve::Arc(arc) = &edge.curve {
+                    for point in arc_extreme_points(arc) {
+                        if !include(point, &mut min, &mut max) {
                             return None;
                         }
-                        min[axis] = min[axis].min(value);
-                        max[axis] = max[axis].max(value);
                     }
                 }
             }
         }
     }
-    min.into_iter()
-        .all(f64::is_finite)
-        .then_some((min, max, planar))
+    min.into_iter().all(f64::is_finite).then_some((min, max))
+}
+
+/// The points where an arc reaches an axis extreme, for the axes whose extreme
+/// its own angular range covers.
+///
+/// `point(a) = center + radius * (cos a * x_axis + sin a * y_axis)`, so along
+/// one axis the arc traces `center + R cos(a - phase)` and reaches its extreme
+/// at `phase` and `phase + pi`. Only an extreme the arc actually sweeps
+/// through counts; elsewhere the endpoints already bound it.
+fn arc_extreme_points(arc: &rvt_model::BrepArc) -> Vec<[f64; 3]> {
+    let y_axis = [
+        arc.z_axis[1] * arc.x_axis[2] - arc.z_axis[2] * arc.x_axis[1],
+        arc.z_axis[2] * arc.x_axis[0] - arc.z_axis[0] * arc.x_axis[2],
+        arc.z_axis[0] * arc.x_axis[1] - arc.z_axis[1] * arc.x_axis[0],
+    ];
+    let point = |angle: f64| {
+        let (sine, cosine) = angle.sin_cos();
+        [0, 1, 2].map(|axis| {
+            arc.center[axis] + arc.radius * (cosine * arc.x_axis[axis] + sine * y_axis[axis])
+        })
+    };
+    // The file's own `u` values run in either direction; the arc covers what
+    // lies between them either way.
+    let (low, high) = (
+        arc.start_angle.min(arc.end_angle),
+        arc.start_angle.max(arc.end_angle),
+    );
+    let mut points = Vec::new();
+    for (x, y) in arc.x_axis.into_iter().zip(y_axis) {
+        let phase = y.atan2(x);
+        for extreme in [phase, phase + std::f64::consts::PI] {
+            // The first turn of this extreme at or after the arc's start.
+            let swept =
+                extreme + std::f64::consts::TAU * ((low - extreme) / std::f64::consts::TAU).ceil();
+            if swept <= high {
+                points.push(point(swept));
+            }
+        }
+    }
+    points
 }
 
 /// Tally the decoded bodies by the class of the element that owns them.
@@ -4660,18 +4705,17 @@ fn tally_class_geometry<'a>(
             row.faces += brep.faces.len();
             row.named_by_an_instance += usize::from(named.contains(id));
             row.verified_by_an_instance += usize::from(verified.contains(id));
-            if let Some((min, max, planar)) = body_extent_feet(brep) {
+            if let Some((min, max)) = body_extent_feet(brep) {
                 let centre_is_placed = min
                     .into_iter()
                     .zip(max)
                     .any(|(low, high)| (low + high).abs() / 2.0 > 1.0);
                 row.bodies_away_from_the_origin += usize::from(centre_is_placed);
                 row.bodies_with_bounds += usize::from(element.geometry_bounds.is_some());
-                row.planar_bodies_with_bounds += usize::from(planar);
                 // The recovery paired this body with the bounds of its own
                 // record; re-deriving it here from the element would cross
                 // one record's body with another's box.
-                row.planar_bodies_matching_their_bounds += usize::from(element.brep_is_placed);
+                row.bodies_matching_their_bounds += usize::from(element.brep_is_placed);
             }
         }
         if is_model_element {
@@ -4713,8 +4757,7 @@ fn body_owners(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(),
             total.named_by_an_instance += row.named_by_an_instance;
             total.verified_by_an_instance += row.verified_by_an_instance;
             total.bodies_with_bounds += row.bodies_with_bounds;
-            total.planar_bodies_with_bounds += row.planar_bodies_with_bounds;
-            total.planar_bodies_matching_their_bounds += row.planar_bodies_matching_their_bounds;
+            total.bodies_matching_their_bounds += row.bodies_matching_their_bounds;
             total.bodies_away_from_the_origin += row.bodies_away_from_the_origin;
             total.model_elements += row.model_elements;
             total.model_elements_with_their_own_body += row.model_elements_with_their_own_body;
@@ -4740,10 +4783,8 @@ fn body_owners(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(),
         total.named_by_an_instance, total.verified_by_an_instance
     );
     println!(
-        "  bodies reproducing their record's own bounds: {} of {} planar ({} bodies have bounds)",
-        total.planar_bodies_matching_their_bounds,
-        total.planar_bodies_with_bounds,
-        total.bodies_with_bounds
+        "  bodies reproducing their record's own bounds: {} of {} that carry one",
+        total.bodies_matching_their_bounds, total.bodies_with_bounds
     );
     println!(
         "  bodies whose centre is over a foot from the origin: {}",
@@ -4766,7 +4807,7 @@ fn print_body_owner_table(rows: &BTreeMap<&str, ClassGeometry>, classes: usize) 
             .then_with(|| left.0.cmp(right.0))
     });
     println!("\nWho owns the bodies:");
-    println!("class\tids\trecords\tcomplete\tfaces\tnamed\tverified\tplanar=bounds\toff-origin");
+    println!("class\tids\trecords\tcomplete\tfaces\tnamed\tverified\t=bounds\toff-origin");
     for (name, row) in by_bodies
         .iter()
         .filter(|(_, row)| row.body_ids > 0)
@@ -4780,8 +4821,8 @@ fn print_body_owner_table(rows: &BTreeMap<&str, ClassGeometry>, classes: usize) 
             row.faces,
             row.named_by_an_instance,
             row.verified_by_an_instance,
-            row.planar_bodies_matching_their_bounds,
-            row.planar_bodies_with_bounds,
+            row.bodies_matching_their_bounds,
+            row.bodies_with_bounds,
             row.bodies_away_from_the_origin
         );
     }
@@ -6971,7 +7012,7 @@ mod tests {
         assert_eq!(wall.body_records, 2);
         // The body reproduces the record's own bounds and sits where the
         // building is, not at a symbol's origin.
-        assert_eq!(wall.planar_bodies_matching_their_bounds, 1);
+        assert_eq!(wall.bodies_matching_their_bounds, 1);
         assert_eq!(wall.bodies_away_from_the_origin, 1);
         // It is a model element that owns a body and reaches the export by no
         // symbol at all - the case the funnel cannot see.
@@ -7027,20 +7068,45 @@ mod tests {
             &bounds([0.0, 0.0, 0.0], [1.0, 1.0, 9.0])
         ));
 
-        // An arc bulges past the endpoints this extent is taken from, so a
-        // curved body is not admitted on a test that cannot see the bulge.
+        // An arc bulges past the endpoints the extent is taken from, and the
+        // bulge is part of the body. This one runs from (41, 5) to (40, 5)
+        // the long way round, reaching y = 4.5 half a foot outside the box
+        // its endpoints describe.
         let mut curved = box_body.clone();
         curved.faces[0].loops[0][0].curve = rvt_model::BrepCurve::Arc(rvt_model::BrepArc {
             center: [40.5, 5.0, 0.0],
             x_axis: [1.0, 0.0, 0.0],
-            z_axis: [0.0, 0.0, 1.0],
+            // Handed so that the sweep from 0 to pi runs through -Y.
+            z_axis: [0.0, 0.0, -1.0],
             radius: 0.5,
             start_angle: 0.0,
             end_angle: std::f64::consts::PI,
         });
+        // The box that ignores the bulge is no longer this body's box.
         assert!(!body_is_placed_in(
             &curved,
             &bounds([40.0, 5.0, 0.0], [41.0, 6.0, 9.0])
+        ));
+        // The one that accounts for it is.
+        assert!(body_is_placed_in(
+            &curved,
+            &bounds([40.0, 4.5, 0.0], [41.0, 6.0, 9.0])
+        ));
+        // An arc that does not sweep through the extreme contributes only its
+        // endpoints: a quarter turn from (41, 5) reaches y = 5 - 0.5*sin, not
+        // the full radius, so the box stays the one the endpoints give.
+        let mut quarter = box_body.clone();
+        quarter.faces[0].loops[0][0].curve = rvt_model::BrepCurve::Arc(rvt_model::BrepArc {
+            center: [40.5, 5.0, 0.0],
+            x_axis: [1.0, 0.0, 0.0],
+            z_axis: [0.0, 0.0, -1.0],
+            radius: 0.5,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::FRAC_PI_2,
+        });
+        assert!(body_is_placed_in(
+            &quarter,
+            &bounds([40.0, 4.5, 0.0], [41.0, 6.0, 9.0])
         ));
     }
 

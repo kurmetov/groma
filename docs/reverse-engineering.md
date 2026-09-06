@@ -1152,3 +1152,30 @@ reproduces it untouched: 570 spaces, 10 252 shapes.
 The two rooms without a volume are the two whose body did not resolve
 completely; they are emitted as spaces with a placement and no shape rather
 than with a guessed one.
+
+### Result: an arc's bulge, and what it did not buy
+
+The placed test admitted only bodies whose every face was planar, because an
+arc bulges past the endpoints the extent was taken from. That exclusion is now
+gone: the extent adds each arc's own extreme analytically. Along one axis an
+arc traces `center + R cos(a - phase)`, so it reaches an extreme at `phase`
+and `phase + pi`, and only an extreme the arc actually sweeps through counts -
+elsewhere the endpoints already bound it. Every point the rule adds is a point
+on the arc, so it can only fail to cover, never overreach. The endpoints bound
+the rest: a planar face by its loops, and a cylindrical one too, whose
+generators are straight lines between boundary points.
+
+It bought almost nothing on AR S1: **3 model elements**, 9 944 to 9 947. The
+hypothesis it was written against - that 2 003 walls were being refused for
+curvature - was wrong, and the corrected count says where they actually are.
+Of the 13 208 wall bodies only **10 748 carry an exact bounds block at all**,
+and of those, **every single one** reproduces it (10 748 / 10 748). The other
+2 460 have no box to be checked against. Curvature was never the gate; a
+missing bounds block is, and that is the next lever.
+
+Where it does change what can be verified is the disciplines made of
+cylinders. On ВК S1 the bodies reproducing their own box go from 1 814 to
+**8 876**, including 6 708 of 6 735 `RbsPipeCurve`. None of it reaches the
+file, because a pipe already carries geometry by the swept-disk path, which is
+checked first and is the better representation. It will matter wherever the
+placed body is the only route a curved element has.
