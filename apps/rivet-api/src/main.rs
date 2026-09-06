@@ -212,6 +212,8 @@ fn query_from(params: &BTreeMap<String, String>) -> Query {
         class: text("class"),
         category: text("category"),
         level: text("level"),
+        // Resolved by the route, which has the model to fold the storey with.
+        level_ids: None,
         name: text("name"),
         text: text("q"),
         model_elements_only: flag("model_elements"),
@@ -219,6 +221,46 @@ fn query_from(params: &BTreeMap<String, String>) -> Query {
         offset: number("offset", 0),
         limit: number("limit", DEFAULT_LIMIT).clamp(1, MAX_LIMIT),
     }
+}
+
+/// The `/elements` answer: the filtered page, and what the filters removed.
+fn elements_response(
+    name: &str,
+    model: &Model,
+    params: &BTreeMap<String, String>,
+) -> Response<Cursor<Vec<u8>>> {
+    let mut query = query_from(params);
+    // A storey is many `Level` records, so the filter is the whole set. An id
+    // that names no storey is refused: answering it with an empty page would
+    // read as an empty storey.
+    if let Some(storey) = params.get("storey").filter(|value| !value.is_empty()) {
+        match storey
+            .parse::<u32>()
+            .ok()
+            .and_then(|id| model.storey_level_ids(id))
+        {
+            Some(level_ids) => query.level_ids = Some(level_ids),
+            None => return error(400, "storey must be an `id` from /levels"),
+        }
+    }
+    let page = model.query(&query);
+    let mut body = serde_json::json!({
+        "model": name,
+        "total": page.total,
+        "offset": query.offset,
+        "limit": query.limit,
+        "elements": page.elements,
+    });
+    if page.excluded_as_not_model_elements > 0 {
+        body["excluded_as_not_model_elements"] =
+            serde_json::json!(page.excluded_as_not_model_elements);
+        body["note"] = serde_json::json!(
+            "model_elements dropped that many matches: rooms, levels, type \
+             definitions and annotation are not model elements. Drop the flag \
+             to count them."
+        );
+    }
+    json_response(200, &body)
 }
 
 fn handle(store: &Store, request: Request) -> std::io::Result<()> {
@@ -256,7 +298,7 @@ fn handle(store: &Store, request: Request) -> std::io::Result<()> {
                 "routes": [
                     "/models",
                     "/models/{model}/summary",
-                    "/models/{model}/elements?class=&category=&level=&name=&q=&model_elements=&with_geometry=&offset=&limit=",
+                    "/models/{model}/elements?class=&category=&storey=&level=&name=&q=&model_elements=&with_geometry=&offset=&limit=",
                     "/models/{model}/elements/{id}",
                     "/models/{model}/rooms",
                     "/models/{model}/levels",
@@ -270,20 +312,7 @@ fn handle(store: &Store, request: Request) -> std::io::Result<()> {
             None => error(404, "unknown model"),
         },
         ["models", name, "elements"] => match store.get(name) {
-            Some(model) => {
-                let query = query_from(&params);
-                let (page, total) = model.query(&query);
-                json_response(
-                    200,
-                    &serde_json::json!({
-                        "model": name,
-                        "total": total,
-                        "offset": query.offset,
-                        "limit": query.limit,
-                        "elements": page,
-                    }),
-                )
-            }
+            Some(model) => elements_response(name, &model, &params),
             None => error(404, "unknown model"),
         },
         ["models", name, "elements", id] => match (store.get(name), id.parse::<u32>()) {
@@ -306,7 +335,7 @@ fn handle(store: &Store, request: Request) -> std::io::Result<()> {
         },
         ["models", name, "levels"] => match store.get(name) {
             Some(model) => {
-                let levels = model.levels();
+                let levels = model.storeys();
                 json_response(
                     200,
                     &serde_json::json!({ "model": name, "total": levels.len(), "levels": levels }),

@@ -41,7 +41,7 @@ milliseconds.
 | `GET /models/{model}/elements?…` | filtered, paged elements |
 | `GET /models/{model}/elements/{id}` | one element by its Revit element id |
 | `GET /models/{model}/rooms` | every room, with its parameters |
-| `GET /models/{model}/levels` | the storeys, low to high |
+| `GET /models/{model}/levels` | the storeys, low to high, with their level ids and counts |
 | `GET /models/{model}/documents` | NDJSON, one document per record worth indexing |
 
 Filters on `/elements`, combining with AND:
@@ -50,7 +50,8 @@ Filters on `/elements`, combining with AND:
 |---|---|
 | `class` | exact Revit class, case-insensitive (`SWall`, `FamilyInstance`, `RoomElem`) |
 | `category` | exact category, case-insensitive (`OST_Walls`) |
-| `level` | exact storey name (`01 Этаж`) |
+| `storey` | storey `id` from `/levels`, matching every `Level` record folded into it |
+| `level` | storey name (`01 Этаж`); names repeat, so this merges the storeys sharing one |
 | `name` | substring of the element's name |
 | `q` | substring of name, class, category, level, type, family and every text parameter |
 | `model_elements` | keep only model elements, not type definitions or annotation |
@@ -58,9 +59,14 @@ Filters on `/elements`, combining with AND:
 | `offset`, `limit` | paging; `limit` defaults to 50 and is capped at 1000 |
 
 `total` in the response is the number of matches, not the size of the page.
+Where `model_elements` is what emptied a page, the answer also carries
+`excluded_as_not_model_elements` and a note - a room passes every other filter
+and fails that one, and a bare `0` would read as "no rooms in this model".
+A `storey` that is not a storey id is a **400**, not an empty page.
 
 ```bash
 curl 'http://127.0.0.1:8787/models/AR_S1/elements?class=SWall&model_elements&limit=5'
+curl 'http://127.0.0.1:8787/models/AR_S1/elements?class=SWall&storey=3182689&limit=1'
 curl 'http://127.0.0.1:8787/models/AR_S1/elements?level=01%20%D0%AD%D1%82%D0%B0%D0%B6&with_geometry'
 curl 'http://127.0.0.1:8787/models/AR_S1/documents' > index.ndjson
 ```
@@ -108,7 +114,19 @@ their areas do come out in square metres; a wall's `WALL_USER_HEIGHT_PARAM`
 does not. Only converted values reach the indexed prose - a number whose unit
 is unknown is left out of it rather than embedded as a bare figure.
 
-**A storey is a level a model element stands on.** The record walk recovers
-every `Level` the file mentions, including those a linked model contributes -
-721 on AR S1 for 15 real storeys. `/levels` and the indexed documents apply the
-exporter's rule, so the API, the IFC and Revit's own export agree on 15.
+**A storey is a level a model element stands on, and it is a set of records.**
+The record walk recovers every `Level` the file mentions, including those a
+linked model contributes - 721 on AR S1 for 15 real storeys. `/levels` and the
+indexed documents apply the exporter's rule, so the API, the IFC and Revit's
+own export agree on 15.
+
+Those 15 storeys are named by **152** `Level` records - `01 Этаж` alone by 37 -
+and elements are spread across all of them, so each storey publishes its
+`level_ids` and `storey=` filters on the whole set. Filtering by one id would
+reach 11 562 of the 15 149 placed model elements. Filtering by *name* is worse
+than coarse: `02 Этаж`, `03 Этаж` and `05 Этаж` are each two storeys 0.9 m
+apart, marked `ambiguous_name`, and a name filter silently adds them together.
+
+The per-storey `model_elements` and `rooms` counts sum to 15 149 and 554 on
+AR S1. The summary's `model_elements_without_level` (**2 228**) is the rest of
+the 17 377: elements placed on no level, which no per-storey count reaches.

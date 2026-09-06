@@ -14,7 +14,7 @@
     },
     {
       "name": "model_summary",
-      "description": "Overview of one Revit model: how many elements it holds, how many are model elements (real building elements rather than annotation or type definitions), how many carry geometry, how many rooms and storeys, and the most frequent Revit classes and categories. Call this before querying elements so you know which class and category values exist in this model.",
+      "description": "Overview of one Revit model: how many elements it holds, how many are model elements (real building elements rather than annotation or type definitions), how many carry geometry, how many rooms and storeys, and the most frequent Revit classes and categories. `model_elements_without_level` is how many model elements sit on no storey at all, so per-storey counts sum to less than `model_elements` by exactly that much - say so rather than presenting the storey counts as the whole model. Call this before querying elements so you know which class and category values exist in this model.",
       "strict": true,
       "input_schema": {
         "type": "object",
@@ -41,7 +41,14 @@
             "type": "string",
             "description": "Exact Revit category, case-insensitive, e.g. OST_Walls, OST_Doors, OST_Windows. Note that real placed instances usually carry NO category of their own - it lives on their type - so filter instances by `class` and use `category` mainly for type definitions."
           },
-          "level": { "type": "string", "description": "Exact storey name as returned by list_levels, e.g. '02 Этаж'." },
+          "storey": {
+            "type": "integer",
+            "description": "Storey `id` from list_levels. This is the exact way to name a storey: it matches every Level record folded into that storey, which a level name cannot do when list_levels marks the name `ambiguous_name` (the same name at two elevations). Prefer this over `level`."
+          },
+          "level": {
+            "type": "string",
+            "description": "Storey name as returned by list_levels, e.g. '02 Этаж'. Names are not unique - where list_levels reports `ambiguous_name` for a name, this filter merges the storeys sharing it and the count covers both. Use `storey` when you mean one storey."
+          },
           "name": { "type": "string", "description": "Substring of the element's own name." },
           "q": {
             "type": "string",
@@ -49,7 +56,7 @@
           },
           "model_elements": {
             "type": "boolean",
-            "description": "Keep only real building elements of the model, excluding type definitions, annotation and view artefacts. Set this true for almost any question about the building itself."
+            "description": "Keep only real building elements of the model, excluding type definitions, annotation and view artefacts. Set this true for a question about the built fabric - walls, floors, stairs, roofs, placed families. Do NOT set it when asking about rooms or levels: they are not building elements and the flag drops them, so `class=RoomElem` with this flag returns 0 on a model full of rooms. When the flag removed matches the answer says so in `excluded_as_not_model_elements`; a 0 total alongside a non-zero one there means the flag, not the model."
           },
           "with_geometry": { "type": "boolean", "description": "Keep only elements whose geometry was recovered." },
           "offset": { "type": "integer", "description": "Elements to skip, for paging. Default 0." },
@@ -88,7 +95,7 @@
     },
     {
       "name": "list_levels",
-      "description": "The storeys of a Revit model, lowest first, with their elevation in metres. A storey here is a level that model elements actually stand on, with duplicates folded together, so this list matches what the model really has rather than every Level record in the file. Use the returned names verbatim as the `level` filter of query_elements.",
+      "description": "The storeys of a Revit model, lowest first, with their elevation in metres, how many model elements and rooms stand on each, and `ambiguous_name` where another storey carries the same name at a different elevation. A storey here is a level model elements actually stand on, with every Level record describing the same place folded together - `level_ids` lists them, and one storey is commonly a dozen records. Pass a storey's `id` as the `storey` filter of query_elements; that reaches all of its records. The per-storey counts here already answer 'how many elements are on each floor' without further queries.",
       "strict": true,
       "input_schema": {
         "type": "object",
@@ -103,7 +110,7 @@
   "_routes": {
     "list_models": "GET /models",
     "model_summary": "GET /models/{model}/summary",
-    "query_elements": "GET /models/{model}/elements?class=&category=&level=&name=&q=&model_elements=&with_geometry=&offset=&limit=",
+    "query_elements": "GET /models/{model}/elements?class=&category=&storey=&level=&name=&q=&model_elements=&with_geometry=&offset=&limit=",
     "get_element": "GET /models/{model}/elements/{id}",
     "list_rooms": "GET /models/{model}/rooms",
     "list_levels": "GET /models/{model}/levels"

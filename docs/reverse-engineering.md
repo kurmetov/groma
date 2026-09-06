@@ -956,3 +956,34 @@ carries **0 `IfcSpace`** against Revit's 553. Emitting them needs a spatial
 boundary or, failing that, a space with a placement and no shape - not
 attempted here, but it is a bounded gap with a reference answer to check
 against.
+
+### Observation: a storey is a set of ids, and the API was answering by name
+
+The storey rule folds the `Level` records that share a name and an elevation.
+`/levels` reported the fold but published one id per storey and offered no
+filter for it, so the only way to ask for a storey's elements was the level
+*name* - and three names on AR S1 belong to two storeys each. Every count made
+that way silently merged them: "05 Этаж" answered 3 355 elements for 3 320 at
+12.3 m plus 35 at 13.2 m.
+
+Nor is the published id enough on its own. The 15 storeys of AR S1 are named
+by **152** `Level` records - "01 Этаж" alone by 37 - and the elements are
+spread over all of them: counting only the id `/levels` published reaches
+11 562 of the 15 149 placed model elements, losing **3 587** to the folded
+records. A storey filter has to be the whole set.
+
+With the set, the counts reconcile: 15 149 model elements on the 15 storeys
+plus **2 228 carrying no level at all** is the 17 377 the summary reports, and
+the 554 rooms land 24 / 56 / 59 per residential storey.
+
+The second silent zero was the `model_elements` flag. It keeps the seven
+building classes the exporter emits, and `RoomElem` is not one of them, so
+`class=RoomElem&model_elements` answered `total: 0` on a model holding 554
+rooms - a number an agent reads as "this model has no rooms". The filter is
+right; saying nothing about what it removed was not.
+
+Fixed in `rivet-api`: `/levels` publishes `level_ids`, `ambiguous_name` and
+per-storey `model_elements` and `rooms` counts, `/elements?storey=` filters on
+the whole folded set (an id that is not a storey is a 400, not an empty page),
+`/summary` carries `model_elements_without_level`, and a page reports
+`excluded_as_not_model_elements` whenever that flag is what emptied it.

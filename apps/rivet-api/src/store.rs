@@ -6,7 +6,7 @@
 //! artefact and to the `source` record inside it, and a decode improvement
 //! reaches the API by re-running the export rather than by changing this.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -214,13 +214,53 @@ pub struct Model {
 pub struct Query {
     pub class: Option<String>,
     pub category: Option<String>,
+    /// Storey name. Names repeat - AR S1 has `02 Этаж` at two elevations - so
+    /// this merges every storey that carries the name. Use `level_ids` from
+    /// `storey_level_ids` to name one storey exactly.
     pub level: Option<String>,
+    /// Every `Level` record of one storey, from `storey_level_ids`. An element
+    /// names one record as its level and a storey is many records, so a storey
+    /// filter is a set rather than an id.
+    pub level_ids: Option<BTreeSet<i64>>,
     pub name: Option<String>,
     pub text: Option<String>,
     pub model_elements_only: bool,
     pub with_geometry: bool,
     pub offset: usize,
     pub limit: usize,
+}
+
+/// A page of matches, with what the filters removed alongside it. An agent
+/// that asked for rooms and model elements at once would otherwise read the
+/// resulting `0` as "this model has no rooms".
+pub struct Page<'a> {
+    pub elements: Vec<&'a Element>,
+    pub total: usize,
+    /// Matched every other filter and was dropped only by
+    /// `model_elements_only`, which no room, level or type definition passes.
+    pub excluded_as_not_model_elements: usize,
+}
+
+/// One storey: every `Level` record sharing a name and an elevation, folded
+/// into the single place they all describe.
+#[derive(Debug, Serialize)]
+pub struct Storey {
+    /// Lowest of the folded record ids, and the value a storey filter takes.
+    pub id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub elevation_meters: f64,
+    /// Every `Level` record folded into this storey. Elements are spread over
+    /// all of them: on AR S1, 15 storeys are named by 152 records, and reading
+    /// only the first of each loses 3 587 of the 15 149 placed elements.
+    pub level_ids: Vec<u32>,
+    /// Another storey carries this name at a different elevation, so the
+    /// `level` name filter cannot separate the two.
+    pub ambiguous_name: bool,
+    /// Model elements standing on any of `level_ids`.
+    pub model_elements: usize,
+    /// Rooms on any of `level_ids`.
+    pub rooms: usize,
 }
 
 impl Model {
@@ -288,30 +328,46 @@ impl Model {
         equal(element.class.as_deref(), &query.class)
             && equal(element.category_name.as_deref(), &query.category)
             && equal(element.level_name.as_deref(), &query.level)
+            && query.level_ids.as_ref().is_none_or(|ids| {
+                element
+                    .level_id
+                    .is_some_and(|level_id| ids.contains(&level_id))
+            })
             && contains(element.name.as_deref(), &query.name)
             && query
                 .text
                 .as_ref()
                 .is_none_or(|text| self.haystacks[index].contains(&text.to_lowercase()))
-            && (!query.model_elements_only || element.is_model_element())
             && (!query.with_geometry || element.geometry.is_some())
     }
 
-    /// Elements matching `query`, and how many matched in total.
+    /// Elements matching `query`, how many matched in total, and how many the
+    /// `model_elements_only` flag alone removed.
     #[must_use]
-    pub fn query(&self, query: &Query) -> (Vec<&Element>, usize) {
+    pub fn query(&self, query: &Query) -> Page<'_> {
         let mut total = 0_usize;
-        let mut page = Vec::new();
+        let mut excluded_as_not_model_elements = 0_usize;
+        let mut elements = Vec::new();
         for index in 0..self.elements.len() {
             if !self.matches(index, query) {
                 continue;
             }
+            // Applied here rather than in `matches` so the answer can say what
+            // it cost: a room passes every other filter and fails this one.
+            if query.model_elements_only && !self.elements[index].is_model_element() {
+                excluded_as_not_model_elements += 1;
+                continue;
+            }
             total += 1;
-            if total > query.offset && page.len() < query.limit {
-                page.push(&self.elements[index]);
+            if total > query.offset && elements.len() < query.limit {
+                elements.push(&self.elements[index]);
             }
         }
-        (page, total)
+        Page {
+            elements,
+            total,
+            excluded_as_not_model_elements,
+        }
     }
 
     #[must_use]
@@ -325,35 +381,89 @@ impl Model {
     /// The record walk recovers every `Level` the file mentions, including
     /// those a linked model contributes - 721 of them on AR S1 for 15 real
     /// storeys, the same name repeated at two elevations. A level is a storey
-    /// only if a model element stands on it, and two levels sharing a name and
-    /// an elevation are one storey however often the file repeats them.
+    /// only if a model element stands on it, and every level sharing a name
+    /// and an elevation is the same storey however often the file repeats it.
+    ///
+    /// The repeats are not empty duplicates: 152 records carry the 15 storeys
+    /// of AR S1 and elements are spread across all of them, so a storey folds
+    /// them together and counts over the whole set.
     #[must_use]
-    pub fn levels(&self) -> Vec<&Element> {
-        let occupied = self
-            .elements
-            .iter()
-            .filter(|element| element.is_model_element())
-            .filter_map(|element| element.level_id)
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut seen = std::collections::BTreeSet::new();
-        let mut levels = self
-            .elements
-            .iter()
-            .filter(|element| element.is_level() && element.elevation_meters.is_some())
-            .filter(|element| occupied.contains(&i64::from(element.id)))
-            .filter(|element| {
-                seen.insert((
-                    element.name.clone(),
-                    element.elevation_meters.unwrap_or_default().to_bits(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        levels.sort_by(|a, b| {
-            a.elevation_meters
-                .unwrap_or_default()
-                .total_cmp(&b.elevation_meters.unwrap_or_default())
-        });
-        levels
+    pub fn storeys(&self) -> Vec<Storey> {
+        // A storey is keyed by what makes it one place. `to_bits` is the exact
+        // comparison an elevation deserves: two records either carry the same
+        // double or describe different heights.
+        let mut folded: BTreeMap<(Option<&str>, u64), Vec<&Element>> = BTreeMap::new();
+        for element in &self.elements {
+            if !element.is_level() {
+                continue;
+            }
+            let Some(elevation) = element.elevation_meters else {
+                continue;
+            };
+            folded
+                .entry((element.name.as_deref(), elevation.to_bits()))
+                .or_default()
+                .push(element);
+        }
+
+        let (mut model_elements, mut rooms) = (BTreeMap::new(), BTreeMap::new());
+        for element in &self.elements {
+            let Some(level_id) = element.level_id else {
+                continue;
+            };
+            if element.is_model_element() {
+                *model_elements.entry(level_id).or_insert(0_usize) += 1;
+            } else if element.is_room() {
+                *rooms.entry(level_id).or_insert(0_usize) += 1;
+            }
+        }
+
+        let mut names: BTreeMap<Option<&str>, usize> = BTreeMap::new();
+        let mut storeys = Vec::new();
+        for ((name, elevation), records) in folded {
+            let mut level_ids = records.iter().map(|level| level.id).collect::<Vec<_>>();
+            level_ids.sort_unstable();
+            let count = |counts: &BTreeMap<i64, usize>| {
+                level_ids
+                    .iter()
+                    .filter_map(|id| counts.get(&i64::from(*id)))
+                    .sum::<usize>()
+            };
+            let standing = count(&model_elements);
+            let rooms = count(&rooms);
+            // The exporter's rule: a level nothing stands on is not a storey.
+            if standing == 0 {
+                continue;
+            }
+            *names.entry(name).or_default() += 1;
+            storeys.push(Storey {
+                id: level_ids[0],
+                name: name.map(str::to_owned),
+                elevation_meters: f64::from_bits(elevation),
+                level_ids,
+                ambiguous_name: false,
+                model_elements: standing,
+                rooms,
+            });
+        }
+        for storey in &mut storeys {
+            storey.ambiguous_name = names
+                .get(&storey.name.as_deref())
+                .is_some_and(|count| *count > 1);
+        }
+        storeys.sort_by(|a, b| a.elevation_meters.total_cmp(&b.elevation_meters));
+        storeys
+    }
+
+    /// Every `Level` record of the storey `id` names, for `Query::level_ids`.
+    /// `None` when no storey has that id, so a caller can refuse the filter
+    /// rather than answer it with an empty page.
+    #[must_use]
+    pub fn storey_level_ids(&self, id: u32) -> Option<BTreeSet<i64>> {
+        self.storeys()
+            .into_iter()
+            .find(|storey| storey.id == id)
+            .map(|storey| storey.level_ids.iter().map(|id| i64::from(*id)).collect())
     }
 
     /// Counts an agent needs before it knows what to ask for.
@@ -362,6 +472,7 @@ impl Model {
         let mut classes: BTreeMap<&str, usize> = BTreeMap::new();
         let mut categories: BTreeMap<&str, usize> = BTreeMap::new();
         let (mut model_elements, mut with_geometry, mut with_parameters) = (0, 0, 0);
+        let mut model_elements_without_level = 0;
         for element in &self.elements {
             if let Some(class) = element.class.as_deref() {
                 *classes.entry(class).or_default() += 1;
@@ -370,6 +481,8 @@ impl Model {
                 *categories.entry(category).or_default() += 1;
             }
             model_elements += usize::from(element.is_model_element());
+            model_elements_without_level +=
+                usize::from(element.is_model_element() && element.level_id.is_none());
             with_geometry += usize::from(element.geometry.is_some());
             with_parameters += usize::from(!element.parameters.is_empty());
         }
@@ -390,7 +503,10 @@ impl Model {
             "with_geometry": with_geometry,
             "with_parameters": with_parameters,
             "rooms": self.elements.iter().filter(|e| e.is_room()).count(),
-            "levels": self.levels().len(),
+            // Placed on no level at all, so no per-storey count reaches them
+            // and the storey counts do not sum to `model_elements`.
+            "model_elements_without_level": model_elements_without_level,
+            "levels": self.storeys().len(),
             "classes": top(classes),
             "categories": top(categories),
         })
@@ -475,10 +591,10 @@ impl Model {
     /// of 15 storeys and disagree with every other route about what exists.
     pub fn documents(&self) -> impl Iterator<Item = Document> + '_ {
         let storeys = self
-            .levels()
+            .storeys()
             .iter()
-            .map(|level| level.id)
-            .collect::<std::collections::BTreeSet<_>>();
+            .map(|storey| storey.id)
+            .collect::<BTreeSet<_>>();
         self.elements
             .iter()
             .filter(move |element| !element.is_level() || storeys.contains(&element.id))
@@ -532,13 +648,20 @@ mod tests {
     }
 
     fn model(test: &str) -> Model {
+        // Two storeys sharing a name, as AR S1 has: one at 0.0 written as two
+        // `Level` records with an element on each, one at 3.3, plus a level
+        // nothing stands on and a wall standing on no level.
         let lines = [
             r#"{"id":1,"class":"SWall","created_phase_id":3,"level_id":5,"level_name":"01 Этаж"}"#,
-            r#"{"id":2,"class":"SWall","created_phase_id":3,"level_id":5,"level_name":"02 Этаж"}"#,
+            r#"{"id":2,"class":"SWall","created_phase_id":3,"level_id":6,"level_name":"01 Этаж"}"#,
             r#"{"id":6,"class":"Level","name":"01 Этаж","elevation_meters":0.0}"#,
-            r#"{"id":3,"class":"RoomElem","name":"Комната","level_name":"01 Этаж","parameters":[{"id":-1006900,"name":"Number","text":"204"}]}"#,
+            r#"{"id":3,"class":"RoomElem","name":"Комната","level_id":5,"level_name":"01 Этаж","parameters":[{"id":-1006900,"name":"Number","text":"204"}]}"#,
             r#"{"id":4,"class":"TextNote","name":"примечание"}"#,
             r#"{"id":5,"class":"Level","name":"01 Этаж","elevation_meters":0.0}"#,
+            r#"{"id":7,"class":"Level","name":"01 Этаж","elevation_meters":3.3}"#,
+            r#"{"id":8,"class":"SWall","created_phase_id":3,"level_id":7,"level_name":"01 Этаж"}"#,
+            r#"{"id":9,"class":"SWall","created_phase_id":3}"#,
+            r#"{"id":10,"class":"Level","name":"02 Этаж","elevation_meters":6.6}"#,
         ];
         // Each test gets its own file: the suite runs them in parallel and a
         // shared path lets one test read another's half-written artefact.
@@ -559,19 +682,68 @@ mod tests {
             limit: 1,
             ..Query::default()
         };
-        let (page, total) = model.query(&query);
+        let page = model.query(&query);
         // The class match is case-insensitive, the page is capped, and the
         // total counts every match rather than the page.
-        assert_eq!(total, 2);
-        assert_eq!(page.len(), 1);
+        assert_eq!(page.total, 4);
+        assert_eq!(page.elements.len(), 1);
 
+        // A name reaches both storeys that carry it, which is why it is not
+        // enough on its own.
         let query = Query {
             class: Some("SWall".to_owned()),
-            level: Some("02 Этаж".to_owned()),
+            level: Some("01 Этаж".to_owned()),
             limit: 10,
             ..Query::default()
         };
-        assert_eq!(model.query(&query).1, 1);
+        assert_eq!(model.query(&query).total, 3);
+    }
+
+    #[test]
+    fn a_storey_filter_separates_two_storeys_that_share_a_name() {
+        let model = model("storey-filter");
+        let ground = model.storey_level_ids(5).unwrap();
+        let upper = model.storey_level_ids(7).unwrap();
+        assert_eq!(ground, BTreeSet::from([5, 6]));
+        assert_eq!(upper, BTreeSet::from([7]));
+        let walls = |level_ids| {
+            model
+                .query(&Query {
+                    class: Some("SWall".to_owned()),
+                    level_ids: Some(level_ids),
+                    limit: 10,
+                    ..Query::default()
+                })
+                .total
+        };
+        // Both records of the lower storey are counted, and the upper storey
+        // of the same name is not.
+        assert_eq!(walls(ground), 2);
+        assert_eq!(walls(upper), 1);
+        // An id that is not a storey is refused rather than answered with 0.
+        assert!(model.storey_level_ids(10).is_none());
+    }
+
+    #[test]
+    fn reports_what_the_model_elements_flag_removed() {
+        let model = model("excluded");
+        // The rooms are there, and this flag is what hides them - an answer
+        // that said only `0` would read as "this model has no rooms".
+        let page = model.query(&Query {
+            class: Some("RoomElem".to_owned()),
+            model_elements_only: true,
+            limit: 10,
+            ..Query::default()
+        });
+        assert_eq!(page.total, 0);
+        assert_eq!(page.excluded_as_not_model_elements, 1);
+        let page = model.query(&Query {
+            class: Some("RoomElem".to_owned()),
+            limit: 10,
+            ..Query::default()
+        });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.excluded_as_not_model_elements, 0);
     }
 
     #[test]
@@ -582,9 +754,9 @@ mod tests {
             limit: 10,
             ..Query::default()
         };
-        let (page, total) = model.query(&query);
-        assert_eq!(total, 1);
-        assert_eq!(page[0].id, 3);
+        let page = model.query(&query);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.elements[0].id, 3);
     }
 
     #[test]
@@ -595,9 +767,14 @@ mod tests {
         // a type or a place and is left out.
         let mut kinds = documents.iter().map(|d| d.kind).collect::<Vec<_>>();
         kinds.sort_unstable();
-        // One level, not two: the index carries the storeys, not every Level
-        // record the file mentions.
-        assert_eq!(kinds, ["element", "element", "level", "room"]);
+        // Two levels for two storeys, not the four Level records the file
+        // holds: the index carries the storeys.
+        assert_eq!(
+            kinds,
+            [
+                "element", "element", "element", "element", "level", "level", "room"
+            ]
+        );
         let room = documents.iter().find(|d| d.kind == "room").unwrap();
         assert_eq!(room.room_number.as_deref(), Some("204"));
         assert!(room.text.contains("Комната"), "{}", room.text);
@@ -605,21 +782,34 @@ mod tests {
     }
 
     #[test]
-    fn a_storey_is_a_level_a_model_element_stands_on_counted_once() {
-        // Level 5 is stood on by both walls; level 6 repeats its name and
-        // elevation but nothing stands on it, and it is not a second storey.
+    fn a_storey_folds_every_level_record_that_describes_it() {
         let model = model("storeys");
-        let levels = model.levels();
-        assert_eq!(levels.len(), 1);
-        assert_eq!(levels[0].id, 5);
+        let storeys = model.storeys();
+        // Two storeys, lowest first. Level 10 is stood on by nothing and is
+        // not one of them.
+        assert_eq!(storeys.len(), 2);
+        assert_eq!(storeys[0].id, 5);
+        assert_eq!(storeys[0].level_ids, [5, 6]);
+        assert_eq!(storeys[0].elevation_meters.to_bits(), 0.0_f64.to_bits());
+        // Both records of the storey are counted, not just the first.
+        assert_eq!(storeys[0].model_elements, 2);
+        assert_eq!(storeys[0].rooms, 1);
+        assert_eq!(storeys[1].id, 7);
+        assert_eq!(storeys[1].model_elements, 1);
+        assert_eq!(storeys[1].rooms, 0);
+        // Both are called `01 Этаж`, so the name filter cannot tell them
+        // apart and each says so.
+        assert!(storeys.iter().all(|storey| storey.ambiguous_name));
     }
 
     #[test]
     fn summary_counts_what_an_agent_needs_before_asking() {
         let summary = model("summary").summary();
-        assert_eq!(summary["elements"], 6);
-        assert_eq!(summary["model_elements"], 2);
+        assert_eq!(summary["elements"], 10);
+        assert_eq!(summary["model_elements"], 4);
         assert_eq!(summary["rooms"], 1);
-        assert_eq!(summary["levels"], 1);
+        assert_eq!(summary["levels"], 2);
+        // The wall on no level: the storey counts sum to 3, not to 4.
+        assert_eq!(summary["model_elements_without_level"], 1);
     }
 }
