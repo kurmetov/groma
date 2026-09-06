@@ -1179,3 +1179,37 @@ cylinders. On ВК S1 the bodies reproducing their own box go from 1 814 to
 file, because a pipe already carries geometry by the swept-disk path, which is
 checked first and is the better representation. It will matter wherever the
 placed body is the only route a curved element has.
+
+### Result: the corpus sweep after the placed body and the spaces
+
+Fifty files, four disciplines, `--include-unplaced`, against the recorded
+sweep taken before any of this:
+
+| | files | with geometry, before | after | |
+|---|---|---|---|---|
+| AR | 14 | 12 183 | **79 919** | 6.6x |
+| KJ | 10 | 17 788 | **23 833** | 1.3x |
+| ОВ | 13 | 40 955 | 40 955 | unchanged |
+| ВК | 13 | 19 053 | 19 053 | unchanged |
+| all | 50 | 89 979 | **163 760** | 1.8x |
+
+Zero failures. **No file carries less geometry than it did.** Storeys are 626
+before and after, which is the check that the storey rule was not disturbed;
+elements go 10 364 925 to 10 369 210, and the difference is exactly the 4 285
+spaces (AR 4 255, KJ 30, and none in the MEP models, which hold no rooms).
+167 314 shape representations for 163 760 elements with geometry - a pipe
+carries an axis and a body - and 111 464 `IfcAdvancedBrep`.
+
+The two MEP disciplines not moving is the expected shape of this change rather
+than a disappointment: their geometry comes by the swept-disk and symbol
+paths, which were already reaching what they can reach, and their models carry
+no walls, floors or rooms for the placed path to find.
+
+Verification beyond the file everything was developed on: KJ S1, a discipline
+never checked before, exports 4 156 shapes - `IfcWall` 700, `IfcSlab` 134,
+proxy 3 322 - and `create_shape` builds every one of them with
+`validate --rules` clean.
+
+`scripts/export_sweep.sh` is the sweep, counting each file and deleting the
+IFC as it goes; only the counts are wanted and the corpus is 50 files of a few
+hundred megabytes each.
