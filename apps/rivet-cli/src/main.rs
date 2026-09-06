@@ -4395,6 +4395,16 @@ fn metadata_model(
             // not an instance; the instances declare none.
             && element.category.is_none()
     };
+    // A room is a place, not a building element: it fails every clause of
+    // `is_model_element` - no building class, no phase - and carries no
+    // category, so nothing would ever admit it. It is admitted on the terms
+    // its own class establishes, with the same two clauses that separate an
+    // instance from a definition: no declared category and no owning view.
+    let is_space = |element: &ExportedElement| {
+        element_type_for_source(class_name(element), None).is_spatial()
+            && element.category.is_none()
+            && element.owner_view_id.is_none()
+    };
     let is_candidate = |element: &ExportedElement| {
         // An element carrying verified geometry is a candidate whether or not
         // its level was recovered. The default export otherwise requires a
@@ -4429,13 +4439,15 @@ fn metadata_model(
         // over-selected is not separable by any field this decode recovers.
         let is_model_element = is_model_element(element);
         let verified_geometry = element.verified_symbol_bounds.is_some();
+        let is_space = is_space(element);
         !element.moribund
             && class_name(element) != Some("Level")
-            && (element.category.is_some() || verified_geometry || is_model_element)
+            && (element.category.is_some() || verified_geometry || is_model_element || is_space)
             && (include_unplaced
                 || element.level_id.is_some()
                 || verified_geometry
-                || is_model_element)
+                || is_model_element
+                || is_space)
     };
 
     let (levels, canonical_level) = building_storeys(recovered, &is_model_element);
@@ -5183,6 +5195,18 @@ fn normalize_element(
         class_name.as_deref(),
         category.as_ref().map(|category| category.name.as_str()),
     );
+    // A room is named by its number and called something else, and Revit's own
+    // export writes the split that way round. Both are on the record, by their
+    // built-in parameters rather than by a display name.
+    let (name, long_name) = if element_type.is_spatial() {
+        let (number, room_name) = room_identity(element, catalog);
+        (
+            number.or_else(|| element.name.as_ref().map(|(name, _)| name.clone())),
+            room_name,
+        )
+    } else {
+        (element.name.as_ref().map(|(name, _)| name.clone()), None)
+    };
 
     let geometry = normalize_geometry(element, element_type, elements);
     if let Some(BimGeometry::Brep(brep)) = &geometry {
@@ -5201,7 +5225,8 @@ fn normalize_element(
         id: BimElementId(id.to_string()),
         element_type,
         class_name,
-        name: element.name.as_ref().map(|(name, _)| name.clone()),
+        name,
+        long_name,
         category,
         level_id: element.level_id.map(|id| BimElementId(id.to_string())),
         // The declared type reference, or the symbol verified by bounds; the
@@ -5214,6 +5239,32 @@ fn normalize_element(
         properties,
         type_properties,
     }
+}
+
+/// A room's number and its name, from the built-in parameters that carry
+/// them. `ROOM_NUMBER` is on 553 of AR S1's 554 rooms and `ROOM_NAME` on all
+/// 554, so the number can be missing where the name is not.
+fn room_identity(
+    element: &ExportedElement,
+    catalog: Option<Catalog>,
+) -> (Option<String>, Option<String>) {
+    let mut number = None;
+    let mut name = None;
+    for parameter in &element.parameters {
+        let Some(built_in) = catalog.and_then(|catalog| catalog.built_in_parameter(parameter.id))
+        else {
+            continue;
+        };
+        let ParameterValue::Text(text) = &parameter.value else {
+            continue;
+        };
+        match built_in.enum_name {
+            "ROOM_NUMBER" => number = Some(text.clone()),
+            "ROOM_NAME" => name = Some(text.clone()),
+            _ => {}
+        }
+    }
+    (number, name)
 }
 
 /// Below this, a `Brep` body is flagged as likely-degenerate source geometry
@@ -7053,5 +7104,37 @@ mod tests {
         // same body is not emitted: the flag is the whole of the gate.
         wall.brep_is_placed = false;
         assert!(normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new()).is_none());
+    }
+
+    #[test]
+    fn a_room_is_named_by_its_number_and_called_by_its_name() {
+        let Some(catalog) = Catalog::for_release(2023) else {
+            // The catalogue is generated per release; without it there is no
+            // built-in to read and nothing this test can assert.
+            return;
+        };
+        let mut room = ExportedElement {
+            parameters: vec![
+                rvt_model::Parameter {
+                    id: -1_006_900,
+                    value: ParameterValue::Text("Комната".to_owned()),
+                },
+                rvt_model::Parameter {
+                    id: -1_006_901,
+                    value: ParameterValue::Text("204".to_owned()),
+                },
+            ],
+            ..ExportedElement::default()
+        };
+        let (number, name) = room_identity(&room, Some(catalog));
+        assert_eq!(number.as_deref(), Some("204"));
+        assert_eq!(name.as_deref(), Some("Комната"));
+
+        // A room with no number keeps its name, which is the case for one of
+        // AR S1's 554.
+        room.parameters.pop();
+        let (number, name) = room_identity(&room, Some(catalog));
+        assert_eq!(number, None);
+        assert_eq!(name.as_deref(), Some("Комната"));
     }
 }

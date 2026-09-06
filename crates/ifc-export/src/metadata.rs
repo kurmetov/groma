@@ -428,6 +428,10 @@ fn push_elements(
     origin_axis: EntityRef,
 ) {
     let mut containment: BTreeMap<String, (EntityRef, Vec<EntityRef>)> = BTreeMap::new();
+    // A space is part of the spatial structure, so its storey decomposes it
+    // rather than containing it. Kept apart from the first pass so the two
+    // relationships never carry the same product.
+    let mut decomposition: BTreeMap<String, (EntityRef, Vec<EntityRef>)> = BTreeMap::new();
     for element in elements {
         let (container, container_identity) = element
             .level_id
@@ -455,19 +459,23 @@ fn push_elements(
             placement_elevation,
             metric_placement,
         );
-        let entity = push_element(
-            file,
-            element,
-            options,
-            owner,
-            placement,
-            ElementGeometryContext {
-                representation_context,
-                storey_elevation: placement_elevation,
-                placement: metric_placement,
-            },
-        );
-        containment
+        let geometry_context = ElementGeometryContext {
+            representation_context,
+            storey_elevation: placement_elevation,
+            placement: metric_placement,
+        };
+        let spatial = resolved_element_type(element).is_spatial();
+        let entity = if spatial {
+            push_space(file, element, options, owner, placement, geometry_context)
+        } else {
+            push_element(file, element, options, owner, placement, geometry_context)
+        };
+        let relationship = if spatial {
+            &mut decomposition
+        } else {
+            &mut containment
+        };
+        relationship
             .entry(container_identity)
             .or_insert_with(|| (container, Vec::new()))
             .1
@@ -477,6 +485,60 @@ fn push_elements(
     for (identity, (container, elements)) in containment {
         push_containment(file, options, owner, &identity, container, elements);
     }
+    for (identity, (container, spaces)) in decomposition {
+        push_aggregate(
+            file,
+            options,
+            owner,
+            &format!("spaces:{identity}"),
+            container,
+            spaces,
+        );
+    }
+}
+
+/// Write one `IfcSpace`. It is a spatial structure element, not an element:
+/// where `IfcElement` ends its eight attributes with `Tag`, this carries
+/// `LongName`, `CompositionType` and its own `PredefinedType`, so it cannot go
+/// through the generic writer.
+///
+/// Revit's own export names a space by its number and puts the room's name in
+/// `LongName`, and both are on the record; the same split is written here.
+/// `PredefinedType` stays `NOTDEFINED` because nothing in the source says
+/// which kind of space this is.
+fn push_space(
+    file: &mut StepFile,
+    element: &BimElement,
+    options: &MetadataOptions,
+    owner: EntityRef,
+    placement: EntityRef,
+    geometry_context: ElementGeometryContext,
+) -> EntityRef {
+    let representation = element.geometry.as_ref().and_then(|geometry| {
+        push_geometry(
+            file,
+            geometry,
+            geometry_context.representation_context,
+            geometry_context.storey_elevation,
+            geometry_context.placement,
+        )
+    });
+    file.push(
+        "IFCSPACE",
+        vec![
+            global_id(options, &format!("element:{}", element.id.0)),
+            reference(owner),
+            string(element.name.as_deref().unwrap_or(&element.id.0)),
+            omitted(),
+            optional_string(element.class_name.as_deref()),
+            reference(placement),
+            representation.map_or_else(omitted, reference),
+            optional_string(element.long_name.as_deref()),
+            enumeration("ELEMENT"),
+            enumeration("NOTDEFINED"),
+            omitted(),
+        ],
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -626,6 +688,11 @@ fn product_entity(element_type: BimElementType) -> ProductEntity {
             ("IFCSTAIRFLIGHT", true)
         }
         BimElementType::Unknown => ("IFCBUILDINGELEMENTPROXY", true),
+        // A space never reaches here: `push_elements` sends a spatial type to
+        // `push_space`, whose attributes are a spatial element's rather than
+        // an element's. The match must still be total, and naming the entity
+        // is better than a panic.
+        BimElementType::Space => ("IFCSPACE", false),
     };
     ProductEntity {
         name,
@@ -1454,6 +1521,7 @@ mod tests {
                 element_type: BimElementType::Unknown,
                 class_name: Some("Wall".to_owned()),
                 name: Some("Wall 1".to_owned()),
+                long_name: None,
                 category: Some(BimCategory {
                     id: None,
                     name: "OST_Walls".to_owned(),
@@ -1486,6 +1554,7 @@ mod tests {
             element_type: BimElementType::Unknown,
             class_name: Some(class_name.to_owned()),
             name: Some(format!("Element {id}")),
+            long_name: None,
             category: Some(BimCategory {
                 id: None,
                 name: category_name.to_owned(),
@@ -1521,6 +1590,65 @@ mod tests {
         assert!(text.contains("=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)"));
         assert!(text.contains("=IFCOWNERHISTORY(#3,#4,$,.ADDED.,1788506400,#3,#4,1788506400)"));
         assert!(text.contains("'\\X2\\042D04420430043600200031\\X0\\'"));
+    }
+
+    #[test]
+    fn a_room_is_written_as_a_space_the_storey_decomposes() {
+        let mut model = model();
+        let mut room = model.elements[0].clone();
+        room.id = BimElementId("300".to_owned());
+        room.element_type = BimElementType::Space;
+        room.class_name = Some("RoomElem".to_owned());
+        room.name = Some("204".to_owned());
+        room.long_name = Some("Комната".to_owned());
+        room.category = None;
+        model.elements.push(room);
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        // Named by its number, called by its name, and a spatial element's
+        // attributes: LongName, CompositionType, PredefinedType, and no Tag.
+        let space = text
+            .lines()
+            .find(|line| line.contains("=IFCSPACE("))
+            .expect("the room should be written as a space");
+        assert!(space.contains("'204'"), "{space}");
+        assert!(space.contains("'RoomElem'"), "{space}");
+        assert!(space.ends_with(".ELEMENT.,.NOTDEFINED.,$);"), "{space}");
+
+        // The storey decomposes it. A space is part of the spatial structure,
+        // so it must not also be contained in it like an element.
+        let space_reference = space.split('=').next().expect("an entity id");
+        let names = |entity: &str| {
+            text.lines()
+                .filter(|line| line.contains(entity))
+                .filter(|line| {
+                    line.contains(&format!("{space_reference},"))
+                        || line.contains(&format!("{space_reference})"))
+                })
+                .count()
+        };
+        assert_eq!(names("=IFCRELAGGREGATES("), 1, "aggregated exactly once");
+        assert_eq!(
+            names("=IFCRELCONTAINEDINSPATIALSTRUCTURE("),
+            0,
+            "a space is decomposed by its storey, not contained in it"
+        );
+        // The wall beside it is still contained, so the split is per element
+        // and not a change of relationship for everything.
+        let wall = text
+            .lines()
+            .find(|line| line.contains("=IFCBUILDINGELEMENTPROXY("))
+            .expect("the wall should still be a proxy");
+        let wall_reference = wall.split('=').next().expect("an entity id");
+        assert!(text.lines().any(|line| {
+            line.contains("=IFCRELCONTAINEDINSPATIALSTRUCTURE(")
+                && (line.contains(&format!("{wall_reference},"))
+                    || line.contains(&format!("{wall_reference})")))
+        }));
     }
 
     #[test]

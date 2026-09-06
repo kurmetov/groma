@@ -1114,3 +1114,41 @@ bodies that no bounds block confirms as placed, so they keep their box.
 `RoomElem` carries 552 placed volumes and stays out entirely: a room is not a
 building element and reaches the export as nothing at all, which is the
 `IfcSpace` gap recorded above and is a typing change, not a geometry one.
+
+### Result: rooms reach the IFC as the spaces they are
+
+The rooms had been complete in the JSON for two entries now and reached the
+IFC not at all. What kept them out was not the decode and, after the placed
+body, not the geometry either: a room fails every clause of `is_model_element`
+- it is not a building class and carries no phase - and declares no category,
+so the export's candidate test never saw one. Its class alone establishes what
+it is, exactly as `SWall` and `Floor` do, and against the same reference:
+Revit's export of AR S1 carries **553 `IfcSpace`** and the decode yields 554
+`RoomElem`.
+
+A space is not an element, and the difference is structural rather than
+cosmetic. `IfcSpace` is a spatial structure element: where `IfcElement` ends
+its eight attributes with `Tag`, a space carries `LongName`,
+`CompositionType` and its own `PredefinedType`, and its storey **decomposes**
+it through `IfcRelAggregates` instead of containing it through
+`IfcRelContainedInSpatialStructure`. Both are written here, and a test holds
+the split - a space aggregated exactly once, contained never, while the wall
+beside it stays contained.
+
+Naming follows the record rather than a convention: `ROOM_NUMBER` is on 553 of
+the 554 and becomes `Name`, `ROOM_NAME` is on all 554 and becomes `LongName`,
+which is the split Revit's own export writes. The one room without a number
+keeps its recovered name in both. `PredefinedType` stays `NOTDEFINED` because
+nothing in the source says which kind of space it is.
+
+On AR S1, `--include-unplaced`: **554 `IfcSpace`**, 552 of them carrying the
+room's own volume as an `IfcAdvancedBrep`, products 203 927 -> 204 481 and
+shapes 9 622 -> 10 174. `create_shape` builds all 10 174 - `IfcWall` 7 435,
+`IfcSlab` 703, `IfcSpace` 552, proxy 1 484 - with **zero failures**, and
+`validate --rules` reports no issues, which is the check that would have
+caught a spatial element written with an element's attributes. AR S2
+reproduces it untouched: 570 spaces, 10 252 shapes.
+
+The two rooms without a volume are the two whose body did not resolve
+completely; they are emitted as spaces with a placement and no shape rather
+than with a guessed one.

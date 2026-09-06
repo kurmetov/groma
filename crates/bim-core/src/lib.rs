@@ -24,6 +24,9 @@ pub struct BimElement {
     /// Format-neutral source class, such as `Wall` or `FamilyInstance`.
     pub class_name: Option<String>,
     pub name: Option<String>,
+    /// A descriptive name where `name` carries the identifying one: a room is
+    /// named by its number and called something else. IFC's `LongName`.
+    pub long_name: Option<String>,
     pub category: Option<BimCategory>,
     pub level_id: Option<BimElementId>,
     pub type_id: Option<BimElementId>,
@@ -62,6 +65,19 @@ pub enum BimElementType {
     Roof,
     Stair,
     StairFlight,
+    /// A place rather than a building element: it bounds volume, is part of
+    /// the spatial structure and is decomposed by the storey it sits on
+    /// rather than contained in it.
+    Space,
+}
+
+impl BimElementType {
+    /// Whether this type belongs to the spatial structure - a place the model
+    /// is divided into - rather than to the elements the structure holds.
+    #[must_use]
+    pub fn is_spatial(self) -> bool {
+        matches!(self, Self::Space)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -78,10 +78,13 @@ string and how consistently, so a name read at a calibrated offset can be told
 apart from one found by scanning.
 `export-ifc` writes an IFC4 Reference View file with
 `IfcProject -> IfcSite -> IfcBuilding -> IfcBuildingStorey`, metric units,
-deterministic 22-character GlobalIds, and typed MEP elements. The current
-conservative mapping covers pipe segments/fittings, sanitary/air/fire-
-suppression terminals; unknown class/category pairs remain
-`IfcBuildingElementProxy` instances. Verified straight pipes receive an
+deterministic 22-character GlobalIds, and typed elements. The current
+conservative mapping covers pipe segments/fittings and sanitary/air/fire-
+suppression terminals by category, and the architectural system families by
+class alone - `IfcWall`, `IfcSlab`, `IfcRoof`, `IfcStair`, `IfcStairFlight`.
+A `RoomElem` becomes an `IfcSpace` named by its room number and called by its
+room name, decomposed by the storey it sits on rather than contained in it.
+Unknown class/category pairs remain `IfcBuildingElementProxy` instances. Verified straight pipes receive an
 `IfcPolyline` axis and `IfcSweptDiskSolid` body. Pipe fittings with one
 unambiguous straight `PipeFittingCenterLine` receive an `IfcPolyline` axis but
 no invented body. Bounds-verified, right-handed `GInstance` transforms become

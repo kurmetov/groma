@@ -24,6 +24,11 @@ const CLASS_MAPPINGS: &[(&str, BimElementType)] = &[
     ("StairsRun", BimElementType::StairFlight),
     ("StairsElement", BimElementType::Stair),
     ("ProfileRoof", BimElementType::Roof),
+    // A room is not a building element, but it is established by its class in
+    // the same way and against the same reference: Revit's export of AR S1
+    // carries 553 `IfcSpace` and the decode yields 554 `RoomElem`, each with a
+    // level, a room name and - for 553 of them - a number.
+    ("RoomElem", BimElementType::Space),
 ];
 
 /// Ordered, conservative source mapping. `class_name: None` means that the
@@ -137,6 +142,26 @@ pub(crate) fn resolved_element_type(element: &BimElement) -> BimElementType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_room_is_a_space_by_its_class_and_a_categorised_one_is_not() {
+        // No declared category: the class establishes the type, as it does for
+        // the other architectural classes.
+        assert_eq!(
+            element_type_for_source(Some("RoomElem"), None),
+            BimElementType::Space
+        );
+        assert!(BimElementType::Space.is_spatial());
+        // A record that declares a category is a type or a definition, and
+        // nothing in the category table names a space.
+        assert_eq!(
+            element_type_for_source(Some("RoomElem"), Some("OST_Rooms")),
+            BimElementType::Unknown
+        );
+        // The building elements stay elements.
+        assert!(!BimElementType::Wall.is_spatial());
+        assert!(!BimElementType::Unknown.is_spatial());
+    }
 
     #[test]
     fn maps_the_supported_source_pairs() {
