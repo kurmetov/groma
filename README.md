@@ -86,7 +86,13 @@ suppression terminals; unknown class/category pairs remain
 unambiguous straight `PipeFittingCenterLine` receive an `IfcPolyline` axis but
 no invented body. Bounds-verified, right-handed `GInstance` transforms become
 storey-relative `IfcLocalPlacement` values; world-space geometry is converted
-back into that local frame. Other geometry is omitted rather than approximated.
+back into that local frame. A decoded body reaches the file by one of two
+verified routes: on its own record, when its extent reproduces that record's
+own bounds block and is therefore already placed - which is what a wall, a
+floor or any other system family has - or through a family symbol whose box,
+carried through the instance's transform, agrees with the instance's own.
+Incomplete bodies fall back to a verified box, and other geometry is omitted
+rather than approximated.
 Project storeys are `Level` records without a family reference; family-local
 reference levels are not promoted to building storeys.
 By default it includes live categorized records with a recovered level;
@@ -117,8 +123,10 @@ evidence.
 
 Rivet is experimental. It recovers the object graph's records, identifiers,
 classes, selected fields, level elevations, names, and schema-bound parameter
-sets, plus independently checked straight-pipe bodies and straight fitting
-axes. General geometry is not decoded, and Rivet never writes RVT files.
+sets, plus independently checked straight-pipe bodies, straight fitting axes
+and boundary representations. On the reference model 56.4% of the products
+Revit's own export gives a shape now carry one, every emitted body builds in
+IfcOpenShell, and Rivet never writes RVT files.
 
 The JSON-lines diagnostic exporter and a conservative IFC4 exporter are
 implemented. Coordination IFC still requires most element geometry, and legacy

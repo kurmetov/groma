@@ -987,3 +987,130 @@ per-storey `model_elements` and `rooms` counts, `/elements?storey=` filters on
 the whole folded set (an id that is not a storey is a 400, not an empty page),
 `/summary` carries `model_elements_without_level`, and a page reports
 `excluded_as_not_model_elements` whenever that flag is what emptied it.
+
+### Result: the bodies the export never asks for are the building itself
+
+Observation. `rivet brep` assembles 43 622 bodies from AR S1's face-bearing
+records while the IFC carries 1 468 shapes, and the JSON puts geometry on 577
+of 17 377 model elements - none of them a wall, a floor, a stair or a roof.
+The symbol-link funnel accounts for only its own path: 3 140 instances name a
+symbol, 2 358 of those symbols carry a body, 1 443 pass the bounds check. It
+says nothing about where the other 40 000 bodies are.
+
+Hypothesis. The classes with no geometry have no body in the file, and their
+shape would have to be constructed from their parameters.
+
+Experiment. A body is decoded from a `GElement` record, and that record carries
+the element id it belongs to, so every body already names an owner. `rivet
+body-owners` tallies the decoded bodies by the owning element's class, and
+against each owner asks three further questions: does any instance name it as
+a symbol, does the body's own extent reproduce the bounds block in the same
+record, and is its centre away from the origin - a body in a symbol's local
+frame sits at the origin, a placed one does not.
+
+Result, and the hypothesis is refuted. On AR S1, 30 495 element ids own a body,
+27 857 of them complete, 247 083 faces:
+
+| owner class | ids with a body | records | complete | faces | named by an instance | planar bodies matching their own bounds | off-origin |
+|---|---|---|---|---|---|---|---|
+| `SWall` | 13 208 | 25 486 | 11 208 | 130 217 | 0 | 10 746 / 10 747 | 13 208 |
+| `FilledRegion` | 9 873 | 9 926 | 9 873 | 9 873 | 0 | 9 437 / 9 872 | 6 763 |
+| `FamilySymbol` | 2 751 | 2 759 | 2 507 | 52 919 | 224 | 602 / 648 | 1 011 |
+| `Floor` | 1 183 | 1 339 | 991 | 17 405 | 0 | 1 182 / 1 182 | 1 182 |
+| `RoomElem` | 553 | 1 130 | 552 | 7 631 | 0 | 552 / 553 | 553 |
+
+Every wall, floor and room in the file owns its own solid, and those solids are
+already placed: 10 746 of the 10 747 planar wall bodies reproduce their
+record's own bounds block to within a micro-foot, and all 13 208 sit where the
+building is rather than at an origin. `FamilySymbol` is the control and behaves
+as the opposite: only 1 011 of 2 751 are off-origin, because a symbol's body is
+in its own local frame and needs the instance transform - which is the one path
+the exporter has.
+
+Read against the model elements, the shortfall is one gate wide: **12 482 of
+the 17 377 model elements own a body** (`SWall` 11 011 / 11 011, `Floor`
+896 / 896, `StairsRun` 22 / 22, `StairsLanding` 12 / 12, `ProfileRoof` 3 / 3)
+and 577 more reach one through a verified symbol, against **1 468 shapes
+emitted**. The exporter reads geometry only through `verified_symbol_bounds`
+and never looks at the body on the element's own record.
+
+VK S1 (SMALL) says the same from the other discipline: 12 046 ids own a body,
+6 737 of them `RbsPipeCurve` with 40 422 faces, all off-origin. Its pipes reach
+the IFC by the swept-disk path rather than as B-Rep, and no `FamilyInstance`
+model element there owns a body at all - 82 reach one through a symbol. The
+pipe bodies are cylindrical, so the planar bounds check does not speak for
+them and is not counted as if it did.
+
+So the next step is not a decoder change and not a parametric wall builder. It
+is to emit the element's own body where its extent reproduces its own bounds -
+the same class of per-element verification the symbol path already uses, on
+12 482 elements instead of 577. What that leaves open, and what the shared
+coordinate base still owes, is unchanged.
+
+### Result: emitting the placed body, and what it costs
+
+The measurement above leaves one thing to do: read the body off the element's
+own record instead of only through a symbol. Four pieces, each of which is a
+gate the previous code did not have.
+
+*Pairing.* A body and a bounds block both come from a `GElement` record, and
+one id can carry several such records - 13 208 wall ids carry 25 486 between
+them. The recovery kept whichever body came last and the bounds of whichever
+record carried them last, which for a multi-record id crosses one record's
+body with another's box. They are now paired within the record that produced
+them, and the *placed* body - the one reproducing its own record's box - is
+kept over an unplaced one, the larger of two placed ones over the smaller. An
+id with no placed body still keeps the last, which is what every id did
+before.
+
+*The test.* A body counts as placed when every face of it is planar, the box
+holds volume, and its extent reproduces the record's own bounds to within a
+micro-foot. Planar only, because an arc bulges past the endpoints the extent
+is taken from and a curved body would read as a disagreement; volumetric,
+because AR S1 carries 9 873 `FilledRegion` records whose single flat face
+would otherwise pass. Both exclusions are conservative and both are counted.
+
+*Not on a type definition.* A `FamilySymbol` reproduces its record's box just
+as exactly, and that box is in the symbol's own local frame - the placed test
+cannot tell the two apart, because both are a body agreeing with its own
+record. What tells them apart is the rule this project already established: a
+record that declares its own category is a type or a definition, and not one
+of the 187 131 such records on AR S1 is a product Revit exports. Those keep no
+body. It is not a small exclusion - 2 705 bodies, most of them the 2 197
+`SWall` records that carry a declared category - and it is the difference
+between following the reference export and inflating the file against it.
+
+*Emission.* A placed body needs no symbol and no transform - it is already in
+the project coordinates every other geometry here is carried in - so it goes
+through the same feet-to-metres conversion with an identity transform, and the
+IFC layer expresses it in the product's own frame as it already does for a
+symbol-placed body.
+
+Result on AR S1, `--include-unplaced`, against the previous file of the same
+configuration:
+
+| | before | after |
+|---|---|---|
+| products | 203 927 | 203 927 |
+| `IfcShapeRepresentation` | 1 468 | **9 622** |
+| `IfcAdvancedBrep` | 1 184 | **9 338** |
+| `IfcAdvancedFace` | 8 966 | **84 745** |
+| file | 169 MB | 364 MB |
+
+Every one of the 9 622 shapes builds: `create_shape` with world coordinates
+returns `IfcWall` 7 435, `IfcSlab` 703 and `IfcBuildingElementProxy` 1 484
+with **zero failures**, and `validate --rules` reports no issues. Against
+Revit's own export of the same model, products carrying a shape go from
+**8.6% to 56.4%** of its 17 070. ВК S1 is the regression control and does not
+move: 695 `IfcAdvancedBrep`, the same 695 it had, its geometry coming by the
+swept-disk and symbol paths as before.
+
+What it does not reach, all of it counted: of the 9 008 walls and 896 floors
+carrying a placed body, 7 435 and 703 emit a solid - the rest have at least
+one face the assembly could not resolve, and an incomplete body still falls
+back rather than ship an open shell the kernel refuses. 2 003 further walls
+have a body that is not planar-with-matching-bounds. Stairs and roofs own
+bodies that no bounds block confirms as placed, so they keep their box.
+`RoomElem` carries 552 placed volumes and stays out entirely: a room is not a
+building element and reaches the export as nothing at all, which is the
+`IfcSpace` gap recorded above and is a typing change, not a geometry one.

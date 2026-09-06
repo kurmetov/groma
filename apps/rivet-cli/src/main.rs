@@ -30,7 +30,7 @@ use rvt_model::{
     FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds, GElementGraphFields,
     GInstanceTransformFields, LevelFields, MemberWalk, ParameterSetClassIndexes, ParameterSets,
     ParameterSpec, ParameterValue, PipeLineGeometryFields, RECORD_LENGTH_TRAILER_BYTES,
-    RecordFraming, RecordHeader, RecordLayout, RecordString,
+    RecordFraming, RecordHeader, RecordLayout, RecordString, RvtPoint3,
 };
 use rvt_schema::{Schema, TypeReference};
 
@@ -211,6 +211,17 @@ enum Command {
         /// Print this many excluded-face reasons, most frequent first.
         #[arg(long, default_value_t = 12)]
         reasons: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+    /// Tally the decoded bodies by the class of the element that owns them,
+    /// and by whether anything carries them out to the export.
+    BodyOwners {
+        file: PathBuf,
+        /// Print this many classes, most bodies first.
+        #[arg(long, default_value_t = 24)]
+        classes: usize,
         /// Maximum decoded bytes accepted from one member.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
@@ -487,6 +498,11 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             reasons,
             max_member_bytes,
         } => brep(&file, reasons, max_member_bytes),
+        Command::BodyOwners {
+            file,
+            classes,
+            max_member_bytes,
+        } => body_owners(&file, classes, max_member_bytes),
         Command::Names {
             file,
             classes,
@@ -1940,6 +1956,16 @@ struct ExportedElement {
     /// any id that carries one - typically a `FamilySymbol` - and looked up
     /// by an instance through its verified symbol id, not copied per instance.
     brep: Option<rvt_model::SymbolBrep>,
+    /// How many of this id's `GElement` records yielded a body. More than one
+    /// means the rest were passed over by [`keep_body`].
+    brep_records: usize,
+    /// Whether [`ExportedElement::brep`] reproduces the bounds block of the
+    /// same record it was decoded from. That box is the one the placement
+    /// chain already trusts - a symbol link is accepted when the instance's
+    /// box agrees with the symbol's carried through its transform - so a body
+    /// reproducing it is in the same frame as the box: already placed, needing
+    /// no symbol and no transform.
+    brep_is_placed: bool,
     /// `m_moribund` from the `Element` tail: the element is marked deleted.
     moribund: bool,
     locked: bool,
@@ -3690,7 +3716,20 @@ fn recover_elements(
                                 rvt_model::walk_record_collecting(schema, header.class_index, body);
                             let brep = rvt_model::assemble_symbol_brep(&objects, classes);
                             if !brep.is_empty() {
-                                entry.brep = Some(brep);
+                                // Counted as well as kept: one id can carry
+                                // more than one body-bearing record.
+                                entry.brep_records += 1;
+                                // Paired with the bounds block of *this*
+                                // record. Reading it off the element instead
+                                // would cross one record's body with another's
+                                // box: on AR S1, 13 208 wall ids carry 25 486
+                                // body-bearing records between them.
+                                let placed = exact_bounds
+                                    .is_some_and(|bounds| body_is_placed_in(&brep, &bounds));
+                                if keep_body(&brep, placed, entry) {
+                                    entry.brep_is_placed = placed;
+                                    entry.brep = Some(brep);
+                                }
                             }
                         }
                     }
@@ -4459,6 +4498,321 @@ fn metadata_model(
     )
 }
 
+/// Class name used for a record whose class index the schema did not resolve.
+const UNRESOLVED_CLASS: &str = "(class not resolved)";
+
+/// How close a body's own extent must come to its record's bounds block to
+/// count as the same box. A micro-foot is 0.3 micrometres: far below anything
+/// a modelled dimension carries, and far above double-precision noise.
+const BODY_BOUNDS_TOLERANCE_FEET: f64 = 1e-6;
+
+/// Whether a body is already placed, by reproducing the bounds block carried
+/// by the same `GElement` record.
+///
+/// Only a body whose every face is planar can answer: an arc bulges past its
+/// endpoints, so the extent of a curved body understates its own box and
+/// would read as a disagreement. Such a body is left unplaced rather than
+/// admitted on a weaker test.
+fn body_is_placed_in(brep: &rvt_model::SymbolBrep, bounds: &GElementBounds) -> bool {
+    let Some((min, max, planar)) = body_extent_feet(brep) else {
+        return false;
+    };
+    // A box flat on an axis holds no volume, and its "body" is a region or a
+    // sketch rather than a solid - AR S1 carries 9 873 `FilledRegion` records
+    // that would otherwise pass this test on a single face.
+    bounds.is_volumetric()
+        && planar
+        && min
+            .into_iter()
+            .chain(max)
+            .zip(bounds.min.into_iter().chain(bounds.max))
+            .all(|(ours, theirs)| (ours - theirs).abs() <= BODY_BOUNDS_TOLERANCE_FEET)
+}
+
+/// Whether a newly decoded body should replace the one its id already holds.
+/// A placed body wins over an unplaced one and the larger of two placed bodies
+/// wins; among unplaced bodies the last still wins, which is what every id did
+/// before the two could be told apart.
+fn keep_body(brep: &rvt_model::SymbolBrep, placed: bool, kept: &ExportedElement) -> bool {
+    match (placed, kept.brep_is_placed) {
+        (true | false, false) => true,
+        (true, true) => brep.faces.len() > kept.brep.as_ref().map_or(0, |kept| kept.faces.len()),
+        (false, true) => false,
+    }
+}
+
+/// What one class contributes to the decoded geometry, from both ends: the
+/// bodies its records own, and the model elements of that class that reach a
+/// body at all.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClassGeometry {
+    /// Ids of this class whose own `GElement` record yielded a body.
+    body_ids: usize,
+    /// Body-bearing records on those ids. More than one per id means the
+    /// recovery keeps the last and the rest are not reachable.
+    body_records: usize,
+    /// Bodies with no excluded face, which is what the exporter emits.
+    complete_bodies: usize,
+    faces: usize,
+    /// Bodies whose owning record also carried an exact bounds block, and -
+    /// of the planar ones, whose extent an arc cannot understate - how many
+    /// reproduce that block. Agreement says the body is in the same frame as
+    /// the bounds the placement chain already trusts.
+    bodies_with_bounds: usize,
+    planar_bodies_with_bounds: usize,
+    planar_bodies_matching_their_bounds: usize,
+    /// Bodies whose centre is more than a foot from the origin, i.e. already
+    /// carrying a position rather than sitting in a symbol's local frame.
+    bodies_away_from_the_origin: usize,
+    /// Of `body_ids`, how many are named as a symbol by some instance's
+    /// `GInstance` transform, and how many an instance's bounds check
+    /// accepted. The gap between them is what the export's gates cost.
+    named_by_an_instance: usize,
+    verified_by_an_instance: usize,
+    /// Model elements of this class, and how many reach a body - their own,
+    /// or the one on the symbol their bounds verified.
+    model_elements: usize,
+    model_elements_with_their_own_body: usize,
+    /// Of those, the ones whose body reproduces its record's bounds and is
+    /// therefore emitted: the placed-body path's actual reach.
+    model_elements_with_a_placed_body: usize,
+    model_elements_with_a_verified_symbol_body: usize,
+}
+
+/// A body's axis-aligned extent from its edge endpoints, in Revit internal
+/// feet, and whether every face of it is planar. An arc bulges past its
+/// endpoints, so a body carrying a cylinder can understate its own extent by
+/// up to the sagitta and is counted apart rather than called a mismatch.
+fn body_extent_feet(brep: &rvt_model::SymbolBrep) -> Option<([f64; 3], [f64; 3], bool)> {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    let mut planar = true;
+    for face in &brep.faces {
+        planar &= matches!(face.surface, rvt_model::BrepSurface::Plane { .. });
+        for face_loop in &face.loops {
+            for edge in face_loop {
+                planar &= matches!(edge.curve, rvt_model::BrepCurve::Line);
+                for point in [edge.start, edge.end] {
+                    for (axis, value) in point.into_iter().enumerate() {
+                        if !value.is_finite() {
+                            return None;
+                        }
+                        min[axis] = min[axis].min(value);
+                        max[axis] = max[axis].max(value);
+                    }
+                }
+            }
+        }
+    }
+    min.into_iter()
+        .all(f64::is_finite)
+        .then_some((min, max, planar))
+}
+
+/// Tally the decoded bodies by the class of the element that owns them.
+///
+/// The question this answers is which half of the geometry gap a class is in:
+/// a class with bodies that no instance names holds geometry the export never
+/// asks for, while a class with no bodies at all holds none to ask for and
+/// would have to have its shape constructed from its parameters.
+fn tally_class_geometry<'a>(
+    elements: &BTreeMap<u32, ExportedElement>,
+    class_name: impl Fn(&ExportedElement) -> Option<&'a str>,
+) -> BTreeMap<&'a str, ClassGeometry> {
+    let mut named = BTreeSet::new();
+    let mut verified = BTreeSet::new();
+    for element in elements.values() {
+        if let Some(symbol) = element
+            .ginstance_transform
+            .and_then(|transform| transform.symbol_element_id)
+        {
+            named.insert(symbol);
+        }
+        if let Some(symbol) = element.verified_symbol_bounds {
+            verified.insert(symbol.symbol_element_id);
+        }
+    }
+
+    let mut rows: BTreeMap<&str, ClassGeometry> = BTreeMap::new();
+    for (id, element) in elements {
+        let name = class_name(element).unwrap_or(UNRESOLVED_CLASS);
+        let is_model_element = class_name(element).is_some_and(is_building_element_class)
+            && element.owner_view_id.is_none()
+            && element.created_phase_id.is_some()
+            && element.category.is_none();
+        let row = rows.entry(name).or_default();
+        if let Some(brep) = &element.brep {
+            row.body_ids += 1;
+            row.body_records += element.brep_records;
+            row.complete_bodies += usize::from(brep.excluded_faces.is_empty());
+            row.faces += brep.faces.len();
+            row.named_by_an_instance += usize::from(named.contains(id));
+            row.verified_by_an_instance += usize::from(verified.contains(id));
+            if let Some((min, max, planar)) = body_extent_feet(brep) {
+                let centre_is_placed = min
+                    .into_iter()
+                    .zip(max)
+                    .any(|(low, high)| (low + high).abs() / 2.0 > 1.0);
+                row.bodies_away_from_the_origin += usize::from(centre_is_placed);
+                row.bodies_with_bounds += usize::from(element.geometry_bounds.is_some());
+                row.planar_bodies_with_bounds += usize::from(planar);
+                // The recovery paired this body with the bounds of its own
+                // record; re-deriving it here from the element would cross
+                // one record's body with another's box.
+                row.planar_bodies_matching_their_bounds += usize::from(element.brep_is_placed);
+            }
+        }
+        if is_model_element {
+            row.model_elements += 1;
+            row.model_elements_with_their_own_body += usize::from(element.brep.is_some());
+            row.model_elements_with_a_placed_body += usize::from(element.brep_is_placed);
+            row.model_elements_with_a_verified_symbol_body += usize::from(
+                element
+                    .verified_symbol_bounds
+                    .and_then(|symbol| elements.get(&symbol.symbol_element_id))
+                    .is_some_and(|symbol| symbol.brep.is_some()),
+            );
+        }
+    }
+    rows
+}
+
+/// Report which classes own the decoded bodies, and which classes of model
+/// element reach one. `rivet brep` says how much geometry comes out of the
+/// file; this says whose it is and what carries it out.
+fn body_owners(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
+    let recovered = recover_elements(path, max_member_bytes)?;
+    let schema = recovered.schema.as_ref();
+    let rows = tally_class_geometry(&recovered.elements, |element| {
+        element.class_index.and_then(|index| {
+            schema
+                .and_then(|schema| schema.class_by_index(index))
+                .map(|class| class.name.as_str())
+        })
+    });
+
+    let total = rows
+        .values()
+        .fold(ClassGeometry::default(), |mut total, row| {
+            total.body_ids += row.body_ids;
+            total.body_records += row.body_records;
+            total.complete_bodies += row.complete_bodies;
+            total.faces += row.faces;
+            total.named_by_an_instance += row.named_by_an_instance;
+            total.verified_by_an_instance += row.verified_by_an_instance;
+            total.bodies_with_bounds += row.bodies_with_bounds;
+            total.planar_bodies_with_bounds += row.planar_bodies_with_bounds;
+            total.planar_bodies_matching_their_bounds += row.planar_bodies_matching_their_bounds;
+            total.bodies_away_from_the_origin += row.bodies_away_from_the_origin;
+            total.model_elements += row.model_elements;
+            total.model_elements_with_their_own_body += row.model_elements_with_their_own_body;
+            total.model_elements_with_a_placed_body += row.model_elements_with_a_placed_body;
+            total.model_elements_with_a_verified_symbol_body +=
+                row.model_elements_with_a_verified_symbol_body;
+            total
+        });
+    println!(
+        "Element ids owning a decoded body: {} from {} body-bearing GElement records",
+        total.body_ids, total.body_records
+    );
+    println!(
+        "  bodies held out by keeping one per id: {}",
+        total.body_records.saturating_sub(total.body_ids)
+    );
+    println!(
+        "  complete bodies: {} ({} faces)",
+        total.complete_bodies, total.faces
+    );
+    println!(
+        "  ids an instance names as its symbol: {} ({} bounds-verified)",
+        total.named_by_an_instance, total.verified_by_an_instance
+    );
+    println!(
+        "  bodies reproducing their record's own bounds: {} of {} planar ({} bodies have bounds)",
+        total.planar_bodies_matching_their_bounds,
+        total.planar_bodies_with_bounds,
+        total.bodies_with_bounds
+    );
+    println!(
+        "  bodies whose centre is over a foot from the origin: {}",
+        total.bodies_away_from_the_origin
+    );
+
+    print_body_owner_table(&rows, classes);
+    print_model_element_body_table(&rows, &total, classes);
+    Ok(())
+}
+
+/// Which classes own the decoded bodies, most bodies first.
+fn print_body_owner_table(rows: &BTreeMap<&str, ClassGeometry>, classes: usize) {
+    let mut by_bodies = rows.iter().collect::<Vec<_>>();
+    by_bodies.sort_by(|left, right| {
+        right
+            .1
+            .body_ids
+            .cmp(&left.1.body_ids)
+            .then_with(|| left.0.cmp(right.0))
+    });
+    println!("\nWho owns the bodies:");
+    println!("class\tids\trecords\tcomplete\tfaces\tnamed\tverified\tplanar=bounds\toff-origin");
+    for (name, row) in by_bodies
+        .iter()
+        .filter(|(_, row)| row.body_ids > 0)
+        .take(classes)
+    {
+        println!(
+            "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}/{}\t{}",
+            row.body_ids,
+            row.body_records,
+            row.complete_bodies,
+            row.faces,
+            row.named_by_an_instance,
+            row.verified_by_an_instance,
+            row.planar_bodies_matching_their_bounds,
+            row.planar_bodies_with_bounds,
+            row.bodies_away_from_the_origin
+        );
+    }
+}
+
+/// Which classes of model element reach a body, most elements first.
+fn print_model_element_body_table(
+    rows: &BTreeMap<&str, ClassGeometry>,
+    total: &ClassGeometry,
+    classes: usize,
+) {
+    let mut by_model_elements = rows.iter().collect::<Vec<_>>();
+    by_model_elements.sort_by(|left, right| {
+        right
+            .1
+            .model_elements
+            .cmp(&left.1.model_elements)
+            .then_with(|| left.0.cmp(right.0))
+    });
+    println!("\nWhich model elements reach a body:");
+    println!("class\tmodel elements\town body\tplaced\tverified symbol body");
+    for (name, row) in by_model_elements
+        .iter()
+        .filter(|(_, row)| row.model_elements > 0)
+        .take(classes)
+    {
+        println!(
+            "{name}\t{}\t{}\t{}\t{}",
+            row.model_elements,
+            row.model_elements_with_their_own_body,
+            row.model_elements_with_a_placed_body,
+            row.model_elements_with_a_verified_symbol_body
+        );
+    }
+    println!(
+        "total\t{}\t{}\t{}\t{}",
+        total.model_elements,
+        total.model_elements_with_their_own_body,
+        total.model_elements_with_a_placed_body,
+        total.model_elements_with_a_verified_symbol_body
+    );
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct GeometryStatistics {
     pipe_candidates: usize,
@@ -4962,6 +5316,27 @@ fn normalize_geometry(
             end: point(line.end.coordinates_feet)?,
         }));
     }
+    // A body on the element's own record that reproduces that record's own
+    // bounds needs no symbol and no transform: it is already in the source's
+    // project coordinates, which is the frame every geometry here is carried
+    // in and which the IFC layer expresses in the product's own frame. This is
+    // the only path a system family has - a wall, a floor, a stair and a roof
+    // are not placed from a symbol - and on AR S1 it is 12 482 of the 17 377
+    // model elements against 577 reached through a symbol.
+    // Except on a type definition. A record that declares its own category is
+    // a type, not an instance - the clause `is_model_element` already uses -
+    // and a `FamilySymbol` reproduces its record's box just as exactly while
+    // that box is in the symbol's own local frame. On AR S1 that is 81 records
+    // which would otherwise pile their bodies at the origin.
+    if element.brep_is_placed && element.category_source != Some("declared") {
+        if let Some(brep) = element.brep.as_ref().and_then(normalize_placed_brep) {
+            // Complete bodies only, for the reason the symbol path gives
+            // below: IfcOpenShell refuses a large share of open shells.
+            if brep.complete {
+                return Some(BimGeometry::Brep(brep));
+            }
+        }
+    }
     if !carries_family_symbol_geometry(element_type) {
         return None;
     }
@@ -4989,6 +5364,25 @@ fn normalize_geometry(
         min: point(symbol.bounds.min)?,
         max: point(symbol.bounds.max)?,
     }))
+}
+
+/// The rigid transform of a body that is already placed. Reusing
+/// [`normalize_brep`] with it keeps one conversion from feet to metres and one
+/// surface/curve mapping for both paths, rather than a second copy that could
+/// drift from it.
+const IDENTITY_TRANSFORM: GInstanceTransformFields = GInstanceTransformFields {
+    offset: 0,
+    basis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+    origin: RvtPoint3 {
+        coordinates_feet: [0.0, 0.0, 0.0],
+    },
+    symbol_element_id: None,
+};
+
+/// Convert a body that already carries its own placement, in Revit internal
+/// feet, to the metres the exporter works in.
+fn normalize_placed_brep(placed: &rvt_model::SymbolBrep) -> Option<BimBrep> {
+    normalize_brep(placed, &IDENTITY_TRANSFORM)
 }
 
 /// Place a symbol-local `SymbolBrep` (Revit internal feet) into world
@@ -6448,5 +6842,216 @@ mod tests {
                 Some(BimGeometry::BoundingBox(_))
             ));
         }
+    }
+
+    /// A square planar face one foot on a side, placed at `origin`.
+    fn square_body(origin: [f64; 3]) -> rvt_model::SymbolBrep {
+        let corner = |x: f64, y: f64| [origin[0] + x, origin[1] + y, origin[2]];
+        let edge = |from: [f64; 3], to: [f64; 3]| rvt_model::BrepEdge {
+            start: from,
+            end: to,
+            curve: rvt_model::BrepCurve::Line,
+        };
+        rvt_model::SymbolBrep {
+            faces: vec![rvt_model::BrepFace {
+                surface: rvt_model::BrepSurface::Plane {
+                    origin,
+                    x_axis: [1.0, 0.0, 0.0],
+                    y_axis: [0.0, 1.0, 0.0],
+                },
+                loops: vec![vec![
+                    edge(corner(0.0, 0.0), corner(1.0, 0.0)),
+                    edge(corner(1.0, 0.0), corner(1.0, 1.0)),
+                    edge(corner(1.0, 1.0), corner(0.0, 1.0)),
+                    edge(corner(0.0, 1.0), corner(0.0, 0.0)),
+                ]],
+            }],
+            ..rvt_model::SymbolBrep::default()
+        }
+    }
+
+    #[test]
+    fn tallies_a_body_against_the_class_that_owns_it() {
+        // A wall carrying its own placed body, a symbol carrying a local one,
+        // and the instance that names the symbol. The wall is what the export
+        // never asks for and the symbol is the only path it does ask through,
+        // so the two have to be told apart by owner.
+        let mut elements: BTreeMap<u32, ExportedElement> = BTreeMap::new();
+        let wall = elements.entry(1).or_default();
+        wall.class_index = Some(10);
+        wall.created_phase_id = Some(3);
+        wall.brep = Some(square_body([40.0, 5.0, 0.0]));
+        wall.brep_records = 2;
+        // What the recovery sets when the body reproduces the bounds of the
+        // record it came from; see `body_is_placed_in`.
+        wall.brep_is_placed = true;
+        wall.geometry_bounds = Some(rvt_model::GElementBounds {
+            offset: 0,
+            min: [40.0, 5.0, 0.0],
+            max: [41.0, 6.0, 0.0],
+        });
+        let symbol = elements.entry(2).or_default();
+        symbol.class_index = Some(20);
+        symbol.brep = Some(square_body([0.0, 0.0, 0.0]));
+        symbol.brep_records = 1;
+        let instance = elements.entry(3).or_default();
+        instance.class_index = Some(30);
+        instance.created_phase_id = Some(3);
+        instance.verified_symbol_bounds = Some(VerifiedSymbolBounds {
+            symbol_element_id: 2,
+            bounds: rvt_model::GElementBounds {
+                offset: 0,
+                min: [0.0, 0.0, 0.0],
+                max: [1.0, 1.0, 0.0],
+            },
+        });
+
+        let rows = tally_class_geometry(&elements, |element| match element.class_index {
+            Some(10) => Some("SWall"),
+            Some(20) => Some("FamilySymbol"),
+            Some(30) => Some("FamilyInstance"),
+            _ => None,
+        });
+
+        let wall = &rows["SWall"];
+        assert_eq!(wall.body_ids, 1);
+        // Both of the id's body-bearing records are counted, though only the
+        // last is kept.
+        assert_eq!(wall.body_records, 2);
+        // The body reproduces the record's own bounds and sits where the
+        // building is, not at a symbol's origin.
+        assert_eq!(wall.planar_bodies_matching_their_bounds, 1);
+        assert_eq!(wall.bodies_away_from_the_origin, 1);
+        // It is a model element that owns a body and reaches the export by no
+        // symbol at all - the case the funnel cannot see.
+        assert_eq!(wall.model_elements, 1);
+        assert_eq!(wall.model_elements_with_their_own_body, 1);
+        assert_eq!(wall.model_elements_with_a_verified_symbol_body, 0);
+
+        let symbol = &rows["FamilySymbol"];
+        assert_eq!(symbol.body_ids, 1);
+        assert_eq!(symbol.verified_by_an_instance, 1);
+        assert_eq!(symbol.bodies_away_from_the_origin, 0);
+        // A symbol is a type definition, never a model element.
+        assert_eq!(symbol.model_elements, 0);
+
+        let instance = &rows["FamilyInstance"];
+        assert_eq!(instance.body_ids, 0);
+        assert_eq!(instance.model_elements_with_a_verified_symbol_body, 1);
+    }
+
+    fn bounds(min: [f64; 3], max: [f64; 3]) -> rvt_model::GElementBounds {
+        rvt_model::GElementBounds {
+            offset: 0,
+            min,
+            max,
+        }
+    }
+
+    #[test]
+    fn a_body_is_placed_only_where_it_reproduces_its_own_records_box() {
+        let body = square_body([40.0, 5.0, 0.0]);
+        // A flat square is a region, not a solid: its box holds no volume.
+        assert!(!body_is_placed_in(
+            &body,
+            &bounds([40.0, 5.0, 0.0], [41.0, 6.0, 0.0])
+        ));
+
+        // The same face as one side of a volumetric box does not reproduce it.
+        assert!(!body_is_placed_in(
+            &body,
+            &bounds([40.0, 5.0, 0.0], [41.0, 6.0, 9.0])
+        ));
+
+        let mut box_body = square_body([40.0, 5.0, 0.0]);
+        let mut lid = square_body([40.0, 5.0, 9.0]);
+        box_body.faces.append(&mut lid.faces);
+        assert!(body_is_placed_in(
+            &box_body,
+            &bounds([40.0, 5.0, 0.0], [41.0, 6.0, 9.0])
+        ));
+        // A box the body does not reach is a different frame, not this one.
+        assert!(!body_is_placed_in(
+            &box_body,
+            &bounds([0.0, 0.0, 0.0], [1.0, 1.0, 9.0])
+        ));
+
+        // An arc bulges past the endpoints this extent is taken from, so a
+        // curved body is not admitted on a test that cannot see the bulge.
+        let mut curved = box_body.clone();
+        curved.faces[0].loops[0][0].curve = rvt_model::BrepCurve::Arc(rvt_model::BrepArc {
+            center: [40.5, 5.0, 0.0],
+            x_axis: [1.0, 0.0, 0.0],
+            z_axis: [0.0, 0.0, 1.0],
+            radius: 0.5,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::PI,
+        });
+        assert!(!body_is_placed_in(
+            &curved,
+            &bounds([40.0, 5.0, 0.0], [41.0, 6.0, 9.0])
+        ));
+    }
+
+    #[test]
+    fn a_placed_body_outranks_the_one_its_id_already_holds() {
+        let mut kept = ExportedElement::default();
+        // Nothing held yet: anything is an improvement.
+        assert!(keep_body(&square_body([0.0, 0.0, 0.0]), false, &kept));
+        kept.brep = Some(square_body([0.0, 0.0, 0.0]));
+
+        // An unplaced body still replaces an unplaced one, which is what every
+        // id did before the two could be told apart.
+        assert!(keep_body(&square_body([1.0, 0.0, 0.0]), false, &kept));
+        // A placed one takes it over.
+        assert!(keep_body(&square_body([1.0, 0.0, 0.0]), true, &kept));
+
+        kept.brep_is_placed = true;
+        // Held placed body wins over an unplaced newcomer, whatever its size.
+        assert!(!keep_body(&square_body([1.0, 0.0, 0.0]), false, &kept));
+        // Between two placed bodies the larger one wins.
+        assert!(!keep_body(&square_body([1.0, 0.0, 0.0]), true, &kept));
+        let mut larger = square_body([1.0, 0.0, 0.0]);
+        let mut second_face = square_body([1.0, 0.0, 1.0]);
+        larger.faces.append(&mut second_face.faces);
+        assert!(keep_body(&larger, true, &kept));
+    }
+
+    #[test]
+    fn a_placed_body_is_emitted_without_a_symbol_or_a_transform() {
+        let mut wall = ExportedElement::default();
+        let mut body = square_body([40.0, 5.0, 0.0]);
+        let mut lid = square_body([40.0, 5.0, 9.0]);
+        body.faces.append(&mut lid.faces);
+        wall.brep = Some(body);
+        wall.brep_is_placed = true;
+
+        let geometry = normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new());
+        let Some(BimGeometry::Brep(brep)) = geometry else {
+            panic!("a placed body should reach the export: {geometry:?}");
+        };
+        assert!(brep.complete);
+        assert_eq!(brep.faces.len(), 2);
+        // Carried straight through in the source's own project coordinates,
+        // converted to metres and to nothing else.
+        let start = &brep.faces[0].loops[0][0].start;
+        assert_eq!(start.unit.id, "autodesk.unit.unit:meters-1.0.0");
+        for (actual, feet) in start.coordinates.into_iter().zip([40.0, 5.0, 0.0]) {
+            assert!((actual - feet * 0.304_8).abs() < 1.0e-12, "{actual}");
+        }
+
+        // A record declaring its own category is a type definition, and its
+        // box is in its own local frame however exactly the body reproduces
+        // it. The same body is refused there.
+        wall.category = Some(-2_000_011);
+        wall.category_source = Some("declared");
+        assert!(normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new()).is_none());
+        wall.category = None;
+        wall.category_source = None;
+
+        // Without the placed flag there is no symbol to fall back to, so the
+        // same body is not emitted: the flag is the whole of the gate.
+        wall.brep_is_placed = false;
+        assert!(normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new()).is_none());
     }
 }
