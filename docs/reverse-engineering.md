@@ -1293,3 +1293,88 @@ That is the same backlog the placed path already had, and on AR S1 it is
 dominated by one exclusion: 76 510 of 80 205 excluded faces are `"face has no
 first loop"`. This tier moved the gate from "no box to check against" to
 "the body is incomplete", which is a different problem and the next one.
+
+### Result: a face with no loop has no boundary in its record either
+
+The entry above ended on the exclusion that now dominates every other:
+`"face has no first loop"`, 76 510 of AR S1's 80 205 excluded faces.
+`rivet loop-owner-probe` is the measurement, on AR S1, KJ S1, ВК S1 and ОВ S1.
+
+*What such a face is.* `assemble_face` reads the boundary from the face's own
+first reference, `GFace.m_pFirstLoop`. The faces that fail carry a literal
+`(id 0, class 0)` there - all 76 510 of them on AR S1, 1 740 on KJ, 1 139 on
+ВК, 2 106 on ОВ - and are otherwise ordinary: four references like every other
+face, a resolved surface on every one (76 472 `Plane` and 38 `CylSurf` on AR
+S1), an identifier no other face shares, named by a `Geometry` node's
+`m_pFaces` array exactly as the loop-bearing faces are, only from later slots.
+Every record involved tiled its body exactly, so this is what the file says,
+not where a walk drifted.
+
+*Hypothesis 1: read the link from the loop's side.* `GEdgeLoop` declares
+`m_pFace`, and `walk_loop` already refuses a loop whose `pFace` is not its
+face, so the link exists in both directions and the missing one could be
+recovered by grouping the loops by the face they name.
+
+**Refuted, and the control is what refutes it.** On faces that *do* carry a
+reference the inverse map reproduces it: 367 193 of AR S1's 380 906 are
+claimed by exactly one loop and it is the referenced one, 13 281 by several
+including it, and 16 disagree. On the faces that carry none, **no loop claims
+a single one of them** - 76 510 of 76 510. The loops are not hiding behind a
+sentinel; they are not in the record.
+
+*They are still part of the solid.* Every `Edge` names the two faces it
+separates, and on AR S1 82 009 edges separate a bounded face from a loopless
+one while 11 669 join two loopless ones (KJ 4 182 / 1 051, ВК 2 777 / 517,
+ОВ 6 848 / 1 418). So the shell the bounded faces make is open along those
+edges, and dropping the loopless faces is not a repair.
+
+*Hypothesis 2: rebuild the boundary from the edges.* `Edge.identifiers` is
+`[pFace0, pFace1, next0, next1, prev0, prev1]`, so the ring around a face is
+in the edges themselves and the `EdgeLoop` object is only an entry point into
+it: walk from the edge no other edge of that face steps onto, and stop when
+the chain names something that is not an edge.
+
+That reading is right, and the loops prove it. The rebuild fails on no face of
+any of the four files, and where a loop exists it lands on the same ring the
+loop does - one ring, ending on the very loop that claims the face, starting
+at the edge that loop declares: 331 175 of AR S1's 380 906 loop-bearing faces,
+87 249 of 90 881 on KJ, 57 873 of 59 667 on ВК.
+
+**And it recovers nothing.** Every ring that no loop of the record ends is one
+edge long: 415 486 on AR S1, 15 310 on KJ, 9 305 on ВК, 27 030 on ОВ, against
+a real ring's 2 to 11+ edges (366 865 of AR S1's are quads). Those chains end
+on an identifier inside the record's own id space that no object in the record
+carries. So they are not holes and not boundaries - they are edges whose next
+link on that side was never written. And 60 886 of AR S1's 76 510 loopless
+faces have no edge naming them at all.
+
+| | AR S1 | KJ S1 | ВК S1 | ОВ S1 |
+|---|---|---|---|---|
+| faces in face-bearing records | 457 416 | 92 621 | 60 806 | 295 657 |
+| with a first-loop reference | 380 906 | 90 881 | 59 667 | 293 551 |
+| with none | 76 510 | 1 740 | 1 139 | 2 106 |
+| ... claimed by a loop anyway | 0 | 0 | 0 | 0 |
+| ... with no edge naming them | 60 886 | 974 | 249 | 355 |
+| rings no loop ends, of one edge | 415 486 | 15 310 | 9 305 | 27 030 |
+| ... of more than one | 440 | 14 | 0 | 0 |
+
+*Result.* Both routes to the missing boundary are closed by measurement: it is
+not on the loop's side and it is not in the edge chain. Nothing in the export
+changes - the exclusion stands and the ~1 000 placed-but-incomplete bodies on
+AR S1 keep their boxes - but the question is now a different one. The chains
+end on identifiers the record's id space contains and no object fills, which
+is the same shape as the 415 486 unwritten links, and the only rings a loop
+object ends without claiming the face are AR S1's 440 and KJ's 14, all ended
+by `EdgeLoopWithChainEnvelopes`. Whatever writes those identifiers is what
+would have to be found.
+
+What is left as an option, and it is a weaker one: the 15 624 loopless faces
+on AR S1 that edges do name could have those edges ordered by their endpoints
+rather than by a declared link, and closure checked geometrically. That is a
+reconstruction rather than a reading, it reaches a fifth of the population,
+and it is worth doing only if nothing better turns up.
+
+Confidence: high on all of it. Each count is over four files of three
+disciplines, every record involved tiled exactly, and the rebuild's control -
+that it reproduces the loop wherever a loop exists - is what makes its silence
+elsewhere evidence rather than a failure to find.

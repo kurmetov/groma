@@ -323,6 +323,17 @@ enum Command {
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
     },
+    /// Probe how a `Face` reaches its `EdgeLoop`: by the reference the face
+    /// carries, or by the `pFace` every loop declares.
+    LoopOwnerProbe {
+        file: PathBuf,
+        /// Print this many rows of each histogram.
+        #[arg(long, default_value_t = 20)]
+        rows: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
     /// Probe the `GElement` node graph: which node classes hang under it and
     /// where their object identifiers resolve.
     GeometryGraphProbe {
@@ -562,6 +573,11 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             node_class.as_deref(),
             max_member_bytes,
         ),
+        Command::LoopOwnerProbe {
+            file,
+            rows,
+            max_member_bytes,
+        } => loop_owner_probe(&file, rows, max_member_bytes),
         Command::GeometryGraphProbe {
             file,
             rows,
@@ -2231,6 +2247,702 @@ fn describe_parameter_value(value: &ParameterValue) -> String {
         ParameterValue::Integer(number) => format!("int={number}"),
         ParameterValue::Text(text) => format!("text={text:?}"),
         ParameterValue::Reference(id) => format!("ref={id}"),
+    }
+}
+
+/// How a `Face` reaches the `EdgeLoop` that bounds it.
+///
+/// `assemble_face` reads the loop from the face's own first reference, and
+/// where that reference is missing the face is dropped: on AR S1 that is
+/// 76 510 of the 80 205 excluded faces, the largest exclusion by an order of
+/// magnitude. Every `EdgeLoop` also declares the face it bounds in
+/// `identifiers[0]` - `walk_loop` already refuses a loop whose `pFace` is not
+/// its face - so the same link exists on the loop's side, and this measures
+/// whether reading it backwards is the same link.
+///
+/// Two questions, and the first has to be answered before the second means
+/// anything. On faces that *do* carry a reference the inverse map must
+/// reproduce it: that is the control, and a disagreement there refutes the
+/// map. Only then does the count of loops claiming a face that carries no
+/// reference say what could be recovered. Both are split on whether the
+/// record's declarations tiled its body exactly, because a drifted walk hands
+/// this arbitrary bytes rather than the fields it names.
+#[allow(clippy::too_many_lines)] // One streaming pass and the tallies it fills.
+fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the class schema is required for this probe",
+        )
+    })?;
+    let classes = (|| {
+        Some(rvt_model::BrepClassIndexes {
+            face: schema_class_index(Some(&schema), "Face")?,
+            edge_loop: schema_class_index(Some(&schema), "EdgeLoop")?,
+            edge: schema_class_index(Some(&schema), "Edge")?,
+            plane: schema_class_index(Some(&schema), "Plane")?,
+            cyl_surf: schema_class_index(Some(&schema), "CylSurf")?,
+        })
+    })();
+    let geometry_element_class_index = schema_class_index(Some(&schema), "GElement");
+    let (Some(classes), Some(geometry_element_class_index)) =
+        (classes, geometry_element_class_index)
+    else {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the schema does not declare the boundary-representation classes",
+        )));
+    };
+    let partition_paths = partition_paths(&container);
+
+    // Every count is (all records, exactly-tiled records only).
+    let mut faces = [0_u64; 2];
+    let mut referenced = [0_u64; 2];
+    let mut control = BTreeMap::<&'static str, [u64; 2]>::new();
+    let mut unreferenced = BTreeMap::<&'static str, [u64; 2]>::new();
+    // What the first reference of a face that carries no usable one actually
+    // holds, so the sentinel can be recognised rather than guessed at.
+    let mut first_reference = BTreeMap::<String, u64>::new();
+    let mut excluded_without_a_loop = [0_u64; 2];
+    let mut recoverable = [0_u64; 2];
+    // How many further references a face with a null first one carries, and
+    // whether such faces come a whole record at a time or mixed in among
+    // faces that do reach a loop.
+    let mut reference_counts = BTreeMap::<usize, u64>::new();
+    let mut record_split = BTreeMap::<&'static str, u64>::new();
+    // What a face with no loop still names: its surface, and whether that
+    // surface or its own identifier is one a loop-bearing face in the same
+    // record already used.
+    let mut null_surface_class = BTreeMap::<String, u64>::new();
+    let mut shares_a_surface = 0_u64;
+    let mut shares_an_identifier = 0_u64;
+    // The scalar fields a face declares - `m_cutType`, `m_faceFlags_v9` - for
+    // each kind of face. If the two kinds differ in a declared field, the file
+    // is saying what the loopless ones are.
+    let mut null_scalars = BTreeMap::<String, u64>::new();
+    let mut loop_bearing_scalars = BTreeMap::<String, u64>::new();
+    let mut loop_bearing_reference_counts = BTreeMap::<usize, u64>::new();
+    // Who names each kind of face, by the class of the naming object and the
+    // slot the name sits in. A face is reached by the walk because something
+    // referenced it, and if the two kinds are reached from different places
+    // that is what they are.
+    let mut null_parents = BTreeMap::<String, u64>::new();
+    let mut loop_bearing_parents = BTreeMap::<String, u64>::new();
+    // Whether the shell the loop-bearing faces make is self-contained. Every
+    // `Edge` names the two faces it separates, so an edge naming a loopless
+    // face says that face is part of the solid and its boundary is missing;
+    // no such edge says the loopless faces are not in the shell at all.
+    let mut edges_naming = BTreeMap::<&'static str, u64>::new();
+    // Whether a face's boundary can be rebuilt from the edges alone. Every
+    // `Edge` names the two faces it separates and, for each of them, the next
+    // edge around that face, so the ring is in the edges and the `EdgeLoop`
+    // object is only an entry point into it. Asked of both kinds of face: on
+    // the ones that have a loop the rebuild must reproduce it, and on the ones
+    // that have none it is the only route there is.
+    let mut rings = [BTreeMap::<String, u64>::new(), BTreeMap::new()];
+    // Identifiers are record-local, so two objects of one class sharing one
+    // identifier inside a record would make every map here cross two objects.
+    let mut duplicate_identifiers = BTreeMap::<&'static str, u64>::new();
+    // What a ring's last edge steps onto when it is not one of the loops that
+    // claim the face: an object of some other class, or nothing this record
+    // holds at all.
+    let mut terminators = BTreeMap::<String, u64>::new();
+    let mut terminator_range = BTreeMap::<&'static str, u64>::new();
+    // How many edges each ring has, split on whether an `EdgeLoop` of the
+    // record ends it. A ring of one or two edges is a broken chain rather than
+    // a hole, so this is the check on the rings no loop knows about.
+    let mut ring_lengths = [BTreeMap::<usize, u64>::new(), BTreeMap::new()];
+    // The same rebuild in three numbers per kind of face: rings recovered,
+    // no edge to recover them from, and a rebuild that failed outright.
+    let mut rebuilt_tally = [[0_u64; 3]; 2];
+    // Rings recovered beyond the loops the record actually holds - a face
+    // whose holes are in the edges and in no `EdgeLoop` object.
+    let mut rings_beyond_the_loops = [0_u64; 2];
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, _, layout, walk, payload| {
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if header.class_index != geometry_element_class_index {
+                    continue;
+                }
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                let (record_walk, objects) =
+                    rvt_model::walk_record_collecting(&schema, header.class_index, body);
+                if !objects
+                    .iter()
+                    .any(|object| object.class_index == classes.face)
+                {
+                    continue;
+                }
+                let exact = record_walk.is_exact();
+                let bump = |counter: &mut [u64; 2]| {
+                    counter[0] += 1;
+                    counter[1] += u64::from(exact);
+                };
+
+                // Which loops claim each face, read from `EdgeLoop.pFace`. A
+                // loop that does not declare all three of pFace/next/prev is
+                // one `walk_loop` would refuse anyway, so it claims nothing.
+                let mut claimed: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+                for object in &objects {
+                    if object.class_index != classes.edge_loop || object.identifiers.len() != 3 {
+                        continue;
+                    }
+                    claimed
+                        .entry(object.identifiers[0])
+                        .or_default()
+                        .push(object.object_id);
+                }
+
+                for face in objects
+                    .iter()
+                    .filter(|object| object.class_index == classes.face)
+                {
+                    bump(&mut faces);
+                    let claiming = claimed.get(&face.object_id).map_or(&[][..], Vec::as_slice);
+                    if let Some(reference) = face
+                        .references
+                        .first()
+                        .filter(|reference| reference.object_id != 0)
+                    {
+                        bump(&mut referenced);
+                        let verdict = match claiming {
+                            [] => "no loop claims the face",
+                            [only] if *only == reference.object_id => {
+                                "one loop, and it is the referenced one"
+                            }
+                            [_] => "one loop, and it is not the referenced one",
+                            many if many.contains(&reference.object_id) => {
+                                "several loops, the referenced one among them"
+                            }
+                            _ => "several loops, none of them the referenced one",
+                        };
+                        bump(control.entry(verdict).or_default());
+                    } else {
+                        let verdict = match claiming {
+                            [] => "no loop claims the face",
+                            [_] => "exactly one loop claims the face",
+                            _ => "several loops claim the face",
+                        };
+                        bump(unreferenced.entry(verdict).or_default());
+                        *reference_counts.entry(face.references.len()).or_default() += 1;
+                        *first_reference
+                            .entry(face.references.first().map_or_else(
+                                || "no references at all".to_owned(),
+                                |reference| {
+                                    format!(
+                                        "first reference (id {}, class {})",
+                                        reference.object_id, reference.class_index
+                                    )
+                                },
+                            ))
+                            .or_default() += 1;
+                    }
+                }
+
+                // Every object naming a face of this record, by the class
+                // that names it and the slot the name sits in.
+                let mut named_by: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+                for object in &objects {
+                    for (slot, reference) in object.references.iter().enumerate() {
+                        if reference.object_id == 0 || reference.class_index != classes.face {
+                            continue;
+                        }
+                        named_by
+                            .entry(reference.object_id)
+                            .or_default()
+                            .push(format!(
+                                "{} slot {slot}",
+                                schema.class_by_index(object.class_index).map_or_else(
+                                    || format!("class {}", object.class_index),
+                                    |class| class.name.clone()
+                                )
+                            ));
+                    }
+                }
+
+                // Every surface and identifier a loop-bearing face in this
+                // record claims, to test the null-loop faces against.
+                let mut loop_bearing_surfaces = BTreeSet::new();
+                let mut loop_bearing_faces = BTreeSet::new();
+                for face in objects.iter().filter(|object| {
+                    object.class_index == classes.face
+                        && object
+                            .references
+                            .first()
+                            .is_some_and(|reference| reference.object_id != 0)
+                }) {
+                    loop_bearing_faces.insert(face.object_id);
+                    *loop_bearing_reference_counts
+                        .entry(face.references.len())
+                        .or_default() += 1;
+                    *loop_bearing_scalars.entry(face_scalars(face)).or_default() += 1;
+                    *loop_bearing_parents
+                        .entry(named_by.get(&face.object_id).map_or_else(
+                            || "nothing names it".to_owned(),
+                            |names| names.join(", "),
+                        ))
+                        .or_default() += 1;
+                    if let Some(surface) = face.references.last() {
+                        loop_bearing_surfaces.insert((surface.object_id, surface.class_index));
+                    }
+                }
+                for face in objects.iter().filter(|object| {
+                    object.class_index == classes.face
+                        && object
+                            .references
+                            .first()
+                            .is_none_or(|reference| reference.object_id == 0)
+                }) {
+                    let surface = face.references.last();
+                    *null_surface_class
+                        .entry(surface.map_or_else(
+                            || "no surface reference".to_owned(),
+                            |surface| {
+                                if surface.object_id == 0 {
+                                    "null surface reference".to_owned()
+                                } else if surface.class_index == classes.plane {
+                                    "Plane".to_owned()
+                                } else if surface.class_index == classes.cyl_surf {
+                                    "CylSurf".to_owned()
+                                } else {
+                                    format!("class {}", surface.class_index)
+                                }
+                            },
+                        ))
+                        .or_default() += 1;
+                    if surface.is_some_and(|surface| {
+                        loop_bearing_surfaces.contains(&(surface.object_id, surface.class_index))
+                    }) {
+                        shares_a_surface += 1;
+                    }
+                    if loop_bearing_faces.contains(&face.object_id) {
+                        shares_an_identifier += 1;
+                    }
+                    *null_scalars.entry(face_scalars(face)).or_default() += 1;
+                    *null_parents
+                        .entry(named_by.get(&face.object_id).map_or_else(
+                            || "nothing names it".to_owned(),
+                            |names| names.join(", "),
+                        ))
+                        .or_default() += 1;
+                }
+
+                {
+                    let mut seen = BTreeMap::<(u16, u32), u64>::new();
+                    for object in &objects {
+                        *seen
+                            .entry((object.class_index, object.object_id))
+                            .or_default() += 1;
+                    }
+                    for ((class_index, _), count) in seen {
+                        if count > 1 {
+                            *duplicate_identifiers
+                                .entry(if class_index == classes.face {
+                                    "Face"
+                                } else if class_index == classes.edge {
+                                    "Edge"
+                                } else if class_index == classes.edge_loop {
+                                    "EdgeLoop"
+                                } else {
+                                    "another class"
+                                })
+                                .or_default() += count - 1;
+                        }
+                    }
+                }
+
+                let objects_by_id: BTreeMap<u32, u16> = objects
+                    .iter()
+                    .map(|object| (object.object_id, object.class_index))
+                    .collect();
+
+                let loop_first_edge: BTreeMap<u32, u32> = objects
+                    .iter()
+                    .filter(|object| {
+                        object.class_index == classes.edge_loop && object.identifiers.len() == 3
+                    })
+                    .map(|object| (object.object_id, object.identifiers[1]))
+                    .collect();
+
+                // `Edge.identifiers` is `[pFace0, pFace1, next0, next1,
+                // prev0, prev1]`, so the ring around face `pFace[side]`
+                // continues at `next[side]`.
+                let edge_links: BTreeMap<u32, [u32; 4]> = objects
+                    .iter()
+                    .filter(|object| {
+                        object.class_index == classes.edge && object.identifiers.len() == 6
+                    })
+                    .map(|edge| {
+                        (
+                            edge.object_id,
+                            [
+                                edge.identifiers[0],
+                                edge.identifiers[1],
+                                edge.identifiers[2],
+                                edge.identifiers[3],
+                            ],
+                        )
+                    })
+                    .collect();
+                let mut edges_of_face: BTreeMap<u32, Vec<(u32, usize)>> = BTreeMap::new();
+                for (id, links) in &edge_links {
+                    for (side, face) in links[..2].iter().enumerate() {
+                        if *face != 0 {
+                            edges_of_face.entry(*face).or_default().push((*id, side));
+                        }
+                    }
+                }
+
+                for face in objects
+                    .iter()
+                    .filter(|object| object.class_index == classes.face)
+                {
+                    let has_a_loop = face
+                        .references
+                        .first()
+                        .is_some_and(|reference| reference.object_id != 0);
+                    let claiming = claimed.get(&face.object_id).map_or(&[][..], Vec::as_slice);
+                    let verdict = match rebuild_rings(
+                        face.object_id,
+                        edges_of_face
+                            .get(&face.object_id)
+                            .map_or(&[][..], Vec::as_slice),
+                        &edge_links,
+                    ) {
+                        Err(failure) => {
+                            rebuilt_tally[usize::from(has_a_loop)]
+                                [usize::from(failure.starts_with("no edge"))] += 1;
+                            failure
+                        }
+                        Ok(rebuilt) => {
+                            // Each ring ends by stepping onto the `EdgeLoop`
+                            // that owns it, and each loop declares the edge
+                            // its ring starts at, so agreement is checkable in
+                            // both directions rather than by counting.
+                            for (_, terminator, length) in &rebuilt {
+                                *ring_lengths[usize::from(claiming.contains(terminator))]
+                                    .entry(*length)
+                                    .or_default() += 1;
+                                if claiming.contains(terminator) {
+                                    continue;
+                                }
+                                *terminator_range
+                                    .entry(if objects_by_id.contains_key(terminator) {
+                                        "an object of this record"
+                                    } else if *terminator == u32::MAX {
+                                        "0xffffffff"
+                                    } else if objects_by_id
+                                        .keys()
+                                        .next_back()
+                                        .is_some_and(|highest| terminator <= highest)
+                                    {
+                                        "an unused identifier below the record's highest"
+                                    } else {
+                                        "above every identifier the record uses"
+                                    })
+                                    .or_default() += 1;
+                                *terminators
+                                    .entry(objects_by_id.get(terminator).map_or_else(
+                                        || "no object of this record".to_owned(),
+                                        |class_index| {
+                                            schema.class_by_index(*class_index).map_or_else(
+                                                || format!("class {class_index}"),
+                                                |class| class.name.clone(),
+                                            )
+                                        },
+                                    ))
+                                    .or_default() += 1;
+                            }
+                            rebuilt_tally[usize::from(has_a_loop)][2] += 1;
+                            rings_beyond_the_loops[usize::from(has_a_loop)] +=
+                                (rebuilt.len() as u64).saturating_sub(claiming.len() as u64);
+                            let ends_on_its_loop = rebuilt
+                                .iter()
+                                .all(|(_, terminator, _)| claiming.contains(terminator));
+                            let starts_where_the_loops_say = claiming.iter().all(|loop_id| {
+                                loop_first_edge.get(loop_id).is_some_and(|first| {
+                                    rebuilt.iter().any(|(head, _, _)| head == first)
+                                })
+                            });
+                            format!(
+                                "{} ring(s) against {} loop(s); ends on its loop: {}; starts \
+                                 where the loops say: {}",
+                                rebuilt.len(),
+                                claiming.len(),
+                                ends_on_its_loop,
+                                starts_where_the_loops_say,
+                            )
+                        }
+                    };
+                    *rings[usize::from(has_a_loop)].entry(verdict).or_default() += 1;
+                }
+
+                let loopless: BTreeSet<u32> = objects
+                    .iter()
+                    .filter(|object| {
+                        object.class_index == classes.face
+                            && object
+                                .references
+                                .first()
+                                .is_none_or(|reference| reference.object_id == 0)
+                    })
+                    .map(|object| object.object_id)
+                    .collect();
+                for edge in objects
+                    .iter()
+                    .filter(|object| object.class_index == classes.edge)
+                {
+                    let named = &edge.identifiers.get(..2).unwrap_or_default();
+                    let verdict = match named.iter().filter(|face| loopless.contains(face)).count()
+                    {
+                        0 if named.len() == 2 => "both faces bounded",
+                        1 => "one face has no loop",
+                        2 => "both faces have no loop",
+                        _ => "edge names fewer than two faces",
+                    };
+                    *edges_naming.entry(verdict).or_default() += 1;
+                }
+
+                let record_faces = objects
+                    .iter()
+                    .filter(|object| object.class_index == classes.face)
+                    .count();
+                let record_null = objects
+                    .iter()
+                    .filter(|object| {
+                        object.class_index == classes.face
+                            && object
+                                .references
+                                .first()
+                                .is_none_or(|reference| reference.object_id == 0)
+                    })
+                    .count();
+                *record_split
+                    .entry(if record_null == 0 {
+                        "every face reaches a loop"
+                    } else if record_null == record_faces {
+                        "no face in the record reaches a loop"
+                    } else {
+                        "some faces reach a loop and some do not"
+                    })
+                    .or_default() += 1;
+
+                // The same question asked of the exclusions themselves, which
+                // is what a fix would actually buy: a face excluded for
+                // carrying no first loop has already resolved its surface,
+                // because `assemble_face` reads that first.
+                let assembled = rvt_model::assemble_symbol_brep(&objects, &classes);
+                for exclusion in &assembled.excluded_faces {
+                    if exclusion.reason != "face has no first loop" {
+                        continue;
+                    }
+                    bump(&mut excluded_without_a_loop);
+                    if claimed
+                        .get(&exclusion.face_id)
+                        .is_some_and(|loops| loops.len() == 1)
+                    {
+                        bump(&mut recoverable);
+                    }
+                }
+            }
+        },
+    )?;
+
+    println!("Faces in face-bearing `GElement` records: {faces:?} (all, exactly tiled)");
+    println!("  carrying a usable first-loop reference: {referenced:?}");
+    println!("\nControl - what `EdgeLoop.pFace` says about a face that carries a reference:");
+    print_loop_owner_rows(&control, rows);
+    println!("\nWhat it says about a face that carries none:");
+    print_loop_owner_rows(&unreferenced, rows);
+    println!("\nWhat those faces carry in the first reference slot instead:");
+    let mut shapes = first_reference.into_iter().collect::<Vec<_>>();
+    shapes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (shape, count) in shapes.into_iter().take(rows) {
+        println!("  {count}\t{}", escape_terminal_text(&shape));
+    }
+    println!("\n  further references such a face carries (count: faces):");
+    for (count, faces) in &reference_counts {
+        println!("  {count}\t{faces}");
+    }
+    println!(
+        "\nRebuild in three numbers (rebuild failed, no edge names the face, rings recovered):\n  \
+         a face with a loop: {:?}, rings beyond the loops the record holds: {}\n  \
+         a face with none:   {:?}, rings beyond the loops the record holds: {}",
+        rebuilt_tally[1], rings_beyond_the_loops[1], rebuilt_tally[0], rings_beyond_the_loops[0]
+    );
+    println!("\nEdges per ring - a ring an `EdgeLoop` of the record ends:");
+    print_ring_lengths(&ring_lengths[1]);
+    println!("  and a ring no loop of the record knows about:");
+    print_ring_lengths(&ring_lengths[0]);
+    println!("\nWhat kind of identifier such a ring ends on:");
+    for (kind, count) in &terminator_range {
+        println!("  {count}\t{kind}");
+    }
+    println!("\nWhere a ring ends when it is not on a loop that claims the face:");
+    print_scalar_rows(&terminators, rows);
+    println!("\nObjects sharing an identifier with another of their class in one record:");
+    for (class, count) in &duplicate_identifiers {
+        println!("  {count}\t{class}");
+    }
+    println!("\nRebuilding a face's boundary from the edges alone - a face with a loop:");
+    print_scalar_rows(&rings[1], rows);
+    println!("  and a face with none:");
+    print_scalar_rows(&rings[0], rows);
+    println!("\nWhat the edges say about the two kinds of face:");
+    let mut naming = edges_naming.into_iter().collect::<Vec<_>>();
+    naming.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    for (verdict, count) in naming {
+        println!("  {count}\t{verdict}");
+    }
+    println!("\n  what names such a face:");
+    print_scalar_rows(&null_parents, rows);
+    println!("\n  and what names a loop-bearing face:");
+    print_scalar_rows(&loop_bearing_parents, rows);
+    println!("\n  the scalars such a face declares:");
+    print_scalar_rows(&null_scalars, rows);
+    println!("\n  and those a loop-bearing face declares:");
+    print_scalar_rows(&loop_bearing_scalars, rows);
+    println!("  references a loop-bearing face carries (count: faces):");
+    for (count, faces) in &loop_bearing_reference_counts {
+        println!("  {count}\t{faces}");
+    }
+    println!("\n  the surface such a face names:");
+    let mut surfaces = null_surface_class.into_iter().collect::<Vec<_>>();
+    surfaces.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (class, count) in surfaces {
+        println!("  {count}\t{}", escape_terminal_text(&class));
+    }
+    println!(
+        "  sharing that surface with a loop-bearing face of the same record: {shares_a_surface}"
+    );
+    println!("  whose own identifier a loop-bearing face also carries: {shares_an_identifier}");
+    println!("\nHow the two kinds of face fall across records:");
+    let mut split = record_split.into_iter().collect::<Vec<_>>();
+    split.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    for (verdict, count) in split {
+        println!("  {count}\t{verdict}");
+    }
+    println!(
+        "\nFaces excluded as \"face has no first loop\": {excluded_without_a_loop:?}, \
+         of which exactly one loop claims: {recoverable:?}"
+    );
+    Ok(())
+}
+
+/// Ring sizes, smallest first, with everything past ten collapsed.
+fn print_ring_lengths(rows: &BTreeMap<usize, u64>) {
+    let mut long = 0_u64;
+    for (length, count) in rows {
+        if *length > 10 {
+            long += count;
+        } else {
+            println!("  {length} edge(s)\t{count}");
+        }
+    }
+    println!("  11+ edges\t{long}");
+}
+
+/// Walk the edges that name one face into rings, and say what came of it.
+///
+/// From any edge, the next edge around this face is `next[side]`, and the ring
+/// closes by naming something that is not an edge of this record - the
+/// `EdgeLoop` object, which is the one thing a loopless face does not have.
+/// So the ring is walked until it leaves the edges, and the verdict is
+/// whether the rings partition exactly the edges that name the face.
+fn rebuild_rings(
+    face_id: u32,
+    edges: &[(u32, usize)],
+    links: &BTreeMap<u32, [u32; 4]>,
+) -> Result<Vec<(u32, u32, usize)>, String> {
+    if edges.is_empty() {
+        return Err("no edge names the face".to_owned());
+    }
+    // The chain a ring makes is a path, not a cycle: its last edge's next
+    // names the `EdgeLoop` object rather than the first edge. So a ring has to
+    // be walked from its head - the edge no other edge of this face steps onto
+    // - and starting anywhere else would walk only a suffix.
+    let successors: BTreeSet<u32> = edges
+        .iter()
+        .filter_map(|&(edge, side)| {
+            let next = links[&edge][2 + side];
+            links.contains_key(&next).then_some(next)
+        })
+        .collect();
+    let heads = edges
+        .iter()
+        .filter(|(edge, _)| !successors.contains(edge))
+        .copied()
+        .collect::<Vec<_>>();
+    if heads.is_empty() {
+        return Err("no edge of the face begins a ring".to_owned());
+    }
+    let mut visited = BTreeSet::new();
+    // Each ring as the edge it starts at and the identifier its last edge
+    // steps onto - which should be the `EdgeLoop` that names this face.
+    let mut rings = Vec::new();
+    for &(start, start_side) in &heads {
+        if visited.contains(&start) {
+            continue;
+        }
+        let before = visited.len();
+        let (mut edge, mut side) = (start, start_side);
+        let terminator = loop {
+            if !visited.insert(edge) {
+                return Err("the ring came back to an edge it had already used".to_owned());
+            }
+            let next = links[&edge][2 + side];
+            let Some(next_links) = links.get(&next) else {
+                break next;
+            };
+            side = if next_links[0] == face_id {
+                0
+            } else if next_links[1] == face_id {
+                1
+            } else {
+                return Err("the ring stepped onto an edge of another face".to_owned());
+            };
+            edge = next;
+        };
+        rings.push((start, terminator, visited.len() - before));
+    }
+    if visited.len() != edges.len() {
+        return Err("the rings did not use every edge that names the face".to_owned());
+    }
+    Ok(rings)
+}
+
+/// A face's declared scalars, as one comparable key: the `Integer32` fields
+/// `m_cutType` and `m_faceFlags_v9`, then whatever narrower fields the walk
+/// read.
+fn face_scalars(face: &rvt_model::SerialObject) -> String {
+    format!("{:?} / {:?}", face.integers, face.small_integers)
+}
+
+/// One histogram of face scalars, most frequent first.
+fn print_scalar_rows(rows: &BTreeMap<String, u64>, limit: usize) {
+    let mut ordered = rows.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+    for (scalars, count) in ordered.into_iter().take(limit) {
+        println!("  {count}\t{}", escape_terminal_text(scalars));
+    }
+}
+
+/// One tally of the loop-owner probe, most frequent first, as `count (exact:
+/// count)`.
+fn print_loop_owner_rows(rows: &BTreeMap<&'static str, [u64; 2]>, limit: usize) {
+    let mut ordered = rows.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| right.1[0].cmp(&left.1[0]).then_with(|| left.0.cmp(right.0)));
+    for (verdict, counts) in ordered.into_iter().take(limit) {
+        println!("  {}\t(exact: {})\t{verdict}", counts[0], counts[1]);
     }
 }
 
@@ -6741,6 +7453,34 @@ fn read_basic_file_info(container: &RvtContainer) -> Result<Option<BasicFileInfo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reading `rebuild_rings` encodes: `Edge.identifiers` is
+    /// `[pFace0, pFace1, next0, next1, ...]`, so the ring around a face
+    /// continues at `next[side]` and ends where the chain leaves the edges.
+    #[test]
+    fn walks_the_edges_of_a_face_into_one_ring() {
+        // A triangle on face 1, its far side on faces 2, 3 and 4, ending on
+        // loop 99. Edge 12 also carries a link for face 2 that goes nowhere,
+        // which is the shape of every ring no loop of a record ends.
+        let links = BTreeMap::from([
+            (10_u32, [1_u32, 2, 11, 98]),
+            (11, [1, 3, 12, 97]),
+            (12, [1, 4, 99, 96]),
+        ]);
+        let edges = [(10_u32, 0_usize), (11, 0), (12, 0)];
+        assert_eq!(
+            rebuild_rings(1, &edges, &links),
+            Ok(vec![(10, 99, 3)]),
+            "one ring of three edges, ending on the loop"
+        );
+        // Face 2 is named by one edge whose link names no edge of this record:
+        // a fragment, not a boundary.
+        assert_eq!(rebuild_rings(2, &[(10, 1)], &links), Ok(vec![(10, 98, 1)]));
+        assert_eq!(
+            rebuild_rings(5, &[], &links),
+            Err("no edge names the face".to_owned())
+        );
+    }
 
     #[test]
     fn resolves_the_references_that_name_something_to_that_name() {
