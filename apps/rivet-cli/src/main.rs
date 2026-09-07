@@ -323,6 +323,16 @@ enum Command {
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
     },
+    /// Probe the identifiers a record names and writes no object for.
+    IdentifierProbe {
+        file: PathBuf,
+        /// Print this many rows of each histogram.
+        #[arg(long, default_value_t = 20)]
+        rows: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
     /// Probe how a `Face` reaches its `EdgeLoop`: by the reference the face
     /// carries, or by the `pFace` every loop declares.
     LoopOwnerProbe {
@@ -573,6 +583,11 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             node_class.as_deref(),
             max_member_bytes,
         ),
+        Command::IdentifierProbe {
+            file,
+            rows,
+            max_member_bytes,
+        } => identifier_probe(&file, rows, max_member_bytes),
         Command::LoopOwnerProbe {
             file,
             rows,
@@ -2250,6 +2265,209 @@ fn describe_parameter_value(value: &ParameterValue) -> String {
     }
 }
 
+/// Which identifiers a record names and never writes an object for.
+///
+/// A node reaches the stream by being *fully* referenced - identifier plus
+/// class - because that is what the walk queues; a bare identifier
+/// (`GEdge.m_next`, `GEdgeLoop.m_pFace`) names an object without queueing one.
+/// So an object nothing full-references is never written, and the boundary of
+/// a face whose `m_pFirstLoop` is null is missing for exactly that reason: the
+/// only full reference to its loop was that null.
+///
+/// This asks what those unwritten identifiers are. Per record: which slots
+/// name them, whether the written identifiers form a dense range with the
+/// unwritten ones as its gaps, and whether the record's neighbours in the same
+/// member write the objects it is missing.
+#[allow(clippy::too_many_lines)] // One streaming pass and the tallies it fills.
+fn identifier_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the class schema is required for this probe",
+        )
+    })?;
+    let face_class_index = schema_class_index(Some(&schema), "Face");
+    let geometry_element_class_index = schema_class_index(Some(&schema), "GElement");
+    let (Some(face_class_index), Some(geometry_element_class_index)) =
+        (face_class_index, geometry_element_class_index)
+    else {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the schema does not declare Face and GElement",
+        )));
+    };
+    let partition_paths = partition_paths(&container);
+    let class_name = |class_index: u16| {
+        schema.class_by_index(class_index).map_or_else(
+            || format!("class {class_index}"),
+            |class| class.name.clone(),
+        )
+    };
+
+    let mut records = 0_u64;
+    let mut written = 0_u64;
+    let mut distinct_written = 0_u64;
+    let mut named = 0_u64;
+    let mut unwritten = 0_u64;
+    // Which slot names an identifier no object is written for, and which slot
+    // names one that is written - the same tally twice, so a slot that only
+    // ever names the missing can be told from one that usually resolves.
+    let mut slots = [BTreeMap::<String, u64>::new(), BTreeMap::new()];
+    // Identifiers are not a dense counter - the highest one a record writes is
+    // far above the number it writes - so "an identifier below the highest" is
+    // no evidence of anything, and this records only that.
+    let mut highest = 0_u64;
+    // Whether another record of the same member writes what this one misses.
+    let mut unwritten_in_member = 0_u64;
+    let mut written_by_a_neighbour = 0_u64;
+    let mut neighbour_classes = BTreeMap::<String, u64>::new();
+    // An element writes more than one `GElement` record, and the export keeps
+    // one of them. Per element: how many of its records carry a face with no
+    // loop, and how many faces each record holds - so a record missing
+    // boundaries can be checked against its own siblings.
+    let mut element_records: BTreeMap<u32, Vec<(usize, usize)>> = BTreeMap::new();
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, _, layout, walk, payload| {
+            // Every identifier this member writes an object for, and every one
+            // its records name and do not write.
+            let mut member_written: BTreeMap<u32, u16> = BTreeMap::new();
+            let mut member_missing: BTreeSet<u32> = BTreeSet::new();
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if header.class_index != geometry_element_class_index {
+                    continue;
+                }
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                let (_, objects) =
+                    rvt_model::walk_record_collecting(&schema, header.class_index, body);
+                if !objects
+                    .iter()
+                    .any(|object| object.class_index == face_class_index)
+                {
+                    continue;
+                }
+                records += 1;
+                written += objects.len() as u64;
+                let record_written: BTreeMap<u32, u16> = objects
+                    .iter()
+                    .map(|object| (object.object_id, object.class_index))
+                    .collect();
+                distinct_written += record_written.len() as u64;
+                member_written.extend(&record_written);
+
+                element_records.entry(header.id).or_default().push((
+                    objects
+                        .iter()
+                        .filter(|object| object.class_index == face_class_index)
+                        .count(),
+                    objects
+                        .iter()
+                        .filter(|object| {
+                            object.class_index == face_class_index
+                                && object
+                                    .references
+                                    .first()
+                                    .is_none_or(|reference| reference.object_id == 0)
+                        })
+                        .count(),
+                ));
+
+                let mut record_named: BTreeSet<u32> = BTreeSet::new();
+                for object in &objects {
+                    for (slot, identifier) in object.identifiers.iter().enumerate() {
+                        if *identifier == 0 {
+                            continue;
+                        }
+                        record_named.insert(*identifier);
+                        let resolved = record_written.contains_key(identifier);
+                        *slots[usize::from(resolved)]
+                            .entry(format!("{} slot {slot}", class_name(object.class_index)))
+                            .or_default() += 1;
+                    }
+                }
+                named += record_named.len() as u64;
+                let missing = record_named
+                    .iter()
+                    .filter(|identifier| !record_written.contains_key(identifier))
+                    .copied()
+                    .collect::<Vec<_>>();
+                unwritten += missing.len() as u64;
+                member_missing.extend(&missing);
+
+                if let Some(top) = record_written.keys().next_back() {
+                    highest = highest.max(u64::from(*top));
+                }
+            }
+            for identifier in &member_missing {
+                unwritten_in_member += 1;
+                if let Some(class_index) = member_written.get(identifier) {
+                    written_by_a_neighbour += 1;
+                    *neighbour_classes
+                        .entry(class_name(*class_index))
+                        .or_default() += 1;
+                }
+            }
+        },
+    )?;
+
+    println!("Face-bearing `GElement` records: {records}");
+    println!("  objects written: {written} ({distinct_written} distinct identifiers)");
+    println!("  identifiers named by a bare reference: {named}, of them unwritten: {unwritten}");
+    println!("  highest identifier written by any record: {highest}");
+    println!(
+        "  distinct unwritten identifiers per member: {unwritten_in_member}, \
+         written by another record of the same member: {written_by_a_neighbour}"
+    );
+    let mut neighbours = neighbour_classes.into_iter().collect::<Vec<_>>();
+    neighbours.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    for (class, count) in neighbours.into_iter().take(rows) {
+        println!("  {count}\t{}", escape_terminal_text(&class));
+    }
+    // An element whose every record is short of boundaries has nowhere else to
+    // look; one with a whole sibling has the geometry somewhere in the file.
+    let mut elements = [0_u64; 4];
+    let mut faces_lost = [0_u64; 2];
+    for records in element_records.values() {
+        let short = records.iter().filter(|(_, missing)| *missing > 0).count();
+        let whole = records.len() - short;
+        let index = match (short, whole) {
+            (0, _) => 0,
+            (_, 0) => 1,
+            _ => 2,
+        };
+        elements[index] += 1;
+        elements[3] += u64::from(records.len() > 1);
+        if index != 0 {
+            faces_lost[usize::from(whole > 0)] += records
+                .iter()
+                .map(|(_, missing)| *missing as u64)
+                .sum::<u64>();
+        }
+    }
+    println!(
+        "\nElements by what their `GElement` records carry: {} whole, {} short in every record, \
+         {} short in some and whole in another ({} elements write more than one record)",
+        elements[0], elements[1], elements[2], elements[3]
+    );
+    println!(
+        "  loopless faces in elements with no whole record: {}, and in elements that have one: {}",
+        faces_lost[0], faces_lost[1]
+    );
+    println!("\nSlots naming an identifier no object is written for:");
+    print_scalar_rows(&slots[0], rows);
+    println!("\nSlots naming an identifier that is written:");
+    print_scalar_rows(&slots[1], rows);
+    Ok(())
+}
+
 /// How a `Face` reaches the `EdgeLoop` that bounds it.
 ///
 /// `assemble_face` reads the loop from the face's own first reference, and
@@ -2636,7 +2854,9 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
                                     continue;
                                 }
                                 *terminator_range
-                                    .entry(if objects_by_id.contains_key(terminator) {
+                                    .entry(if *terminator == 0 {
+                                        "a null link"
+                                    } else if objects_by_id.contains_key(terminator) {
                                         "an object of this record"
                                     } else if *terminator == u32::MAX {
                                         "0xffffffff"

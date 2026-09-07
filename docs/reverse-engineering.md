@@ -1343,10 +1343,12 @@ at the edge that loop declares: 331 175 of AR S1's 380 906 loop-bearing faces,
 **And it recovers nothing.** Every ring that no loop of the record ends is one
 edge long: 415 486 on AR S1, 15 310 on KJ, 9 305 on ВК, 27 030 on ОВ, against
 a real ring's 2 to 11+ edges (366 865 of AR S1's are quads). Those chains end
-on an identifier inside the record's own id space that no object in the record
-carries. So they are not holes and not boundaries - they are edges whose next
-link on that side was never written. And 60 886 of AR S1's 76 510 loopless
-faces have no edge naming them at all.
+on a **null** `m_next` - written as 0, not as an identifier - so they are not
+holes and not boundaries: they are edges whose next link on that side the file
+declines to give. (This paragraph first said the chains ended on an unresolved
+identifier; that was a misreading of the probe, corrected in the entry below,
+which measures where the terminators actually go.) And 60 886 of AR S1's
+76 510 loopless faces have no edge naming them at all.
 
 | | AR S1 | KJ S1 | ВК S1 | ОВ S1 |
 |---|---|---|---|---|
@@ -1361,12 +1363,9 @@ faces have no edge naming them at all.
 *Result.* Both routes to the missing boundary are closed by measurement: it is
 not on the loop's side and it is not in the edge chain. Nothing in the export
 changes - the exclusion stands and the ~1 000 placed-but-incomplete bodies on
-AR S1 keep their boxes - but the question is now a different one. The chains
-end on identifiers the record's id space contains and no object fills, which
-is the same shape as the 415 486 unwritten links, and the only rings a loop
-object ends without claiming the face are AR S1's 440 and KJ's 14, all ended
-by `EdgeLoopWithChainEnvelopes`. Whatever writes those identifiers is what
-would have to be found.
+AR S1 keep their boxes. The one thread left is the 440 rings on AR S1 and 14
+on KJ that a real `EdgeLoopWithChainEnvelopes` ends without claiming the face;
+everything else ends in a null.
 
 What is left as an option, and it is a weaker one: the 15 624 loopless faces
 on AR S1 that edges do name could have those edges ordered by their endpoints
@@ -1378,3 +1377,60 @@ Confidence: high on all of it. Each count is over four files of three
 disciplines, every record involved tiled exactly, and the rebuild's control -
 that it reproduces the loop wherever a loop exists - is what makes its silence
 elsewhere evidence rather than a failure to find.
+
+### Result: nothing is missing from the record - the boundary is a written null
+
+The entry above ended by pointing at the identifiers those broken chains end
+on. There are none: they end on zero. `rivet identifier-probe` asks the
+question properly and the answer closes the direction rather than opening it.
+
+*Why an identifier could have been missing.* A node reaches a record's node
+stream by being *fully* referenced - identifier plus class - because that is
+what `walk_record_inner` queues. A bare identifier (`GEdge.m_next`,
+`GEdgeLoop.m_pFace`) names an object without queueing one. So an object that
+nothing full-references is never written, and that is exactly why a face with
+a null `GFace.m_pFirstLoop` has no loop: the only full reference to that loop
+was the null. An identifier named by a bare reference and written by nothing
+would be the trace of such an object, and would say where to look.
+
+*There are no such identifiers.* Over AR S1's 43 637 face-bearing `GElement`
+records, 1 843 876 identifiers are named by a bare reference and **every one
+of them is written as an object by the same record** - zero unwritten. So are
+KJ S1's 461 841, ВК S1's 248 034 and ОВ S1's 1 230 085. The graph each record
+carries is closed: no
+`Edge`, no `EdgeLoop`, no `GFilling` names anything the record does not also
+write. The 415 486 "unresolved" terminators of the previous entry were the
+literal 0 of a null link, which the probe had classified as an identifier
+below the record's highest - and identifiers are not a dense counter, the
+highest written is 0xffffffff, so that classification measured nothing.
+
+*Nor is it in a sibling record.* An element writes more than one `GElement`
+record and the export keeps one, so a record short of boundaries could have a
+whole sibling. It does not:
+
+| elements by what their records carry | AR S1 | KJ S1 | ВК S1 | ОВ S1 |
+|---|---|---|---|---|
+| whole in every record | 28 310 | 7 293 | 7 375 | 31 893 |
+| short in **every** record | 2 197 | 134 | 162 | 471 |
+| short in one and whole in another | 3 | 9 | 0 | 0 |
+| loopless faces in elements with no whole record | 76 503 | 1 638 | 1 139 | 2 106 |
+| ... and in elements that have one | 7 | 102 | 0 | 0 |
+
+Between 1 409 and 6 324 elements per file write more than one record, so the
+question had room to come out the other way, and on ВК and ОВ not a single
+element is short in one record and whole in another.
+
+*Result.* The boundary of a loopless face is not somewhere else in the file
+under an identifier we failed to follow. The record says null in both places
+that could carry it - the face's `m_pFirstLoop` and the adjoining edges'
+`m_next` - and says it consistently, in records that tile exactly and whose
+object graphs are closed. Whatever fills those nulls is not serialized beside
+the geometry: it is either computed at load or written in a structure this
+walk does not reach at all. Confidence: high, and this direction is closed
+until something outside the `GElement` body suggests where else to look.
+
+What remains for the exclusion is the weaker option already named: order the
+edges of the 15 624 loopless faces that edges do name by their endpoints
+rather than by a declared link, and check closure geometrically. It is a
+reconstruction rather than a reading, and it reaches a fifth of the
+population.
