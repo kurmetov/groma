@@ -118,15 +118,18 @@ pub struct HoleTally {
 ///
 /// A face that declares a loop is ordered both ways - by the chain the file
 /// declares and by joining endpoints - and the two are compared as cyclic
-/// sequences.
+/// sequences. Only a face whose declared loop uses every edge naming it is
+/// asked, so the answer the reconstruction has to give is one ring: closing
+/// several where the file declares one is a contradiction, not a hole.
 ///
 /// The two ways of failing are kept apart because they mean opposite things. A
 /// `refused` face is one the ordering declined - an ambiguous corner, a ring
 /// that did not close - and declining is what it does on a face it cannot
 /// read, so it costs nothing but the face. A `contradicted` face is one where
-/// it produced a ring *and the file says a different one*: that is the
-/// reconstruction being wrong while believing itself right, which is the only
-/// result that would refuse it the licence to run at all.
+/// it produced a ring *and the file says a different one* - a different
+/// ordering, or more rings than the one declared: that is the reconstruction
+/// being wrong while believing itself right, which is the only result that
+/// would refuse it the licence to run at all.
 ///
 /// `not_comparable` counts the faces the question cannot be put to: more edges
 /// name the face than its loop uses, so the two orderings are over different
@@ -338,7 +341,7 @@ pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolB
                     let declared = &assembled.loops[0];
                     if declared.len() == incidences.len() {
                         match order_face_edges(incidences, &edges) {
-                            Ok(ordered) if rings_agree(declared, &ordered) => {
+                            Ok(rings) if rings.len() == 1 && rings_agree(declared, &rings[0]) => {
                                 ordering_control.agreed += 1;
                             }
                             Ok(_) => ordering_control.contradicted += 1,
@@ -716,12 +719,14 @@ fn assemble_face(
         // is null on that side, so the file offers nothing to read here.
         // What is left is the edges that name the face, ordered by their
         // endpoints - a reconstruction, and held to the checks in
-        // [`order_face_edges`].
-        return order_face_edges(incidences, edges).map(|ring| {
+        // [`order_face_edges`]. A face without a loop object has no
+        // `m_nextLoop` chain either, so its holes are read the same way its
+        // outer bound is: as the further rings its own edges close into.
+        return order_face_edges(incidences, edges).map(|rings| {
             (
                 BrepFace {
                     surface,
-                    loops: vec![ring],
+                    loops: rings,
                 },
                 None,
             )
@@ -782,21 +787,30 @@ fn assemble_face(
     Ok((BrepFace { surface, loops }, stopped))
 }
 
-/// Order the edges that name a face into one closed ring by their endpoints.
+/// Order the edges that name a face into its closed rings by their endpoints.
 ///
 /// This is a reconstruction rather than a reading, so it is held to more than
 /// closure. Each step must have exactly one unused edge starting where the
 /// last one ended, and an ambiguous junction refuses the face rather than
-/// picking; every edge naming the face must be used; and the ring must close.
-/// An edge's direction is not guessed at either: it is the same
+/// picking; every edge naming the face must be used; and every ring must
+/// close. An edge's direction is not guessed at either: it is the same
 /// `(m_flags & 1 != 0) != (side == 1)` the declared loops are read with.
 ///
-/// The check that it is allowed at all is [`OrderingControl`]: on the faces
-/// that do declare a loop, this must reproduce it.
+/// A face's edges need not form a single ring: a face with a hole closes its
+/// outer bound and leaves the hole's edges over, exactly as a face that
+/// declares a loop leaves them to its `m_nextLoop` chain. So the walk closes a
+/// ring where it runs out of continuations and starts the next one from the
+/// lowest edge it has not used, rather than refusing the face. Nothing about
+/// the first ring changes: a face whose edges do form one is walked, checked
+/// and closed exactly as before, which is why the control below still applies
+/// to it.
+///
+/// The check that this is allowed at all is [`OrderingControl`]: on the faces
+/// that do declare a loop, this must reproduce it - one ring, the same one.
 fn order_face_edges(
     incidences: &[(u32, usize)],
     edges: &HashMap<u32, Result<ResolvedEdge, EdgeFailure>>,
-) -> Result<BrepLoop, &'static str> {
+) -> Result<Vec<BrepLoop>, &'static str> {
     if incidences.is_empty() {
         return Err("face has no first loop");
     }
@@ -814,30 +828,71 @@ fn order_face_edges(
     }
 
     let mut used = vec![false; oriented.len()];
-    used[0] = true;
-    let mut ring = vec![oriented[0]];
-    while ring.len() < oriented.len() {
-        let end = ring[ring.len() - 1].end;
-        let mut next = None;
-        for (index, edge) in oriented.iter().enumerate() {
-            if used[index] || distance(edge.start, end) > CLOSURE_TOLERANCE_FEET {
-                continue;
+    let mut rings: Vec<BrepLoop> = Vec::new();
+    while let Some(start) = used.iter().position(|&used| !used) {
+        used[start] = true;
+        let mut ring = vec![oriented[start]];
+        loop {
+            let end = ring[ring.len() - 1].end;
+            let mut next = None;
+            for (index, edge) in oriented.iter().enumerate() {
+                if used[index] || distance(edge.start, end) > CLOSURE_TOLERANCE_FEET {
+                    continue;
+                }
+                if next.is_some() {
+                    return Err("a face's edges meet ambiguously at one of its corners");
+                }
+                next = Some(index);
             }
-            if next.is_some() {
-                return Err("a face's edges meet ambiguously at one of its corners");
-            }
-            next = Some(index);
+            let Some(index) = next else { break };
+            used[index] = true;
+            ring.push(oriented[index]);
         }
-        let Some(index) = next else {
-            return Err("a face's edges do not order into one ring");
-        };
-        used[index] = true;
-        ring.push(oriented[index]);
+        if distance(ring[0].start, ring[ring.len() - 1].end) > CLOSURE_TOLERANCE_FEET {
+            // Which of the two this is says what is wrong with the face. A
+            // chain that ran out of edges with none left over is a closed set
+            // of edges that does not describe a ring; one that broke off with
+            // edges still unused has a boundary with a hole in it - and not a
+            // tolerance's worth: measured over MEDIUM's 1 610 such faces the
+            // gap is 28.6 mm at the median and never under 0.1 mm, against a
+            // join tolerance of 3 um.
+            return Err(if used.iter().all(|&used| used) {
+                "a face's ordered edges do not close in 3D"
+            } else {
+                "a face's edges break off before closing a ring"
+            });
+        }
+        rings.push(ring);
     }
-    if distance(ring[0].start, ring[ring.len() - 1].end) > CLOSURE_TOLERANCE_FEET {
-        return Err("a face's ordered edges do not close in 3D");
+    let outer = outer_ring(&rings);
+    rings.swap(0, outer);
+    Ok(rings)
+}
+
+/// Which of a reconstructed face's rings is its outer bound, which the file
+/// does not say and the loops of a face that declares one answer by position.
+///
+/// A hole lies inside the bound it perforates, so its corners span a smaller
+/// box - measured on the corners rather than the curves because that is what
+/// a ring carries, and understating an arc's bulge cannot make a hole span
+/// more than what encloses it. Ties keep the ring the walk closed first.
+fn outer_ring(rings: &[BrepLoop]) -> usize {
+    let mut widest = (0, f64::NEG_INFINITY);
+    for (index, ring) in rings.iter().enumerate() {
+        let mut low = [f64::INFINITY; 3];
+        let mut high = [f64::NEG_INFINITY; 3];
+        for edge in ring {
+            for axis in 0..3 {
+                low[axis] = low[axis].min(edge.start[axis]);
+                high[axis] = high[axis].max(edge.start[axis]);
+            }
+        }
+        let span = distance(low, high);
+        if span > widest.1 {
+            widest = (index, span);
+        }
     }
-    Ok(ring)
+    widest.0
 }
 
 /// Whether two orderings of one face's edges describe the same ring. They are
@@ -1437,6 +1492,55 @@ mod tests {
                 "the ring is not consecutive at {index}"
             );
         }
+    }
+
+    /// A face without a loop object can still have a hole: its edges close
+    /// into two rings rather than one, and refusing the face for that would
+    /// throw away a boundary the edges fully describe. The hole is written
+    /// first here, so the outer bound only reaches `loops[0]` by being the
+    /// wider of the two.
+    #[test]
+    fn closes_a_loopless_face_with_a_hole_into_two_rings() {
+        let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let face = face_object(1, 0, reference(900, PLANE));
+        let edges = vec![
+            line_edge(200, 1, 2, [0, 0], [0, 0], 0, (1.0, 1.0), (3.0, 1.0)),
+            line_edge(201, 1, 2, [0, 0], [0, 0], 0, (3.0, 1.0), (3.0, 3.0)),
+            line_edge(202, 1, 2, [0, 0], [0, 0], 0, (3.0, 3.0), (1.0, 3.0)),
+            line_edge(203, 1, 2, [0, 0], [0, 0], 0, (1.0, 3.0), (1.0, 1.0)),
+            line_edge(100, 1, 2, [0, 0], [0, 0], 0, (0.0, 0.0), (4.0, 0.0)),
+            line_edge(101, 1, 2, [0, 0], [0, 0], 0, (4.0, 0.0), (4.0, 4.0)),
+            line_edge(102, 1, 2, [0, 0], [0, 0], 0, (4.0, 4.0), (0.0, 4.0)),
+            line_edge(103, 1, 2, [0, 0], [0, 0], 0, (0.0, 4.0), (0.0, 0.0)),
+        ];
+        let mut objects = vec![plane, face];
+        objects.extend(edges);
+
+        let brep = assemble(&objects, &classes());
+        assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
+        let loops = &brep.faces[0].loops;
+        assert_eq!(loops.len(), 2);
+        assert_eq!((loops[0].len(), loops[1].len()), (4, 4));
+        assert!(
+            distance(loops[0][0].start, [0.0, 0.0, 0.0]) < 1.0e-9,
+            "the outer bound is not first: {:?}",
+            loops[0][0].start
+        );
+        assert!(distance(loops[1][0].start, [1.0, 1.0, 0.0]) < 1.0e-9);
+        // The independent check: every edge naming the face is now used by one
+        // of its rings, which reading only the first would not have done.
+        assert_eq!(
+            brep.holes,
+            HoleTally {
+                faces: 1,
+                loops: 1,
+                edges_accounted: 1,
+                first_loop_accounted: 0,
+                edges_short: 0,
+                edges_over: 0,
+                unread: Vec::new(),
+            }
+        );
     }
 
     /// One edge short, the reconstruction refuses rather than shipping an open

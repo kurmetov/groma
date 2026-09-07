@@ -1538,3 +1538,75 @@ a disappointment, and it is the same shape the placed body itself showed: ВК's
 geometry comes by the swept-disk path, which the tier does not touch, while ОВ
 carries a handful of records whose exact block was missing.
 
+
+### Result: ordering a loopless face's edges, and what a reconstruction has to prove
+
+Two entries closed the routes to a loopless face's declared boundary: no
+`EdgeLoop` claims it, its neighbours' `m_next` is null on that side, no
+identifier is left dangling anywhere in the record, and no sibling record of
+the same element carries the geometry. What remains is the edges themselves.
+An `Edge` names the two faces it separates, so the edges that name a face are
+its boundary whether or not anything says in which order - and a ring can be
+recovered by joining them end to end.
+
+That is a reconstruction rather than a reading, so it is held to more than
+closure. `order_face_edges` requires that each step have **exactly one** unused
+edge starting where the last one ended - an ambiguous corner refuses the face
+instead of picking - that every edge naming the face be used, and that the ring
+close in 3D. Direction is not guessed at either: it is the same
+`(m_flags & 1 != 0) != (side == 1)` the declared loops are read with, now
+shared between both paths as `oriented_edge`.
+
+*The licence.* On a face that declares a loop, the file already gives the
+answer, so the same ordering must find it. The two failures are counted apart
+because they mean opposite things: a *refusal* is the ordering declining a face
+it cannot read, which costs nothing, while a *contradiction* is it producing a
+ring the file says is a different ring - the reconstruction wrong and confident.
+
+| | AR S1 | KJ S1 | ВК S1 | ОВ S1 |
+|---|---|---|---|---|
+| declared loop reproduced | 328 195 | 86 126 | 54 247 | 269 611 |
+| refused | 2 | 0 | 0 | 0 |
+| **contradicted** | **0** | **0** | **0** | **0** |
+| not comparable | 49 014 | 3 600 | 1 325 | 5 121 |
+
+738 179 comparable faces, not one contradiction. "Not comparable" is a face
+more edges name than its loop uses - the single-edge fragments of the entry
+above - where the two orderings would be over different sets before either ran.
+
+*What it assembles.*
+
+| | AR S1 | KJ S1 | ВК S1 | ОВ S1 |
+|---|---|---|---|---|
+| records with every face resolved | 38 073 -> **38 805** | 8 031 -> **8 072** | 8 152 -> **8 159** | 32 444 -> **32 500** |
+| faces resolved | 377 211 -> **388 033** | 89 726 -> **89 966** | 55 572 -> **55 965** | 274 732 -> **275 444** |
+| faces excluded | 80 205 -> **69 383** | 2 895 -> **2 655** | 5 234 -> **4 841** | 20 925 -> **20 213** |
+| `face has no first loop` | 76 510 -> 60 886 | 1 736 -> 974 | 1 129 -> 245 | 2 100 -> 349 |
+
+What is left under the old reason is exactly the faces no edge names, where
+there is nothing to order. The refusals are new reasons and they are honest
+ones: on AR S1, 4 349 faces meet ambiguously at a corner, 268 do not close,
+185 do not order into one ring; each keeps the face excluded exactly as before.
+
+*In the export.* AR S1, `--include-unplaced`: elements with verified geometry
+11 815 -> **11 896**, `IfcAdvancedBrep` 11 531 -> **11 612**, `IfcAdvancedFace`
+108 857 -> **109 764**, `IfcBoundingBox` 284 either way, and `IfcWall` /
+`IfcSlab` / `IfcSpace` unchanged at 11 011 / 908 / 554. `create_shape` builds
+**all 11 896 with zero failures** - `IfcWall` 9 077 -> 9 157, and the whole
+gain is walls - and `ifcopenshell.validate --rules` reports no issues.
+
+The export gains 81 solids where `rivet brep` gains 732 whole records, and the
+difference is [`keep_body`]: 13 127 of AR S1's body-bearing records are held
+out by keeping one body per element id, so a record completed for the first
+time is usually not the one its element kept.
+
+*What it cost.* One body of the 12 448 that reproduced their record's own
+bounds no longer does: it gained a face and its extent grew past the box. That
+is the placement check doing its work - the body is refused rather than shipped
+wrong - and no product changed as a result, the boxes staying at 284. It is
+also the one thing the control cannot see, since a face that closes wrongly
+still closes, which is why the box remains the second gate.
+
+Confidence: high. Four files of three disciplines, a control with no
+contradiction over 738 179 faces, the kernel building every emitted body, and
+a refusal path that leaves a face exactly as it was.
