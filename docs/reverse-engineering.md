@@ -1509,3 +1509,32 @@ change to `ifc-export`: 1 496 / 259 / 979 `IfcFaceBound` entities where there
 were none. Element and geometry counts are unchanged (2 774 / 1 989 / 392 with
 geometry), `validate --rules` is clean, and `create_shape` still builds every
 emitted body.
+
+### Result: the corpus after the graph header's box
+
+The tier that places a body by the box its `GElement` graph header declares
+was accepted on AR S1 and on four files' worth of box agreement. The rule here
+is that a change to a selection path is judged on the whole corpus, so: fifty
+files, four disciplines, `--include-unplaced`, against the sweep recorded
+before the tier.
+
+| | files | with geometry, before | after | |
+|---|---|---|---|---|
+| AR | 14 | 79 919 | **96 808** | 1.21x |
+| KJ | 10 | 23 833 | **26 109** | 1.10x |
+| ОВ | 13 | 40 955 | 40 997 | +42 |
+| ВК | 13 | 19 053 | 19 053 | unchanged |
+| all | 50 | 163 760 | **182 967** | 1.12x |
+
+Zero failures, and **no file carries less geometry than it did**. Elements are
+10 369 210 before and after, spaces 4 285, storeys 626 - the three counts that
+say the tier touched nothing but which bodies are placed. `IfcAdvancedBrep`
+goes 111 464 to 130 671, which is 19 207 more, exactly the number of new
+elements with geometry: every element the tier adds arrives as a solid, not as
+a box.
+
+The two MEP disciplines behaving differently is the expected shape rather than
+a disappointment, and it is the same shape the placed body itself showed: ВК's
+geometry comes by the swept-disk path, which the tier does not touch, while ОВ
+carries a handful of records whose exact block was missing.
+
