@@ -1564,6 +1564,34 @@ mod tests {
         );
     }
 
+    /// The other way the reconstruction refuses, and the one the corpus is
+    /// mostly made of: the chain breaks off with edges still unused. That is a
+    /// boundary with a gap in it, not a closed set of edges in the wrong
+    /// order, so it is refused under its own reason - the square here is
+    /// perfectly good and still does not save the face.
+    #[test]
+    fn refuses_a_loopless_face_whose_edges_break_off_with_others_left() {
+        let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let face = face_object(1, 0, reference(900, PLANE));
+        let edges = vec![
+            line_edge(100, 1, 2, [0, 0], [0, 0], 0, (0.0, 0.0), (1.0, 0.0)),
+            line_edge(101, 1, 2, [0, 0], [0, 0], 0, (1.0, 0.0), (1.0, 1.0)),
+            line_edge(200, 1, 2, [0, 0], [0, 0], 0, (5.0, 5.0), (7.0, 5.0)),
+            line_edge(201, 1, 2, [0, 0], [0, 0], 0, (7.0, 5.0), (7.0, 7.0)),
+            line_edge(202, 1, 2, [0, 0], [0, 0], 0, (7.0, 7.0), (5.0, 7.0)),
+            line_edge(203, 1, 2, [0, 0], [0, 0], 0, (5.0, 7.0), (5.0, 5.0)),
+        ];
+        let mut objects = vec![plane, face];
+        objects.extend(edges);
+
+        let brep = assemble(&objects, &classes());
+        assert!(brep.faces.is_empty());
+        assert_eq!(
+            brep.excluded_faces[0].reason,
+            "a face's edges break off before closing a ring"
+        );
+    }
+
     /// A face no edge names keeps the exclusion it always had.
     #[test]
     fn keeps_the_old_reason_for_a_loopless_face_with_no_edges() {

@@ -1610,3 +1610,87 @@ still closes, which is why the box remains the second gate.
 Confidence: high. Four files of three disciplines, a control with no
 contradiction over 738 179 faces, the kernel building every emitted body, and
 a refusal path that leaves a face exactly as it was.
+
+### Result: a loopless face's edges close into more than one ring
+
+`order_face_edges` above required that every edge naming a face fall into **one**
+ring, and refused the face otherwise. That is right for a boundary with no
+hole and wrong for one with a hole: a face that declares a loop puts its holes
+on the `m_nextLoop` chain, and a face with no loop object has no chain to put
+them on, so its holes are in the same place its outer bound is - among the
+edges that name it. The outer ring closes, the hole's edges are left over, and
+the old rule threw the whole face away for it.
+
+So the walk now closes a ring where it runs out of continuations and starts the
+next one from the lowest edge it has not used. Nothing about the first ring
+changed: same corner rule, same refusal on an ambiguous junction, same closure
+check, so a face whose edges do form one ring is read exactly as before - which
+is what keeps the control below applicable to it.
+
+*Which ring is the outer one.* The file does not say, and for a face that
+declares its loops the answer is their order. A hole lies inside the bound it
+perforates, so `outer_ring` takes the ring whose corners span the widest box
+and puts it first, where `push_advanced_face` writes `IfcFaceOuterBound` and
+the rest as `IfcFaceBound`. Measured on the corners rather than the curves,
+because a ring carries corners; understating an arc's bulge cannot make a hole
+span more than what encloses it.
+
+*The control, and it is not the ordering one.* `holes.edges_accounted` counts
+resolved faces whose loops use exactly the edges that name them, and the edges
+name their face from their own side - so it is read without any loop at all. If
+these faces are genuinely hole-bearing, every one that now resolves must land
+in `edges_accounted` and none in `edges_over`, which no wrong grouping of the
+same edges would give. It came out exactly: **+9 / +203 / +419** on
+SMALL / MEDIUM / BIG against **+9 / +203 / +419** faces resolved, and
+**+35 / +6 / +9 / +40** on AR / KJ / ВК / ОВ S1 against the same face counts,
+with `edges_over` still zero everywhere. The ordering control did not move
+either - 328 195 / 86 126 / 54 247 / 269 611 agreements, 2 refusals on AR S1
+and none elsewhere, **no contradiction** - because a declared loop that uses
+every edge naming its face still has to come back as one ring, and closing
+several where the file declares one is now counted as a contradiction, not as a
+refusal.
+
+| | SMALL (ВК) | MEDIUM (ЭОМ) | BIG (КЖ) |
+|---|---|---|---|
+| records with every face resolved | 12 337 | 7 229 -> **7 274** | 8 972 -> **9 035** |
+| faces resolved | 86 821 -> **86 830** | 44 589 -> **44 792** | 98 618 -> **99 037** |
+| faces excluded | 29 951 -> **29 942** | 3 975 -> **3 772** | 15 809 -> **15 390** |
+
+| | AR S1 | KJ S1 | ВК S1 | ОВ S1 |
+|---|---|---|---|---|
+| records with every face resolved | 38 805 -> **38 807** | 8 072 | 8 159 | 32 500 -> **32 502** |
+| faces resolved | 388 033 -> **388 068** | 89 966 -> **89 972** | 55 965 -> **55 974** | 275 444 -> **275 484** |
+| faces excluded | 69 383 -> **69 348** | 2 655 -> **2 649** | 4 841 -> **4 832** | 20 213 -> **20 173** |
+
+ВК S1 is the same model as SMALL, so the seven columns are six files.
+
+*Where the old reason's faces went, and the finding.* `a face's edges do not
+order into one ring` is gone; its faces did not all become holes. On MEDIUM,
+1 813 of them are 203 hole-bearing faces, 1 603 chains that break off with
+edges still unused, and 7 that use every edge without closing; on BIG, 2 202
+are 419, 1 751, 11 and 21 newly ambiguous corners. So the failure is split in
+two now, because it is two different things: `a face's ordered edges do not
+close in 3D` keeps the closed set of edges that does not describe a ring, and
+`a face's edges break off before closing a ring` (78 / 1 603 / 1 751, and
+144 / 17 / 78 / 126 on the S1 files) is a boundary with a piece missing.
+
+That second one is not a tolerance. Over MEDIUM's 1 829 unclosed chains the
+gap between the chain's two ends is **28.6 mm at the median**, 0.1 mm at the
+smallest and 619 mm at the largest, against a 3 um join tolerance - 18 under
+1 mm, 361 under 10 mm, 1 681 under 100 mm. Loosening the tolerance would not
+recover one of them; edges are missing from these faces' boundaries. That is a
+different question from the `edges_short` faces of the entry above - those
+resolve and leave edges over - and it is now the largest single thing standing
+between a loopless face and its boundary.
+
+*In the export.* SMALL / MEDIUM / BIG: `ifcopenshell.validate --rules` reports
+no issues on all three, `create_shape` builds every represented product -
+2 774 / 1 989 / 392 with zero failures - and `IfcAdvancedBrep` stays at
+695 / 1 721 / 174, so the faces gained are in bodies the exporter's gates were
+already holding back rather than in new solids.
+
+Confidence: high for the reading, medium for which ring is outer. The reading
+has an independent check that no wrong grouping passes and an ordering control
+that did not move. The outer-ring choice has neither: nothing in the file
+states it, the export validates and geometrizes either way, and a hole wide
+enough to out-span its own bound would be picked wrongly and quietly.
