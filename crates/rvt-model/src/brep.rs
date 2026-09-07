@@ -49,6 +49,16 @@ pub struct BrepClassIndexes {
     pub edge: u16,
     pub plane: u16,
     pub cyl_surf: u16,
+    pub cone_surf: u16,
+    pub surf_rev: u16,
+    pub ruled_surf: u16,
+    /// The two profile curve classes read here. `SurfRev` names one object
+    /// and `RuledSurf` two; 1 800 of SMALL's 1 844 `SurfRev` profiles and
+    /// 214 / 276 / 330 of the corpus's 246 / 276 / 878 `RuledSurf` sides are
+    /// one of these. A `GEllipse`, `GHermiteSpline` or `GNurbSpline` profile
+    /// is left unread rather than approximated.
+    pub g_line: u16,
+    pub g_arc: u16,
 }
 
 /// One symbol's boundary representation, in the symbol's own local
@@ -161,7 +171,7 @@ pub struct BrepExclusion {
 pub struct BrepEdgeFailure {
     pub edge_id: u32,
     pub reason: &'static str,
-    /// How far apart the two adjacent faces placed a shared endpoint, in feet.
+    /// How far apart the two adjacent faces placed a shared `EdgePnt`, in feet.
     /// `None` for a failure that is not a disagreement between two readings.
     ///
     /// This is the number that separates a tolerance problem from a wrong
@@ -181,17 +191,21 @@ pub struct BrepFace {
 
 pub type BrepLoop = Vec<BrepEdge>;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BrepEdge {
     pub start: [f64; 3],
     pub end: [f64; 3],
     pub curve: BrepCurve,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum BrepCurve {
     Line,
     Arc(BrepArc),
+    /// A source-sampled curve. The points include both topological endpoints
+    /// and every `GEdge.m_interiorEdgePnts` sample between them, in traversal
+    /// order and in the symbol's local frame.
+    Polyline(Vec<[f64; 3]>),
 }
 
 /// A circular arc. `point(angle) = center + radius * (cos(angle) * x_axis +
@@ -221,6 +235,83 @@ pub enum BrepSurface {
         y_axis: [f64; 3],
         z_axis: [f64; 3],
         radius: f64,
+    },
+    /// A profile curve, held in this frame's own coordinates, swept about the
+    /// frame's `z_axis`. `SurfRev` supplies the profile as another object;
+    /// `ConeSurf` supplies its apex and half-angle directly. `u` turns the
+    /// profile and `v` runs along it.
+    Revolution {
+        center: [f64; 3],
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+        z_axis: [f64; 3],
+        profile: BrepProfile,
+    },
+    /// Two profiles joined by straight rulings:
+    /// `S(u, v) = (1 - v) * first(u) + v * second(u)`.
+    ///
+    /// Unlike every other surface here `RuledSurf` declares no frame, so both
+    /// profiles are already in the body's own coordinates. `u` runs along the
+    /// profiles, normalised onto each one's `m_endParams`; `v` runs across the
+    /// rulings, with the first profile at `v = 0` and the second at `v = 1`.
+    ///
+    /// Measured on SMALL's record 50329: a face whose profiles are two arcs of
+    /// radius 0.1875 and 0.14583 carries an edge holding `v = 1` whose seven
+    /// `EdgePnt`s step `u` uniformly over [0, 1]; the adjacent plane places
+    /// those same points on a 180-degree arc of radius 0.14583 - the second
+    /// profile, swept over exactly the `[pi, 2pi]` its `m_endParams` declares.
+    /// Its edges holding `u` constant carry no interior points at all, which
+    /// is what a straight ruling needs.
+    Ruled {
+        first: BrepRuling,
+        second: BrepRuling,
+    },
+}
+
+/// The curve a [`BrepSurface::Revolution`] turns, in that surface's frame.
+///
+/// Revolved about the frame's `z`, a line coplanar with the axis gives a cone,
+/// an arc whose plane holds the axis gives a torus, and one whose centre is on
+/// the axis gives a sphere. Measured over SMALL's 1 844 `SurfRev` objects that
+/// is every one of them: 1 040 lines, all slanted and all coplanar with the
+/// axis; 728 arcs off the axis and 32 on it, all in a plane that holds it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BrepProfile {
+    /// `origin + v * direction`.
+    Line {
+        origin: [f64; 3],
+        direction: [f64; 3],
+    },
+    /// `center + radius * (cos(v) * x_axis + sin(v) * y_axis)`.
+    Arc {
+        center: [f64; 3],
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+        radius: f64,
+    },
+}
+
+/// One side of a [`BrepSurface::Ruled`].
+///
+/// `RuledSurf` declares two profile references and two points. Measured over
+/// the corpus's 246 / 276 / 878 objects, a null reference and a non-zero
+/// matching point occur together and never apart: 8 / 192 / 66 sides are a
+/// null reference beside a used point, and every live reference sits beside a
+/// zero point. So a null reference states that the profile has collapsed to
+/// that point, and both sides of the surface are seen to do it - side 1 on
+/// SMALL and BIG, side 2 on MEDIUM.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BrepRuling {
+    /// A degenerate profile: every `u` reaches the same point.
+    Point([f64; 3]),
+    /// `profile` evaluated at `start + u * (end - start)`. The surface's `u`
+    /// is normalised - every `RuledSurf` envelope in the corpus states a `u`
+    /// range inside [0, 1] - and the interval is the curve's own
+    /// `GCurve.m_endParams`.
+    Curve {
+        profile: BrepProfile,
+        start: f64,
+        end: f64,
     },
 }
 
@@ -391,6 +482,29 @@ fn resolve_face_surfaces(
     let mut cylinders = objects
         .iter()
         .filter(|object| object.class_index == classes.cyl_surf);
+    let mut cones = objects
+        .iter()
+        .filter(|object| object.class_index == classes.cone_surf);
+    // `SurfRev` shares the same sentinel identifier a `CylSurf` does, so it is
+    // paired the same way - by encounter order - for the same reason.
+    let mut revolutions = objects
+        .iter()
+        .filter(|object| object.class_index == classes.surf_rev);
+    // `RuledSurf` is sentinel-identified too: every one of the corpus's 88 /
+    // 59 / 294 records holding one quotes 0xFFFFFFFF from every face. It is
+    // paired by encounter order on the same measured precondition the others
+    // need - in every such record the count of faces naming a `RuledSurf`
+    // equals the count of `RuledSurf` objects the record writes.
+    let mut ruled = objects
+        .iter()
+        .filter(|object| object.class_index == classes.ruled_surf);
+    let curves_by_id: HashMap<(u16, u32), &SerialObject> = objects
+        .iter()
+        .filter(|object| {
+            object.class_index == classes.g_line || object.class_index == classes.g_arc
+        })
+        .map(|object| ((object.class_index, object.object_id), object))
+        .collect();
     let mut resolved = HashMap::new();
     for face in objects
         .iter()
@@ -411,6 +525,16 @@ fn resolve_face_surfaces(
                 .and_then(plane_surface)
         } else if surface_ref.class_index == classes.cyl_surf {
             cylinders.next().and_then(cylinder_surface)
+        } else if surface_ref.class_index == classes.cone_surf {
+            cones.next().and_then(cone_surface)
+        } else if surface_ref.class_index == classes.surf_rev {
+            revolutions
+                .next()
+                .and_then(|object| revolution_surface(object, &curves_by_id, classes))
+        } else if surface_ref.class_index == classes.ruled_surf {
+            ruled
+                .next()
+                .and_then(|object| ruled_surface(object, &curves_by_id, classes))
         } else {
             None
         };
@@ -445,6 +569,179 @@ fn cylinder_surface(object: &SerialObject) -> Option<BrepSurface> {
     })
 }
 
+/// Read a `ConeSurf` as the line from its apex swept about its local `z`.
+/// Its `v` is distance along the generator, so the profile direction is the
+/// unit vector `(sin(half_angle), 0, cos(half_angle))`.
+fn cone_surface(object: &SerialObject) -> Option<BrepSurface> {
+    let n = &object.numbers;
+    if n.len() < 17 {
+        return None;
+    }
+    let half_angle = n[16];
+    if !half_angle.is_finite()
+        || half_angle.abs() <= f64::EPSILON
+        || half_angle.abs() >= std::f64::consts::FRAC_PI_2
+    {
+        return None;
+    }
+    Some(BrepSurface::Revolution {
+        center: [n[4], n[5], n[6]],
+        x_axis: [n[7], n[8], n[9]],
+        y_axis: [n[10], n[11], n[12]],
+        z_axis: [n[13], n[14], n[15]],
+        profile: BrepProfile::Line {
+            origin: [0.0, 0.0, 0.0],
+            direction: [half_angle.sin(), 0.0, half_angle.cos()],
+        },
+    })
+}
+
+/// Read a `SurfRev` and the profile curve it names.
+///
+/// The numbers are the parent `Surface`'s four-number envelope and then the
+/// frame, exactly as `Plane` and `CylSurf` carry theirs; the profile is the one
+/// object the class declares, and its own numbers start with `GCurve`'s two
+/// end parameters. A profile this does not read - `GEllipse`,
+/// `GHermiteSpline` - leaves the face unresolved rather than approximated.
+/// Read one profile curve and the parameter interval it declares.
+///
+/// `GCurve.m_endParams` is the first pair of numbers on every curve, so a
+/// profile is its shape together with the interval its own parameter runs
+/// over. A class this does not read - `GEllipse`, `GHermiteSpline`,
+/// `GNurbSpline` - answers `None` rather than being approximated.
+fn profile_curve(
+    class_index: u16,
+    object_id: u32,
+    curves: &HashMap<(u16, u32), &SerialObject>,
+    classes: &BrepClassIndexes,
+) -> Option<(BrepProfile, f64, f64)> {
+    let curve = curves.get(&(class_index, object_id))?;
+    let p = &curve.numbers;
+    let profile = if class_index == classes.g_line {
+        if p.len() < 8 {
+            return None;
+        }
+        BrepProfile::Line {
+            origin: [p[2], p[3], p[4]],
+            direction: [p[5], p[6], p[7]],
+        }
+    } else if class_index == classes.g_arc {
+        if p.len() < 12 {
+            return None;
+        }
+        BrepProfile::Arc {
+            x_axis: [p[2], p[3], p[4]],
+            y_axis: [p[5], p[6], p[7]],
+            radius: p[8],
+            center: [p[9], p[10], p[11]],
+        }
+    } else {
+        return None;
+    };
+    Some((profile, p[0], p[1]))
+}
+
+/// Read a `RuledSurf` and the two profiles it interpolates.
+///
+/// The numbers are the parent `Surface`'s four-number envelope, then
+/// `m_Point1` and `m_Point2`; the two references are `m_pProfileCurve1` and
+/// `m_pProfileCurve2`. Every object in the corpus carries exactly those ten
+/// numbers and exactly two references. A null reference takes its side's
+/// point instead; an unread curve class leaves the face unresolved.
+fn ruled_surface(
+    object: &SerialObject,
+    curves: &HashMap<(u16, u32), &SerialObject>,
+    classes: &BrepClassIndexes,
+) -> Option<BrepSurface> {
+    let n = &object.numbers;
+    if n.len() < 10 {
+        return None;
+    }
+    let side = |index: usize| -> Option<BrepRuling> {
+        let reference = object.references.get(index)?;
+        if reference.object_id == 0 {
+            let start = 4 + index * 3;
+            let point = n.get(start..start + 3)?;
+            return Some(BrepRuling::Point([point[0], point[1], point[2]]));
+        }
+        let (profile, start, end) =
+            profile_curve(reference.class_index, reference.object_id, curves, classes)?;
+        Some(BrepRuling::Curve {
+            profile,
+            start,
+            end,
+        })
+    };
+    Some(BrepSurface::Ruled {
+        first: side(0)?,
+        second: side(1)?,
+    })
+}
+
+fn revolution_surface(
+    object: &SerialObject,
+    curves: &HashMap<(u16, u32), &SerialObject>,
+    classes: &BrepClassIndexes,
+) -> Option<BrepSurface> {
+    let n = &object.numbers;
+    if n.len() < 16 {
+        return None;
+    }
+    let reference = object.references.first()?;
+    // `SurfRev`'s own `v` is the profile's raw parameter, so the interval the
+    // curve declares is not needed here; a ruled surface normalises onto it.
+    let (profile, _, _) =
+        profile_curve(reference.class_index, reference.object_id, curves, classes)?;
+    Some(BrepSurface::Revolution {
+        center: [n[4], n[5], n[6]],
+        x_axis: [n[7], n[8], n[9]],
+        y_axis: [n[10], n[11], n[12]],
+        z_axis: [n[13], n[14], n[15]],
+        profile,
+    })
+}
+
+/// A point on the profile, in the revolved surface's own frame.
+fn profile_point(profile: BrepProfile, v: f64) -> [f64; 3] {
+    match profile {
+        BrepProfile::Line { origin, direction } => add3(origin, scale3(direction, v)),
+        BrepProfile::Arc {
+            center,
+            x_axis,
+            y_axis,
+            radius,
+        } => add3(
+            center,
+            add3(
+                scale3(x_axis, radius * v.cos()),
+                scale3(y_axis, radius * v.sin()),
+            ),
+        ),
+    }
+}
+
+/// A point of one side of a ruled surface, at the surface's normalised `u`.
+fn ruling_point(ruling: BrepRuling, u: f64) -> [f64; 3] {
+    match ruling {
+        BrepRuling::Point(point) => point,
+        BrepRuling::Curve {
+            profile,
+            start,
+            end,
+        } => profile_point(profile, start + u * (end - start)),
+    }
+}
+
+/// Turn a point of the frame about the frame's own `z`.
+fn turn_about_z(point: [f64; 3], u: f64) -> [f64; 3] {
+    let (c, s) = (u.cos(), u.sin());
+    [
+        point[0] * c - point[1] * s,
+        point[0] * s + point[1] * c,
+        point[2],
+    ]
+}
+
 fn eval_uv(surface: BrepSurface, u: f64, v: f64) -> [f64; 3] {
     match surface {
         BrepSurface::Plane {
@@ -462,6 +759,27 @@ fn eval_uv(surface: BrepSurface, u: f64, v: f64) -> [f64; 3] {
             let (cu, su) = (u.cos(), u.sin());
             let radial = add3(scale3(x_axis, radius * cu), scale3(y_axis, radius * su));
             add3(center, add3(radial, scale3(z_axis, v)))
+        }
+        BrepSurface::Revolution {
+            center,
+            x_axis,
+            y_axis,
+            z_axis,
+            profile,
+        } => {
+            let turned = turn_about_z(profile_point(profile, v), u);
+            add3(
+                center,
+                add3(
+                    scale3(x_axis, turned[0]),
+                    add3(scale3(y_axis, turned[1]), scale3(z_axis, turned[2])),
+                ),
+            )
+        }
+        BrepSurface::Ruled { first, second } => {
+            let from = ruling_point(first, u);
+            let to = ruling_point(second, u);
+            add3(from, scale3(add3(to, scale3(from, -1.0)), v))
         }
     }
 }
@@ -501,10 +819,7 @@ fn resolve_edge(
         edge.identifiers[5],
     ];
 
-    let surfaces = [
-        face_surfaces.get(&pface[0]).copied().flatten(),
-        face_surfaces.get(&pface[1]).copied().flatten(),
-    ];
+    let surfaces = pface.map(|id| face_surfaces.get(&id).copied().flatten());
     let point_for = |side: usize, pnt: &[f64]| -> Option<[f64; 3]> {
         surfaces[side].map(|surface| eval_uv(surface, pnt[side * 2], pnt[side * 2 + 1]))
     };
@@ -524,7 +839,16 @@ fn resolve_edge(
             raw_end,
         )
     };
-    let raw_curve = match (surfaces[0], surfaces[1]) {
+    let opinion = |side: usize| {
+        surface_opinion(
+            surfaces[side],
+            (first_pnt[side * 2], first_pnt[side * 2 + 1]),
+            (last_pnt[side * 2], last_pnt[side * 2 + 1]),
+            raw_start,
+            raw_end,
+        )
+    };
+    let analytic_curve = match (surfaces[0], surfaces[1]) {
         // An edge between two cylinders is read from both parameterisations
         // and only accepted when they describe the same 3D curve. Neither side
         // is privileged and neither is guessed at: the file stores this edge's
@@ -540,10 +864,10 @@ fn resolve_edge(
         (Some(BrepSurface::Cylinder { .. }), Some(BrepSurface::Cylinder { .. })) => {
             match (classify(0), classify(1)) {
                 (Ok(first), Ok(second)) => {
-                    if curves_agree(first, second) {
-                        first
+                    if curves_agree(&first, &second) {
+                        Ok(first)
                     } else {
-                        return Err("the two cylinders disagree on the edge's curve".into());
+                        Err("the two cylinders disagree on the edge's curve".into())
                     }
                 }
                 // Asymmetry is a contradiction, not a partial success: a curve
@@ -551,15 +875,42 @@ fn resolve_edge(
                 // the other too. Taking the side that answered would be reading
                 // through a disagreement.
                 (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
-                    return Err("only one of the two cylinders gives the edge a curve".into());
+                    Err("only one of the two cylinders gives the edge a curve".into())
                 }
-                (Err(reason), Err(_)) => return Err(reason.into()),
+                (Err(reason), Err(_)) => Err(reason.into()),
             }
         }
-        (Some(BrepSurface::Cylinder { .. }), _) => classify(0).map_err(EdgeFailure::from)?,
-        (_, Some(BrepSurface::Cylinder { .. })) => classify(1).map_err(EdgeFailure::from)?,
-        _ => straight_line(raw_start, raw_end).map_err(EdgeFailure::from)?,
+        // Any other pair of curved faces is held to the same oracle, for the
+        // same reason: a curve lying on both is named by both.
+        _ => match (opinion(0), opinion(1)) {
+            (Some(Ok(first)), Some(Ok(second))) => {
+                if curves_agree(&first, &second) {
+                    Ok(first)
+                } else {
+                    Err("the two curved faces disagree on the edge's curve".into())
+                }
+            }
+            (Some(Ok(_)), Some(Err(_))) | (Some(Err(_)), Some(Ok(_))) => {
+                Err("only one of the two curved faces gives the edge a curve".into())
+            }
+            (Some(Err(reason)), Some(Err(_))) => Err(reason.into()),
+            (Some(only), None) | (None, Some(only)) => only.map_err(EdgeFailure::from),
+            (None, None) => straight_line(raw_start, raw_end).map_err(EdgeFailure::from),
+        },
     };
+    // Exact analytic curves remain exact. When the adjacent surfaces cannot
+    // classify an edge as a line or circle, the file's interior EdgePnt array
+    // is the path: evaluate every stored UV pair and preserve the samples as a
+    // polyline instead of replacing the unknown curve with its chord.
+    let raw_curve = analytic_curve.or_else(|analytic_failure| {
+        sampled_edge_curve(
+            &edge.numbers[..edge.numbers.len() - 8],
+            &surfaces,
+            raw_start,
+            raw_end,
+        )
+        .unwrap_or(Err(analytic_failure))
+    })?;
 
     Ok(ResolvedEdge {
         pface,
@@ -569,6 +920,70 @@ fn resolve_edge(
         raw_curve,
         flags,
     })
+}
+
+/// What one adjacent face's surface says this edge's curve is.
+///
+/// A face whose surface curves says on its own what the edge is; a plane does
+/// not, and neither does a face this cannot read. `None` is "this side has no
+/// opinion", which is why such a side falls through to a line.
+fn surface_opinion(
+    surface: Option<BrepSurface>,
+    first: (f64, f64),
+    last: (f64, f64),
+    raw_start: [f64; 3],
+    raw_end: [f64; 3],
+) -> Option<Result<BrepCurve, &'static str>> {
+    match surface {
+        Some(surface @ BrepSurface::Cylinder { .. }) => Some(classify_cylinder_edge(
+            surface, first, last, raw_start, raw_end,
+        )),
+        Some(surface @ BrepSurface::Revolution { .. }) => Some(classify_revolution_edge(
+            surface, first, last, raw_start, raw_end,
+        )),
+        Some(surface @ BrepSurface::Ruled { .. }) => Some(classify_ruled_edge(
+            surface, first, last, raw_start, raw_end,
+        )),
+        Some(BrepSurface::Plane { .. }) | None => None,
+    }
+}
+
+/// Evaluate the `m_interiorEdgePnts` array preceding the two endpoint
+/// `EdgePnt`s. Each item is `(u0, v0, u1, v1)`, one UV pair for each adjacent
+/// face. When both surfaces are readable they must place every sample at the
+/// same 3D point, just as they must for the endpoints.
+fn sampled_edge_curve(
+    interior_numbers: &[f64],
+    surfaces: &[Option<BrepSurface>; 2],
+    raw_start: [f64; 3],
+    raw_end: [f64; 3],
+) -> Option<Result<BrepCurve, EdgeFailure>> {
+    if interior_numbers.is_empty() {
+        return None;
+    }
+    if interior_numbers.len() % 4 != 0 {
+        return Some(Err("edge has a partial interior EdgePnt".into()));
+    }
+
+    let mut points = Vec::with_capacity(interior_numbers.len() / 4 + 2);
+    points.push(raw_start);
+    for pnt in interior_numbers.chunks_exact(4) {
+        let point = agree(
+            surfaces[0].map(|surface| eval_uv(surface, pnt[0], pnt[1])),
+            surfaces[1].map(|surface| eval_uv(surface, pnt[2], pnt[3])),
+        );
+        match point {
+            Ok(point) if point.into_iter().all(f64::is_finite) => points.push(point),
+            Ok(_) => {
+                return Some(Err(
+                    "interior EdgePnt evaluates to a non-finite point".into()
+                ));
+            }
+            Err(failure) => return Some(Err(failure)),
+        }
+    }
+    points.push(raw_end);
+    Some(Ok(BrepCurve::Polyline(points)))
 }
 
 /// Prefer whichever side(s) evaluated; when both did, they must agree.
@@ -608,6 +1023,185 @@ fn straight_line(start: [f64; 3], end: [f64; 3]) -> Result<BrepCurve, &'static s
         return Err("degenerate zero-length edge");
     }
     Ok(BrepCurve::Line)
+}
+
+/// What curve an edge of a revolved face is, from that face's own `(u, v)`.
+///
+/// Only two families lie on a surface of revolution and are named by a single
+/// parameter being constant: an edge at one `u` is the profile itself, turned
+/// there, and an edge at one `v` is the circle that point traces about the
+/// axis. Anything else - a seam where a revolved face meets another solid - is
+/// refused rather than approximated by its endpoints, exactly as the
+/// cylinders refuse theirs.
+///
+/// The arc's `z_axis` is `cross(x, y)` of the turned frame rather than the
+/// frame's own `z`: 248 of SMALL's 1 844 frames are left-handed, and taking
+/// the declared `z` there would trace the arc the wrong way round.
+fn classify_revolution_edge(
+    surface: BrepSurface,
+    (u_start, v_start): (f64, f64),
+    (u_end, v_end): (f64, f64),
+    raw_start: [f64; 3],
+    raw_end: [f64; 3],
+) -> Result<BrepCurve, &'static str> {
+    let BrepSurface::Revolution {
+        center,
+        x_axis,
+        y_axis,
+        z_axis,
+        profile,
+    } = surface
+    else {
+        unreachable!("caller passed a Revolution surface");
+    };
+    let direction = |local: [f64; 3]| {
+        add3(
+            scale3(x_axis, local[0]),
+            add3(scale3(y_axis, local[1]), scale3(z_axis, local[2])),
+        )
+    };
+    let point = |local: [f64; 3]| add3(center, direction(local));
+    let turn = (u_end - u_start).abs();
+    let along = (v_end - v_start).abs();
+    let arc = if turn <= PARAMETER_TOLERANCE && along > PARAMETER_TOLERANCE {
+        // One `u`: the profile curve, turned to where this edge sits.
+        match profile {
+            BrepProfile::Line { .. } => return straight_line(raw_start, raw_end),
+            BrepProfile::Arc {
+                center: profile_center,
+                x_axis: profile_x,
+                y_axis: profile_y,
+                radius,
+            } => {
+                let turned_x = direction(turn_about_z(profile_x, u_start));
+                let turned_y = direction(turn_about_z(profile_y, u_start));
+                BrepArc {
+                    center: point(turn_about_z(profile_center, u_start)),
+                    x_axis: turned_x,
+                    z_axis: cross3(turned_x, turned_y),
+                    radius,
+                    start_angle: v_start,
+                    end_angle: v_end,
+                }
+            }
+        }
+    } else if along <= PARAMETER_TOLERANCE && turn > PARAMETER_TOLERANCE {
+        // One `v`: the circle that one point of the profile traces.
+        if turn > std::f64::consts::TAU + PARAMETER_TOLERANCE {
+            return Err("revolved edge angular span exceeds a full turn");
+        }
+        let local = profile_point(profile, v_start.midpoint(v_end));
+        let radius = local[0].hypot(local[1]);
+        if radius <= CLOSURE_TOLERANCE_FEET {
+            return Err("revolved edge lies on the axis of revolution");
+        }
+        let phase = local[1].atan2(local[0]);
+        BrepArc {
+            center: point([0.0, 0.0, local[2]]),
+            x_axis,
+            z_axis: cross3(x_axis, y_axis),
+            radius,
+            start_angle: phase + u_start,
+            end_angle: phase + u_end,
+        }
+    } else {
+        return Err(
+            "revolved edge parametrization is neither a constant-u profile nor a constant-v circle",
+        );
+    };
+    if distance(arc_point(arc, arc.start_angle), raw_start) > CLOSURE_TOLERANCE_FEET
+        || distance(arc_point(arc, arc.end_angle), raw_end) > CLOSURE_TOLERANCE_FEET
+    {
+        return Err("revolved arc reconstruction disagreed with the evaluated endpoints");
+    }
+    Ok(BrepCurve::Arc(arc))
+}
+
+/// Read an edge of a ruled surface from that surface's own parameters.
+///
+/// A ruled surface answers for exactly two families of edge. One `u` is a
+/// ruling, and a ruling is straight on any ruled surface whatever its
+/// profiles are. One `v` at either end of the ruling is a profile itself -
+/// the first at `v = 0`, the second at `v = 1` - and is that profile's own
+/// shape. One `v` between them is the affine blend of the two profiles: still
+/// straight when both profiles are straight, but in general a curve this does
+/// not name, and it is refused rather than flattened to its chord. The
+/// refusal is what hands the edge to the sampled `EdgePnt` path.
+fn classify_ruled_edge(
+    surface: BrepSurface,
+    (u_start, v_start): (f64, f64),
+    (u_end, v_end): (f64, f64),
+    raw_start: [f64; 3],
+    raw_end: [f64; 3],
+) -> Result<BrepCurve, &'static str> {
+    let BrepSurface::Ruled { first, second } = surface else {
+        unreachable!("caller passed a Ruled surface");
+    };
+    let along = (u_end - u_start).abs();
+    let across = (v_end - v_start).abs();
+    if along <= PARAMETER_TOLERANCE && across > PARAMETER_TOLERANCE {
+        return straight_line(raw_start, raw_end);
+    }
+    if across > PARAMETER_TOLERANCE || along <= PARAMETER_TOLERANCE {
+        return Err(
+            "ruled edge parametrization is neither a constant-u ruling nor a constant-v profile",
+        );
+    }
+    let straight = |ruling: BrepRuling| {
+        matches!(
+            ruling,
+            BrepRuling::Point(_)
+                | BrepRuling::Curve {
+                    profile: BrepProfile::Line { .. },
+                    ..
+                }
+        )
+    };
+    if straight(first) && straight(second) {
+        // Every blend of two straight profiles is straight, so this holds at
+        // any `v`, not only at the two ends.
+        return straight_line(raw_start, raw_end);
+    }
+    let v = v_start.midpoint(v_end);
+    let ruling = if v.abs() <= PARAMETER_TOLERANCE {
+        first
+    } else if (v - 1.0).abs() <= PARAMETER_TOLERANCE {
+        second
+    } else {
+        return Err("ruled edge lies between the two profiles");
+    };
+    let (profile, start, end) = match ruling {
+        BrepRuling::Point(_) => return straight_line(raw_start, raw_end),
+        BrepRuling::Curve {
+            profile,
+            start,
+            end,
+        } => (profile, start, end),
+    };
+    let BrepProfile::Arc {
+        center,
+        x_axis,
+        y_axis,
+        radius,
+    } = profile
+    else {
+        return straight_line(raw_start, raw_end);
+    };
+    let parameter = |u: f64| start + u * (end - start);
+    let arc = BrepArc {
+        center,
+        x_axis,
+        z_axis: cross3(x_axis, y_axis),
+        radius,
+        start_angle: parameter(u_start),
+        end_angle: parameter(u_end),
+    };
+    if distance(arc_point(arc, arc.start_angle), raw_start) > CLOSURE_TOLERANCE_FEET
+        || distance(arc_point(arc, arc.end_angle), raw_end) > CLOSURE_TOLERANCE_FEET
+    {
+        return Err("ruled profile arc reconstruction disagreed with the evaluated endpoints");
+    }
+    Ok(BrepCurve::Arc(arc))
 }
 
 fn classify_cylinder_edge(
@@ -667,18 +1261,21 @@ fn classify_cylinder_edge(
 /// evaluated - so what is left to check is the path between them, and sampling
 /// the midpoint catches the case the endpoints cannot: the same circle traced
 /// the long way round instead of the short.
-fn curves_agree(first: BrepCurve, second: BrepCurve) -> bool {
+fn curves_agree(first: &BrepCurve, second: &BrepCurve) -> bool {
     match (first, second) {
         (BrepCurve::Line, BrepCurve::Line) => true,
         (BrepCurve::Arc(first), BrepCurve::Arc(second)) => {
             (first.radius - second.radius).abs() <= CLOSURE_TOLERANCE_FEET
                 && distance(first.center, second.center) <= CLOSURE_TOLERANCE_FEET
                 && distance(
-                    arc_point(first, first.start_angle.midpoint(first.end_angle)),
-                    arc_point(second, second.start_angle.midpoint(second.end_angle)),
+                    arc_point(*first, first.start_angle.midpoint(first.end_angle)),
+                    arc_point(*second, second.start_angle.midpoint(second.end_angle)),
                 ) <= CLOSURE_TOLERANCE_FEET
         }
-        (BrepCurve::Line, BrepCurve::Arc(_)) | (BrepCurve::Arc(_), BrepCurve::Line) => false,
+        (BrepCurve::Line, BrepCurve::Arc(_))
+        | (BrepCurve::Arc(_), BrepCurve::Line)
+        | (BrepCurve::Polyline(_), _)
+        | (_, BrepCurve::Polyline(_)) => false,
     }
 }
 
@@ -831,7 +1428,7 @@ fn order_face_edges(
     let mut rings: Vec<BrepLoop> = Vec::new();
     while let Some(start) = used.iter().position(|&used| !used) {
         used[start] = true;
-        let mut ring = vec![oriented[start]];
+        let mut ring = vec![oriented[start].clone()];
         loop {
             let end = ring[ring.len() - 1].end;
             let mut next = None;
@@ -846,7 +1443,7 @@ fn order_face_edges(
             }
             let Some(index) = next else { break };
             used[index] = true;
-            ring.push(oriented[index]);
+            ring.push(oriented[index].clone());
         }
         if distance(ring[0].start, ring[ring.len() - 1].end) > CLOSURE_TOLERANCE_FEET {
             // Which of the two this is says what is wrong with the face. A
@@ -922,13 +1519,13 @@ fn oriented_edge(resolved: &ResolvedEdge, side: usize) -> BrepEdge {
         BrepEdge {
             start: resolved.raw_end,
             end: resolved.raw_start,
-            curve: reverse_curve(resolved.raw_curve),
+            curve: reverse_curve(&resolved.raw_curve),
         }
     } else {
         BrepEdge {
             start: resolved.raw_start,
             end: resolved.raw_end,
-            curve: resolved.raw_curve,
+            curve: resolved.raw_curve.clone(),
         }
     }
 }
@@ -1004,14 +1601,19 @@ fn walk_loop(
     Ok(ordered)
 }
 
-fn reverse_curve(curve: BrepCurve) -> BrepCurve {
+fn reverse_curve(curve: &BrepCurve) -> BrepCurve {
     match curve {
         BrepCurve::Line => BrepCurve::Line,
         BrepCurve::Arc(arc) => BrepCurve::Arc(BrepArc {
             start_angle: arc.end_angle,
             end_angle: arc.start_angle,
-            ..arc
+            ..*arc
         }),
+        BrepCurve::Polyline(points) => {
+            let mut points = points.clone();
+            points.reverse();
+            BrepCurve::Polyline(points)
+        }
     }
 }
 
@@ -1045,6 +1647,11 @@ mod tests {
     const EDGE: u16 = 1300;
     const PLANE: u16 = 565;
     const CYL_SURF: u16 = 1039;
+    const CONE_SURF: u16 = 815;
+    const SURF_REV: u16 = 3986;
+    const RULED_SURF: u16 = 3587;
+    const G_LINE: u16 = 1798;
+    const G_ARC: u16 = 2040;
 
     fn classes() -> BrepClassIndexes {
         BrepClassIndexes {
@@ -1053,6 +1660,11 @@ mod tests {
             edge: EDGE,
             plane: PLANE,
             cyl_surf: CYL_SURF,
+            cone_surf: CONE_SURF,
+            surf_rev: SURF_REV,
+            ruled_surf: RULED_SURF,
+            g_line: G_LINE,
+            g_arc: G_ARC,
         }
     }
 
@@ -1093,6 +1705,29 @@ mod tests {
         SerialObject {
             object_id: id,
             class_index: CYL_SURF,
+            offset: 0,
+            bytes: 0,
+            references: Vec::new(),
+            identifiers: Vec::new(),
+            numbers,
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+        }
+    }
+
+    /// A `ConeSurf` whose apex is `center`, axis is +Z and whose `v`
+    /// parameter measures distance along its generator.
+    fn cone_object(center: [f64; 3], half_angle: f64) -> SerialObject {
+        let mut numbers = vec![0.0; 4];
+        numbers.extend(center);
+        numbers.extend([1.0, 0.0, 0.0]); // x_axis
+        numbers.extend([0.0, 1.0, 0.0]); // y_axis
+        numbers.extend([0.0, 0.0, 1.0]); // z_axis
+        numbers.push(half_angle);
+        SerialObject {
+            object_id: u32::MAX,
+            class_index: CONE_SURF,
             offset: 0,
             bytes: 0,
             references: Vec::new(),
@@ -1285,9 +1920,11 @@ mod tests {
 
         // The arcs against the unmodeled caps are unaffected.
         for index in [1, 3] {
-            match edges[index].curve {
+            match &edges[index].curve {
                 BrepCurve::Arc(arc) => assert!((arc.radius - 2.0).abs() < 1.0e-9),
-                BrepCurve::Line => panic!("edge {index} should be an arc"),
+                BrepCurve::Line | BrepCurve::Polyline(_) => {
+                    panic!("edge {index} should be an arc")
+                }
             }
         }
     }
@@ -1314,6 +1951,92 @@ mod tests {
             "{:?}",
             brep.excluded_faces
         );
+    }
+
+    #[test]
+    fn reads_a_diagonal_cylinder_edge_from_its_interior_edge_points() {
+        let mut edge = line_edge(
+            300,
+            1,
+            2,
+            [10, 0],
+            [10, 0],
+            0,
+            (0.0, 0.0),
+            (std::f64::consts::FRAC_PI_2, 2.0),
+        );
+        // `m_interiorEdgePnts` precedes `m_firstAndLastEdgePnts`; side 1 is
+        // zero here because this fixture intentionally resolves only side 0.
+        edge.numbers.splice(
+            0..0,
+            [
+                std::f64::consts::FRAC_PI_6,
+                0.5,
+                0.0,
+                0.0,
+                std::f64::consts::FRAC_PI_3,
+                1.5,
+                0.0,
+                0.0,
+            ],
+        );
+        let mut surfaces = HashMap::new();
+        surfaces.insert(
+            1,
+            Some(BrepSurface::Cylinder {
+                center: [0.0, 0.0, 0.0],
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+                radius: 2.0,
+            }),
+        );
+
+        let resolved = resolve_edge(&edge, &surfaces).expect("the sampled edge resolves");
+        let BrepCurve::Polyline(points) = resolved.raw_curve else {
+            panic!("a diagonal cylinder edge should preserve its sampled path")
+        };
+        assert_eq!(points.len(), 4);
+        assert!(distance(points[0], [2.0, 0.0, 0.0]) < 1.0e-9);
+        assert!(distance(points[1], [3.0_f64.sqrt(), 1.0, 0.5]) < 1.0e-9);
+        assert!(distance(points[2], [1.0, 3.0_f64.sqrt(), 1.5]) < 1.0e-9);
+        assert!(distance(points[3], [0.0, 2.0, 2.0]) < 1.0e-9);
+
+        let reversed = reverse_curve(&BrepCurve::Polyline(points.clone()));
+        let BrepCurve::Polyline(reversed) = reversed else {
+            unreachable!()
+        };
+        assert_eq!(reversed, points.into_iter().rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn keeps_an_exact_cylinder_arc_when_interior_samples_are_present() {
+        let mut edge = line_edge(
+            300,
+            1,
+            2,
+            [10, 0],
+            [10, 0],
+            0,
+            (0.0, 3.0),
+            (std::f64::consts::FRAC_PI_2, 3.0),
+        );
+        edge.numbers
+            .splice(0..0, [std::f64::consts::FRAC_PI_4, 3.0, 0.0, 0.0]);
+        let mut surfaces = HashMap::new();
+        surfaces.insert(
+            1,
+            Some(BrepSurface::Cylinder {
+                center: [0.0, 0.0, 0.0],
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+                radius: 2.0,
+            }),
+        );
+
+        let resolved = resolve_edge(&edge, &surfaces).expect("the analytic arc resolves");
+        assert!(matches!(resolved.raw_curve, BrepCurve::Arc(_)));
     }
 
     /// `loop_object` with a live `m_nextLoop`: the face carries another loop.
@@ -1648,7 +2371,7 @@ mod tests {
 
     #[test]
     fn excludes_a_face_with_no_supported_surface() {
-        // SurfRev (or anything not Plane/CylSurf) is unresolved by design.
+        // A class this does not read at all - not Plane, CylSurf or SurfRev.
         let face = face_object(1, 10, reference(5, 9999));
         let brep = assemble(&[face], &classes());
         assert!(brep.faces.is_empty());
@@ -1717,15 +2440,538 @@ mod tests {
         let arc_edge = &cap.loops[0][0];
         assert!(distance(arc_edge.start, [2.0, 0.0, 0.0]) < 1.0e-9);
         assert!(distance(arc_edge.end, [0.0, 2.0, 0.0]) < 1.0e-9);
-        match arc_edge.curve {
+        match &arc_edge.curve {
             BrepCurve::Arc(arc) => {
                 assert!((arc.radius - 2.0).abs() < 1.0e-9);
                 assert!((arc.start_angle - 0.0).abs() < 1.0e-9);
                 assert!((arc.end_angle - std::f64::consts::FRAC_PI_2).abs() < 1.0e-9);
             }
-            BrepCurve::Line => panic!("expected an arc"),
+            BrepCurve::Line | BrepCurve::Polyline(_) => panic!("expected an arc"),
         }
         assert_eq!(cap.loops[0][1].curve, BrepCurve::Line);
         assert_eq!(cap.loops[0][2].curve, BrepCurve::Line);
+    }
+
+    /// A `SurfRev` whose frame is the identity at the origin, revolving the
+    /// profile the reference names. Its identifier is a sentinel in the file,
+    /// so - like `CylSurf` - it is paired by encounter order and the id the
+    /// face quotes does not matter.
+    fn revolution_object(profile: GElementNodeReference) -> SerialObject {
+        let mut numbers = vec![0.0; 4];
+        numbers.extend([0.0, 0.0, 0.0]); // center
+        numbers.extend([1.0, 0.0, 0.0]); // x_axis
+        numbers.extend([0.0, 1.0, 0.0]); // y_axis
+        numbers.extend([0.0, 0.0, 1.0]); // z_axis
+        SerialObject {
+            object_id: u32::MAX,
+            class_index: SURF_REV,
+            offset: 1,
+            bytes: 0,
+            references: vec![profile],
+            identifiers: Vec::new(),
+            numbers,
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+        }
+    }
+
+    /// One edge of a fixture face: its `(u, v)` at the first point and at the
+    /// last.
+    type RuledCorner = ((f64, f64), (f64, f64));
+
+    /// A `RuledSurf`: the parent `Surface`'s envelope, then `m_Point1` and
+    /// `m_Point2`, with the two profile references in declaration order. Its
+    /// identifier is the same sentinel every face quotes, so - like `CylSurf`
+    /// and `SurfRev` - it is paired by encounter order.
+    fn ruled_object(
+        first: GElementNodeReference,
+        second: GElementNodeReference,
+        point1: [f64; 3],
+        point2: [f64; 3],
+    ) -> SerialObject {
+        let mut numbers = vec![0.0, 0.0, 1.0, 1.0]; // m_Envelope: u, v over [0, 1]
+        numbers.extend(point1);
+        numbers.extend(point2);
+        SerialObject {
+            object_id: u32::MAX,
+            class_index: RULED_SURF,
+            offset: 1,
+            bytes: 0,
+            references: vec![first, second],
+            identifiers: Vec::new(),
+            numbers,
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+        }
+    }
+
+    /// A `GArc` whose `m_endParams` state the interval a ruled surface's `u`
+    /// is normalised onto, rather than the zeroes `g_arc_object` leaves.
+    fn g_arc_over(id: u32, center: [f64; 3], radius: f64, start: f64, end: f64) -> SerialObject {
+        let mut arc = g_arc_object(id, center, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], radius);
+        arc.numbers[0] = start;
+        arc.numbers[1] = end;
+        arc
+    }
+
+    /// One face of a ruled surface, bounded by the `(u, v)` pairs given. As
+    /// with `revolved_face`, side 1 of every edge is a face with no `Face`
+    /// object, so only the ruled side has an opinion.
+    fn ruled_face(surface: SerialObject, corners: &[RuledCorner]) -> Vec<SerialObject> {
+        let count = u32::try_from(corners.len()).expect("a fixture face has few edges");
+        let last_edge = 200 + count - 1;
+        let mut objects = vec![
+            surface,
+            face_object(1, 10, reference(999, RULED_SURF)),
+            loop_object(10, 1, 200, last_edge),
+        ];
+        for (index, (first, last)) in (0u32..).zip(corners.iter().copied()) {
+            let id = 200 + index;
+            let next = if id == last_edge { 10 } else { id + 1 };
+            let previous = if index == 0 { 10 } else { id - 1 };
+            objects.push(line_edge(
+                id,
+                1,
+                2,
+                [next, 0],
+                [previous, 0],
+                0,
+                first,
+                last,
+            ));
+        }
+        objects
+    }
+
+    /// `GLine`: two `GCurve` end parameters, then the origin and direction.
+    fn g_line_object(id: u32, origin: [f64; 3], direction: [f64; 3]) -> SerialObject {
+        let mut numbers = vec![0.0; 2];
+        numbers.extend(origin);
+        numbers.extend(direction);
+        SerialObject {
+            object_id: id,
+            class_index: G_LINE,
+            offset: 0,
+            bytes: 0,
+            references: Vec::new(),
+            identifiers: Vec::new(),
+            numbers,
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+        }
+    }
+
+    /// `GArc`: the two end parameters, then the frame, the radius and last the
+    /// centre - the order `GArc` declares, not `GLine`'s.
+    fn g_arc_object(
+        id: u32,
+        center: [f64; 3],
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+        radius: f64,
+    ) -> SerialObject {
+        let mut numbers = vec![0.0; 2];
+        numbers.extend(x_axis);
+        numbers.extend(y_axis);
+        numbers.push(radius);
+        numbers.extend(center);
+        SerialObject {
+            object_id: id,
+            class_index: G_ARC,
+            offset: 0,
+            bytes: 0,
+            references: Vec::new(),
+            identifiers: Vec::new(),
+            numbers,
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+        }
+    }
+
+    /// One face of a surface of revolution, bounded by the four edges the
+    /// `(u, v)` pairs describe. Side 1 of every edge is face 2, which has no
+    /// `Face` object, so only the revolved side has an opinion.
+    fn revolved_face(
+        surface: SerialObject,
+        corners: [((f64, f64), (f64, f64)); 4],
+    ) -> Vec<SerialObject> {
+        let surface_class = surface.class_index;
+        let mut objects = vec![
+            surface,
+            face_object(1, 10, reference(999, surface_class)),
+            loop_object(10, 1, 200, 203),
+        ];
+        for (index, (first, last)) in (0u32..).zip(corners) {
+            let id = 200 + index;
+            let next = if index == 3 { 10 } else { id + 1 };
+            let previous = if index == 0 { 10 } else { id - 1 };
+            objects.push(line_edge(
+                id,
+                1,
+                2,
+                [next, 0],
+                [previous, 0],
+                0,
+                first,
+                last,
+            ));
+        }
+        objects
+    }
+
+    /// A cone: the line `[1,0,0] + v * [1,0,1]` turned about +Z, so the radius
+    /// at height `v` is `1 + v`. The quarter from `u = 0` to `u = pi/2` and
+    /// `v = 0` to `v = 1` is bounded by two circles and two slant rulings.
+    fn quarter_cone() -> Vec<SerialObject> {
+        let half = std::f64::consts::FRAC_PI_2;
+        let mut objects = revolved_face(
+            revolution_object(reference(700, G_LINE)),
+            [
+                ((0.0, 0.0), (half, 0.0)),  // v = 0: the small circle.
+                ((half, 0.0), (half, 1.0)), // u = pi/2: a ruling.
+                ((half, 1.0), (0.0, 1.0)),  // v = 1: the large circle.
+                ((0.0, 1.0), (0.0, 0.0)),   // u = 0: back down the other ruling.
+            ],
+        );
+        objects.push(g_line_object(700, [1.0, 0.0, 0.0], [1.0, 0.0, 1.0]));
+        objects
+    }
+
+    #[test]
+    fn reads_a_cone_from_a_line_revolved_about_the_axis() {
+        let brep = assemble(&quarter_cone(), &classes());
+        let cone = brep.faces.first().expect("the cone face resolved");
+        assert!(matches!(
+            cone.surface,
+            BrepSurface::Revolution {
+                profile: BrepProfile::Line { .. },
+                ..
+            }
+        ));
+        let edges = &cone.loops[0];
+        assert_eq!(edges.len(), 4);
+
+        // Each circle is centred on the axis at its own height, with the
+        // radius the profile reaches there.
+        for (index, height, radius) in [(0, 0.0, 1.0), (2, 1.0, 2.0)] {
+            match &edges[index].curve {
+                BrepCurve::Arc(arc) => {
+                    assert!(distance(arc.center, [0.0, 0.0, height]) < 1.0e-9);
+                    assert!((arc.radius - radius).abs() < 1.0e-9);
+                    assert!(distance(arc.z_axis, [0.0, 0.0, 1.0]) < 1.0e-9);
+                }
+                BrepCurve::Line | BrepCurve::Polyline(_) => {
+                    panic!("edge {index} should be a circle of the cone")
+                }
+            }
+        }
+        // A revolved line's own profile is straight, wherever it is turned to.
+        assert_eq!(edges[1].curve, BrepCurve::Line);
+        assert_eq!(edges[3].curve, BrepCurve::Line);
+        assert!(distance(edges[1].start, [0.0, 1.0, 0.0]) < 1.0e-9);
+        assert!(distance(edges[1].end, [0.0, 2.0, 1.0]) < 1.0e-9);
+    }
+
+    #[test]
+    fn reads_a_cone_declared_as_a_cone_surface() {
+        let half_angle = 0.5_f64.atan();
+        let half_turn = std::f64::consts::FRAC_PI_2;
+        let objects = revolved_face(
+            cone_object([1.0, 2.0, 3.0], half_angle),
+            [
+                ((0.0, 2.0), (half_turn, 2.0)),
+                ((half_turn, 2.0), (half_turn, 4.0)),
+                ((half_turn, 4.0), (0.0, 4.0)),
+                ((0.0, 4.0), (0.0, 2.0)),
+            ],
+        );
+        let brep = assemble(&objects, &classes());
+        let cone = brep.faces.first().expect("the ConeSurf face resolved");
+        let BrepSurface::Revolution {
+            center, profile, ..
+        } = cone.surface
+        else {
+            panic!("ConeSurf should use the common revolution representation")
+        };
+        assert!(distance(center, [1.0, 2.0, 3.0]) < 1.0e-9);
+        let BrepProfile::Line { origin, direction } = profile else {
+            unreachable!()
+        };
+        assert!(distance(origin, [0.0, 0.0, 0.0]) < 1.0e-9);
+        assert!((direction[0] - 1.0 / 5.0_f64.sqrt()).abs() < 1.0e-9);
+        assert!((direction[2] - 2.0 / 5.0_f64.sqrt()).abs() < 1.0e-9);
+
+        let edges = &cone.loops[0];
+        for (index, v) in [(0, 2.0), (2, 4.0)] {
+            let BrepCurve::Arc(arc) = &edges[index].curve else {
+                panic!("constant-v ConeSurf edge should be a circle")
+            };
+            assert!((arc.radius - v / 5.0_f64.sqrt()).abs() < 1.0e-9);
+            assert!(distance(arc.center, [1.0, 2.0, 3.0 + 2.0 * v / 5.0_f64.sqrt()]) < 1.0e-9);
+        }
+        assert_eq!(edges[1].curve, BrepCurve::Line);
+        assert_eq!(edges[3].curve, BrepCurve::Line);
+    }
+
+    /// A torus: the circle of radius 1/2 about `[2,0,0]` in the plane that
+    /// holds the axis, turned about +Z. Major radius 2, minor 1/2.
+    fn quarter_torus() -> Vec<SerialObject> {
+        let half = std::f64::consts::FRAC_PI_2;
+        let mut objects = revolved_face(
+            revolution_object(reference(700, G_ARC)),
+            [
+                ((0.0, 0.0), (0.0, half)),   // u = 0: the profile itself.
+                ((0.0, half), (half, half)), // v = pi/2: the circle at the top.
+                ((half, half), (half, 0.0)), // u = pi/2: the profile, turned.
+                ((half, 0.0), (0.0, 0.0)),   // v = 0: the outer equator.
+            ],
+        );
+        objects.push(g_arc_object(
+            700,
+            [2.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            0.5,
+        ));
+        objects
+    }
+
+    #[test]
+    fn reads_a_torus_from_an_arc_revolved_about_the_axis() {
+        let brep = assemble(&quarter_torus(), &classes());
+        let torus = brep.faces.first().expect("the torus face resolved");
+        let edges = &torus.loops[0];
+        assert_eq!(edges.len(), 4);
+
+        // The constant-u edges are the profile circle, turned to where they
+        // sit: minor radius, centred a major radius off the axis.
+        match &edges[0].curve {
+            BrepCurve::Arc(arc) => {
+                assert!(distance(arc.center, [2.0, 0.0, 0.0]) < 1.0e-9);
+                assert!((arc.radius - 0.5).abs() < 1.0e-9);
+            }
+            BrepCurve::Line | BrepCurve::Polyline(_) => {
+                panic!("the profile edge should be an arc")
+            }
+        }
+        match &edges[2].curve {
+            BrepCurve::Arc(arc) => {
+                assert!(distance(arc.center, [0.0, 2.0, 0.0]) < 1.0e-9);
+                assert!((arc.radius - 0.5).abs() < 1.0e-9);
+            }
+            BrepCurve::Line | BrepCurve::Polyline(_) => {
+                panic!("the turned profile edge should be an arc")
+            }
+        }
+        // The constant-v edges are the circles those points trace: on the
+        // axis, at the radius and height the profile reaches.
+        match &edges[1].curve {
+            BrepCurve::Arc(arc) => {
+                assert!(distance(arc.center, [0.0, 0.0, 0.5]) < 1.0e-9);
+                assert!((arc.radius - 2.0).abs() < 1.0e-9);
+            }
+            BrepCurve::Line | BrepCurve::Polyline(_) => {
+                panic!("the top edge should be a circle")
+            }
+        }
+        match &edges[3].curve {
+            BrepCurve::Arc(arc) => {
+                assert!(distance(arc.center, [0.0, 0.0, 0.0]) < 1.0e-9);
+                assert!((arc.radius - 2.5).abs() < 1.0e-9);
+            }
+            BrepCurve::Line | BrepCurve::Polyline(_) => {
+                panic!("the equator edge should be a circle")
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_a_revolved_edge_that_turns_and_climbs_at_once() {
+        // The same cone, but the first edge runs diagonally in (u, v): it is
+        // neither the profile nor a circle, and nothing in the surface names
+        // what curve it is. Reading it off its endpoints would invent one.
+        let half = std::f64::consts::FRAC_PI_2;
+        let mut objects = quarter_cone();
+        let diagonal = objects
+            .iter_mut()
+            .find(|object| object.object_id == 200)
+            .expect("the v = 0 edge");
+        diagonal.numbers[4] = half; // u at the last point
+        diagonal.numbers[5] = 1.0; // v at the last point
+
+        let brep = assemble(&objects, &classes());
+        assert!(brep.faces.is_empty(), "{:?}", brep.faces);
+        assert_eq!(
+            brep.excluded_faces[0].reason,
+            "revolved edge parametrization is neither a constant-u profile nor a constant-v circle"
+        );
+    }
+
+    #[test]
+    fn leaves_a_revolved_face_whose_profile_it_cannot_read_unresolved() {
+        // A `GEllipse` profile - anything but `GLine` or `GArc` - is left
+        // alone rather than approximated, and the face falls out with the
+        // reason a face with no surface at all gets.
+        let mut objects = quarter_cone();
+        objects.retain(|object| object.class_index != G_LINE);
+        let brep = assemble(&objects, &classes());
+        assert!(brep.faces.is_empty());
+        assert_eq!(
+            brep.excluded_faces[0].reason,
+            "face has no supported surface"
+        );
+    }
+
+    /// `u` runs along both profiles, normalised onto each one's own
+    /// `m_endParams`, and `v` runs across the rulings with the first profile
+    /// at `v = 0` and the second at `v = 1`. A constant-`v` edge at either end
+    /// is that profile; a constant-`u` edge is a straight ruling.
+    #[test]
+    fn a_ruled_surface_interpolates_between_its_two_profiles() {
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let inner = g_arc_over(301, [0.0, 0.0, 0.0], 1.0, 0.0, quarter);
+        let outer = g_arc_over(302, [0.0, 0.0, 1.0], 2.0, 0.0, quarter);
+        let surface = ruled_object(
+            reference(301, G_ARC),
+            reference(302, G_ARC),
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        );
+        let mut objects = ruled_face(
+            surface,
+            &[
+                ((0.0, 0.0), (1.0, 0.0)), // the first profile
+                ((1.0, 0.0), (1.0, 1.0)), // a ruling
+                ((1.0, 1.0), (0.0, 1.0)), // the second profile, reversed
+                ((0.0, 1.0), (0.0, 0.0)), // the other ruling
+            ],
+        );
+        objects.push(inner);
+        objects.push(outer);
+
+        let brep = assemble(&objects, &classes());
+        assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
+        let face = brep.faces.first().expect("the ruled face resolved");
+        let BrepSurface::Ruled { first, second } = face.surface else {
+            panic!("expected a ruled surface")
+        };
+        assert_eq!(
+            first,
+            BrepRuling::Curve {
+                profile: BrepProfile::Arc {
+                    center: [0.0, 0.0, 0.0],
+                    x_axis: [1.0, 0.0, 0.0],
+                    y_axis: [0.0, 1.0, 0.0],
+                    radius: 1.0,
+                },
+                start: 0.0,
+                end: quarter,
+            }
+        );
+        assert!(matches!(second, BrepRuling::Curve { .. }));
+
+        let edges = &face.loops[0];
+        assert_eq!(edges.len(), 4);
+        // The profile edges keep their own radii, which is what says `u` was
+        // normalised onto each curve's interval rather than taken raw.
+        match &edges[0].curve {
+            BrepCurve::Arc(arc) => {
+                assert!((arc.radius - 1.0).abs() < 1.0e-9);
+                assert!((arc.start_angle - 0.0).abs() < 1.0e-9);
+                assert!((arc.end_angle - quarter).abs() < 1.0e-9);
+            }
+            other => panic!("the v = 0 edge should be the first profile, got {other:?}"),
+        }
+        match &edges[2].curve {
+            BrepCurve::Arc(arc) => {
+                assert!((arc.radius - 2.0).abs() < 1.0e-9);
+                assert!((arc.start_angle - quarter).abs() < 1.0e-9);
+                assert!((arc.end_angle - 0.0).abs() < 1.0e-9);
+            }
+            other => panic!("the v = 1 edge should be the second profile, got {other:?}"),
+        }
+        assert_eq!(edges[1].curve, BrepCurve::Line);
+        assert_eq!(edges[3].curve, BrepCurve::Line);
+        assert!(distance(edges[0].start, [1.0, 0.0, 0.0]) < 1.0e-9);
+        assert!(distance(edges[1].end, [0.0, 2.0, 1.0]) < 1.0e-9);
+    }
+
+    /// A null profile reference states that the profile has collapsed to the
+    /// matching point, which is the only shape the corpus ever shows for a
+    /// null reference. The surface is then a cone over the live profile.
+    #[test]
+    fn a_null_profile_reference_collapses_to_its_point() {
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let apex = [0.0, 0.0, 2.0];
+        let rim = g_arc_over(301, [0.0, 0.0, 0.0], 1.0, 0.0, quarter);
+        let surface = ruled_object(
+            reference(0, 0),
+            reference(301, G_ARC),
+            apex,
+            [0.0, 0.0, 0.0],
+        );
+        let mut objects = ruled_face(
+            surface,
+            &[
+                ((0.0, 1.0), (1.0, 1.0)), // the live profile
+                ((1.0, 1.0), (1.0, 0.0)), // a ruling into the apex
+                ((0.0, 0.0), (0.0, 1.0)), // and back out of it
+            ],
+        );
+        objects.push(rim);
+
+        let brep = assemble(&objects, &classes());
+        assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
+        let face = brep.faces.first().expect("the ruled face resolved");
+        let BrepSurface::Ruled { first, second } = face.surface else {
+            panic!("expected a ruled surface")
+        };
+        assert_eq!(first, BrepRuling::Point(apex));
+        assert!(matches!(second, BrepRuling::Curve { .. }));
+
+        let edges = &face.loops[0];
+        assert_eq!(edges.len(), 3);
+        match &edges[0].curve {
+            BrepCurve::Arc(arc) => assert!((arc.radius - 1.0).abs() < 1.0e-9),
+            other => panic!("the v = 1 edge should be the live profile, got {other:?}"),
+        }
+        assert_eq!(edges[1].curve, BrepCurve::Line);
+        assert!(distance(edges[1].end, apex) < 1.0e-9);
+    }
+
+    /// A profile class this does not read - `GEllipse`, `GHermiteSpline`,
+    /// `GNurbSpline` - leaves the face unresolved instead of approximated.
+    #[test]
+    fn an_unread_profile_class_leaves_the_ruled_face_unresolved() {
+        const G_HERMITE_SPLINE: u16 = 2086;
+        let surface = ruled_object(
+            reference(301, G_HERMITE_SPLINE),
+            reference(302, G_HERMITE_SPLINE),
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        );
+        let objects = ruled_face(
+            surface,
+            &[
+                ((0.0, 0.0), (1.0, 0.0)),
+                ((1.0, 0.0), (1.0, 1.0)),
+                ((1.0, 1.0), (0.0, 1.0)),
+                ((0.0, 1.0), (0.0, 0.0)),
+            ],
+        );
+
+        let brep = assemble(&objects, &classes());
+        assert!(brep.faces.is_empty());
+        assert_eq!(
+            brep.excluded_faces
+                .iter()
+                .map(|exclusion| exclusion.reason)
+                .collect::<Vec<_>>(),
+            vec!["face has no supported surface"]
+        );
     }
 }

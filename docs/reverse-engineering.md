@@ -1694,3 +1694,360 @@ has an independent check that no wrong grouping passes and an ordering control
 that did not move. The outer-ring choice has neither: nothing in the file
 states it, the export validates and geometrizes either way, and a hole wide
 enough to out-span its own bound would be picked wrongly and quietly.
+
+### Result: `SurfRev` is a profile curve and an axis, and it names a cone, a torus or a sphere
+
+`face has no supported surface` was the largest exclusion left that is a
+*surface* problem rather than a boundary one, and it is one class: `SurfRev`,
+index 3986, parent `Surface`, version 1, five declared properties. Everything
+else the corpus puts on a face is already read - `Plane` and `CylSurf`.
+
+*What the record holds.* The five properties are the frame - `center`, `x`,
+`y`, `z` - and one reference, and the numbers sit exactly where `Plane` and
+`CylSurf` put theirs: `Surface.m_Envelope`'s four, then twelve for the frame.
+The reference names the profile curve, and every `SurfRev` in the corpus names
+one object. On SMALL, **1 800 of 1 844** name a `GLine` (1798) or a `GArc`
+(2040), whose own numbers open with `GCurve`'s two end parameters and then
+carry, for a line, an origin and a direction, and for an arc, a frame, a
+radius and last the centre - `GArc`'s order, not `GLine`'s. The other 44 name
+a `GEllipse` or a `GHermiteSpline` and are left unread rather than
+approximated.
+
+*What those profiles are.* Turned about the frame's `z`, a line coplanar with
+the axis sweeps a cone, an arc whose plane holds the axis sweeps a torus, and
+one whose centre is on the axis sweeps a sphere. On SMALL that is every one of
+the 1 800: **1 040 lines**, all slanted and all coplanar with the axis;
+**728 arcs** off the axis and **32** on it, all in a plane that holds it. No
+profile is a curve of some fourth kind, and every frame is orthonormal - so
+the surface is always one of three elementary shapes and never needs a general
+`IfcSurfaceOfRevolution` the kernel would have to sweep itself.
+
+*The edge rule, and why it is the same rule the cylinders get.* Only two
+families lie on a surface of revolution and are named by one parameter being
+constant: an edge at one `u` is the profile itself, turned to where the edge
+sits, and an edge at one `v` is the circle that point traces about the axis.
+`classify_revolution_edge` reads those two and refuses everything else, and
+`resolve_edge` now holds *any* pair of curved faces to the oracle the two
+cylinders were already held to - a curve lying on both faces is named by both,
+so the two readings must agree or the edge is refused. Reading an edge off its
+endpoints would invent a curve the file does not state.
+
+*A frame's handedness is not its `z`.* **248 of SMALL's 1 844** frames are
+left-handed. The circle an edge traces is written with `z = cross(x, y)` of
+the turned frame rather than the frame's declared `z`, because taking the
+declared one there traces the arc the wrong way round - and the reconstruction
+check against the evaluated endpoints is what catches it.
+
+| | SMALL (ВК) | MEDIUM (ЭОМ) | BIG (КЖ) |
+|---|---|---|---|
+| records with every face resolved | 12 337 -> **12 569** | 7 274 -> **7 404** | 9 035 -> **9 496** |
+| faces resolved | 86 830 -> **88 324** | 44 792 -> **45 134** | 99 037 -> **104 233** |
+| faces excluded | 29 942 -> **28 448** | 3 772 -> **3 430** | 15 390 -> **10 194** |
+| `face has no supported surface` | 2 396 -> **596** | 744 -> **306** | 7 644 -> **1 459** |
+
+| | AR S1 | KJ S1 | ВК S1 | ОВ S1 |
+|---|---|---|---|---|
+| records with every face resolved | 38 807 -> **38 881** | 8 072 -> **8 148** | 8 159 -> **8 394** | 32 502 -> **34 501** |
+| faces resolved | 388 068 -> **388 576** | 89 972 -> **90 664** | 55 974 -> **57 472** | 275 484 -> **284 623** |
+| faces excluded | 69 348 -> **68 840** | 2 649 -> **1 957** | 4 832 -> **3 334** | 20 173 -> **11 034** |
+
+*The surface bought fewer whole bodies than it bought faces, and the gap is
+the point.* The faces that gained a surface are exactly the ones the reason
+lost - 1 800 / 438 / 6 185 - but only 232 / 130 / 461 more records came out
+whole. The difference is edges: a face that could not be read at all was one
+exclusion, and a face that can be read is now held to the edge oracle, which
+refuses **173 / 96 / 753** faces whose edges run diagonally in `(u, v)`, and
+**114 / 0 / 194** where two curved faces disagree. Those are not regressions -
+no reason that existed before this change went up - they are the same backlog
+stated more precisely, and the diagonal one is now the largest single thing
+between a revolved face and its boundary.
+
+*In the export, and what IFC4 does not have.* The revolved surface is written
+as what it sweeps. Three of the four shapes are elementary surfaces IFC4
+declares - `IfcToroidalSurface` for an arc off the axis, `IfcSphericalSurface`
+for one on it, and for the two degenerate lines `IfcCylindricalSurface` (the
+line parallel to the axis) and `IfcPlane` (the line square to it). The fourth
+has no entity at all: **`IfcConicalSurface` is ISO 10303-42's, not IFC's**, and
+`ifcopenshell.validate` rejects it outright - as it rejects a torus whose minor
+radius reaches its major one, which `IfcToroidalSurface.MajorLargerMinor`
+forbids and which 44 of SMALL's elbows are, their holes closed to a point.
+
+Both are written the way the record already states them, as an
+`IfcSurfaceOfRevolution` of the profile curve. Two things had to be measured
+rather than assumed, and `ifcopenshell` measured both:
+
+- **the axis is stated in the element's own coordinates**, not in the swept
+  curve's `Position` - the other reading builds a different surface, with the
+  face's own points 2 m off the cone they should lie on, against 2.2e-16 for
+  this one;
+- a **bounded** curve is swept, and the bound comes from the face's own
+  boundary projected onto the axis, widened 5% and stopped at the apex rather
+  than past it. A profile carried past the axis doubles the cone back on
+  itself; one that reaches the apex exactly still builds.
+
+*Where the profile begins on the axis.* A cone may be declared from its own
+apex, and then the profile point names no direction out of the axis and the
+line's own direction has to. Missing that cost 8 of BIG's products their
+geometry outright - a body that now resolves completely is no longer eligible
+for its box, so a face the exporter cannot write takes the whole product with
+it, which is the shape of every mistake in this layer.
+
+| | SMALL (ВК) | MEDIUM (ЭОМ) | BIG (КЖ) |
+|---|---|---|---|
+| `IfcAdvancedBrep` | 695 -> **1 778** | 1 721 -> **1 872** | 174 -> **334** |
+| `IfcSurfaceOfRevolution` | **58** | **8** | **224** |
+| of those, closed tori | 44 | 8 | 8 |
+| `IfcToroidalSurface` | **4 072** | **318** | **296** |
+| products `create_shape` builds | 2 774 | 1 989 | 392 |
+| products it fails | 0 | 0 | 0 |
+| `validate --rules` issues | 0 | 0 | 0 |
+
+No `IfcSphericalSurface` is written on any of the three: SMALL's 32 spheres are
+all on faces some other exclusion still holds, so that arm of the mapping is
+carried by its unit test alone.
+
+Confidence: high for the reading, high for the mapping. The frame and the
+profile are read from declared properties at fixed offsets in records whose
+declarations tile their bodies exactly; the profile census leaves no residue -
+every readable profile is one of three shapes; the edge oracle is the same
+independent check the cylinders pass, and each arc is verified against
+endpoints evaluated from the surface itself. The IFC side is checked by the
+reference kernel on all three files, building every represented product with
+no failures and no rule violations, and the one convention the schema does not
+settle - which coordinate system the axis of revolution is stated in - was
+decided by measurement, not by reading. A `GEllipse` or `GHermiteSpline`
+profile is still unread, and it is refused rather than approximated.
+
+### Result: `GEdge.m_interiorEdgePnts` is the sampled path of a non-analytic edge
+
+`GEdge` writes an array of `EdgePnt` before `m_firstAndLastEdgePnts`. Each
+item is four `f64`s, `(u0, v0, u1, v1)`: the same point parameterised on each
+of the edge's two adjacent faces. The serial walk already decoded those
+numbers but the B-Rep reader took only the last eight, so an edge that was not
+a constant-`v` circle or constant-`u` line lost precisely the data that stated
+its path.
+
+The reader now keeps exact analytic lines and circles unchanged. Only when
+that classification fails does it evaluate every interior UV pair on the
+readable adjacent surfaces. If both faces are readable their 3D answers must
+agree under the same cross-face gate as the endpoints; if neither is readable
+the old failure remains. The two endpoints and the interior points become a
+`BrepCurve::Polyline`, are transformed and converted to metres with the rest
+of the body, and are emitted as `IfcPolyline`. Reversing an edge reverses the
+whole sample sequence, not just its topological endpoints.
+
+| | SMALL (ВК) | MEDIUM (ЭОМ) | BIG (КЖ) |
+|---|---:|---:|---:|
+| records with every face resolved | 12 569 -> **12 797** | 7 404 -> **7 475** | 9 496 -> **9 567** |
+| faces resolved | 88 324 -> **111 046** | 45 134 -> **45 406** | 104 233 -> **107 519** |
+| failed edges | 19 278 -> **450** | 3 516 -> **3 214** | 7 860 -> **4 402** |
+| resolved polyline edge incidences | **37 496** | **600** | **6 286** |
+
+Every cylinder/revolution classification failure disappears on SMALL and
+MEDIUM. BIG retains 10 such edge failures where the sampled fallback itself
+cannot establish the curve; the dominant residue on all three is unchanged:
+an `EdgePnt` disagreement or neither face having a readable surface. The few
+newly visible face-level closure reasons were behind the formerly failing
+edge, so they are a more precise downstream backlog rather than a regression.
+
+In IFC, the new path changes represented bodies without changing the number
+of represented products. `IfcAdvancedBrep` rises from 1 778 to **2 399** on
+SMALL, stays **1 872** on MEDIUM, and rises from 334 to **336** on BIG; the
+files contain 7 140 / 0 / 376 `IfcPolyline` entities. All three report no
+issues under `ifcopenshell.validate --rules`, and `create_shape` builds every
+represented product: **2 774 / 1 989 / 392**, with zero failures.
+
+Confidence: high for the array layout and evaluation, medium for the piecewise
+linear representation. The layout is declaration-backed and every accepted
+two-sided sample passes an independent 3D agreement check over exactly tiled
+records. `IfcPolyline` preserves every point the source supplies and passes
+both IFC controls, but it is still a sampled approximation between those
+points; recovering the source curve's interpolation law would require a
+separate, measured curve-class reading.
+
+### Result: `ConeSurf.v` is distance along the generator from its apex
+
+`ConeSurf` (class 815) inherits the four-number `Surface.m_Envelope` and
+declares five properties: `center`, the three frame axes, and `halfAngle`.
+The 17 numeric values therefore have exactly the same prefix and frame layout
+as `CylSurf`, followed by the angle. All 302 / 30 / 180 instances on
+SMALL / MEDIUM / BIG are paired to their faces by encounter order, like the
+other sentinel-identified curved surfaces.
+
+The centre is the cone's apex, and its parameter `v` is length along the
+generator. In the cone's own frame the revolved profile is therefore
+`v * [sin(halfAngle), 0, cos(halfAngle)]`. The competing interpretation,
+`v` as axial height with direction `[tan(halfAngle), 0, 1]`, was tested on
+SMALL and rejected: it introduced 696 additional cross-face disagreements,
+with a 1.33 mm median and 328 mm maximum, and reduced the resolved-face count.
+The unit-generator interpretation restores the disagreement histogram exactly
+to its pre-`ConeSurf` values while resolving every one of SMALL's 302 cone
+faces. This is the independent plane/cylinder side of each shared edge
+checking the cone formula rather than a plausible frame merely being accepted.
+
+Internally `ConeSurf` becomes the same `BrepSurface::Revolution` with a line
+profile that `SurfRev` already uses. That reuses the measured constant-`u`
+generator and constant-`v` circle classification, including endpoint checks,
+and the existing IFC mapping for a cone declared from its own apex.
+
+| | SMALL (ВК) | MEDIUM (ЭОМ) | BIG (КЖ) |
+|---|---:|---:|---:|
+| records with every face resolved | 12 797 -> **12 898** | 7 475 -> **7 484** | 9 567 -> **9 637** |
+| faces resolved | 111 046 -> **111 348** | 45 406 -> **45 436** | 107 519 -> **107 693** |
+| `face has no supported surface` | 596 -> **294** | 306 -> **276** | 1 459 -> **1 279** |
+| failed edges | 450 -> **148** | 3 214 -> **3 202** | 4 402 -> **4 224** |
+
+BIG resolves 174 of its 180 cone faces; the remaining six now reach an
+existing `EdgePnt` disagreement, four edges in total, instead of stopping one
+layer earlier as an unsupported surface. No pre-existing failure category
+rises on SMALL or MEDIUM.
+
+In IFC, `IfcAdvancedBrep` rises 2 399 -> **2 626**, 1 872 -> **1 873** and
+336 -> **342**; `IfcSurfaceOfRevolution` rises 316 -> **1 076**, 8 -> **10**
+and 248 -> **260**. All three exports have zero rule violations, and
+`create_shape` builds every represented product, **2 774 / 1 989 / 392**, with
+zero failures.
+
+Confidence: high. The field layout is declaration-backed, the rejected axial
+candidate gives a strong negative control, the accepted parameterisation is
+checked by shared-edge agreement across all exactly tiled records, and the IFC
+result passes both schema rules and real kernel construction on all three
+models.
+
+### Result: `RuledSurf` interpolates two profiles, `u` normalised onto each one's own parameter range
+
+`RuledSurf` (class 3587) inherits `Surface`'s four-number `m_Envelope` and
+declares four properties: `m_pProfileCurve1`, `m_pProfileCurve2`, and two
+three-number points `m_Point1` and `m_Point2`. That is ten `Float64`s and two
+object references, and every one of the corpus's 246 / 276 / 878 objects
+carries exactly that - no residue, on any of the three files. Unlike every
+other surface read so far it declares no frame at all, so both profiles are
+already in the body's own coordinates.
+
+`rivet ruled-surf-probe` is the census. It reports, per file, the class pair
+the two references name, whether the named object is written in the same
+record, what each point holds, the envelope, and what the adjacent edges'
+`EdgePnt`s do on the surface's two axes.
+
+*Pairing.* Every record's `RuledSurf` identifiers collapse to the same
+`0xFFFFFFFF` sentinel `CylSurf` and `SurfRev` use, so faces are paired to
+objects by encounter order. The precondition that needs is measured rather
+than assumed: in all 88 / 59 / 294 records holding one, the count of faces
+naming a `RuledSurf` equals the count of `RuledSurf` objects the record
+writes - 28 records of 1, 28 of 2, 24 of 4 and so on, with no record left over.
+
+*The degenerate side.* A null reference and a non-zero matching point occur
+together and never apart: 8 / 192 / 66 sides are a null reference beside a
+used point, and every live reference sits beside a zero point. Both sides do
+it - side 1 on SMALL and BIG, side 2 on MEDIUM - so a null reference states
+that the profile has collapsed to that point, and the surface is a cone over
+the live profile.
+
+*The profiles.* SMALL names 194 `GArc` pairs, 32 `GHermiteSpline` pairs, 12
+`GLine` pairs and 8 point-to-`GArc`; MEDIUM 192 `GArc`-to-point and 84 `GArc`
+pairs; BIG 396 `GHermiteSpline`, 234 `GArc`, 104 `GEllipse`, 66
+point-to-`GArc`, 42 `GNurbSpline`, 22 `GArc`-to-`GLine`, 8 `GLine` and 6
+`GEllipse`-to-`GArc`. The two sides need not be the same class, and the
+classes this does not read are refused rather than approximated.
+
+*The parameterisation.* Read off SMALL's record 50329, whose `RuledSurf`
+states the envelope `[0, 0, 1, 1]` and names two arcs: radius 0.1875 as
+`m_pProfileCurve1` and radius 0.14583 as `m_pProfileCurve2`, both with
+`m_endParams` `[pi, 2pi]`. Its two edges holding the first axis constant carry
+no interior `EdgePnt`s at all, which is what a straight ruling needs. Its edge
+holding the *second* axis at 1.0 carries five interior points stepping the
+first axis uniformly over [0, 1], and the adjacent plane - read independently,
+in its own coordinates - places all seven on a 180-degree arc of radius
+0.14583. That is the second profile, traced over exactly the `pi` its
+`m_endParams` span. So the second axis selects the profile, the first runs
+along it, and `u` is normalised onto the curve's own interval:
+`S(u, v) = (1 - v) * C1(t1(u)) + v * C2(t2(u))` with
+`tk(u) = tk0 + u * (tk1 - tk0)`.
+
+The envelope is the face's own trim box, `[u_min, v_min, u_max, v_max]`. `u`
+stays inside [0, 1] on every object of all three files, which is what a
+normalised axis looks like. `v` does not: its span is often exactly 1 but
+offset, `[-1, 0]` on 218 of BIG's objects and `[36.364, 37.364]` on 28 of
+them. Only `v` at 0 or 1 is therefore read as a profile; a constant-`v` edge
+between them is the affine blend of the two, which is still a straight line
+when both profiles are straight and otherwise a curve this does not name, and
+it is refused so that the sampled `EdgePnt` path reads it instead.
+
+| | SMALL (ВК) | MEDIUM (ЭОМ) | BIG (КЖ) |
+|---|---:|---:|---:|
+| faces resolved | 111 348 -> **111 562** | 45 436 -> **45 712** | 107 693 -> **108 023** |
+| `face has no supported surface` | 294 -> **80** | 276 -> **0** | 1 279 -> **949** |
+| records with every face resolved | 12 898 -> **12 946** | 7 484 -> **7 533** | 9 637 -> **9 709** |
+| failed edges | 148 -> **72** | 3 202 -> **3 202** | 4 224 -> **4 096** |
+| cross-face `EdgePnt` disagreements | 28 -> **28** | 1 648 -> **1 648** | 1 768 -> **1 768** |
+
+The faces gained are 214 / 276 / 330, which is exactly the number of objects
+the census says are readable - both profiles `GLine`, `GArc` or a point. The
+unsupported-surface residue falls by exactly the same number on each file and
+reaches zero on MEDIUM. No other exclusion reason moves at all on any file,
+no edge-failure category rises, the cross-face disagreement counts are
+unchanged, and loop ordering still refuses nothing it did not refuse before
+(BIG's 20 refusals predate this and are unmoved). The baselines here were
+measured on the same tree with the `RuledSurf` branch of `resolve_face_surfaces`
+disabled, not quoted from an earlier run.
+
+Confidence: high for the layout and the reading, high for the parameterisation.
+The layout is declaration-backed and tiles the object exactly on every
+instance in the corpus; the pairing precondition is checked per record rather
+than assumed; the degenerate case is an exceptionless correlation over 266
+sides; and the parameterisation was read off an independent surface's own
+coordinates - the plane's arc radius picks out which of the two profiles the
+axis selects, and its uniform steps fix the normalisation - then confirmed at
+corpus scale by a face gain that matches the census exactly with no
+disagreement anywhere. What is *not* read: the `GEllipse`, `GHermiteSpline`
+and `GNurbSpline` profiles, which are 32 / 0 / 548 objects, and any
+constant-`v` edge strictly between the two profiles.
+
+### Result: a face IFC cannot write leaves the shell open instead of deleting the body
+
+IFC4 has no ruled-surface entity, so `push_brep_surface` refuses a
+`BimBrepSurface::Ruled`. `push_brep` used to propagate that refusal with `?`,
+which discarded the *whole* body for one unwritable face. Reading `RuledSurf`
+therefore had a cost that the B-Rep numbers do not show: a body whose ruled
+face used to be dropped in `rvt-model` reached the exporter incomplete and
+still exported; once the face resolves, the body reaches the exporter with a
+face IFC will not write, and the old `?` deleted it.
+
+Measured on SMALL and MEDIUM as three exports of the same tree - the reading
+off, the reading on with `push_brep` untouched, and both changes - counting
+`IfcShapeRepresentation` by representation type:
+
+| SMALL | reading off | reading on, `?` kept | both |
+|---|---:|---:|---:|
+| `AdvancedBrep` | 2 626 | 2 626 | 2 626 |
+| `AdvancedSweptSolid` | 77 | 77 | 77 |
+| `SurfaceModel` | 0 | 0 | **26** |
+| `BoundingBox` | 40 | 14 | 14 |
+| total | 2 743 | **2 717** | 2 743 |
+
+| MEDIUM | reading off | reading on, `?` kept | both |
+|---|---:|---:|---:|
+| `AdvancedBrep` | 1 873 | 1 873 | 1 873 |
+| `SurfaceModel` | 0 | 0 | **99** |
+| `BoundingBox` | 116 | 17 | 17 |
+| total | 1 989 | **1 890** | 1 989 |
+
+The middle column is the regression: 26 and 99 products lose their
+representation outright, because a resolved body takes precedence over the
+bounding-box fallback and then the whole body is thrown away. With both
+changes those same products carry a real `IfcShellBasedSurfaceModel` over the
+faces that did write - strictly more than the box they had before - and the
+totals return to where they started. BIG is unmoved either way: 342
+`AdvancedBrep` and 50 `BoundingBox` in all variants.
+
+`brep.complete` now has to account for a face lost at export as well as one
+lost at reading, so the closed-shell claim is `brep.complete && wrote_every_face`.
+That keeps the invariant the entity choice depends on: an `IfcClosedShell` is
+only written when every face the source declares is present in it.
+
+All three exports report "No validation issues found" under
+`ifcopenshell.validate --rules`, and `scripts/check_shapes.py` builds every
+represented product.
+
+Confidence: high. The attribution is a three-way controlled comparison on the
+same tree, the counts balance exactly, and both IFC controls pass.

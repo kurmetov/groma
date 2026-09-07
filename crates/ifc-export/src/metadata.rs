@@ -5,12 +5,30 @@ use std::{
 };
 
 use bim_core::{
-    BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepSurface, BimElement,
-    BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimModel,
-    BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
+    BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
+    BimBrepSurface, BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel,
+    BimLineSegment, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
 };
 
 use crate::{EntityRef, IfcGuid, StepFile, StepHeader, StepValue, mapping::resolved_element_type};
+
+/// How near the axis of revolution a profile's point must be to call it *on*
+/// the axis, in metres - the difference between a sphere and a torus, and
+/// between a cylinder and a cone. Well below any modelled dimension and well
+/// above the noise in a decoded double.
+const REVOLVED_AXIS_TOLERANCE_METRES: f64 = 1.0e-9;
+
+/// How far past its face's own reach a cone's profile is swept, as a fraction
+/// of that reach, so the boundary trims the surface's interior rather than
+/// landing exactly on its edge.
+const CONE_MARGIN_FRACTION: f64 = 0.05;
+
+/// How much smaller than the major radius a minor radius has to be before the
+/// surface is written as an `IfcToroidalSurface`. The schema's own rule is a
+/// strict inequality; this keeps a torus that satisfies it by one part in
+/// 10^15 - a horn torus whose radii came back from two decoded doubles - out
+/// of a form that cannot hold it.
+const TORUS_RADIUS_MARGIN: f64 = 1.0e-6;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataOptions {
@@ -790,16 +808,22 @@ fn push_brep(
         return None;
     }
     let mut faces = Vec::with_capacity(brep.faces.len());
+    // A face this cannot write leaves the shell open instead of discarding
+    // the whole body, which is what the incomplete-shell path is for. The
+    // closed-solid claim then has to account for it: a shell missing a face
+    // the source does declare is not closed, however the face was lost.
+    let mut wrote_every_face = true;
     for face in &brep.faces {
-        faces.push(push_advanced_face(
-            file,
-            face,
-            placement_elevation,
-            metric_placement,
-        )?);
+        match push_advanced_face(file, face, placement_elevation, metric_placement) {
+            Some(written) => faces.push(written),
+            None => wrote_every_face = false,
+        }
+    }
+    if faces.is_empty() {
+        return None;
     }
     let face_list = StepValue::List(faces.into_iter().map(reference).collect());
-    let (item, representation_type) = if brep.complete {
+    let (item, representation_type) = if brep.complete && wrote_every_face {
         let shell = file.push("IFCCLOSEDSHELL", vec![face_list]);
         (
             file.push("IFCADVANCEDBREP", vec![reference(shell)]),
@@ -844,7 +868,7 @@ fn push_advanced_face(
     placement_elevation: f64,
     metric_placement: Option<MetricPlacement>,
 ) -> Option<EntityRef> {
-    let surface = push_brep_surface(file, &face.surface, placement_elevation, metric_placement)?;
+    let surface = push_brep_surface(file, face, placement_elevation, metric_placement)?;
     if face.loops.is_empty() {
         return None;
     }
@@ -868,13 +892,16 @@ fn push_advanced_face(
     ))
 }
 
+/// One face's surface. The face rather than the surface alone, because a cone
+/// is written as a *bounded* curve revolved about an axis and the face's own
+/// boundary is what bounds it.
 fn push_brep_surface(
     file: &mut StepFile,
-    surface: &BimBrepSurface,
+    face: &BimBrepFace,
     placement_elevation: f64,
     metric_placement: Option<MetricPlacement>,
 ) -> Option<EntityRef> {
-    match surface {
+    match &face.surface {
         BimBrepSurface::Plane {
             origin,
             x_axis,
@@ -917,7 +944,379 @@ fn push_brep_surface(
                 vec![reference(axis), StepValue::Real(radius.value)],
             ))
         }
+        surface @ BimBrepSurface::Revolution { .. } => push_revolved_surface(
+            file,
+            surface,
+            &face.loops,
+            placement_elevation,
+            metric_placement,
+        ),
+        // IFC4 has no ruled-surface entity. Some ruled surfaces coincide with
+        // one it does have - a profile translated along a direction is an
+        // `IfcSurfaceOfLinearExtrusion`, and a circle ruled to a point is a
+        // cone - but each of those is a condition to be tested on the numbers,
+        // not assumed, so the surface is refused until it is. Refusing leaves
+        // the face out of the shell rather than approximating it.
+        BimBrepSurface::Ruled { .. } => None,
     }
+}
+
+/// The frame a `SurfRev` turns its profile in: an origin and three axes, in
+/// world coordinates, and the profile's own numbers read against them.
+struct RevolvedFrame<'a> {
+    center: &'a BimPoint3,
+    x_axis: [f64; 3],
+    y_axis: [f64; 3],
+    z_axis: [f64; 3],
+}
+
+impl RevolvedFrame<'_> {
+    fn point(&self, local: [f64; 3]) -> BimPoint3 {
+        BimPoint3 {
+            coordinates: [0, 1, 2].map(|axis| {
+                self.center.coordinates[axis]
+                    + local[0] * self.x_axis[axis]
+                    + local[1] * self.y_axis[axis]
+                    + local[2] * self.z_axis[axis]
+            }),
+            unit: self.center.unit.clone(),
+        }
+    }
+
+    fn direction(&self, local: [f64; 3]) -> [f64; 3] {
+        [0, 1, 2].map(|axis| {
+            local[0] * self.x_axis[axis]
+                + local[1] * self.y_axis[axis]
+                + local[2] * self.z_axis[axis]
+        })
+    }
+}
+
+/// A revolved profile is named by what it sweeps out rather than written as an
+/// `IfcSurfaceOfRevolution`: the profile is a line coplanar with the axis or an
+/// arc in a plane holding it, so the surface is a cone, a torus or a sphere,
+/// and IFC has all three as elementary surfaces the kernel knows how to build.
+fn push_revolved_surface(
+    file: &mut StepFile,
+    surface: &BimBrepSurface,
+    loops: &[Vec<BimBrepEdge>],
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    let BimBrepSurface::Revolution {
+        center,
+        x_axis,
+        y_axis,
+        z_axis,
+        profile,
+    } = surface
+    else {
+        return None;
+    };
+    let frame = RevolvedFrame {
+        center,
+        x_axis: *x_axis,
+        y_axis: *y_axis,
+        z_axis: *z_axis,
+    };
+    match profile {
+        BimBrepProfile::Line { origin, direction } => push_revolved_line_surface(
+            file,
+            &frame,
+            (origin.coordinates, *direction),
+            loops,
+            placement_elevation,
+            metric_placement,
+        ),
+        BimBrepProfile::Arc { center, radius, .. } => push_revolved_arc_surface(
+            file,
+            &frame,
+            (center.coordinates, radius),
+            placement_elevation,
+            metric_placement,
+        ),
+    }
+}
+
+/// A line turned about the frame's axis: a cone, or - where it does not slant -
+/// the cylinder or the flat annulus that slant would degenerate into.
+fn push_revolved_line_surface(
+    file: &mut StepFile,
+    frame: &RevolvedFrame,
+    (point, direction): ([f64; 3], [f64; 3]),
+    loops: &[Vec<BimBrepEdge>],
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    // Which way out of the axis the profile's own plane lies. The point names
+    // it, unless the point is *on* the axis - a cone declared from its own
+    // apex - and then the direction does. A line with neither is the axis
+    // itself, which sweeps no surface.
+    let (radial_local, radius) = {
+        let from_point = point[0].hypot(point[1]);
+        let from_direction = direction[0].hypot(direction[1]);
+        if from_point > REVOLVED_AXIS_TOLERANCE_METRES {
+            (
+                [point[0] / from_point, point[1] / from_point, 0.0],
+                from_point,
+            )
+        } else if from_direction > REVOLVED_AXIS_TOLERANCE_METRES {
+            (
+                [
+                    direction[0] / from_direction,
+                    direction[1] / from_direction,
+                    0.0,
+                ],
+                0.0,
+            )
+        } else {
+            return None;
+        }
+    };
+    if !radius.is_finite() {
+        return None;
+    }
+    let radial = frame.direction(radial_local);
+    // How fast the radius grows as the profile climbs.
+    let outward = direction[0] * radial_local[0] + direction[1] * radial_local[1];
+    let rise = direction[2];
+    let position = frame.point([0.0, 0.0, point[2]]);
+    if rise.abs() <= REVOLVED_AXIS_TOLERANCE_METRES {
+        // The line is perpendicular to the axis: an annulus, which is flat.
+        let axis = push_local_axis(
+            file,
+            &position,
+            frame.z_axis,
+            radial,
+            placement_elevation,
+            metric_placement,
+        )?;
+        return Some(file.push("IFCPLANE", vec![reference(axis)]));
+    }
+    if outward.abs() <= REVOLVED_AXIS_TOLERANCE_METRES {
+        // Parallel to the axis: a cylinder of that radius.
+        let axis = push_local_axis(
+            file,
+            &position,
+            frame.z_axis,
+            radial,
+            placement_elevation,
+            metric_placement,
+        )?;
+        return Some(file.push(
+            "IFCCYLINDRICALSURFACE",
+            vec![reference(axis), StepValue::Real(radius)],
+        ));
+    }
+    // IFC4 has no conical surface - `IfcConicalSurface` is ISO 10303-42's, and
+    // `ifcopenshell.validate` refuses it - so the cone is written as what the
+    // record already says it is: the profile line, revolved about the frame's
+    // axis. `IfcSurfaceOfRevolution` sweeps a *bounded* curve, and the bound
+    // is the face's own boundary measured along that axis: every point of it
+    // lies on the surface, so the span they cover is the span the face needs.
+    let slope = outward / rise;
+    let (low, high) = axial_span(frame, loops)?;
+    // Off the ends, so the boundary is trimmed out of the surface's interior
+    // rather than off its edge.
+    let margin = ((high - low) * CONE_MARGIN_FRACTION).max(REVOLVED_AXIS_TOLERANCE_METRES);
+    let mut ends = [low - margin, high + margin];
+    // The margin must not carry the profile past the axis, where the sweep
+    // would double back into a second cone. The apex itself is allowed - a
+    // face that runs to its own point needs the surface to reach it, and
+    // `ifcopenshell` builds that.
+    let apex = point[2] - radius / slope;
+    if slope > 0.0 {
+        ends[0] = ends[0].max(apex);
+    } else {
+        ends[1] = ends[1].min(apex);
+    }
+    if ends[0] >= ends[1] || !ends[0].is_finite() || !ends[1].is_finite() {
+        return None;
+    }
+    let profile_radius = |height: f64| radius + (height - point[2]) * slope;
+    let curve = {
+        let points =
+            ends.map(|height| push_cartesian_point_2d(file, [profile_radius(height), height]));
+        file.push(
+            "IFCPOLYLINE",
+            vec![StepValue::List(points.into_iter().map(reference).collect())],
+        )
+    };
+    let profile = file.push(
+        "IFCARBITRARYOPENPROFILEDEF",
+        vec![enumeration("CURVE"), omitted(), reference(curve)],
+    );
+    // The profile's own plane: `x` along the radius, and therefore `y` along
+    // the axis, which is where a surface of revolution requires its axis to
+    // lie. Both the placement and the axis are in the element's coordinates,
+    // not the profile's - measured against `ifcopenshell`, which builds the
+    // cone the profile describes for the one reading and a different surface
+    // for the other.
+    let position = push_local_axis(
+        file,
+        frame.center,
+        cross(radial, frame.z_axis),
+        radial,
+        placement_elevation,
+        metric_placement,
+    )?;
+    let axis = push_axis_placement_1d(
+        file,
+        frame.center,
+        frame.z_axis,
+        placement_elevation,
+        metric_placement,
+    )?;
+    Some(file.push(
+        "IFCSURFACEOFREVOLUTION",
+        vec![reference(profile), reference(position), reference(axis)],
+    ))
+}
+
+/// How far a revolved face's boundary reaches along the frame's axis, measured
+/// from the frame's own origin. `None` when the face has no boundary to
+/// measure or a point of it is not in metres.
+fn axial_span(frame: &RevolvedFrame, loops: &[Vec<BimBrepEdge>]) -> Option<(f64, f64)> {
+    let center = metric_coordinates(frame.center)?;
+    let mut span: Option<(f64, f64)> = None;
+    for edge in loops.iter().flatten() {
+        for point in [&edge.start, &edge.end] {
+            let height = dot(subtract(metric_coordinates(point)?, center), frame.z_axis);
+            if !height.is_finite() {
+                return None;
+            }
+            span = Some(match span {
+                Some((low, high)) => (low.min(height), high.max(height)),
+                None => (height, height),
+            });
+        }
+    }
+    span
+}
+
+/// An arc turned about the frame's axis: a torus, or a sphere where the arc is
+/// centred on the axis itself.
+fn push_revolved_arc_surface(
+    file: &mut StepFile,
+    frame: &RevolvedFrame,
+    (point, radius): ([f64; 3], &BimNumber),
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    if radius.unit.as_ref()?.id != "autodesk.unit.unit:meters-1.0.0"
+        || !radius.value.is_finite()
+        || radius.value <= 0.0
+    {
+        return None;
+    }
+    let major = point[0].hypot(point[1]);
+    if !major.is_finite() {
+        return None;
+    }
+    let position = frame.point([0.0, 0.0, point[2]]);
+    if major <= REVOLVED_AXIS_TOLERANCE_METRES {
+        // The arc is centred on the axis: a sphere.
+        let axis = push_local_axis(
+            file,
+            &position,
+            frame.z_axis,
+            frame.x_axis,
+            placement_elevation,
+            metric_placement,
+        )?;
+        return Some(file.push(
+            "IFCSPHERICALSURFACE",
+            vec![reference(axis), StepValue::Real(radius.value)],
+        ));
+    }
+    let radial = frame.direction([point[0] / major, point[1] / major, 0.0]);
+    if radius.value >= major * (1.0 - TORUS_RADIUS_MARGIN) {
+        // The profile circle reaches the axis or crosses it, and
+        // `IfcToroidalSurface` requires a minor radius strictly under the
+        // major one - so this torus, which is a real shape with no hole left
+        // in it, is written the way the cone is: the profile revolved.
+        return push_revolved_arc_as_revolution(
+            file,
+            frame,
+            (radial, [major, point[2]], radius.value),
+            placement_elevation,
+            metric_placement,
+        );
+    }
+    let axis = push_local_axis(
+        file,
+        &position,
+        frame.z_axis,
+        radial,
+        placement_elevation,
+        metric_placement,
+    )?;
+    Some(file.push(
+        "IFCTOROIDALSURFACE",
+        vec![
+            reference(axis),
+            StepValue::Real(major),
+            StepValue::Real(radius.value),
+        ],
+    ))
+}
+
+/// The profile circle itself, revolved: for a torus whose hole has closed, the
+/// only form IFC4 has. The circle is written whole - a full turn either side
+/// of the axis - because the face's own boundary is what trims it, and where
+/// its two-dimensional reference direction points does not change the set of
+/// points it sweeps.
+fn push_revolved_arc_as_revolution(
+    file: &mut StepFile,
+    frame: &RevolvedFrame,
+    (radial, center, radius): ([f64; 3], [f64; 2], f64),
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    let profile_center = push_cartesian_point_2d(file, center);
+    let profile_direction = push_direction_2d(file, [1.0, 0.0]);
+    let profile_position = file.push(
+        "IFCAXIS2PLACEMENT2D",
+        vec![reference(profile_center), reference(profile_direction)],
+    );
+    let circle = file.push(
+        "IFCCIRCLE",
+        vec![reference(profile_position), StepValue::Real(radius)],
+    );
+    // A full turn, in the radians this file declares its angles in.
+    let trimmed = file.push(
+        "IFCTRIMMEDCURVE",
+        vec![
+            reference(circle),
+            StepValue::List(vec![parameter_value(0.0)]),
+            StepValue::List(vec![parameter_value(std::f64::consts::TAU)]),
+            StepValue::Boolean(true),
+            enumeration("PARAMETER"),
+        ],
+    );
+    let profile = file.push(
+        "IFCARBITRARYOPENPROFILEDEF",
+        vec![enumeration("CURVE"), omitted(), reference(trimmed)],
+    );
+    let position = push_local_axis(
+        file,
+        frame.center,
+        cross(radial, frame.z_axis),
+        radial,
+        placement_elevation,
+        metric_placement,
+    )?;
+    let axis = push_axis_placement_1d(
+        file,
+        frame.center,
+        frame.z_axis,
+        placement_elevation,
+        metric_placement,
+    )?;
+    Some(file.push(
+        "IFCSURFACEOFREVOLUTION",
+        vec![reference(profile), reference(position), reference(axis)],
+    ))
 }
 
 /// `IfcEdgeLoop.IsContinuous` (`IfcLoopHeadToTail`) requires edge `i`'s
@@ -1019,6 +1418,20 @@ fn push_oriented_edge(
                 "IFCCIRCLE",
                 vec![reference(axis), StepValue::Real(arc.radius.value)],
             )
+        }
+        BimBrepCurve::Polyline(points) => {
+            if points.len() < 3 {
+                return None;
+            }
+            let mut point_refs = Vec::with_capacity(points.len());
+            for point in points {
+                let coordinates = local_coordinates(point, placement_elevation, metric_placement)?;
+                if coordinates.into_iter().any(|value| !value.is_finite()) {
+                    return None;
+                }
+                point_refs.push(reference(push_cartesian_point(file, coordinates)));
+            }
+            file.push("IFCPOLYLINE", vec![StepValue::List(point_refs)])
         }
     };
     let edge_curve = file.push(
@@ -1215,11 +1628,58 @@ fn cross(left: [f64; 3], right: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+/// A point of a profile's own two-dimensional plane, which is not the
+/// element's coordinate system and takes none of its placement.
+fn push_cartesian_point_2d(file: &mut StepFile, coordinates: [f64; 2]) -> EntityRef {
+    file.push(
+        "IFCCARTESIANPOINT",
+        vec![StepValue::List(
+            coordinates.into_iter().map(StepValue::Real).collect(),
+        )],
+    )
+}
+
+/// An axis with a position but no reference direction: what a surface of
+/// revolution turns about.
+fn push_axis_placement_1d(
+    file: &mut StepFile,
+    origin: &BimPoint3,
+    axis_world: [f64; 3],
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    let point = local_coordinates(origin, placement_elevation, metric_placement)?;
+    let axis = local_direction(axis_world, metric_placement);
+    if point
+        .into_iter()
+        .chain(axis)
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    let point_ref = push_cartesian_point(file, point);
+    let axis_ref = push_direction(file, axis);
+    Some(file.push(
+        "IFCAXIS1PLACEMENT",
+        vec![reference(point_ref), reference(axis_ref)],
+    ))
+}
+
 fn push_cartesian_point(file: &mut StepFile, coordinates: [f64; 3]) -> EntityRef {
     file.push(
         "IFCCARTESIANPOINT",
         vec![StepValue::List(
             coordinates.into_iter().map(StepValue::Real).collect(),
+        )],
+    )
+}
+
+/// A direction of a profile's own two-dimensional plane.
+fn push_direction_2d(file: &mut StepFile, direction: [f64; 2]) -> EntityRef {
+    file.push(
+        "IFCDIRECTION",
+        vec![StepValue::List(
+            direction.into_iter().map(StepValue::Real).collect(),
         )],
     )
 }
@@ -1477,6 +1937,13 @@ fn optional_string(value: Option<&str>) -> StepValue {
 
 const fn omitted() -> StepValue {
     StepValue::Omitted
+}
+
+fn parameter_value(value: f64) -> StepValue {
+    StepValue::Typed {
+        name: "IFCPARAMETERVALUE".to_owned(),
+        value: Box::new(StepValue::Real(value)),
+    }
 }
 
 fn enumeration(value: &str) -> StepValue {
@@ -2065,6 +2532,30 @@ mod tests {
     }
 
     #[test]
+    fn writes_a_sampled_brep_edge_as_an_ifc_polyline() {
+        let mut brep = quarter_disc_brep(true);
+        brep.faces[0].loops[0][0].curve = BimBrepCurve::Polyline(vec![
+            metres_point([2.0, 0.0, 3.048]),
+            metres_point([1.4, 1.4, 3.048]),
+            metres_point([0.0, 2.0, 3.048]),
+        ]);
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::SanitaryTerminal;
+        model.elements[0].geometry = Some(BimGeometry::Brep(brep));
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("=IFCPOLYLINE("), "{text}");
+        assert!(
+            text.contains("(1.400000000000000e0,1.400000000000000e0,0.000000000000000e0)"),
+            "{text}"
+        );
+        assert!(text.contains("=IFCADVANCEDBREP("), "{text}");
+    }
+
+    #[test]
     fn writes_an_incomplete_brep_as_an_open_shell() {
         let mut model = model();
         model.elements[0].element_type = BimElementType::SanitaryTerminal;
@@ -2096,6 +2587,205 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("=IFCADVANCEDBREP("));
         assert!(!text.contains("=IFCSHELLBASEDSURFACEMODEL("));
+    }
+
+    /// One revolved face's surface, as the STEP text of the entity it became.
+    /// The face's boundary is a straight edge between two heights on the
+    /// profile, which is all a cone needs to bound its sweep and which every
+    /// other surface here ignores. World coordinates throughout: no storey
+    /// elevation, no placement.
+    fn revolved_surface_text(profile: BimBrepProfile, heights: (f64, f64)) -> String {
+        let mut file = StepFile::new(step_header(&options()));
+        let face = BimBrepFace {
+            surface: BimBrepSurface::Revolution {
+                center: metres_point([0.0, 0.0, 0.0]),
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+                profile,
+            },
+            loops: vec![vec![BimBrepEdge {
+                start: metres_point([1.0, 0.0, heights.0]),
+                end: metres_point([1.0, 0.0, heights.1]),
+                curve: BimBrepCurve::Line,
+            }]],
+        };
+        push_brep_surface(&mut file, &face, 0.0, None).expect("the surface was written");
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn writes_a_revolved_line_as_the_cone_it_sweeps() {
+        // The line `[1,0,0] + v * [1,0,1]`: radius 1 where it crosses z = 0,
+        // opening upwards at 45 degrees, on a face reaching from z = 0 to
+        // z = 2 - so radius 1 to radius 3, and a 5% margin past each.
+        let text = revolved_surface_text(
+            BimBrepProfile::Line {
+                origin: metres_point([1.0, 0.0, 0.0]),
+                direction: [1.0, 0.0, 1.0],
+            },
+            (0.0, 2.0),
+        );
+        assert!(text.contains("=IFCSURFACEOFREVOLUTION("), "{text}");
+        assert!(
+            text.contains("=IFCARBITRARYOPENPROFILEDEF(.CURVE.,$,"),
+            "{text}"
+        );
+        assert!(text.contains("=IFCAXIS1PLACEMENT("), "{text}");
+        // The profile's two ends, in the profile plane: (radius, height).
+        assert!(
+            text.contains("((9.000000000000000e-1,-1.000000000000000e-1))"),
+            "{text}"
+        );
+        assert!(
+            text.contains("((3.100000000000000e0,2.100000000000000e0))"),
+            "{text}"
+        );
+        // IFC4 has no conical surface at all.
+    }
+
+    #[test]
+    fn reads_a_cone_declared_from_its_own_apex() {
+        // The profile line starts on the axis: the point names no direction
+        // out of it, so the line's own does, and this is an ordinary cone
+        // whose apex is where the profile begins.
+        let text = revolved_surface_text(
+            BimBrepProfile::Line {
+                origin: metres_point([0.0, 0.0, 0.0]),
+                direction: [1.0, 0.0, 1.0],
+            },
+            (0.0, 2.0),
+        );
+        assert!(text.contains("=IFCSURFACEOFREVOLUTION("), "{text}");
+        // The apex, and the far end a 5% margin past the face's reach.
+        assert!(
+            text.contains("((0.000000000000000e0,0.000000000000000e0))"),
+            "{text}"
+        );
+        assert!(
+            text.contains("((2.100000000000000e0,2.100000000000000e0))"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn stops_a_cone_at_the_apex_rather_than_past_it() {
+        // The same cone on a face that reaches below the apex at z = -1.
+        // Sweeping the profile past the axis would double the cone back on
+        // itself, so the profile stops on the point.
+        let text = revolved_surface_text(
+            BimBrepProfile::Line {
+                origin: metres_point([1.0, 0.0, 0.0]),
+                direction: [1.0, 0.0, 1.0],
+            },
+            (-3.0, 2.0),
+        );
+        assert!(text.contains("=IFCSURFACEOFREVOLUTION("), "{text}");
+        assert!(
+            text.contains("((0.000000000000000e0,-1.000000000000000e0))"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn writes_a_line_parallel_to_the_axis_as_a_cylinder() {
+        // Revolving a line that never changes its distance from the axis
+        // sweeps a cylinder, which IFC4 has as an elementary surface.
+        let text = revolved_surface_text(
+            BimBrepProfile::Line {
+                origin: metres_point([1.5, 0.0, 0.0]),
+                direction: [0.0, 0.0, 1.0],
+            },
+            (0.0, 1.0),
+        );
+        assert!(text.contains("=IFCCYLINDRICALSURFACE("), "{text}");
+        assert!(text.contains("1.500000000000000e0"), "{text}");
+    }
+
+    #[test]
+    fn writes_a_line_square_to_the_axis_as_a_plane() {
+        // A line that only moves outwards sweeps the flat annulus its own
+        // plane already describes.
+        let text = revolved_surface_text(
+            BimBrepProfile::Line {
+                origin: metres_point([1.0, 0.0, 4.0]),
+                direction: [1.0, 0.0, 0.0],
+            },
+            (4.0, 4.0),
+        );
+        assert!(text.contains("=IFCPLANE("), "{text}");
+        assert!(!text.contains("=IFCSURFACEOFREVOLUTION("));
+        // The plane sits at the height the line runs at, not at the frame's
+        // own origin.
+        assert!(text.contains("0.000000000000000e0,0.000000000000000e0,4.000000000000000e0"));
+    }
+
+    #[test]
+    fn writes_an_off_axis_arc_as_a_torus() {
+        let text = revolved_surface_text(
+            BimBrepProfile::Arc {
+                center: metres_point([2.0, 0.0, 0.0]),
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 0.0, 1.0],
+                radius: metres_number(0.5),
+            },
+            (-0.5, 0.5),
+        );
+        assert!(text.contains("=IFCTOROIDALSURFACE("), "{text}");
+        // Major radius then minor, in that order.
+        assert!(
+            text.contains("2.000000000000000e0,5.000000000000000e-1);"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn writes_a_torus_with_no_hole_left_as_a_revolved_circle() {
+        // Minor radius equal to major: the profile circle touches the axis and
+        // the hole has closed, which `IfcToroidalSurface` may not hold.
+        let text = revolved_surface_text(
+            BimBrepProfile::Arc {
+                center: metres_point([0.5, 0.0, 0.0]),
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 0.0, 1.0],
+                radius: metres_number(0.5),
+            },
+            (-0.5, 0.5),
+        );
+        assert!(text.contains("=IFCSURFACEOFREVOLUTION("), "{text}");
+        assert!(text.contains("=IFCTRIMMEDCURVE("), "{text}");
+        assert!(!text.contains("=IFCTOROIDALSURFACE("));
+        // The profile circle, in the plane that holds the axis: centred a
+        // major radius out, and swept a whole turn in radians.
+        assert!(
+            text.contains("((5.000000000000000e-1,0.000000000000000e0))"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "IFCPARAMETERVALUE({:.15e})),.T.,.PARAMETER.);",
+                std::f64::consts::TAU
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn writes_an_arc_centred_on_the_axis_as_a_sphere() {
+        let text = revolved_surface_text(
+            BimBrepProfile::Arc {
+                center: metres_point([0.0, 0.0, 1.0]),
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 0.0, 1.0],
+                radius: metres_number(0.75),
+            },
+            (0.25, 1.75),
+        );
+        assert!(text.contains("=IFCSPHERICALSURFACE("), "{text}");
+        assert!(text.contains("7.500000000000000e-1);"), "{text}");
+        assert!(!text.contains("=IFCTOROIDALSURFACE("));
     }
 
     #[test]

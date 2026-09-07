@@ -12,10 +12,10 @@ use std::{
 };
 
 use bim_core::{
-    BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepSurface,
-    BimCategory, BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel,
-    BimLineSegment, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
-    BimSource, BimSweptDisk, BimUnit,
+    BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
+    BimBrepRuling, BimBrepSurface, BimCategory, BimElement, BimElementId, BimElementType,
+    BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimModel, BimNumber, BimPlacement,
+    BimPoint3, BimProperty, BimPropertyValue, BimSource, BimSweptDisk, BimUnit,
 };
 use clap::{Parser, Subcommand};
 use ifc_export::{MetadataOptions, element_type_for_source, metadata_ifc, uuid_v5};
@@ -361,6 +361,17 @@ enum Command {
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
     },
+    /// Census every `RuledSurf`: which curve classes its two profiles name,
+    /// when it falls back to a declared point, and how its faces pair to it.
+    RuledSurfProbe {
+        file: PathBuf,
+        /// Print this many rows of each histogram.
+        #[arg(long, default_value_t = 20)]
+        rows: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
     /// Export an IFC4 spatial tree, typed elements, and verified geometry.
     ExportIfc {
         file: PathBuf,
@@ -605,6 +616,11 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             rows,
             max_member_bytes,
         } => geometry_graph_probe(&file, rows, max_member_bytes),
+        Command::RuledSurfProbe {
+            file,
+            rows,
+            max_member_bytes,
+        } => ruled_surf_probe(&file, rows, max_member_bytes),
         Command::ExportIfc {
             file,
             output,
@@ -2508,6 +2524,11 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
             edge: schema_class_index(Some(&schema), "Edge")?,
             plane: schema_class_index(Some(&schema), "Plane")?,
             cyl_surf: schema_class_index(Some(&schema), "CylSurf")?,
+            cone_surf: schema_class_index(Some(&schema), "ConeSurf")?,
+            surf_rev: schema_class_index(Some(&schema), "SurfRev")?,
+            ruled_surf: schema_class_index(Some(&schema), "RuledSurf")?,
+            g_line: schema_class_index(Some(&schema), "GLine")?,
+            g_arc: schema_class_index(Some(&schema), "GArc")?,
         })
     })();
     let geometry_element_class_index = schema_class_index(Some(&schema), "GElement");
@@ -3229,6 +3250,11 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
             edge: schema_class_index(schema.as_ref(), "Edge")?,
             plane: schema_class_index(schema.as_ref(), "Plane")?,
             cyl_surf: schema_class_index(schema.as_ref(), "CylSurf")?,
+            cone_surf: schema_class_index(schema.as_ref(), "ConeSurf")?,
+            surf_rev: schema_class_index(schema.as_ref(), "SurfRev")?,
+            ruled_surf: schema_class_index(schema.as_ref(), "RuledSurf")?,
+            g_line: schema_class_index(schema.as_ref(), "GLine")?,
+            g_arc: schema_class_index(schema.as_ref(), "GArc")?,
         })
     })();
     // The solid lives in a `GElement` record, and only there. Reading every
@@ -3252,6 +3278,7 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
     let mut loops = 0_u64;
     let mut edges = 0_u64;
     let mut arcs = 0_u64;
+    let mut polylines = 0_u64;
     let mut why: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut exact_why: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut edge_why: BTreeMap<&'static str, u64> = BTreeMap::new();
@@ -3310,6 +3337,10 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
                         arcs += face_loop
                             .iter()
                             .filter(|edge| matches!(edge.curve, rvt_model::BrepCurve::Arc(_)))
+                            .count() as u64;
+                        polylines += face_loop
+                            .iter()
+                            .filter(|edge| matches!(edge.curve, rvt_model::BrepCurve::Polyline(_)))
                             .count() as u64;
                     }
                 }
@@ -3370,7 +3401,7 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
     println!("  every face resolved: {complete}");
     println!("    of those, in an exactly-tiled record: {exact_complete}");
     println!("Faces resolved: {faces}");
-    println!("  loops: {loops}, edges: {edges}, of which arcs: {arcs}");
+    println!("  loops: {loops}, edges: {edges}, of which arcs: {arcs}, polylines: {polylines}");
     println!(
         "Faces excluded: {excluded} (in an exactly-tiled record: {})",
         exact_why.values().sum::<u64>()
@@ -3436,7 +3467,7 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
     }
 
     if !gaps.is_empty() {
-        // How far apart the two faces put a shared endpoint separates a
+        // How far apart the two faces put a shared EdgePnt separates a
         // tolerance that is too tight from a face evaluated against the wrong
         // surface. Reported in millimetres, which is the scale the answer
         // matters at - except that a non-finite gap is neither: it means an
@@ -3453,7 +3484,7 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
         gaps.retain(|gap| gap.is_finite());
         gaps.sort_by(f64::total_cmp);
         let millimetres = |feet: f64| feet * 304.8;
-        println!("Cross-face endpoint disagreements: {total}");
+        println!("Cross-face EdgePnt disagreements: {total}");
         println!(
             "  in a record that holds a cylinder: {gaps_with_a_cylinder} ({:.1}%)",
             share(gaps_with_a_cylinder)
@@ -4289,6 +4320,22 @@ fn report_boundary_topology(
     );
     println!("    classes: {summary}");
 
+    for object in objects.iter().filter(|object| {
+        matches!(
+            name_of(object.class_index),
+            "RuledSurf" | "GLine" | "GArc" | "GEllipse" | "Face" | "Edge"
+        )
+    }) {
+        println!(
+            "    object {} {} refs={:?} ids={:?} numbers={:?}",
+            object.object_id,
+            name_of(object.class_index),
+            object.references,
+            object.identifiers,
+            object.numbers
+        );
+    }
+
     let ids_of = |wanted: &str| {
         objects
             .iter()
@@ -4447,6 +4494,352 @@ fn describe_serial_stop(stop: &rvt_model::SerialStop) -> String {
         }
         rvt_model::SerialStop::TooDeep => "class chain too deep".to_owned(),
     }
+}
+
+/// Census every `RuledSurf` the corpus writes.
+///
+/// After the parent `Surface`'s four-number envelope the class declares two
+/// object references - `m_pProfileCurve1` and `m_pProfileCurve2` - and two
+/// three-number points, `m_Point1` and `m_Point2`. Which of the four a given
+/// surface actually uses is not stated anywhere, so this counts it rather
+/// than assuming it: the class pair the references name, whether the named
+/// object is written in the same record, what the points hold on each side,
+/// and whether a face reaches its `RuledSurf` by identifier or by encounter
+/// order the way `CylSurf` does.
+#[allow(clippy::too_many_lines)] // One streaming pass and the tallies it fills.
+fn ruled_surf_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "the class schema is required for this probe",
+        )
+    })?;
+    let ruled_class_index = schema_class_index(Some(&schema), "RuledSurf")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this schema has no RuledSurf"))?;
+    let face_class_index = schema_class_index(Some(&schema), "Face")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this schema has no Face"))?;
+    let edge_class_index = schema_class_index(Some(&schema), "Edge")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this schema has no Edge"))?;
+    let geometry_element_class_index = schema_class_index(Some(&schema), "GElement")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "this schema has no GElement"))?;
+    let partition_paths = partition_paths(&container);
+
+    let mut records_with_a_ruled_surface = 0_u64;
+    let mut surfaces = 0_u64;
+    let mut faces_naming_one = 0_u64;
+    let mut numbers_widths: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut reference_counts: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut profile_pairs: BTreeMap<(String, String), u64> = BTreeMap::new();
+    // Per side: is the reference live, does the named object exist in this
+    // record, and is the matching point non-zero? A degenerate profile is
+    // expected to show as a null reference beside a used point, but that is
+    // the hypothesis, not the reading.
+    let mut side_shape: BTreeMap<(usize, bool, bool, bool), u64> = BTreeMap::new();
+    // Distinct identifiers among a record's `RuledSurf` objects, against how
+    // many it holds. A sentinel-identified class collapses to one.
+    let mut identifier_spread: BTreeMap<(usize, usize), u64> = BTreeMap::new();
+    let mut sentinel_identifiers: BTreeMap<u32, u64> = BTreeMap::new();
+    // Does the count of faces naming a `RuledSurf` match the count of objects?
+    // Encounter-order pairing is only sound where it does.
+    let mut face_to_object_balance: BTreeMap<(usize, usize), u64> = BTreeMap::new();
+    let mut profile_end_params: BTreeMap<String, (u64, f64, f64)> = BTreeMap::new();
+    // What the file's own `EdgePnt`s say about the surface's two axes. The
+    // ruling axis of a ruled surface runs between the two profiles, so it
+    // should span exactly [0, 1]; the other should span the profile's own
+    // `m_endParams`. Measuring both ranges decides which axis is which
+    // without assuming either.
+    let mut u_low = f64::MAX;
+    let mut u_high = f64::MIN;
+    let mut v_low = f64::MAX;
+    let mut v_high = f64::MIN;
+    let mut edge_points_on_a_ruled_face = 0_u64;
+    // Record identifiers to hand to `serial-probe --element` for a trace.
+    let mut example_records: Vec<u32> = Vec::new();
+    // `Surface.m_Envelope` is the surface's own parameter box. If a ruled
+    // surface always states [0, 0, 1, 1] then both of its axes are normalised
+    // and neither carries a profile's raw parameter.
+    let mut envelopes: BTreeMap<String, u64> = BTreeMap::new();
+    let mut v_outside_unit = 0_u64;
+    // How often each axis holds still across an edge: a ruling is constant in
+    // the along-profile axis, a profile-following edge in the ruling axis.
+    let mut u_constant = 0_u64;
+    let mut v_constant = 0_u64;
+    let mut neither_constant = 0_u64;
+    // The ruling axis should take its extreme values on the profiles
+    // themselves, so tally how often an edge sits exactly at each end.
+    let mut ruling_axis_endpoints: BTreeMap<String, u64> = BTreeMap::new();
+
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, _, layout, walk, payload| {
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if header.class_index != geometry_element_class_index {
+                    continue;
+                }
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                let (_, objects) =
+                    rvt_model::walk_record_collecting(&schema, header.class_index, body);
+                let ruled: Vec<&rvt_model::SerialObject> = objects
+                    .iter()
+                    .filter(|object| object.class_index == ruled_class_index)
+                    .collect();
+                if ruled.is_empty() {
+                    continue;
+                }
+                records_with_a_ruled_surface += 1;
+                if example_records.len() < 8 {
+                    example_records.push(header.id);
+                }
+                let present: BTreeSet<(u16, u32)> = objects
+                    .iter()
+                    .map(|object| (object.class_index, object.object_id))
+                    .collect();
+                let naming_faces = objects
+                    .iter()
+                    .filter(|object| object.class_index == face_class_index)
+                    .filter(|object| {
+                        object
+                            .references
+                            .last()
+                            .is_some_and(|reference| reference.class_index == ruled_class_index)
+                    })
+                    .count();
+                faces_naming_one += naming_faces as u64;
+                *face_to_object_balance
+                    .entry((naming_faces, ruled.len()))
+                    .or_default() += 1;
+                let distinct: BTreeSet<u32> = ruled.iter().map(|object| object.object_id).collect();
+                *identifier_spread
+                    .entry((distinct.len(), ruled.len()))
+                    .or_default() += 1;
+                if distinct.len() == 1 {
+                    if let Some(identifier) = distinct.iter().next() {
+                        *sentinel_identifiers.entry(*identifier).or_default() += 1;
+                    }
+                }
+                // Pair faces to objects by encounter order, the way every
+                // sentinel-identified surface class is paired, then read the
+                // `EdgePnt`s the edges of those faces store on that side.
+                let ruled_faces: BTreeSet<u32> = objects
+                    .iter()
+                    .filter(|object| object.class_index == face_class_index)
+                    .filter(|object| {
+                        object
+                            .references
+                            .last()
+                            .is_some_and(|reference| reference.class_index == ruled_class_index)
+                    })
+                    .map(|object| object.object_id)
+                    .collect();
+                for edge in objects
+                    .iter()
+                    .filter(|object| object.class_index == edge_class_index)
+                {
+                    if edge.identifiers.len() != 6 || edge.numbers.len() < 8 {
+                        continue;
+                    }
+                    let tail = &edge.numbers[edge.numbers.len() - 8..];
+                    for side in 0..2 {
+                        if !ruled_faces.contains(&edge.identifiers[side]) {
+                            continue;
+                        }
+                        let (first_u, first_v) = (tail[side * 2], tail[side * 2 + 1]);
+                        let (last_u, last_v) = (tail[4 + side * 2], tail[4 + side * 2 + 1]);
+                        for value in [first_u, last_u] {
+                            u_low = u_low.min(value);
+                            u_high = u_high.max(value);
+                        }
+                        for value in [first_v, last_v] {
+                            v_low = v_low.min(value);
+                            v_high = v_high.max(value);
+                        }
+                        edge_points_on_a_ruled_face += 1;
+                        for value in [first_v, last_v] {
+                            if value < -1.0e-9 || value > 1.0 + 1.0e-9 {
+                                v_outside_unit += 1;
+                            }
+                        }
+                        let still_u = (first_u - last_u).abs() <= 1.0e-9;
+                        let still_v = (first_v - last_v).abs() <= 1.0e-9;
+                        match (still_u, still_v) {
+                            (true, false) => u_constant += 1,
+                            (false, true) => v_constant += 1,
+                            _ => neither_constant += 1,
+                        }
+                        if still_u {
+                            let at = if first_u.abs() <= 1.0e-9 {
+                                "u held at 0"
+                            } else if (first_u - 1.0).abs() <= 1.0e-9 {
+                                "u held at 1"
+                            } else {
+                                "u held elsewhere"
+                            };
+                            *ruling_axis_endpoints.entry(at.to_owned()).or_default() += 1;
+                        }
+                        if still_v {
+                            let at = if first_v.abs() <= 1.0e-9 {
+                                "v held at 0"
+                            } else if (first_v - 1.0).abs() <= 1.0e-9 {
+                                "v held at 1"
+                            } else {
+                                "v held elsewhere"
+                            };
+                            *ruling_axis_endpoints.entry(at.to_owned()).or_default() += 1;
+                        }
+                    }
+                }
+                for object in &ruled {
+                    surfaces += 1;
+                    *numbers_widths.entry(object.numbers.len()).or_default() += 1;
+                    if let Some(envelope) = object.numbers.get(0..4) {
+                        *envelopes
+                            .entry(format!(
+                                "[{:.3}, {:.3}, {:.3}, {:.3}]",
+                                envelope[0], envelope[1], envelope[2], envelope[3]
+                            ))
+                            .or_default() += 1;
+                    }
+                    *reference_counts.entry(object.references.len()).or_default() += 1;
+                    let named = |side: usize| -> Option<&rvt_model::GElementNodeReference> {
+                        object
+                            .references
+                            .get(side)
+                            .filter(|reference| reference.object_id != 0)
+                    };
+                    let class_name = |side: usize| -> String {
+                        named(side).map_or_else(
+                            || "null".to_owned(),
+                            |reference| {
+                                schema.class_by_index(reference.class_index).map_or_else(
+                                    || format!("class {}", reference.class_index),
+                                    |class| class.name.clone(),
+                                )
+                            },
+                        )
+                    };
+                    *profile_pairs
+                        .entry((class_name(0), class_name(1)))
+                        .or_default() += 1;
+                    for side in 0..2 {
+                        // `m_Point1` is numbers 4..7 and `m_Point2` 7..10, the
+                        // envelope taking the first four.
+                        let start = 4 + side * 3;
+                        let point = object.numbers.get(start..start + 3);
+                        let point_used =
+                            point.is_some_and(|point| point.iter().any(|value| value.abs() > 0.0));
+                        let reference = named(side);
+                        let resolvable = reference.is_some_and(|reference| {
+                            present.contains(&(reference.class_index, reference.object_id))
+                        });
+                        *side_shape
+                            .entry((side, reference.is_some(), resolvable, point_used))
+                            .or_default() += 1;
+                        // A live profile's own parameter range says what `v`
+                        // the ruling runs over; `GCurve.m_endParams` is the
+                        // first two numbers of every curve.
+                        if let Some(reference) = reference {
+                            if let Some(curve) = objects.iter().find(|candidate| {
+                                candidate.class_index == reference.class_index
+                                    && candidate.object_id == reference.object_id
+                            }) {
+                                if let Some(params) = curve.numbers.get(0..2) {
+                                    let entry = profile_end_params
+                                        .entry(class_name(side))
+                                        .or_insert((0, f64::MAX, f64::MIN));
+                                    entry.0 += 1;
+                                    entry.1 = entry.1.min(params[0]);
+                                    entry.2 = entry.2.max(params[1]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )?;
+
+    println!("RuledSurf census for {}", path.display());
+    println!("Records holding at least one: {records_with_a_ruled_surface}");
+    println!("RuledSurf objects: {surfaces}");
+    println!("Faces naming one as their surface: {faces_naming_one}");
+
+    println!("Float64 values per object:");
+    for (width, count) in numbers_widths.iter().take(rows) {
+        println!("  {width}\t{count}");
+    }
+    println!("References per object:");
+    for (count, records) in reference_counts.iter().take(rows) {
+        println!("  {count}\t{records}");
+    }
+
+    println!("Profile pair (m_pProfileCurve1, m_pProfileCurve2):");
+    let mut ranked: Vec<_> = profile_pairs.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    for ((first, second), count) in ranked.iter().take(rows) {
+        println!("  {count}\t{first} -> {second}");
+    }
+
+    println!("Per side (side, reference live, names an object in this record, point non-zero):");
+    let mut sides: Vec<_> = side_shape.into_iter().collect();
+    sides.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    for ((side, live, resolvable, point_used), count) in sides.iter().take(rows) {
+        println!(
+            "  {count}\tm_Point{} live={live} resolvable={resolvable} point={point_used}",
+            side + 1
+        );
+    }
+
+    println!("Profile parameter range by class (from GCurve.m_endParams):");
+    for (name, (count, low, high)) in profile_end_params.iter().take(rows) {
+        println!("  {name}\tn={count} min={low:.6} max={high:.6}");
+    }
+
+    println!("Surface.m_Envelope values:");
+    let mut boxes: Vec<_> = envelopes.into_iter().collect();
+    boxes.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    for (envelope, count) in boxes.iter().take(rows) {
+        println!("  {count}\t{envelope}");
+    }
+    println!("Edge v values outside [0, 1]: {v_outside_unit}");
+    println!("Example records (serial-probe --element): {example_records:?}");
+    println!("EdgePnt values on ruled faces: {edge_points_on_a_ruled_face} edge sides");
+    if edge_points_on_a_ruled_face > 0 {
+        println!("  u spans {u_low:.6} .. {u_high:.6}");
+        println!("  v spans {v_low:.6} .. {v_high:.6}");
+    }
+    println!("  u held constant across the edge: {u_constant}");
+    println!("  v held constant across the edge: {v_constant}");
+    println!("  neither held constant: {neither_constant}");
+    for (label, count) in &ruling_axis_endpoints {
+        println!("  {count}\t{label}");
+    }
+    println!("Distinct identifiers vs objects per record:");
+    let mut spread: Vec<_> = identifier_spread.into_iter().collect();
+    spread.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    for ((distinct, held), count) in spread.iter().take(rows) {
+        println!("  {count}\t{distinct} distinct of {held}");
+    }
+    println!("Shared identifier when a record collapses to one:");
+    let mut sentinels: Vec<_> = sentinel_identifiers.into_iter().collect();
+    sentinels.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    for (identifier, count) in sentinels.iter().take(rows) {
+        println!("  {count}\t0x{identifier:08x}");
+    }
+    println!("Faces naming one vs objects held, per record:");
+    let mut balance: Vec<_> = face_to_object_balance.into_iter().collect();
+    balance.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    for ((naming, held), count) in balance.iter().take(rows) {
+        println!("  {count}\t{naming} faces, {held} objects");
+    }
+    Ok(())
 }
 
 /// Walk every `GElement` record, decode its inherited `GGroup.m_subNodes`
@@ -4679,6 +5072,11 @@ fn recover_elements(
             edge: schema_class_index(schema.as_ref(), "Edge")?,
             plane: plane_class_index?,
             cyl_surf: schema_class_index(schema.as_ref(), "CylSurf")?,
+            cone_surf: schema_class_index(schema.as_ref(), "ConeSurf")?,
+            surf_rev: schema_class_index(schema.as_ref(), "SurfRev")?,
+            ruled_surf: schema_class_index(schema.as_ref(), "RuledSurf")?,
+            g_line: schema_class_index(schema.as_ref(), "GLine")?,
+            g_arc: schema_class_index(schema.as_ref(), "GArc")?,
         })
     })();
     let partition_paths = partition_paths(&container);
@@ -6732,12 +7130,161 @@ fn normalize_placed_brep(placed: &rvt_model::SymbolBrep) -> Option<BimBrep> {
     normalize_brep(placed, &IDENTITY_TRANSFORM)
 }
 
+fn normalize_brep_points(
+    points: &[[f64; 3]],
+    world_point: &impl Fn([f64; 3]) -> Option<BimPoint3>,
+) -> Option<Vec<BimPoint3>> {
+    points.iter().copied().map(world_point).collect()
+}
+
+/// The profile a revolved surface turns, in that surface's own frame: still a
+/// length, so still metres, but the frame's axes already carry the instance's
+/// rotation and it must not be applied twice.
+/// Place one side of a ruled surface in world coordinates and metres.
+///
+/// A line profile's parameter is a length, so it converts with the origin; an
+/// arc's is an angle and does not.
+fn world_ruling(
+    ruling: rvt_model::BrepRuling,
+    world_point: &impl Fn([f64; 3]) -> Option<BimPoint3>,
+    world_direction: &impl Fn([f64; 3]) -> [f64; 3],
+) -> Option<BimBrepRuling> {
+    let metres = |value: f64| revit_catalog::internal_feet_to_metres(value);
+    Some(match ruling {
+        rvt_model::BrepRuling::Point(point) => BimBrepRuling::Point(world_point(point)?),
+        rvt_model::BrepRuling::Curve {
+            profile: rvt_model::BrepProfile::Line { origin, direction },
+            start,
+            end,
+        } => BimBrepRuling::Curve {
+            profile: BimBrepProfile::Line {
+                origin: world_point(origin)?,
+                direction: world_direction(direction),
+            },
+            start: metres(start)?,
+            end: metres(end)?,
+        },
+        rvt_model::BrepRuling::Curve {
+            profile:
+                rvt_model::BrepProfile::Arc {
+                    center,
+                    x_axis,
+                    y_axis,
+                    radius,
+                },
+            start,
+            end,
+        } => BimBrepRuling::Curve {
+            profile: BimBrepProfile::Arc {
+                center: world_point(center)?,
+                x_axis: world_direction(x_axis),
+                y_axis: world_direction(y_axis),
+                radius: BimNumber {
+                    value: metres(radius)?,
+                    unit: Some(metres_unit()),
+                },
+            },
+            start,
+            end,
+        },
+    })
+}
+
+fn normalize_brep_profile(profile: rvt_model::BrepProfile) -> Option<BimBrepProfile> {
+    let metres = |value: f64| revit_catalog::internal_feet_to_metres(value);
+    let frame_point = |point: [f64; 3]| -> Option<BimPoint3> {
+        Some(BimPoint3 {
+            coordinates: [metres(point[0])?, metres(point[1])?, metres(point[2])?],
+            unit: metres_unit(),
+        })
+    };
+    Some(match profile {
+        rvt_model::BrepProfile::Line { origin, direction } => BimBrepProfile::Line {
+            origin: frame_point(origin)?,
+            direction,
+        },
+        rvt_model::BrepProfile::Arc {
+            center,
+            x_axis,
+            y_axis,
+            radius,
+        } => BimBrepProfile::Arc {
+            center: frame_point(center)?,
+            x_axis,
+            y_axis,
+            radius: BimNumber {
+                value: metres(radius)?,
+                unit: Some(metres_unit()),
+            },
+        },
+    })
+}
+
 /// Place a symbol-local `SymbolBrep` (Revit internal feet) into world
 /// coordinates via the instance's own `GInstance` transform, and convert to
 /// metres. Reuses the same rigid transform
 /// [`GElementBounds::matches_transformed`] already applies to bounding-box
 /// corners: `world = origin + sum_i local[i] * basis[i]` for a point, and
 /// the same sum without `origin` for a direction.
+/// One face's surface, placed in world coordinates and metres.
+fn world_brep_surface(
+    surface: rvt_model::BrepSurface,
+    world_point: &impl Fn([f64; 3]) -> Option<BimPoint3>,
+    world_direction: &impl Fn([f64; 3]) -> [f64; 3],
+) -> Option<BimBrepSurface> {
+    let metres = |value: f64| revit_catalog::internal_feet_to_metres(value);
+    Some(match surface {
+        rvt_model::BrepSurface::Plane {
+            origin,
+            x_axis,
+            y_axis,
+        } => BimBrepSurface::Plane {
+            origin: world_point(origin)?,
+            x_axis: world_direction(x_axis),
+            y_axis: world_direction(y_axis),
+        },
+        rvt_model::BrepSurface::Cylinder {
+            center,
+            x_axis,
+            y_axis,
+            z_axis,
+            radius,
+        } => BimBrepSurface::Cylinder {
+            center: world_point(center)?,
+            x_axis: world_direction(x_axis),
+            y_axis: world_direction(y_axis),
+            z_axis: world_direction(z_axis),
+            radius: BimNumber {
+                value: metres(radius)?,
+                unit: Some(metres_unit()),
+            },
+        },
+        // The frame goes to world coordinates; the profile stays in the
+        // frame's own, which is the only place its numbers mean anything.
+        rvt_model::BrepSurface::Revolution {
+            center,
+            x_axis,
+            y_axis,
+            z_axis,
+            profile,
+        } => BimBrepSurface::Revolution {
+            center: world_point(center)?,
+            x_axis: world_direction(x_axis),
+            y_axis: world_direction(y_axis),
+            z_axis: world_direction(z_axis),
+            profile: normalize_brep_profile(profile)?,
+        },
+        // `RuledSurf` states both profiles in the body's own coordinates
+        // rather than in a frame of the surface's, so unlike a
+        // revolution's profile they are placed in world coordinates like
+        // any other point.
+        rvt_model::BrepSurface::Ruled { first, second } => BimBrepSurface::Ruled {
+            first: world_ruling(first, &world_point, &world_direction)?,
+            second: world_ruling(second, &world_point, &world_direction)?,
+        },
+    })
+}
+
 fn normalize_brep(
     local: &rvt_model::SymbolBrep,
     transform: &GInstanceTransformFields,
@@ -6766,38 +7313,12 @@ fn normalize_brep(
     };
     let mut faces = Vec::with_capacity(local.faces.len());
     for face in &local.faces {
-        let surface = match face.surface {
-            rvt_model::BrepSurface::Plane {
-                origin,
-                x_axis,
-                y_axis,
-            } => BimBrepSurface::Plane {
-                origin: world_point(origin)?,
-                x_axis: world_direction(x_axis),
-                y_axis: world_direction(y_axis),
-            },
-            rvt_model::BrepSurface::Cylinder {
-                center,
-                x_axis,
-                y_axis,
-                z_axis,
-                radius,
-            } => BimBrepSurface::Cylinder {
-                center: world_point(center)?,
-                x_axis: world_direction(x_axis),
-                y_axis: world_direction(y_axis),
-                z_axis: world_direction(z_axis),
-                radius: BimNumber {
-                    value: metres(radius)?,
-                    unit: Some(metres_unit()),
-                },
-            },
-        };
+        let surface = world_brep_surface(face.surface, &world_point, &world_direction)?;
         let mut loops = Vec::with_capacity(face.loops.len());
         for loop_edges in &face.loops {
             let mut edges = Vec::with_capacity(loop_edges.len());
             for edge in loop_edges {
-                let curve = match edge.curve {
+                let curve = match &edge.curve {
                     rvt_model::BrepCurve::Line => BimBrepCurve::Line,
                     rvt_model::BrepCurve::Arc(arc) => BimBrepCurve::Arc(BimBrepArc {
                         center: world_point(arc.center)?,
@@ -6810,6 +7331,9 @@ fn normalize_brep(
                         start_angle: arc.start_angle,
                         end_angle: arc.end_angle,
                     }),
+                    rvt_model::BrepCurve::Polyline(points) => {
+                        BimBrepCurve::Polyline(normalize_brep_points(points, &world_point)?)
+                    }
                 };
                 edges.push(BimBrepEdge {
                     start: world_point(edge.start)?,
@@ -7121,6 +7645,123 @@ fn write_point_json(writer: &mut impl Write, name: &str, point: &BimPoint3) -> i
     write_axis_json(writer, name, point.coordinates)
 }
 
+/// One profile curve. A revolved surface holds its profile in the surface's
+/// own frame; a ruled surface holds both of its profiles in world
+/// coordinates, because that is where the source states them.
+fn write_brep_profile_json(writer: &mut impl Write, profile: &BimBrepProfile) -> io::Result<()> {
+    match profile {
+        BimBrepProfile::Line { origin, direction } => {
+            write!(writer, "{{\"kind\":\"line\"")?;
+            write_point_json(writer, "origin_meters", origin)?;
+            write_axis_json(writer, "direction", *direction)?;
+            write!(writer, "}}")?;
+        }
+        BimBrepProfile::Arc {
+            center,
+            x_axis,
+            y_axis,
+            radius,
+        } => {
+            write!(writer, "{{\"kind\":\"arc\"")?;
+            write_point_json(writer, "center_meters", center)?;
+            write_axis_json(writer, "x_axis", *x_axis)?;
+            write_axis_json(writer, "y_axis", *y_axis)?;
+            write!(writer, ",\"radius_meters\":{}}}", json_number(radius.value))?;
+        }
+    }
+    Ok(())
+}
+
+/// One side of a ruled surface. `start`/`end` are the profile's own parameter
+/// interval, which the surface's `u` in [0, 1] is normalised onto.
+fn write_brep_ruling_json(writer: &mut impl Write, ruling: &BimBrepRuling) -> io::Result<()> {
+    match ruling {
+        BimBrepRuling::Point(point) => {
+            write!(writer, "{{\"kind\":\"point\"")?;
+            write_point_json(writer, "point_meters", point)?;
+            write!(writer, "}}")?;
+        }
+        BimBrepRuling::Curve {
+            profile,
+            start,
+            end,
+        } => {
+            write!(writer, "{{\"kind\":\"curve\",\"profile\":")?;
+            write_brep_profile_json(writer, profile)?;
+            write!(
+                writer,
+                ",\"start\":{},\"end\":{}}}",
+                json_number(*start),
+                json_number(*end)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// One face's surface. The frame of a revolved surface is in world
+/// coordinates and its profile is in that frame's own, exactly as the surface
+/// holds them.
+fn write_brep_surface_json(writer: &mut impl Write, surface: &BimBrepSurface) -> io::Result<()> {
+    match surface {
+        BimBrepSurface::Plane {
+            origin,
+            x_axis,
+            y_axis,
+        } => {
+            write!(writer, "{{\"kind\":\"plane\"")?;
+            write_point_json(writer, "origin_meters", origin)?;
+            write_axis_json(writer, "x_axis", *x_axis)?;
+            write_axis_json(writer, "y_axis", *y_axis)?;
+            write!(writer, "}}")?;
+        }
+        BimBrepSurface::Cylinder {
+            center,
+            x_axis,
+            y_axis,
+            z_axis,
+            radius,
+        } => {
+            write!(writer, "{{\"kind\":\"cylinder\"")?;
+            write_point_json(writer, "center_meters", center)?;
+            write_axis_json(writer, "x_axis", *x_axis)?;
+            write_axis_json(writer, "y_axis", *y_axis)?;
+            write_axis_json(writer, "z_axis", *z_axis)?;
+            write!(writer, ",\"radius_meters\":{}}}", json_number(radius.value))?;
+        }
+        // The frame is in world coordinates and the profile is in the
+        // frame's own, exactly as the surface holds them; naming the
+        // profile's numbers `_meters` too keeps that visible without
+        // pretending they are world points.
+        BimBrepSurface::Revolution {
+            center,
+            x_axis,
+            y_axis,
+            z_axis,
+            profile,
+        } => {
+            write!(writer, "{{\"kind\":\"revolution\"")?;
+            write_point_json(writer, "center_meters", center)?;
+            write_axis_json(writer, "x_axis", *x_axis)?;
+            write_axis_json(writer, "y_axis", *y_axis)?;
+            write_axis_json(writer, "z_axis", *z_axis)?;
+            write!(writer, ",\"profile\":")?;
+            write_brep_profile_json(writer, profile)?;
+            write!(writer, "}}")?;
+        }
+        // Both profiles are world points here, not frame-local ones, because
+        // the source states them that way.
+        BimBrepSurface::Ruled { first, second } => {
+            write!(writer, "{{\"kind\":\"ruled\",\"first\":")?;
+            write_brep_ruling_json(writer, first)?;
+            write!(writer, ",\"second\":")?;
+            write_brep_ruling_json(writer, second)?;
+            write!(writer, "}}")?;
+        }
+    }
+    Ok(())
+}
+
 /// Every face of one body: its surface, its outer loop and its holes, and each
 /// edge's own curve. This is the whole of what [`rvt_model::brep`] recovered -
 /// the counts beside it are counts of exactly these.
@@ -7132,33 +7773,7 @@ fn write_brep_faces_json(writer: &mut impl Write, brep: &BimBrep) -> io::Result<
     for (face_index, face) in brep.faces.iter().enumerate() {
         let separator = if face_index > 0 { "," } else { "" };
         write!(writer, "{separator}{{\"surface\":")?;
-        match &face.surface {
-            BimBrepSurface::Plane {
-                origin,
-                x_axis,
-                y_axis,
-            } => {
-                write!(writer, "{{\"kind\":\"plane\"")?;
-                write_point_json(writer, "origin_meters", origin)?;
-                write_axis_json(writer, "x_axis", *x_axis)?;
-                write_axis_json(writer, "y_axis", *y_axis)?;
-                write!(writer, "}}")?;
-            }
-            BimBrepSurface::Cylinder {
-                center,
-                x_axis,
-                y_axis,
-                z_axis,
-                radius,
-            } => {
-                write!(writer, "{{\"kind\":\"cylinder\"")?;
-                write_point_json(writer, "center_meters", center)?;
-                write_axis_json(writer, "x_axis", *x_axis)?;
-                write_axis_json(writer, "y_axis", *y_axis)?;
-                write_axis_json(writer, "z_axis", *z_axis)?;
-                write!(writer, ",\"radius_meters\":{}}}", json_number(radius.value))?;
-            }
-        }
+        write_brep_surface_json(writer, &face.surface)?;
         write!(writer, ",\"loops\":[")?;
         for (loop_index, edges) in face.loops.iter().enumerate() {
             let separator = if loop_index > 0 { "," } else { "" };
@@ -7189,6 +7804,23 @@ fn write_brep_faces_json(writer: &mut impl Write, brep: &BimBrep) -> io::Result<
                             json_number(arc.start_angle),
                             json_number(arc.end_angle)
                         )?;
+                    }
+                    BimBrepCurve::Polyline(points) => {
+                        write!(
+                            writer,
+                            ",\"curve\":{{\"kind\":\"polyline\",\"points_meters\":["
+                        )?;
+                        for (index, point) in points.iter().enumerate() {
+                            let separator = if index > 0 { "," } else { "" };
+                            write!(
+                                writer,
+                                "{separator}[{},{},{}]",
+                                json_number(point.coordinates[0]),
+                                json_number(point.coordinates[1]),
+                                json_number(point.coordinates[2])
+                            )?;
+                        }
+                        write!(writer, "]}}")?;
                     }
                 }
                 write!(writer, "}}")?;
@@ -7243,7 +7875,7 @@ fn write_body_json(
         .iter()
         .map(|face| face.loops.len())
         .sum::<usize>();
-    let (mut edges, mut arcs) = (0_usize, 0_usize);
+    let (mut edges, mut arcs, mut polylines) = (0_usize, 0_usize, 0_usize);
     for edge in brep
         .faces
         .iter()
@@ -7252,11 +7884,12 @@ fn write_body_json(
     {
         edges += 1;
         arcs += usize::from(matches!(edge.curve, rvt_model::BrepCurve::Arc(_)));
+        polylines += usize::from(matches!(edge.curve, rvt_model::BrepCurve::Polyline(_)));
     }
     write!(
         writer,
         ",\"body\":{{\"records\":{},\"placed\":{},\"complete\":{},\"faces\":{},\"loops\":{loops},\
-         \"edges\":{edges},\"arc_edges\":{arcs},\"excluded_faces\":{},\"failed_edges\":{}",
+         \"edges\":{edges},\"arc_edges\":{arcs},\"polyline_edges\":{polylines},\"excluded_faces\":{},\"failed_edges\":{}",
         element.brep_records,
         element.brep_is_placed,
         brep.excluded_faces.is_empty(),
@@ -7576,21 +8209,22 @@ fn write_geometry_json(
             )
         }
         Some(BimGeometry::Brep(brep)) => {
-            let (mut lines, mut arcs) = (0_usize, 0_usize);
+            let (mut lines, mut arcs, mut polylines) = (0_usize, 0_usize, 0_usize);
             for edge in brep
                 .faces
                 .iter()
                 .flat_map(|face| face.loops.iter())
                 .flat_map(|edge_loop| edge_loop.iter())
             {
-                match edge.curve {
+                match &edge.curve {
                     BimBrepCurve::Line => lines += 1,
                     BimBrepCurve::Arc(_) => arcs += 1,
+                    BimBrepCurve::Polyline(_) => polylines += 1,
                 }
             }
             write!(
                 writer,
-                ",\"geometry\":{{\"kind\":\"brep\",\"faces\":{},\"complete\":{},\"line_edges\":{lines},\"arc_edges\":{arcs}",
+                ",\"geometry\":{{\"kind\":\"brep\",\"faces\":{},\"complete\":{},\"line_edges\":{lines},\"arc_edges\":{arcs},\"polyline_edges\":{polylines}",
                 brep.faces.len(),
                 brep.complete
             )?;

@@ -127,6 +127,58 @@ pub enum BimBrepSurface {
         z_axis: [f64; 3],
         radius: BimNumber,
     },
+    /// A profile curve swept about `z_axis`. The frame is in world
+    /// coordinates; the profile is in the frame's own, which is where the
+    /// source keeps it.
+    Revolution {
+        center: BimPoint3,
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+        z_axis: [f64; 3],
+        profile: BimBrepProfile,
+    },
+    /// Two profiles joined by straight rulings:
+    /// `S(u, v) = (1 - v) * first(u) + v * second(u)`, `u` running along the
+    /// profiles and `v` across them. Unlike the other surfaces here it
+    /// carries no frame of its own: the source states both profiles in the
+    /// body's coordinates, so both are placed in world coordinates like any
+    /// other point.
+    Ruled {
+        first: BimBrepRuling,
+        second: BimBrepRuling,
+    },
+}
+
+/// One side of a [`BimBrepSurface::Ruled`]: a profile curve in world
+/// coordinates, or the point a degenerate profile collapses to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BimBrepRuling {
+    Point(BimPoint3),
+    /// `profile` evaluated at `start + u * (end - start)` for `u` in [0, 1].
+    /// The interval is an angle for an arc and a length in metres for a line,
+    /// matching what the profile's own numbers mean.
+    Curve {
+        profile: BimBrepProfile,
+        start: f64,
+        end: f64,
+    },
+}
+
+/// The curve a [`BimBrepSurface::Revolution`] turns, in that surface's frame:
+/// a line gives a cone, an arc a torus, and an arc centred on the axis a
+/// sphere.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BimBrepProfile {
+    Line {
+        origin: BimPoint3,
+        direction: [f64; 3],
+    },
+    Arc {
+        center: BimPoint3,
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+        radius: BimNumber,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,6 +192,8 @@ pub struct BimBrepEdge {
 pub enum BimBrepCurve {
     Line,
     Arc(BimBrepArc),
+    /// A sampled source curve, including its two topological endpoints.
+    Polyline(Vec<BimPoint3>),
 }
 
 /// `point(angle) = center + radius * (cos(angle) * x_axis + sin(angle) *
