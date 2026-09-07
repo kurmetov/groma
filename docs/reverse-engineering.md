@@ -1434,3 +1434,78 @@ edges of the 15 624 loopless faces that edges do name by their endpoints
 rather than by a declared link, and check closure geometrically. It is a
 reconstruction rather than a reading, and it reaches a fifth of the
 population.
+
+
+### Result: the loopless face's boundary, ordered by its endpoints
+
+The weaker option the entry above named has been taken, and the reason it is
+allowed is a control rather than an argument.
+
+*The reading.* A face whose `m_pFirstLoop` is null is assembled from the edges
+that name it - `GEdge.m_pFace` gives each edge's face on each side - ordered
+into one ring by joining endpoints. The direction of each edge is not guessed
+at: it is the same `(m_flags & 1 != 0) != (side == 1)` a declared loop is read
+with. Each step must find exactly one unused edge starting where the last one
+ended, every edge naming the face must be used, and the ring must close in 3D;
+anything else refuses the face rather than picking.
+
+*The control.* Ordering by endpoints is a reconstruction, so it is put to the
+faces where the file already declares the answer: those must come out the same
+ring, compared cyclically. On the three corpus files that is **80 761 / 39 959
+/ 83 335 agreed, 0 / 0 / 20 refused, and 0 / 0 / 0 contradicted**. Not one face
+in the corpus has the reconstruction produce a ring the file disagrees with,
+which is the only outcome that would have refused it the licence to run at all
+- a refusal costs the face and nothing else. (The 1 325 / 4 289 / 13 248 faces
+reported "not comparable" are faces more edges name than their first loop uses.
+That is not noise: they are the faces with holes, and the entry below reads
+them.)
+
+*What it buys.* `"face has no first loop"` falls 9 813 / 3 294 / 7 435 ->
+4 587 / 539 / 1 336 and faces resolved rise 82 086 / 44 248 / 96 603 ->
+86 821 / 44 589 / 98 618, with bodies whose every face resolved 12 330 / 7 222
+/ 8 945 -> 12 337 / 7 229 / 8 972. The route's own refusals are counted under
+their own reasons rather than folded back into the old one: an ambiguous corner
+209 / 356 / 1 201, edges that do not order into one ring 87 / 1 813 / 2 202,
+and a ring that does not close 191 / 219 / 646. What is left of the original
+exclusion is a face no edge names at all.
+
+### Result: a face's holes are the `m_nextLoop` chain, and the edges vouch for it
+
+`GEdgeLoop.m_nextLoop` was readable but unread: the comment in `assemble_face`
+still refused it a sentinel, on the strength of loop 162 of record 278446
+carrying `(8, class 0)` there. That was the null read two bytes early under the
+old `GInfo.m_flags` width, and with the width corrected the sentinel is an
+ordinary null. A terminal loop writes it; a face with holes writes a live
+reference to its next loop.
+
+*The reading.* Follow the chain from the face's first loop, walking each link
+with the same `walk_loop` as the first - so a loop naming a different face, or
+one whose edges do not close, is refused by the checks already there. A chain
+that stops keeps the loops already read and records why, so no face that
+resolved before reading holes stops resolving now. 897 / 2 136 / 5 481 faces
+carry a further loop, 1 058 / 4 799 / 15 083 further loops read.
+
+*The check that does not come from the chain.* The edges name their face from
+their own side, so the edges bounding a face are known without reading any loop
+at all. A face whose loops use exactly those edges has had its whole boundary
+read; one that leaves edges over has a hole nobody read. Reading the chain
+moves faces from the second population to the first and can do nothing else:
+
+| resolved faces | SMALL | MEDIUM | BIG |
+|---|---|---|---|
+| accounted by the first loop alone | 85 496 | 40 300 | 85 370 |
+| accounted by every loop of the face | **86 242** | **42 179** | **90 399** |
+| leaving edges no loop of theirs uses | 579 | 2 410 | 8 219 |
+| using more edges than name them | **0** | **0** | **0** |
+
+No arrangement of a wrong chain produces that, and the failures agree: every
+chain that stopped early - 15 / 78 / 47 of them - stopped on the cylinder-edge
+backlog, never on a link that was not an `EdgeLoop`, never on a loop naming
+another face, never on a cycle.
+
+*In the export.* `IfcAdvancedFace` already emitted `IfcFaceOuterBound` for the
+first loop and `IfcFaceBound` for the rest, so the holes reached IFC with no
+change to `ifc-export`: 1 496 / 259 / 979 `IfcFaceBound` entities where there
+were none. Element and geometry counts are unchanged (2 774 / 1 989 / 392 with
+geometry), `validate --rules` is clean, and `create_shape` still builds every
+emitted body.

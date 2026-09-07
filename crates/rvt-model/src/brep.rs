@@ -34,6 +34,10 @@ const CLOSURE_TOLERANCE_FEET: f64 = 1.0e-5;
 const PARAMETER_TOLERANCE: f64 = 1.0e-6;
 /// Guard against a malformed or cyclic edge/loop chain.
 const MAX_LOOP_EDGES: usize = 1024;
+/// Guard on the `m_nextLoop` chain: how many loops one face may carry. The
+/// most any face in the corpus carries is far below this; it exists so a
+/// chain that points back at itself terminates.
+const MAX_FACE_LOOPS: usize = 256;
 
 /// Schema class indices this module needs, resolved once by the caller
 /// (mirrors [`crate::PipeLineGeometryFields::parse`]'s `curve_driver_class_index`
@@ -60,6 +64,79 @@ pub struct SymbolBrep {
     /// by the *first* failing edge its loop reaches, so face exclusions
     /// undercount and cannot say how badly a reading missed; these can.
     pub failed_edges: Vec<BrepEdgeFailure>,
+    /// What ordering a face's edges by their endpoints says on the faces that
+    /// declare a loop, where the declared loop is the answer. See
+    /// [`OrderingControl`].
+    pub ordering_control: OrderingControl,
+    /// What the `GEdgeLoop.m_nextLoop` chains yielded. See [`HoleTally`].
+    pub holes: HoleTally,
+}
+
+/// What reading a face's further loops - its holes - produced, and what the
+/// edges say about it.
+///
+/// A hole is read from the chain `GEdgeLoop.m_nextLoop` writes: a terminal
+/// loop writes a null identifier, a face with holes writes a live reference to
+/// the next one. Each link is walked by [`walk_loop`] exactly as the first
+/// loop is, so a loop naming a different face, or one whose edges do not
+/// close, is refused by the same checks rather than by a new rule.
+///
+/// `edges_accounted` is the independent check, and it is the reason to believe
+/// the chain: `GEdge.m_pFace` names a face from the edge's own side, so the
+/// edges that name a face are known without reading any loop at all. A face
+/// whose loops use exactly those edges has had its whole boundary read; one
+/// that leaves some over has a hole nobody read. That count moves from
+/// `edges_short` to `edges_accounted` as holes are read, which no arrangement
+/// of a wrong chain would do.
+///
+/// `unread` keeps the chains that stopped early. The face itself is *not*
+/// excluded for one: it keeps the loops that did read, exactly as it did
+/// before any hole was read at all, so nothing that resolved before stops
+/// resolving now.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HoleTally {
+    /// Faces carrying at least one further loop.
+    pub faces: usize,
+    /// Further loops read, over all faces.
+    pub loops: usize,
+    /// Faces whose loops use exactly the edges that name the face.
+    pub edges_accounted: usize,
+    /// The same count over the first loop alone, which is what reading no hole
+    /// at all would give: the difference is what reading the chain bought.
+    pub first_loop_accounted: usize,
+    /// Faces some of whose edges no loop of theirs uses - an unread hole.
+    pub edges_short: usize,
+    /// Faces using more edge incidences than name them, which no correct
+    /// reading produces and which nothing in the corpus has yet shown.
+    pub edges_over: usize,
+    /// Chains that stopped before their terminal loop, with the reason.
+    pub unread: Vec<BrepExclusion>,
+}
+
+/// The control on [`order_face_edges`], which is a reconstruction rather than
+/// a reading and so may not be used unchecked.
+///
+/// A face that declares a loop is ordered both ways - by the chain the file
+/// declares and by joining endpoints - and the two are compared as cyclic
+/// sequences.
+///
+/// The two ways of failing are kept apart because they mean opposite things. A
+/// `refused` face is one the ordering declined - an ambiguous corner, a ring
+/// that did not close - and declining is what it does on a face it cannot
+/// read, so it costs nothing but the face. A `contradicted` face is one where
+/// it produced a ring *and the file says a different one*: that is the
+/// reconstruction being wrong while believing itself right, which is the only
+/// result that would refuse it the licence to run at all.
+///
+/// `not_comparable` counts the faces the question cannot be put to: more edges
+/// name the face than its loop uses, so the two orderings are over different
+/// sets before either runs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OrderingControl {
+    pub agreed: usize,
+    pub refused: usize,
+    pub contradicted: usize,
+    pub not_comparable: usize,
 }
 
 impl SymbolBrep {
@@ -201,14 +278,78 @@ pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolB
         .collect::<Vec<_>>();
     failed_edges.sort_by_key(|failure| failure.edge_id);
 
+    // Which edges name each face, and on which side. `GEdge.m_pFace` is a
+    // bare identifier pair, so this is the boundary read from the edges rather
+    // than from the face - the only route a face with a null `m_pFirstLoop`
+    // leaves open.
+    let mut by_face: HashMap<u32, Vec<(u32, usize)>> = HashMap::new();
+    for edge in objects
+        .iter()
+        .filter(|object| object.class_index == classes.edge && object.identifiers.len() == 6)
+    {
+        for (side, face) in edge.identifiers[..2].iter().enumerate() {
+            if *face != 0 {
+                by_face
+                    .entry(*face)
+                    .or_default()
+                    .push((edge.object_id, side));
+            }
+        }
+    }
+
     let mut faces = Vec::new();
     let mut excluded_faces = Vec::new();
+    let mut ordering_control = OrderingControl::default();
+    let mut holes = HoleTally::default();
     for face in objects
         .iter()
         .filter(|object| object.class_index == classes.face)
     {
-        match assemble_face(face, classes, &by_id, &edges, &face_surfaces) {
-            Ok(assembled) => faces.push(assembled),
+        let incidences = by_face.get(&face.object_id).map_or(&[][..], Vec::as_slice);
+        match assemble_face(face, classes, &by_id, &edges, &face_surfaces, incidences) {
+            Ok((assembled, stopped)) => {
+                if assembled.loops.len() > 1 {
+                    holes.faces += 1;
+                    holes.loops += assembled.loops.len() - 1;
+                }
+                if let Some(reason) = stopped {
+                    holes.unread.push(BrepExclusion {
+                        face_id: face.object_id,
+                        reason,
+                    });
+                }
+                let used = assembled.loops.iter().map(Vec::len).sum::<usize>();
+                holes.first_loop_accounted +=
+                    usize::from(assembled.loops.first().map(Vec::len) == Some(incidences.len()));
+                match used.cmp(&incidences.len()) {
+                    std::cmp::Ordering::Equal => holes.edges_accounted += 1,
+                    std::cmp::Ordering::Less => holes.edges_short += 1,
+                    std::cmp::Ordering::Greater => holes.edges_over += 1,
+                }
+                // The control: where the file declares the answer, ordering by
+                // endpoints has to give the same one. Only faces whose loop
+                // uses exactly the edges that name the face can be asked -
+                // elsewhere the two orderings are over different sets.
+                if face
+                    .references
+                    .first()
+                    .is_some_and(|reference| reference.object_id != 0)
+                {
+                    let declared = &assembled.loops[0];
+                    if declared.len() == incidences.len() {
+                        match order_face_edges(incidences, &edges) {
+                            Ok(ordered) if rings_agree(declared, &ordered) => {
+                                ordering_control.agreed += 1;
+                            }
+                            Ok(_) => ordering_control.contradicted += 1,
+                            Err(_) => ordering_control.refused += 1,
+                        }
+                    } else {
+                        ordering_control.not_comparable += 1;
+                    }
+                }
+                faces.push(assembled);
+            }
             Err(reason) => excluded_faces.push(BrepExclusion {
                 face_id: face.object_id,
                 reason,
@@ -219,6 +360,8 @@ pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolB
         faces,
         excluded_faces,
         failed_edges,
+        ordering_control,
+        holes,
     }
 }
 
@@ -554,7 +697,8 @@ fn assemble_face(
     by_id: &HashMap<u32, &SerialObject>,
     edges: &HashMap<u32, Result<ResolvedEdge, EdgeFailure>>,
     face_surfaces: &HashMap<u32, Option<BrepSurface>>,
-) -> Result<BrepFace, &'static str> {
+    incidences: &[(u32, usize)],
+) -> Result<(BrepFace, Option<&'static str>), &'static str> {
     let surface = face_surfaces
         .get(&face.object_id)
         .copied()
@@ -565,7 +709,23 @@ fn assemble_face(
         .first()
         .filter(|reference| reference.object_id != 0)
     else {
-        return Err("face has no first loop");
+        // No loop object is written for this face, and none can be: the walk
+        // queues a node only for a full reference, and that null was the only
+        // one to its loop. Measured on four corpus files, no `EdgeLoop`
+        // elsewhere claims such a face and the adjoining edges' own `m_next`
+        // is null on that side, so the file offers nothing to read here.
+        // What is left is the edges that name the face, ordered by their
+        // endpoints - a reconstruction, and held to the checks in
+        // [`order_face_edges`].
+        return order_face_edges(incidences, edges).map(|ring| {
+            (
+                BrepFace {
+                    surface,
+                    loops: vec![ring],
+                },
+                None,
+            )
+        });
     };
     let loop_object = *by_id
         .get(&first_loop.object_id)
@@ -574,18 +734,148 @@ fn assemble_face(
         return Err("loop reference does not name an EdgeLoop");
     }
     let loop_edges = walk_loop(face.object_id, loop_object, by_id, classes, edges)?;
-    // `GEdgeLoop.m_nextLoop` (a further loop for a face with holes) is
-    // declared in the schema, but its "no further loop" sentinel is not a
-    // null (0) reference: loop 162 in record 278446, a face with no holes,
-    // carries `references.first() = (8, class 0)` there, not `(0, _)`. Every
-    // face in that record resolves to exactly one loop, so nothing here has
-    // exercised what a real second loop looks like. Rather than guess at the
-    // sentinel, only the first loop is read; a face with holes is not yet
-    // representable and is not claimed to be.
-    Ok(BrepFace {
-        surface,
-        loops: vec![loop_edges],
-    })
+    let mut loops = vec![loop_edges];
+    // `GEdgeLoop.m_nextLoop` is the face's next boundary loop - its holes.
+    // The sentinel is an ordinary null reference; the `(8, class 0)` that loop
+    // 162 of record 278446 appeared to carry there was that null read two
+    // bytes early, under a `GInfo.m_flags` width that has since been measured
+    // and corrected. A terminal loop writes the null and stops.
+    //
+    // Each link is walked exactly as the first loop is, so its `m_pFace` must
+    // name this same face and its edges must close - see [`walk_loop`]. A
+    // chain that stops early keeps the loops already read and reports why, so
+    // a face that resolved before one was read still resolves.
+    let mut current = loop_object;
+    let mut visited = vec![loop_object.object_id];
+    let mut stopped = None;
+    while let Some(next) = current
+        .references
+        .first()
+        .filter(|reference| reference.object_id != 0)
+    {
+        if loops.len() >= MAX_FACE_LOOPS {
+            stopped = Some("face's loop chain exceeded the loop guard");
+            break;
+        }
+        if visited.contains(&next.object_id) {
+            stopped = Some("face's loop chain returned to a loop it had read");
+            break;
+        }
+        let Some(next_object) = by_id.get(&next.object_id).copied() else {
+            stopped = Some("next loop in the chain is missing");
+            break;
+        };
+        if next_object.class_index != classes.edge_loop {
+            stopped = Some("next loop in the chain does not name an EdgeLoop");
+            break;
+        }
+        match walk_loop(face.object_id, next_object, by_id, classes, edges) {
+            Ok(ring) => loops.push(ring),
+            Err(reason) => {
+                stopped = Some(reason);
+                break;
+            }
+        }
+        visited.push(next_object.object_id);
+        current = next_object;
+    }
+    Ok((BrepFace { surface, loops }, stopped))
+}
+
+/// Order the edges that name a face into one closed ring by their endpoints.
+///
+/// This is a reconstruction rather than a reading, so it is held to more than
+/// closure. Each step must have exactly one unused edge starting where the
+/// last one ended, and an ambiguous junction refuses the face rather than
+/// picking; every edge naming the face must be used; and the ring must close.
+/// An edge's direction is not guessed at either: it is the same
+/// `(m_flags & 1 != 0) != (side == 1)` the declared loops are read with.
+///
+/// The check that it is allowed at all is [`OrderingControl`]: on the faces
+/// that do declare a loop, this must reproduce it.
+fn order_face_edges(
+    incidences: &[(u32, usize)],
+    edges: &HashMap<u32, Result<ResolvedEdge, EdgeFailure>>,
+) -> Result<BrepLoop, &'static str> {
+    if incidences.is_empty() {
+        return Err("face has no first loop");
+    }
+    if incidences.len() > MAX_LOOP_EDGES {
+        return Err("face names more edges than the loop guard allows");
+    }
+    let mut oriented = Vec::with_capacity(incidences.len());
+    for &(edge_id, side) in incidences {
+        let resolved = edges
+            .get(&edge_id)
+            .ok_or("loop edge is not an Edge object")?
+            .as_ref()
+            .map_err(|failure| failure.reason)?;
+        oriented.push(oriented_edge(resolved, side));
+    }
+
+    let mut used = vec![false; oriented.len()];
+    used[0] = true;
+    let mut ring = vec![oriented[0]];
+    while ring.len() < oriented.len() {
+        let end = ring[ring.len() - 1].end;
+        let mut next = None;
+        for (index, edge) in oriented.iter().enumerate() {
+            if used[index] || distance(edge.start, end) > CLOSURE_TOLERANCE_FEET {
+                continue;
+            }
+            if next.is_some() {
+                return Err("a face's edges meet ambiguously at one of its corners");
+            }
+            next = Some(index);
+        }
+        let Some(index) = next else {
+            return Err("a face's edges do not order into one ring");
+        };
+        used[index] = true;
+        ring.push(oriented[index]);
+    }
+    if distance(ring[0].start, ring[ring.len() - 1].end) > CLOSURE_TOLERANCE_FEET {
+        return Err("a face's ordered edges do not close in 3D");
+    }
+    Ok(ring)
+}
+
+/// Whether two orderings of one face's edges describe the same ring. They are
+/// cyclic sequences, so a shared starting edge is looked for first and the
+/// rest compared from there.
+fn rings_agree(declared: &BrepLoop, ordered: &BrepLoop) -> bool {
+    if declared.len() != ordered.len() {
+        return false;
+    }
+    let same = |left: &BrepEdge, right: &BrepEdge| {
+        distance(left.start, right.start) <= CLOSURE_TOLERANCE_FEET
+            && distance(left.end, right.end) <= CLOSURE_TOLERANCE_FEET
+    };
+    let Some(offset) = ordered.iter().position(|edge| same(edge, &declared[0])) else {
+        return false;
+    };
+    declared
+        .iter()
+        .enumerate()
+        .all(|(index, edge)| same(edge, &ordered[(offset + index) % ordered.len()]))
+}
+
+/// One edge as the face on `side` of it sees it: the file stores the curve in
+/// its own `first`/`last` order, and `m_flags`' low bit flips that for side 0.
+fn oriented_edge(resolved: &ResolvedEdge, side: usize) -> BrepEdge {
+    if (resolved.flags & 1 != 0) ^ (side == 1) {
+        BrepEdge {
+            start: resolved.raw_end,
+            end: resolved.raw_start,
+            curve: reverse_curve(resolved.raw_curve),
+        }
+    } else {
+        BrepEdge {
+            start: resolved.raw_start,
+            end: resolved.raw_end,
+            curve: resolved.raw_curve,
+        }
+    }
 }
 
 fn walk_loop(
@@ -626,23 +916,14 @@ fn walk_loop(
         } else {
             return Err("edge's pFace does not name this loop's face");
         };
-        let reverse = (resolved.flags & 1 != 0) != (side == 1);
-        let (start, end, curve) = if reverse {
-            (
-                resolved.raw_end,
-                resolved.raw_start,
-                reverse_curve(resolved.raw_curve),
-            )
-        } else {
-            (resolved.raw_start, resolved.raw_end, resolved.raw_curve)
-        };
+        let edge = oriented_edge(resolved, side);
         if let Some(previous_end) = previous_end {
-            if distance(previous_end, start) > CLOSURE_TOLERANCE_FEET {
+            if distance(previous_end, edge.start) > CLOSURE_TOLERANCE_FEET {
                 return Err("consecutive edges do not share an endpoint");
             }
         }
-        previous_end = Some(end);
-        ordered.push(BrepEdge { start, end, curve });
+        previous_end = Some(edge.end);
+        ordered.push(edge);
 
         // `links = identifiers[2..6] = [next0, next1, prev0, prev1]`, so the
         // next-edge pointer for this side is `links[side]`, not `links[2+side]`
@@ -980,6 +1261,78 @@ mod tests {
         );
     }
 
+    /// `loop_object` with a live `m_nextLoop`: the face carries another loop.
+    fn chained_loop_object(
+        id: u32,
+        face: u32,
+        first_edge: u32,
+        last_edge: u32,
+        next_loop: u32,
+    ) -> SerialObject {
+        let mut object = loop_object(id, face, first_edge, last_edge);
+        object.references = vec![reference(next_loop, EDGE_LOOP)];
+        object
+    }
+
+    /// A unit square in the XY plane with a smaller square hole in it: the
+    /// outer loop's `m_nextLoop` names the hole's loop, and both name face 1.
+    fn square_with_a_hole(next_loop_of_the_hole: u32) -> Vec<SerialObject> {
+        let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let face = face_object(1, 10, reference(900, PLANE));
+        vec![
+            plane,
+            face,
+            chained_loop_object(10, 1, 100, 103, 11),
+            chained_loop_object(11, 1, 110, 113, next_loop_of_the_hole),
+            line_edge(100, 1, 2, [101, 0], [10, 0], 0, (0.0, 0.0), (1.0, 0.0)),
+            line_edge(101, 1, 2, [102, 0], [100, 0], 0, (1.0, 0.0), (1.0, 1.0)),
+            line_edge(102, 1, 2, [103, 0], [101, 0], 0, (1.0, 1.0), (0.0, 1.0)),
+            line_edge(103, 1, 2, [10, 0], [102, 0], 0, (0.0, 1.0), (0.0, 0.0)),
+            // The hole, traversed the other way round, as a real inner bound
+            // is: (0.25,0.25) -> (0.25,0.75) -> (0.75,0.75) -> (0.75,0.25).
+            line_edge(110, 1, 2, [111, 0], [11, 0], 0, (0.25, 0.25), (0.25, 0.75)),
+            line_edge(111, 1, 2, [112, 0], [110, 0], 0, (0.25, 0.75), (0.75, 0.75)),
+            line_edge(112, 1, 2, [113, 0], [111, 0], 0, (0.75, 0.75), (0.75, 0.25)),
+            line_edge(113, 1, 2, [11, 0], [112, 0], 0, (0.75, 0.25), (0.25, 0.25)),
+        ]
+    }
+
+    #[test]
+    fn reads_a_face_hole_from_the_next_loop_chain() {
+        let brep = assemble(&square_with_a_hole(0), &classes());
+        assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
+        assert_eq!(brep.faces.len(), 1);
+        let face = &brep.faces[0];
+        assert_eq!(face.loops.len(), 2, "the hole is a second loop");
+        assert_eq!(face.loops[1].len(), 4);
+        assert!(distance(face.loops[1][0].start, [0.25, 0.25, 0.0]) < 1.0e-9);
+        assert_eq!(brep.holes.faces, 1);
+        assert_eq!(brep.holes.loops, 1);
+        assert!(brep.holes.unread.is_empty(), "{:?}", brep.holes.unread);
+        // Both loops together use exactly the edges that name the face, which
+        // is the check that does not come from the chain: reading the outer
+        // loop alone leaves four edges over.
+        assert_eq!(brep.holes.edges_accounted, 1);
+        assert_eq!(brep.holes.first_loop_accounted, 0);
+        assert_eq!(brep.holes.edges_short, 0);
+    }
+
+    #[test]
+    fn stops_a_loop_chain_that_returns_to_a_loop_it_has_read() {
+        // The hole names the outer loop as its own next, which is a cycle. The
+        // face keeps both loops it did read rather than being excluded.
+        let brep = assemble(&square_with_a_hole(10), &classes());
+        assert_eq!(brep.faces.len(), 1);
+        assert_eq!(brep.faces[0].loops.len(), 2);
+        assert_eq!(
+            brep.holes.unread,
+            vec![BrepExclusion {
+                face_id: 1,
+                reason: "face's loop chain returned to a loop it had read",
+            }]
+        );
+    }
+
     #[test]
     fn assembles_a_planar_rectangle_from_four_line_edges() {
         // A unit square in the XY plane: origin (0,0,0), x_axis=(1,0,0),
@@ -1053,6 +1406,93 @@ mod tests {
         assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
         let start = brep.faces[0].loops[0][0].start;
         assert!(distance(start, [0.0, 0.0, 0.0]) < 1.0e-9);
+    }
+
+    /// The reconstruction for a face whose `m_pFirstLoop` is null: the same
+    /// square, with the loop object removed and the face's reference nulled,
+    /// so nothing but the four edges' endpoints says what the boundary is.
+    #[test]
+    fn orders_a_loopless_face_from_the_edges_that_name_it() {
+        let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let face = face_object(1, 0, reference(900, PLANE));
+        // The same four edges as the declared-loop fixture, in an order that
+        // is not the ring's, and with their chain links pointing nowhere.
+        let edges = vec![
+            line_edge(102, 1, 2, [0, 0], [0, 0], 0, (1.0, 1.0), (0.0, 1.0)),
+            line_edge(100, 1, 2, [0, 0], [0, 0], 0, (0.0, 0.0), (1.0, 0.0)),
+            line_edge(103, 1, 2, [0, 0], [0, 0], 0, (0.0, 1.0), (0.0, 0.0)),
+            line_edge(101, 1, 2, [0, 0], [0, 0], 0, (1.0, 0.0), (1.0, 1.0)),
+        ];
+        let mut objects = vec![plane, face];
+        objects.extend(edges);
+
+        let brep = assemble(&objects, &classes());
+        assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
+        let ring = &brep.faces[0].loops[0];
+        assert_eq!(ring.len(), 4);
+        for (index, edge) in ring.iter().enumerate() {
+            let next = &ring[(index + 1) % ring.len()];
+            assert!(
+                distance(edge.end, next.start) < 1.0e-9,
+                "the ring is not consecutive at {index}"
+            );
+        }
+    }
+
+    /// One edge short, the reconstruction refuses rather than shipping an open
+    /// face - and says so under its own reason, not the loop's.
+    #[test]
+    fn refuses_a_loopless_face_whose_edges_do_not_close() {
+        let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let face = face_object(1, 0, reference(900, PLANE));
+        let edges = vec![
+            line_edge(100, 1, 2, [0, 0], [0, 0], 0, (0.0, 0.0), (1.0, 0.0)),
+            line_edge(101, 1, 2, [0, 0], [0, 0], 0, (1.0, 0.0), (1.0, 1.0)),
+        ];
+        let mut objects = vec![plane, face];
+        objects.extend(edges);
+
+        let brep = assemble(&objects, &classes());
+        assert!(brep.faces.is_empty());
+        assert_eq!(
+            brep.excluded_faces[0].reason,
+            "a face's ordered edges do not close in 3D"
+        );
+    }
+
+    /// A face no edge names keeps the exclusion it always had.
+    #[test]
+    fn keeps_the_old_reason_for_a_loopless_face_with_no_edges() {
+        let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let face = face_object(1, 0, reference(900, PLANE));
+        let brep = assemble(&[plane, face], &classes());
+        assert_eq!(brep.excluded_faces[0].reason, "face has no first loop");
+    }
+
+    /// The control the reconstruction is allowed on: a face that declares a
+    /// loop is ordered both ways and the two agree.
+    #[test]
+    fn ordering_by_endpoints_reproduces_a_declared_loop() {
+        let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let face = face_object(1, 10, reference(900, PLANE));
+        let corner_loop = loop_object(10, 1, 100, 103);
+        let edges = vec![
+            line_edge(100, 1, 2, [101, 0], [10, 0], 0, (0.0, 0.0), (1.0, 0.0)),
+            line_edge(101, 1, 2, [102, 0], [100, 0], 0, (1.0, 0.0), (1.0, 1.0)),
+            line_edge(102, 1, 2, [103, 0], [101, 0], 0, (1.0, 1.0), (0.0, 1.0)),
+            line_edge(103, 1, 2, [10, 0], [102, 0], 0, (0.0, 1.0), (0.0, 0.0)),
+        ];
+        let mut objects = vec![plane, face, corner_loop];
+        objects.extend(edges);
+
+        let brep = assemble(&objects, &classes());
+        assert_eq!(
+            brep.ordering_control,
+            OrderingControl {
+                agreed: 1,
+                ..OrderingControl::default()
+            }
+        );
     }
 
     #[test]

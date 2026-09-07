@@ -2577,6 +2577,14 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
     // Rings recovered beyond the loops the record actually holds - a face
     // whose holes are in the edges and in no `EdgeLoop` object.
     let mut rings_beyond_the_loops = [0_u64; 2];
+    // What ordering the edges of a loopless face geometrically could reach.
+    // A body is emitted whole or not at all, so the population that matters is
+    // records, not faces: a record where one loopless face has no edge to
+    // order cannot be completed however well the others go.
+    let mut short_records = 0_u64;
+    let mut every_loopless_face_has_edges = 0_u64;
+    let mut short_only_for_want_of_a_loop = 0_u64;
+    let mut recoverable_records = 0_u64;
     for_each_member(
         &container,
         &partition_paths,
@@ -2956,6 +2964,30 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
                     })
                     .or_default() += 1;
 
+                if record_null > 0 {
+                    short_records += 1;
+                    let all_have_edges = objects
+                        .iter()
+                        .filter(|object| {
+                            object.class_index == classes.face
+                                && object
+                                    .references
+                                    .first()
+                                    .is_none_or(|reference| reference.object_id == 0)
+                        })
+                        .all(|face| edges_of_face.contains_key(&face.object_id));
+                    every_loopless_face_has_edges += u64::from(all_have_edges);
+                    // Whether the loop is the record's *only* complaint. A
+                    // record excluded for something else as well is not
+                    // completed by ordering edges.
+                    let only_the_loop = rvt_model::assemble_symbol_brep(&objects, &classes)
+                        .excluded_faces
+                        .iter()
+                        .all(|exclusion| exclusion.reason == "face has no first loop");
+                    short_only_for_want_of_a_loop += u64::from(only_the_loop);
+                    recoverable_records += u64::from(all_have_edges && only_the_loop);
+                }
+
                 // The same question asked of the exclusions themselves, which
                 // is what a fix would actually buy: a face excluded for
                 // carrying no first loop has already resolved its surface,
@@ -2993,6 +3025,11 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
     for (count, faces) in &reference_counts {
         println!("  {count}\t{faces}");
     }
+    println!(
+        "\nRecords carrying a loopless face: {short_records}, of them every loopless face \
+         named by an edge: {every_loopless_face_has_edges}, excluded for nothing else: \
+         {short_only_for_want_of_a_loop}, both: {recoverable_records}"
+    );
     println!(
         "\nRebuild in three numbers (rebuild failed, no edge names the face, rings recovered):\n  \
          a face with a loop: {:?}, rings beyond the loops the record holds: {}\n  \
@@ -3212,6 +3249,9 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
     let mut exact_why: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut edge_why: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut exact_edge_why: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut ordering_control = rvt_model::OrderingControl::default();
+    let mut holes = rvt_model::HoleTally::default();
+    let mut hole_why: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut gaps: Vec<f64> = Vec::new();
     let mut gaps_with_a_cylinder = 0_u64;
     let mut gaps_in_exact_records = 0_u64;
@@ -3272,6 +3312,19 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
                         *exact_why.entry(exclusion.reason).or_default() += 1;
                     }
                 }
+                ordering_control.agreed += assembled.ordering_control.agreed;
+                ordering_control.refused += assembled.ordering_control.refused;
+                ordering_control.contradicted += assembled.ordering_control.contradicted;
+                ordering_control.not_comparable += assembled.ordering_control.not_comparable;
+                holes.faces += assembled.holes.faces;
+                holes.loops += assembled.holes.loops;
+                holes.edges_accounted += assembled.holes.edges_accounted;
+                holes.first_loop_accounted += assembled.holes.first_loop_accounted;
+                holes.edges_short += assembled.holes.edges_short;
+                holes.edges_over += assembled.holes.edges_over;
+                for unread in &assembled.holes.unread {
+                    *hole_why.entry(unread.reason).or_default() += 1;
+                }
                 // Whether a record holds any cylinder at all is the control for
                 // the one place a face's surface is *inferred* rather than
                 // read: `CylSurf` objects share one identifier, so they are
@@ -3321,6 +3374,38 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
         println!(
             "  {count}\t(exact: {})\t{}",
             exact_why.get(reason).copied().unwrap_or(0),
+            escape_terminal_text(reason)
+        );
+    }
+
+    // The licence for the reconstruction a loopless face is assembled by:
+    // where the file declares the ring, ordering the edges by their endpoints
+    // has to find the same one.
+    println!(
+        "Ordering a declared loop's edges by their endpoints: {} agreed, {} refused, \
+         {} contradicted, {} not comparable",
+        ordering_control.agreed,
+        ordering_control.refused,
+        ordering_control.contradicted,
+        ordering_control.not_comparable
+    );
+
+    // A face's holes, and the check on them that does not come from the loop
+    // chain at all: the edges name their face from their own side, so a face
+    // whose loops use exactly those edges has had its whole boundary read.
+    println!(
+        "Faces carrying a further loop: {}, further loops read: {}",
+        holes.faces, holes.loops
+    );
+    println!(
+        "  resolved faces whose loops use exactly the edges naming them: {} (by the first loop alone: {}), {} leave edges over, {} use more",
+        holes.edges_accounted, holes.first_loop_accounted, holes.edges_short, holes.edges_over
+    );
+    let mut ordered = hole_why.into_iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    for (reason, count) in ordered.into_iter().take(reasons) {
+        println!(
+            "  {count}\tloop chain stopped: {}",
             escape_terminal_text(reason)
         );
     }

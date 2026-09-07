@@ -9,7 +9,7 @@ mod serial;
 
 pub use brep::{
     BrepArc, BrepClassIndexes, BrepCurve, BrepEdge, BrepExclusion, BrepFace, BrepLoop, BrepSurface,
-    SymbolBrep, assemble as assemble_symbol_brep,
+    HoleTally, OrderingControl, SymbolBrep, assemble as assemble_symbol_brep,
 };
 pub use elem_table::{
     ElemTable, ElemTableError, ElemTableHeader, ElemTableLayout, ElemTableRecord, RecordFraming,
