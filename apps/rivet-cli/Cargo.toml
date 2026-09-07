@@ -4,6 +4,7 @@ description = "Command-line inspection tools for Rivet"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "rivet"

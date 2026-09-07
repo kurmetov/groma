@@ -1,0 +1,67 @@
+Rivet
+Copyright (C) 2026 Rivet contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+The full license text is in the LICENSE file at the root of this repository.
+
+Because Rivet is offered under the AGPL, section 13 applies: if you modify it
+and let users interact with it remotely over a network — for example by running
+the `rivet-api` server, or a service built on these crates — those users must be
+offered the corresponding source of your modified version.
+
+
+## Relationship to Autodesk
+
+Rivet is an independent, clean-room, read-only implementation. It is not
+affiliated with, endorsed by, or derived from Autodesk, Inc.
+
+"Autodesk", "Revit", "RVT" and "BIM 360" are trademarks or registered
+trademarks of Autodesk, Inc. They are used here only nominatively — to state
+which file format this software reads — and not as branding for this project.
+
+Rivet contains no Autodesk source code, no decompiled Autodesk binaries, no
+Autodesk SDK, and no code derived from the Revit API or the ODA BimRv SDK. The
+format knowledge in `docs/` was obtained by observing bytes in files the
+project's authors were entitled to read, and every recovered rule is recorded
+with the measurement that justifies it.
+
+Two boundaries are deliberate and must be preserved by contributors:
+
+1. **No proprietary model content is redistributed.** `.rvt`, `.rfa`, `.rte`
+   and `.rft` files are ignored by git, and `fixtures/README.md` sets the rule
+   for anything that is committed: only samples with explicit redistribution
+   permission, recorded with provenance, license, Revit release and SHA-256.
+   The test suite builds synthetic CFB files at runtime instead.
+
+2. **No circumvention of protection measures.** Reading and describing a file
+   format is interoperability work. Defeating a technical protection measure is
+   a different legal category. In particular, the high-entropy block found in
+   the inter-member gaps is deliberately left undecoded, and this project does
+   not accept contributions that decode it.
+
+Reverse engineering for interoperability is protected in the jurisdictions this
+project is developed in — see EU Directive 2009/24/EC arts. 5(3) and 6, DMCA
+§1201(f), *Sega v. Accolade* and *Sony v. Connectix* — but that protection
+depends on staying inside the two boundaries above.
+
+
+## Third-party components
+
+Rivet's dependencies are declared in `Cargo.toml` and pinned in `Cargo.lock`;
+each carries its own license. Run `cargo tree` to enumerate them.
+
+The Revit 2023 catalogue tables under `crates/revit-catalog/src/` are built from
+publicly documented enumeration names and identifiers. They contain no Autodesk
+source code. `scripts/generate_revit_2023_catalog.py` records how they were
+produced.

@@ -4,6 +4,7 @@ description = "Read-only access to the physical streams in Revit CFB containers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 cfb.workspace = true

@@ -7,9 +7,6 @@
 *.[rR][tT][eE]
 *.[rR][fF][tT]
 
-# Local working notes, not part of the project.
-/BRIEF.md
-
 # Python bytecode from the helper scripts.
 __pycache__/
 /.venv/

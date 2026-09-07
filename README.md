@@ -24,6 +24,24 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+The repository test suite builds synthetic CFB files at runtime, so it needs no
+`.rvt` model and runs anywhere.
+
+Decode accuracy is a separate gate, because it can only be measured against real
+models and those are not redistributable. If you have a corpus, run:
+
+```bash
+scripts/corpus_check.sh                   # measure and compare
+scripts/corpus_check.sh --write           # accept the current numbers
+RIVET_CORPUS=/path/to/models scripts/corpus_check.sh
+```
+
+It re-measures the numbers in [`tests/baseline/corpus_metrics.tsv`](tests/baseline/corpus_metrics.tsv)
+and fails if any of them moved the wrong way. Run it before and after any change
+to the record walk: such a change can buy one class by selling another, and this
+is what catches that. Without `RIVET_CORPUS` the gate skips, so `cargo test`
+stays fast and CI stays meaningful.
+
 ## CLI
 
 ```bash
@@ -148,3 +166,20 @@ parameter candidates from unsupported schemas stay out of IFC. See
 
 The live metadata sample is checked with IfcOpenShell's schema validator and
 IFC4 EXPRESS rules in addition to the Rust test suite.
+
+## License
+
+Rivet is free software under the [GNU Affero General Public License v3.0
+only](LICENSE).
+
+Section 13 is the clause to read before deploying it: if you modify Rivet and
+let users interact with it over a network — including through `rivet-api` or any
+service built on these crates — you must offer those users the source of your
+modified version.
+
+Rivet is an independent clean-room implementation. It contains no Autodesk code
+and is not affiliated with or endorsed by Autodesk, Inc.; "Autodesk" and "Revit"
+are their trademarks, used here only to say which format Rivet reads. See
+[`NOTICE`](NOTICE) for the boundaries this project keeps, including the two that
+contributions must respect: no proprietary model content in the repository, and
+no decoding of the inter-member protection block.

@@ -4,6 +4,7 @@ description = "Loss-preserving intermediate representation of serialized Revit o
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 rvt-schema = { path = "../rvt-schema" }
