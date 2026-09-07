@@ -824,6 +824,48 @@ fn export_json_emits_one_object_per_element() {
 }
 
 #[test]
+fn export_json_full_indexes_the_model_before_the_elements() {
+    let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args(["export-json", fixture.path().to_str().unwrap(), "--full"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    // The model line indexes what follows: one line per element, and a class
+    // histogram naming the sections those lines fall into.
+    let model = lines.next().unwrap();
+    assert!(model.starts_with("{\"kind\":\"model\""), "{model}");
+    assert!(model.contains("\"elements\":2"), "{model}");
+    assert!(model.contains("\"records\":4"), "{model}");
+    assert!(model.contains("\"with_class\":2"), "{model}");
+    assert!(
+        model.contains("\"bodies\":{\"elements\":0,\"records\":0"),
+        "{model}"
+    );
+    assert!(
+        model.contains("\"units\":{\"length\":\"meters\""),
+        "{model}"
+    );
+    assert!(
+        model.contains("{\"index\":12,\"name\":\"Element\",\"elements\":2}"),
+        "{model}"
+    );
+    assert_eq!(lines.count(), 2);
+
+    // Without the flag the model line is not written at all, so an existing
+    // reader of the element lines sees the same file it did before.
+    let plain = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args(["export-json", fixture.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(!plain.contains("\"kind\":\"model\""), "{plain}");
+}
+
+#[test]
 fn export_json_writes_to_a_file_and_honours_the_limit() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
     let target = NamedTempFile::new().unwrap();

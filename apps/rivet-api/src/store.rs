@@ -276,6 +276,12 @@ impl Model {
             if line.trim().is_empty() {
                 continue;
             }
+            // `export-json --full` opens the artefact with a model line
+            // indexing the file. It is not an element and its absence is not
+            // partiality, so it is passed over without counting.
+            if line.starts_with("{\"kind\":\"model\"") {
+                continue;
+            }
             match serde_json::from_str::<Element>(&line) {
                 Ok(element) => elements.push(element),
                 Err(_) => skipped += 1,

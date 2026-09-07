@@ -46,6 +46,7 @@ cargo run -p rivet-cli -- inspect model.rvt
 cargo run -p rivet-cli -- names model.rvt
 cargo run -p rivet-cli -- parameters model.rvt --class FamilyInstance
 cargo run -p rivet-cli -- export-json model.rvt --output model.jsonl
+cargo run -p rivet-cli -- export-json model.rvt --full --output model.jsonl
 cargo run -p rivet-cli -- export-ifc model.rvt --output model.ifc
 python -m ifcopenshell.validate model.ifc --rules
 ```
@@ -73,7 +74,16 @@ a metric swept-disk axis and radius; owner-verified, single-line pipe-fitting
 centerlines carry an axis-only metric representation. A diagnostic
 `FamilyInstance` placement is included only when one orthonormal
 `m_instOrigin`/`m_RefDir`/`m_zAxis` candidate is unique inside independently
-recovered owner bounds; it is not yet promoted to IFC. `names` reports where each class keeps its
+recovered owner bounds; it is not yet promoted to IFC. `--full` writes every
+decoded section instead of the export's selection: a leading model line - the
+release, schema size, partition list, the size of each recovered section and
+the class histogram indexing the element lines - and, on every element, the
+whole body decoded from its own `GElement` record (each face's plane or
+cylinder, its outer loop and holes, and every edge's line or arc), the boxes
+that body was checked against, each face and edge the decode could not read
+with the reason it gave, and the centerline readings kept as candidates. It is
+a superset: the element lines carry the same fields with or without it.
+`names` reports where each class keeps its
 string and how consistently, so a name read at a calibrated offset can be told
 apart from one found by scanning.
 `export-ifc` writes an IFC4 Reference View file with

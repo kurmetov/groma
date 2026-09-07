@@ -5,7 +5,7 @@ use std::{
     error::Error,
     fmt::Write as _,
     fs::File,
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
@@ -245,6 +245,12 @@ enum Command {
         /// Stop after this many elements.
         #[arg(long)]
         limit: Option<usize>,
+        /// Write every decoded section rather than the export's selection: a
+        /// leading model line indexing the file, and per element the whole
+        /// decoded body - every face, loop and edge - the boxes it was checked
+        /// against, and the faces and edges the decode could not read.
+        #[arg(long)]
+        full: bool,
         /// Maximum decoded bytes accepted from one member.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
@@ -533,8 +539,9 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             file,
             output,
             limit,
+            full,
             max_member_bytes,
-        } => export_json(&file, output.as_deref(), limit, max_member_bytes),
+        } => export_json(&file, output.as_deref(), limit, full, max_member_bytes),
         Command::SerialProbe {
             file,
             class,
@@ -5154,11 +5161,12 @@ fn export_json(
     path: &Path,
     output: Option<&Path>,
     limit: Option<usize>,
+    full: bool,
     max_member_bytes: u64,
 ) -> Result<(), Box<dyn Error>> {
     let recovered = recover_elements(path, max_member_bytes)?;
     let writer: Box<dyn Write> = match output {
-        Some(output) => Box::new(File::create(output)?),
+        Some(output) => Box::new(BufWriter::new(File::create(output)?)),
         None => Box::new(io::stdout().lock()),
     };
     let metadata = ExportMetadata {
@@ -5167,8 +5175,9 @@ fn export_json(
         parameter_names: &recovered.parameter_names,
         parameter_specs: &recovered.parameter_specs,
         catalog: recovered.catalog,
+        full,
     };
-    let written = write_exported_elements(writer, &recovered.elements, &metadata, limit)?;
+    let written = write_exported_elements(writer, path, &recovered, &metadata, limit)?;
     if output.is_some() {
         println!(
             "Elements written: {written} of {}",
@@ -6356,14 +6365,22 @@ struct ExportMetadata<'a> {
     parameter_names: &'a BTreeMap<i32, String>,
     parameter_specs: &'a BTreeMap<i32, String>,
     catalog: Option<Catalog>,
+    /// Write every decoded section rather than the selection the IFC export
+    /// would make. See [`write_model_json`] and [`write_body_json`].
+    full: bool,
 }
 
 fn write_exported_elements(
     mut writer: Box<dyn Write>,
-    elements: &BTreeMap<u32, ExportedElement>,
+    path: &Path,
+    recovered: &RecoveredElements,
     metadata: &ExportMetadata<'_>,
     limit: Option<usize>,
 ) -> io::Result<usize> {
+    let elements = &recovered.elements;
+    if metadata.full {
+        write_model_json(&mut writer, path, recovered, metadata)?;
+    }
     let mut written = 0_usize;
     for (id, element) in elements {
         if limit.is_some_and(|limit| written >= limit) {
@@ -6903,6 +6920,520 @@ fn write_resolved_reference_names(
     Ok(())
 }
 
+/// The model line `--full` writes ahead of the elements: what the file is,
+/// which sections the decode recovered, and how much each one holds.
+///
+/// It is an index rather than a summary - every count here is the size of a
+/// section the following lines carry in full, so a reader can tell an empty
+/// section from one this decode never reaches.
+fn write_model_json(
+    writer: &mut impl Write,
+    path: &Path,
+    recovered: &RecoveredElements,
+    metadata: &ExportMetadata<'_>,
+) -> io::Result<()> {
+    let tally = ModelTally::of(&recovered.elements);
+    write!(writer, "{{\"kind\":\"model\"")?;
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        write!(writer, ",\"file\":\"{}\"", json_escape(name))?;
+    }
+    if let Some(release) = recovered.release {
+        write!(writer, ",\"revit_release\":{release}")?;
+    }
+    write!(
+        writer,
+        ",\"parameter_catalog\":{},\"parameter_values_schema_bound\":{}",
+        recovered.catalog.is_some(),
+        recovered.parameter_values_schema_bound
+    )?;
+    if let Some(schema) = metadata.schema {
+        write!(
+            writer,
+            ",\"schema\":{{\"classes\":{},\"properties\":{}}}",
+            schema.classes.len(),
+            schema.property_count
+        )?;
+    }
+    write!(writer, ",\"partitions\":[")?;
+    for (index, partition) in metadata.partition_paths.iter().enumerate() {
+        let separator = if index > 0 { "," } else { "" };
+        write!(writer, "{separator}\"{}\"", json_escape(partition))?;
+    }
+    write!(writer, "]")?;
+    write!(
+        writer,
+        ",\"elements\":{},\"records\":{},\"with_class\":{},\"with_category\":{},\
+         \"with_level\":{},\"with_name\":{},\"with_type\":{},\"moribund\":{}",
+        recovered.elements.len(),
+        tally.records,
+        tally.with_class,
+        tally.with_category,
+        tally.with_level,
+        tally.with_name,
+        tally.with_type,
+        tally.moribund
+    )?;
+    write!(
+        writer,
+        ",\"parameters\":{{\"values\":{},\"type_values\":{},\"named_definitions\":{},\
+         \"specs\":{}}}",
+        tally.parameter_values,
+        tally.type_parameter_values,
+        metadata.parameter_names.len(),
+        metadata.parameter_specs.len()
+    )?;
+    write!(
+        writer,
+        ",\"bodies\":{{\"elements\":{},\"records\":{},\"placed\":{},\"complete\":{},\
+         \"faces\":{},\"excluded_faces\":{},\"edges\":{},\"failed_edges\":{}}}",
+        tally.body_elements,
+        tally.body_records,
+        tally.placed_bodies,
+        tally.complete_bodies,
+        tally.faces,
+        tally.excluded_faces,
+        tally.edges,
+        tally.failed_edges
+    )?;
+    write!(
+        writer,
+        ",\"placements\":{{\"ginstance_transforms\":{},\"verified_symbol_links\":{}}}",
+        tally.transforms, tally.verified_symbol_links
+    )?;
+    write!(
+        writer,
+        ",\"units\":{{\"length\":\"meters\",\"source\":\"Revit internal feet\",\
+         \"angle\":\"radians\"}}"
+    )?;
+    write_model_classes_json(writer, &tally.classes, metadata)?;
+    writeln!(writer, "}}")
+}
+
+/// The class histogram: which kinds of record this file holds and how many
+/// elements of each, most first. This is the index into the element lines.
+fn write_model_classes_json(
+    writer: &mut impl Write,
+    classes: &BTreeMap<u16, usize>,
+    metadata: &ExportMetadata<'_>,
+) -> io::Result<()> {
+    let mut by_count = classes.iter().collect::<Vec<_>>();
+    by_count.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
+    write!(writer, ",\"classes\":[")?;
+    for (index, (class_index, count)) in by_count.iter().enumerate() {
+        let separator = if index > 0 { "," } else { "" };
+        write!(writer, "{separator}{{\"index\":{class_index}")?;
+        if let Some(class) = metadata
+            .schema
+            .and_then(|schema| schema.class_by_index(**class_index))
+        {
+            write!(writer, ",\"name\":\"{}\"", json_escape(&class.name))?;
+        }
+        write!(writer, ",\"elements\":{count}}}")?;
+    }
+    write!(writer, "]")
+}
+
+/// How much each recovered section holds, counted once for the model line.
+#[derive(Default)]
+struct ModelTally {
+    records: usize,
+    with_class: usize,
+    with_category: usize,
+    with_level: usize,
+    with_name: usize,
+    with_type: usize,
+    moribund: usize,
+    parameter_values: usize,
+    type_parameter_values: usize,
+    transforms: usize,
+    verified_symbol_links: usize,
+    body_elements: usize,
+    body_records: usize,
+    placed_bodies: usize,
+    complete_bodies: usize,
+    faces: usize,
+    excluded_faces: usize,
+    edges: usize,
+    failed_edges: usize,
+    classes: BTreeMap<u16, usize>,
+}
+
+impl ModelTally {
+    fn of(elements: &BTreeMap<u32, ExportedElement>) -> Self {
+        let mut tally = Self::default();
+        for element in elements.values() {
+            tally.records += element.record_count;
+            tally.with_class += usize::from(element.class_index.is_some());
+            tally.with_category += usize::from(element.category.is_some());
+            tally.with_level += usize::from(element.level_id.is_some());
+            tally.with_name += usize::from(element.name.is_some());
+            tally.with_type += usize::from(element.type_element_reference().is_some());
+            tally.parameter_values += element.parameters.len();
+            tally.type_parameter_values += element.type_parameters.len();
+            tally.moribund += usize::from(element.moribund);
+            tally.transforms += usize::from(element.ginstance_transform.is_some());
+            tally.verified_symbol_links += usize::from(element.verified_symbol_bounds.is_some());
+            if let Some(class_index) = element.class_index {
+                *tally.classes.entry(class_index).or_default() += 1;
+            }
+            if let Some(brep) = &element.brep {
+                tally.body_elements += 1;
+                tally.body_records += element.brep_records;
+                tally.placed_bodies += usize::from(element.brep_is_placed);
+                tally.complete_bodies += usize::from(brep.excluded_faces.is_empty());
+                tally.faces += brep.faces.len();
+                tally.excluded_faces += brep.excluded_faces.len();
+                tally.edges += brep
+                    .faces
+                    .iter()
+                    .flat_map(|face| face.loops.iter())
+                    .map(Vec::len)
+                    .sum::<usize>();
+                tally.failed_edges += brep.failed_edges.len();
+            }
+        }
+        tally
+    }
+}
+
+/// A finite `f64` as JSON, and `null` for anything else. A decoded coordinate
+/// can be infinite or NaN where a reading went wrong, and writing that
+/// verbatim produces a file no JSON parser accepts.
+fn json_number(value: f64) -> String {
+    if value.is_finite() {
+        value.to_string()
+    } else {
+        "null".to_owned()
+    }
+}
+
+fn write_axis_json(writer: &mut impl Write, name: &str, axis: [f64; 3]) -> io::Result<()> {
+    write!(
+        writer,
+        ",\"{name}\":[{},{},{}]",
+        json_number(axis[0]),
+        json_number(axis[1]),
+        json_number(axis[2])
+    )
+}
+
+fn write_point_json(writer: &mut impl Write, name: &str, point: &BimPoint3) -> io::Result<()> {
+    write_axis_json(writer, name, point.coordinates)
+}
+
+/// Every face of one body: its surface, its outer loop and its holes, and each
+/// edge's own curve. This is the whole of what [`rvt_model::brep`] recovered -
+/// the counts beside it are counts of exactly these.
+///
+/// Written under `boundary` rather than `faces` because `faces` is already the
+/// count both objects carry, and one key cannot be both.
+fn write_brep_faces_json(writer: &mut impl Write, brep: &BimBrep) -> io::Result<()> {
+    write!(writer, ",\"boundary\":[")?;
+    for (face_index, face) in brep.faces.iter().enumerate() {
+        let separator = if face_index > 0 { "," } else { "" };
+        write!(writer, "{separator}{{\"surface\":")?;
+        match &face.surface {
+            BimBrepSurface::Plane {
+                origin,
+                x_axis,
+                y_axis,
+            } => {
+                write!(writer, "{{\"kind\":\"plane\"")?;
+                write_point_json(writer, "origin_meters", origin)?;
+                write_axis_json(writer, "x_axis", *x_axis)?;
+                write_axis_json(writer, "y_axis", *y_axis)?;
+                write!(writer, "}}")?;
+            }
+            BimBrepSurface::Cylinder {
+                center,
+                x_axis,
+                y_axis,
+                z_axis,
+                radius,
+            } => {
+                write!(writer, "{{\"kind\":\"cylinder\"")?;
+                write_point_json(writer, "center_meters", center)?;
+                write_axis_json(writer, "x_axis", *x_axis)?;
+                write_axis_json(writer, "y_axis", *y_axis)?;
+                write_axis_json(writer, "z_axis", *z_axis)?;
+                write!(writer, ",\"radius_meters\":{}}}", json_number(radius.value))?;
+            }
+        }
+        write!(writer, ",\"loops\":[")?;
+        for (loop_index, edges) in face.loops.iter().enumerate() {
+            let separator = if loop_index > 0 { "," } else { "" };
+            write!(writer, "{separator}[")?;
+            for (edge_index, edge) in edges.iter().enumerate() {
+                let separator = if edge_index > 0 { "," } else { "" };
+                // Opened inline because every helper below writes its own
+                // leading comma, and this is the object's first member.
+                write!(
+                    writer,
+                    "{separator}{{\"start_meters\":[{},{},{}]",
+                    json_number(edge.start.coordinates[0]),
+                    json_number(edge.start.coordinates[1]),
+                    json_number(edge.start.coordinates[2])
+                )?;
+                write_point_json(writer, "end_meters", &edge.end)?;
+                match &edge.curve {
+                    BimBrepCurve::Line => write!(writer, ",\"curve\":{{\"kind\":\"line\"}}")?,
+                    BimBrepCurve::Arc(arc) => {
+                        write!(writer, ",\"curve\":{{\"kind\":\"arc\"")?;
+                        write_point_json(writer, "center_meters", &arc.center)?;
+                        write_axis_json(writer, "x_axis", arc.x_axis)?;
+                        write_axis_json(writer, "z_axis", arc.z_axis)?;
+                        write!(
+                            writer,
+                            ",\"radius_meters\":{},\"start_angle\":{},\"end_angle\":{}}}",
+                            json_number(arc.radius.value),
+                            json_number(arc.start_angle),
+                            json_number(arc.end_angle)
+                        )?;
+                    }
+                }
+                write!(writer, "}}")?;
+            }
+            write!(writer, "]")?;
+        }
+        write!(writer, "]}}")?;
+    }
+    write!(writer, "]")
+}
+
+/// Everything the decode recovered for one element that the export's own
+/// selection does not carry: the body in the frame its record wrote it in,
+/// the boxes it was checked against, and the centerline readings kept as
+/// candidates. Written only under `--full`.
+fn write_decoded_sections_json(
+    writer: &mut impl Write,
+    element: &ExportedElement,
+    geometry: Option<&BimGeometry>,
+) -> io::Result<()> {
+    write_body_json(
+        writer,
+        element,
+        matches!(geometry, Some(BimGeometry::Brep(_))),
+    )?;
+    write_bounds_json(writer, element)?;
+    write_curve_candidates_json(writer, element)?;
+    if let Some(spec) = &element.parameter_spec {
+        write!(writer, ",\"parameter_spec\":\"{}\"", json_escape(spec))?;
+    }
+    Ok(())
+}
+
+/// The body decoded from this element's own `GElement` record, in the frame
+/// that record wrote it in, together with the account of what the decode could
+/// not read: every excluded face and failed edge with the reason given for it.
+///
+/// `geometry` above is the export's *selection* - one representation, chosen,
+/// placed, and only when a verified route reached it. This is the decode
+/// itself, so a body that is incomplete, unplaced or attached to nothing is
+/// still visible here rather than silently absent.
+fn write_body_json(
+    writer: &mut impl Write,
+    element: &ExportedElement,
+    already_written_as_geometry: bool,
+) -> io::Result<()> {
+    let Some(brep) = &element.brep else {
+        return Ok(());
+    };
+    let loops = brep
+        .faces
+        .iter()
+        .map(|face| face.loops.len())
+        .sum::<usize>();
+    let (mut edges, mut arcs) = (0_usize, 0_usize);
+    for edge in brep
+        .faces
+        .iter()
+        .flat_map(|face| face.loops.iter())
+        .flat_map(|edge_loop| edge_loop.iter())
+    {
+        edges += 1;
+        arcs += usize::from(matches!(edge.curve, rvt_model::BrepCurve::Arc(_)));
+    }
+    write!(
+        writer,
+        ",\"body\":{{\"records\":{},\"placed\":{},\"complete\":{},\"faces\":{},\"loops\":{loops},\
+         \"edges\":{edges},\"arc_edges\":{arcs},\"excluded_faces\":{},\"failed_edges\":{}",
+        element.brep_records,
+        element.brep_is_placed,
+        brep.excluded_faces.is_empty(),
+        brep.faces.len(),
+        brep.excluded_faces.len(),
+        brep.failed_edges.len()
+    )?;
+    if !brep.excluded_faces.is_empty() {
+        write!(writer, ",\"excluded\":[")?;
+        for (index, exclusion) in brep.excluded_faces.iter().enumerate() {
+            let separator = if index > 0 { "," } else { "" };
+            write!(
+                writer,
+                "{separator}{{\"face\":{},\"reason\":\"{}\"}}",
+                exclusion.face_id,
+                json_escape(exclusion.reason)
+            )?;
+        }
+        write!(writer, "]")?;
+    }
+    if !brep.failed_edges.is_empty() {
+        write!(writer, ",\"failed\":[")?;
+        for (index, failure) in brep.failed_edges.iter().enumerate() {
+            let separator = if index > 0 { "," } else { "" };
+            write!(
+                writer,
+                "{separator}{{\"edge\":{},\"reason\":\"{}\"",
+                failure.edge_id,
+                json_escape(failure.reason)
+            )?;
+            if let Some(gap) = failure
+                .gap_feet
+                .and_then(revit_catalog::internal_feet_to_metres)
+            {
+                write!(writer, ",\"gap_mm\":{}", json_number(gap * 1000.0))?;
+            }
+            write!(writer, "}}")?;
+        }
+        write!(writer, "]")?;
+    }
+    let residuals = element.brep_box_residuals;
+    for (key, residual) in [
+        ("exact", residuals.exact),
+        ("graph", residuals.graph),
+        ("near_duplicate", residuals.near_duplicate),
+        ("graph_from_exact", residuals.graph_from_exact),
+    ] {
+        if let Some(residual) = residual {
+            write!(
+                writer,
+                ",\"box_residual_{key}_feet\":{}",
+                json_number(residual)
+            )?;
+        }
+    }
+    // The coordinates themselves, unless `geometry` already carried this same
+    // body placed: a placed body is written there in world coordinates and
+    // repeating it here would double the file for nothing.
+    if already_written_as_geometry {
+        write!(writer, ",\"boundary_in\":\"geometry\"")?;
+    } else if let Some(local) = normalize_placed_brep(brep) {
+        write!(writer, ",\"frame\":\"record\"")?;
+        write_brep_faces_json(writer, &local)?;
+    } else {
+        // Some coordinate of this body is not finite, so no metric body can be
+        // written for it. Said rather than dropped.
+        write!(
+            writer,
+            ",\"frame\":\"record\",\"metric_conversion\":\"refused\""
+        )?;
+    }
+    write!(writer, "}}")
+}
+
+/// The boxes this element's record declares, and what they were checked
+/// against. `geometry` may carry one of these as the element's only shape;
+/// these are the raw readings behind that, including for elements whose
+/// geometry the export did not select.
+fn write_bounds_json(writer: &mut impl Write, element: &ExportedElement) -> io::Result<()> {
+    let metres = |value: f64| revit_catalog::internal_feet_to_metres(value);
+    let box_json = |bounds: &GElementBounds| {
+        let mut text = String::new();
+        let (min, max) = (bounds.min.map(metres), bounds.max.map(metres));
+        let ([Some(x0), Some(y0), Some(z0)], [Some(x1), Some(y1), Some(z1)]) = (min, max) else {
+            return None;
+        };
+        let _ = write!(
+            text,
+            "{{\"min_meters\":[{x0},{y0},{z0}],\"max_meters\":[{x1},{y1},{z1}],\"offset\":{}}}",
+            bounds.offset
+        );
+        Some(text)
+    };
+    for (key, bounds) in [
+        ("declared_bounds", element.geometry_bounds.as_ref()),
+        ("placement_bounds", element.placement_bounds.as_ref()),
+        (
+            "graph_bounds",
+            element.geometry_graph.as_ref().map(|graph| &graph.bounds),
+        ),
+    ] {
+        if let Some(text) = bounds.and_then(box_json) {
+            write!(writer, ",\"{key}\":{text}")?;
+        }
+    }
+    if let Some(graph) = &element.geometry_graph {
+        write!(writer, ",\"graph_nodes\":{}", graph.top_level_nodes.len())?;
+    }
+    if let Some(symbol) = &element.verified_symbol_bounds {
+        write!(
+            writer,
+            ",\"verified_symbol\":{{\"id\":{}",
+            symbol.symbol_element_id
+        )?;
+        if let Some(text) = box_json(&symbol.bounds) {
+            write!(writer, ",\"bounds\":{text}")?;
+        }
+        write!(writer, "}}")?;
+    }
+    Ok(())
+}
+
+/// The centerline readings, kept as candidates rather than promoted: a pipe's
+/// own line and the fitting centerlines, whether or not the export used them.
+fn write_curve_candidates_json(
+    writer: &mut impl Write,
+    element: &ExportedElement,
+) -> io::Result<()> {
+    let metres = |value: f64| revit_catalog::internal_feet_to_metres(value);
+    let segment = |start: RvtPoint3, end: RvtPoint3| {
+        let (start, end) = (
+            start.coordinates_feet.map(metres),
+            end.coordinates_feet.map(metres),
+        );
+        let ([Some(x0), Some(y0), Some(z0)], [Some(x1), Some(y1), Some(z1)]) = (start, end) else {
+            return None;
+        };
+        Some(format!(
+            "\"start_meters\":[{x0},{y0},{z0}],\"end_meters\":[{x1},{y1},{z1}]"
+        ))
+    };
+    if let Some(line) = element.pipe_line_candidate {
+        if let Some(text) = segment(line.start, line.end) {
+            write!(writer, ",\"pipe_line\":{{{text}")?;
+            if let Some(diameter) = metres(line.nominal_diameter_feet) {
+                write!(
+                    writer,
+                    ",\"nominal_diameter_meters\":{}",
+                    json_number(diameter)
+                )?;
+            }
+            write!(writer, ",\"offset\":{}}}", line.line_offset)?;
+        }
+    }
+    for (key, candidate) in [
+        ("fitting_center_line", element.fitting_center_line_candidate),
+        ("fitting_axis", element.fitting_axis_candidate),
+    ] {
+        let Some(candidate) = candidate else { continue };
+        if let Some(text) = segment(candidate.start, candidate.end) {
+            write!(
+                writer,
+                ",\"{key}\":{{{text},\"owner_element_id\":{}}}",
+                candidate.owner_element_id
+            )?;
+        }
+    }
+    if !element.family_instance_placement_candidates.is_empty() {
+        write!(
+            writer,
+            ",\"family_instance_frame_candidates\":{}",
+            element.family_instance_placement_candidates.len()
+        )?;
+    }
+    Ok(())
+}
+
 fn write_element_json(
     writer: &mut impl Write,
     id: u32,
@@ -6953,7 +7484,10 @@ fn write_element_json(
             json_escape(&category.name)
         )?;
     }
-    write_geometry_json(writer, normalized.geometry.as_ref())?;
+    write_geometry_json(writer, normalized.geometry.as_ref(), metadata.full)?;
+    if metadata.full {
+        write_decoded_sections_json(writer, element, normalized.geometry.as_ref())?;
+    }
     write_family_instance_placement(writer, element.family_instance_placement)?;
     write_ginstance_transform(writer, element.ginstance_transform)?;
     if element.moribund {
@@ -7008,7 +7542,11 @@ fn write_element_json(
     writeln!(writer, "}}")
 }
 
-fn write_geometry_json(writer: &mut impl Write, geometry: Option<&BimGeometry>) -> io::Result<()> {
+fn write_geometry_json(
+    writer: &mut impl Write,
+    geometry: Option<&BimGeometry>,
+    full: bool,
+) -> io::Result<()> {
     match geometry {
         Some(BimGeometry::SweptDisk(swept_disk)) => {
             let start = swept_disk.directrix.start.coordinates;
@@ -7052,10 +7590,14 @@ fn write_geometry_json(writer: &mut impl Write, geometry: Option<&BimGeometry>) 
             }
             write!(
                 writer,
-                ",\"geometry\":{{\"kind\":\"brep\",\"faces\":{},\"complete\":{},\"line_edges\":{lines},\"arc_edges\":{arcs}}}",
+                ",\"geometry\":{{\"kind\":\"brep\",\"faces\":{},\"complete\":{},\"line_edges\":{lines},\"arc_edges\":{arcs}",
                 brep.faces.len(),
                 brep.complete
-            )
+            )?;
+            if full {
+                write_brep_faces_json(writer, brep)?;
+            }
+            write!(writer, "}}")
         }
         None => Ok(()),
     }
@@ -7823,6 +8365,7 @@ mod tests {
             parameter_specs: &BTreeMap::new(),
             catalog: None,
             partition_paths: &[],
+            full: false,
         };
         let render = |id: u32| {
             let mut bytes = Vec::new();
