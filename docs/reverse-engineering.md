@@ -1213,3 +1213,83 @@ proxy 3 322 - and `create_shape` builds every one of them with
 `scripts/export_sweep.sh` is the sweep, counting each file and deleting the
 IFC as it goes; only the counts are wanted and the corpus is 50 files of a few
 hundred megabytes each.
+
+### Result: the graph header's box places the bodies the exact block cannot
+
+The entry above closed with the gate named: of the 13 208 wall bodies on AR S1
+only 10 748 carry an exact bounds block at all, every one of those reproduces
+it, and the other 2 460 were refused for having nothing to be checked against.
+A `GElement` record carries other boxes, so the question was whether any of
+them is the same box.
+
+*What the exact block is, and why a record can lack one.*
+`GElementBounds::parse` scans the whole body for an adjacent pair of
+byte-identical six-`f64` blocks and takes it **only if there is exactly one**.
+That uniqueness is what makes it trustworthy without knowing where it lives,
+and it is also why it fails: a record with no such pair, or with two, yields
+nothing. `GElementGraphFields::parse` instead reads a box at a *declared*
+offset - immediately after `GGroup.m_subNodes`, whose length the record
+states - so it does not care how many other blocks the body contains.
+
+*The measurement.* For every body-bearing record, the largest of the six
+coordinate differences between the body's own extent and each box the record
+carries. Where a record carries both boxes, they are the same box:
+
+| | AR S1 | KJ S1 | ВК | ЭОМ |
+|---|---|---|---|---|
+| bodies whose record carries both boxes | 14 808 | 2 678 | 9 840 | 3 720 |
+| of those, graph box differing from the exact block | **0** | **0** | **0** | **0** |
+| bodies whose record carries no exact block | 5 139 | 2 251 | 883 | 1 476 |
+| of those, placed by the graph box | **2 642** | **806** | **160** | **26** |
+| ... and by the near duplicate as well | 1 239 | 116 | 10 | 2 |
+| ... by either, counting the overlap once | 2 642 | 806 | 160 | 26 |
+
+Two readings of one box, agreeing 31 046 times out of 31 046. This is the
+independent-oracle pattern the type link was accepted on: the graph header's
+box is reached by a different route - a declared offset rather than a
+whole-body scan - and lands on the same six numbers.
+
+The agreement with the *body* is as sharp as the exact block's, which is the
+part that decides whether a second tier is a reading or a guess. Of AR S1's
+2 742 bodies whose record carries no exact block but does carry a graph box,
+**2 642 reproduce it to within a micro-foot** and the remaining 100 spread
+across every wider bucket - 4 within 1e-4 ft, 20 within 1e-2, 40 within a
+foot, 36 beyond. A box that merely sits near a body is a different box, and
+almost nothing here sits near.
+
+The near duplicate that `GElementBounds::parse_near_duplicate` finds is
+**refuted as an addition**: on all four files, every body it would place the
+graph box already places. It stays in the measurement and out of the
+placement.
+
+*The tier.* `body_placement_box` is `exact.or(graph)`: a record carrying an
+exact block is judged on it alone, and only a record carrying none falls
+through to the graph header's box. Picking one box rather than trying both is
+the point - a body its own record's exact block refuses must not get to ask a
+second box for a better answer - and because the two boxes agree wherever both
+exist, that discipline costs nothing.
+
+*Result on AR S1*, `--include-unplaced`, against the same file exported at the
+previous commit:
+
+| | before | after |
+|---|---|---|
+| elements with verified geometry | 10 173 | **11 815** |
+| `IfcAdvancedBrep` | 9 889 | **11 531** |
+| `IfcAdvancedFace` | 92 415 | **108 857** |
+| `IfcBoundingBox` | 284 | 284 |
+| `IfcWall` / `IfcSlab` / `IfcSpace` products | 11 011 / 908 / 554 | unchanged |
+
+No product appears or disappears and no box is traded away; 1 642 products
+that carried a box now carry a solid. `create_shape` with world coordinates
+builds **every** product of both files with zero failures - before `IfcWall`
+7 435, `IfcSlab` 702, `IfcSpace` 552, proxy 1 484; after the same but
+`IfcWall` **9 077** - so the entire gain is walls, and the entire gain builds.
+
+*What it does not reach.* 2 642 bodies were newly placed and 1 642 became
+solids. The other 1 000 have at least one face the assembly could not resolve
+and fall back to their box rather than ship an open shell the kernel refuses.
+That is the same backlog the placed path already had, and on AR S1 it is
+dominated by one exclusion: 76 510 of 80 205 excluded faces are `"face has no
+first loop"`. This tier moved the gate from "no box to check against" to
+"the body is incomplete", which is a different problem and the next one.

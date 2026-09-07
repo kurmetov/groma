@@ -1959,13 +1959,16 @@ struct ExportedElement {
     /// How many of this id's `GElement` records yielded a body. More than one
     /// means the rest were passed over by [`keep_body`].
     brep_records: usize,
-    /// Whether [`ExportedElement::brep`] reproduces the bounds block of the
-    /// same record it was decoded from. That box is the one the placement
-    /// chain already trusts - a symbol link is accepted when the instance's
-    /// box agrees with the symbol's carried through its transform - so a body
-    /// reproducing it is in the same frame as the box: already placed, needing
-    /// no symbol and no transform.
+    /// Whether [`ExportedElement::brep`] reproduces the box of the same record
+    /// it was decoded from - see [`body_placement_box`] for which box that is.
+    /// That box is the one the placement chain already trusts - a symbol link
+    /// is accepted when the instance's box agrees with the symbol's carried
+    /// through its transform - so a body reproducing it is in the same frame
+    /// as the box: already placed, needing no symbol and no transform.
     brep_is_placed: bool,
+    /// What each box on the record the kept body came from says about it. See
+    /// [`BodyBoxResiduals`]: measurement for a possible second placement tier.
+    brep_box_residuals: BodyBoxResiduals,
     /// `m_moribund` from the `Element` tail: the element is marked deleted.
     moribund: bool,
     locked: bool,
@@ -3700,6 +3703,7 @@ fn recover_elements(
                         if let Some(bounds) = exact_bounds {
                             entry.geometry_bounds = Some(bounds);
                         }
+                        let graph_bounds = graph.as_ref().map(|graph| graph.bounds);
                         entry.geometry_graph = graph;
                         if let Some(bounds) = placement_bounds {
                             entry.placement_bounds = Some(bounds);
@@ -3724,9 +3728,40 @@ fn recover_elements(
                                 // would cross one record's body with another's
                                 // box: on AR S1, 13 208 wall ids carry 25 486
                                 // body-bearing records between them.
-                                let placed = exact_bounds
+                                let placed = body_placement_box(exact_bounds, graph_bounds)
                                     .is_some_and(|bounds| body_is_placed_in(&brep, &bounds));
                                 if keep_body(&brep, placed, entry) {
+                                    entry.brep_box_residuals = BodyBoxResiduals {
+                                        exact: exact_bounds.and_then(|bounds| {
+                                            body_bounds_residual_feet(&brep, &bounds)
+                                        }),
+                                        graph: graph_bounds.and_then(|bounds| {
+                                            body_bounds_residual_feet(&brep, &bounds)
+                                        }),
+                                        // Scanned only where there is no exact
+                                        // block to compare against, which is
+                                        // both the population that could gain
+                                        // by it and the only one worth the
+                                        // cost of a whole-body scan.
+                                        near_duplicate: exact_bounds
+                                            .is_none()
+                                            .then(|| GElementBounds::parse_near_duplicate(body))
+                                            .flatten()
+                                            .and_then(|bounds| {
+                                                body_bounds_residual_feet(&brep, &bounds)
+                                            }),
+                                        graph_from_exact: exact_bounds.zip(graph_bounds).map(
+                                            |(exact, graph)| {
+                                                exact
+                                                    .min
+                                                    .into_iter()
+                                                    .chain(exact.max)
+                                                    .zip(graph.min.into_iter().chain(graph.max))
+                                                    .map(|(left, right)| (left - right).abs())
+                                                    .fold(0.0_f64, f64::max)
+                                            },
+                                        ),
+                                    };
                                     entry.brep_is_placed = placed;
                                     entry.brep = Some(brep);
                                 }
@@ -4518,21 +4553,80 @@ const UNRESOLVED_CLASS: &str = "(class not resolved)";
 /// a modelled dimension carries, and far above double-precision noise.
 const BODY_BOUNDS_TOLERANCE_FEET: f64 = 1e-6;
 
+/// How far a body's own extent sits from a bounds block: the largest of the
+/// six coordinate differences, in Revit internal feet.
+///
+/// `None` when the body has no extent, or when the box holds no volume - a box
+/// flat on an axis describes a region or a sketch rather than a solid, and AR
+/// S1 carries 9 873 `FilledRegion` records that would otherwise agree with one
+/// on a single face.
+fn body_bounds_residual_feet(brep: &rvt_model::SymbolBrep, bounds: &GElementBounds) -> Option<f64> {
+    let (min, max) = body_extent_feet(brep)?;
+    bounds.is_volumetric().then(|| {
+        min.into_iter()
+            .chain(max)
+            .zip(bounds.min.into_iter().chain(bounds.max))
+            .map(|(ours, theirs)| (ours - theirs).abs())
+            .fold(0.0_f64, f64::max)
+    })
+}
+
 /// Whether a body is already placed, by reproducing the bounds block carried
 /// by the same `GElement` record.
 fn body_is_placed_in(brep: &rvt_model::SymbolBrep, bounds: &GElementBounds) -> bool {
-    let Some((min, max)) = body_extent_feet(brep) else {
-        return false;
-    };
-    // A box flat on an axis holds no volume, and its "body" is a region or a
-    // sketch rather than a solid - AR S1 carries 9 873 `FilledRegion` records
-    // that would otherwise pass this test on a single face.
-    bounds.is_volumetric()
-        && min
-            .into_iter()
-            .chain(max)
-            .zip(bounds.min.into_iter().chain(bounds.max))
-            .all(|(ours, theirs)| (ours - theirs).abs() <= BODY_BOUNDS_TOLERANCE_FEET)
+    body_bounds_residual_feet(brep, bounds)
+        .is_some_and(|residual| residual <= BODY_BOUNDS_TOLERANCE_FEET)
+}
+
+/// The box a body is judged against: the exact duplicated block its own record
+/// carries, or - only where that record carries none - the box in the record's
+/// `GElement` graph header.
+///
+/// The two are one box read two ways. Where a record carries both, they agree
+/// on every record in the corpus that carries a body: 14 808 on AR S1, 2 678
+/// on KJ S1, 9 840 on ВК and 3 720 on ЭОМ, with not one disagreement. So the
+/// graph header's box is not a second opinion to fall back on - a record whose
+/// exact block refuses a body is not re-asked, which is why this picks one box
+/// rather than trying both - it is the same box on the records where the
+/// whole-body scan cannot single one out. Reading it places 2 642 more bodies
+/// on AR S1, 2 321 of them walls, and 806 / 160 / 26 on the other three.
+///
+/// The near duplicate that [`GElementBounds::parse_near_duplicate`] finds adds
+/// nothing here: every body it would place, the graph header's box already
+/// places, on all four files.
+fn body_placement_box(
+    exact: Option<GElementBounds>,
+    graph: Option<GElementBounds>,
+) -> Option<GElementBounds> {
+    exact.or(graph)
+}
+
+/// What every box on a body's own record says about where that body sits.
+///
+/// Measurement only: the export places a body on the exact duplicated block
+/// alone, and this records what the record's other two boxes - the `GElement`
+/// graph header's, and the numerically-equal near duplicate - would have said
+/// about the same body. Each value is the residual from
+/// [`body_bounds_residual_feet`], so `Some(0.0)` is exact agreement and `None`
+/// means that box was absent or held no volume.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BodyBoxResiduals {
+    exact: Option<f64>,
+    graph: Option<f64>,
+    /// Read only for a record carrying no exact block: it is a scan of the
+    /// whole body, and that is the only population it could add anything to.
+    near_duplicate: Option<f64>,
+    /// How far the graph header's box sits from the exact block on records
+    /// that carry both. If the two are the same box, the graph box inherits
+    /// whatever standing the exact one has.
+    graph_from_exact: Option<f64>,
+}
+
+impl BodyBoxResiduals {
+    /// Whether a residual is close enough to call the two boxes the same.
+    fn agrees(residual: Option<f64>) -> bool {
+        residual.is_some_and(|residual| residual <= BODY_BOUNDS_TOLERANCE_FEET)
+    }
 }
 
 /// Whether a newly decoded body should replace the one its id already holds.
@@ -4565,6 +4659,21 @@ struct ClassGeometry {
     /// bounds the placement chain already trusts.
     bodies_with_bounds: usize,
     bodies_matching_their_bounds: usize,
+    /// The same question asked of the two other boxes the record carries, as
+    /// the measurement behind a possible second placement tier. `only` counts
+    /// bodies whose record carries no exact block at all: what that tier would
+    /// actually add, rather than what it would re-confirm.
+    bodies_with_graph_bounds: usize,
+    bodies_matching_their_graph_bounds: usize,
+    bodies_placed_only_by_graph_bounds: usize,
+    bodies_placed_only_by_near_duplicate_bounds: usize,
+    /// Placed by either of them: what a second tier reading both would add,
+    /// with the overlap counted once.
+    bodies_placed_only_by_another_box: usize,
+    /// Bodies whose record carries both boxes and whose graph box is not the
+    /// exact block. Where this is zero the graph box is the exact block seen
+    /// from its declared offset.
+    graph_bounds_differing_from_exact: usize,
     /// Bodies whose centre is more than a foot from the origin, i.e. already
     /// carrying a position rather than sitting in a symbol's local frame.
     bodies_away_from_the_origin: usize,
@@ -4715,7 +4824,30 @@ fn tally_class_geometry<'a>(
                 // The recovery paired this body with the bounds of its own
                 // record; re-deriving it here from the element would cross
                 // one record's body with another's box.
-                row.bodies_matching_their_bounds += usize::from(element.brep_is_placed);
+                let residuals = element.brep_box_residuals;
+                // The exact block alone, so this column keeps meaning what it
+                // did before the graph box became a second tier;
+                // `model_elements_with_a_placed_body` below is the one that
+                // counts both.
+                row.bodies_matching_their_bounds +=
+                    usize::from(BodyBoxResiduals::agrees(residuals.exact));
+                row.bodies_with_graph_bounds += usize::from(residuals.graph.is_some());
+                row.bodies_matching_their_graph_bounds +=
+                    usize::from(BodyBoxResiduals::agrees(residuals.graph));
+                if residuals.exact.is_none() {
+                    row.bodies_placed_only_by_graph_bounds +=
+                        usize::from(BodyBoxResiduals::agrees(residuals.graph));
+                    row.bodies_placed_only_by_near_duplicate_bounds +=
+                        usize::from(BodyBoxResiduals::agrees(residuals.near_duplicate));
+                    row.bodies_placed_only_by_another_box += usize::from(
+                        BodyBoxResiduals::agrees(residuals.graph)
+                            || BodyBoxResiduals::agrees(residuals.near_duplicate),
+                    );
+                }
+                row.graph_bounds_differing_from_exact += usize::from(
+                    residuals.graph_from_exact.is_some()
+                        && !BodyBoxResiduals::agrees(residuals.graph_from_exact),
+                );
             }
         }
         if is_model_element {
@@ -4758,6 +4890,13 @@ fn body_owners(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(),
             total.verified_by_an_instance += row.verified_by_an_instance;
             total.bodies_with_bounds += row.bodies_with_bounds;
             total.bodies_matching_their_bounds += row.bodies_matching_their_bounds;
+            total.bodies_with_graph_bounds += row.bodies_with_graph_bounds;
+            total.bodies_matching_their_graph_bounds += row.bodies_matching_their_graph_bounds;
+            total.bodies_placed_only_by_graph_bounds += row.bodies_placed_only_by_graph_bounds;
+            total.bodies_placed_only_by_near_duplicate_bounds +=
+                row.bodies_placed_only_by_near_duplicate_bounds;
+            total.bodies_placed_only_by_another_box += row.bodies_placed_only_by_another_box;
+            total.graph_bounds_differing_from_exact += row.graph_bounds_differing_from_exact;
             total.bodies_away_from_the_origin += row.bodies_away_from_the_origin;
             total.model_elements += row.model_elements;
             total.model_elements_with_their_own_body += row.model_elements_with_their_own_body;
@@ -4790,10 +4929,87 @@ fn body_owners(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(),
         "  bodies whose centre is over a foot from the origin: {}",
         total.bodies_away_from_the_origin
     );
+    println!(
+        "  bodies reproducing their record's graph-header box: {} of {} that carry one \
+         ({} of those boxes are not the exact block)",
+        total.bodies_matching_their_graph_bounds,
+        total.bodies_with_graph_bounds,
+        total.graph_bounds_differing_from_exact
+    );
+    println!(
+        "  of the bodies with no exact block, placed by the graph box: {}, by the near \
+         duplicate: {}, by either: {}",
+        total.bodies_placed_only_by_graph_bounds,
+        total.bodies_placed_only_by_near_duplicate_bounds,
+        total.bodies_placed_only_by_another_box
+    );
+
+    print_body_box_residuals(&recovered.elements);
 
     print_body_owner_table(&rows, classes);
     print_model_element_body_table(&rows, &total, classes);
     Ok(())
+}
+
+/// How closely each box on a body's own record reproduces that body.
+///
+/// A second placement tier is only worth adding if agreement with the graph
+/// header's box is as sharp as agreement with the exact block: a box that is
+/// merely near the body is a different box, not a looser reading of the same
+/// one. The rows split on whether the record also carried an exact block,
+/// because the bodies that carry none are the ones a second tier would add.
+fn print_body_box_residuals(elements: &BTreeMap<u32, ExportedElement>) {
+    /// Upper bound of each bucket in Revit internal feet, and its label.
+    const BUCKETS: [(f64, &str); 6] = [
+        (BODY_BOUNDS_TOLERANCE_FEET, "<=1e-6ft"),
+        (1e-4, "<=1e-4ft"),
+        (1e-2, "<=1e-2ft"),
+        (1.0, "<=1ft"),
+        (100.0, "<=100ft"),
+        (f64::INFINITY, ">100ft"),
+    ];
+    // Rows: graph box with an exact block present, graph box without one,
+    // near duplicate without one. Columns: the buckets, then "no such box".
+    let mut rows = [[0_usize; BUCKETS.len() + 1]; 3];
+    for element in elements.values() {
+        if element.brep.is_none() {
+            continue;
+        }
+        let residuals = element.brep_box_residuals;
+        let measured: &[(usize, Option<f64>)] = if residuals.exact.is_some() {
+            &[(0, residuals.graph)]
+        } else {
+            &[(1, residuals.graph), (2, residuals.near_duplicate)]
+        };
+        for &(row, residual) in measured {
+            let column = residual.map_or(BUCKETS.len(), |residual| {
+                BUCKETS
+                    .iter()
+                    .position(|(bound, _)| residual <= *bound)
+                    .unwrap_or(BUCKETS.len() - 1)
+            });
+            rows[row][column] += 1;
+        }
+    }
+    println!("\nHow far each box sits from the body on its own record:");
+    print!("box");
+    for (_, label) in BUCKETS {
+        print!("\t{label}");
+    }
+    println!("\tno box");
+    for (row, name) in [
+        ("graph box, exact block present", 0),
+        ("graph box, no exact block", 1),
+        ("near duplicate, no exact block", 2),
+    ]
+    .map(|(name, row)| (row, name))
+    {
+        print!("{name}");
+        for count in rows[row] {
+            print!("\t{count}");
+        }
+        println!();
+    }
 }
 
 /// Which classes own the decoded bodies, most bodies first.
@@ -4807,14 +5023,16 @@ fn print_body_owner_table(rows: &BTreeMap<&str, ClassGeometry>, classes: usize) 
             .then_with(|| left.0.cmp(right.0))
     });
     println!("\nWho owns the bodies:");
-    println!("class\tids\trecords\tcomplete\tfaces\tnamed\tverified\t=bounds\toff-origin");
+    println!(
+        "class\tids\trecords\tcomplete\tfaces\tnamed\tverified\t=bounds\t+graph\t+dup\t+either\toff-origin"
+    );
     for (name, row) in by_bodies
         .iter()
         .filter(|(_, row)| row.body_ids > 0)
         .take(classes)
     {
         println!(
-            "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}/{}\t{}",
+            "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}/{}\t{}\t{}\t{}\t{}",
             row.body_ids,
             row.body_records,
             row.complete_bodies,
@@ -4823,6 +5041,9 @@ fn print_body_owner_table(rows: &BTreeMap<&str, ClassGeometry>, classes: usize) 
             row.verified_by_an_instance,
             row.bodies_matching_their_bounds,
             row.bodies_with_bounds,
+            row.bodies_placed_only_by_graph_bounds,
+            row.bodies_placed_only_by_near_duplicate_bounds,
+            row.bodies_placed_only_by_another_box,
             row.bodies_away_from_the_origin
         );
     }
@@ -6977,6 +7198,11 @@ mod tests {
         // What the recovery sets when the body reproduces the bounds of the
         // record it came from; see `body_is_placed_in`.
         wall.brep_is_placed = true;
+        wall.brep_box_residuals = BodyBoxResiduals {
+            exact: Some(0.0),
+            graph: Some(0.0),
+            ..BodyBoxResiduals::default()
+        };
         wall.geometry_bounds = Some(rvt_model::GElementBounds {
             offset: 0,
             min: [40.0, 5.0, 0.0],
@@ -7013,6 +7239,9 @@ mod tests {
         // The body reproduces the record's own bounds and sits where the
         // building is, not at a symbol's origin.
         assert_eq!(wall.bodies_matching_their_bounds, 1);
+        // Its record carried an exact block, so the graph box adds nothing:
+        // that column counts only what a second tier would newly place.
+        assert_eq!(wall.bodies_placed_only_by_graph_bounds, 0);
         assert_eq!(wall.bodies_away_from_the_origin, 1);
         // It is a model element that owns a body and reaches the export by no
         // symbol at all - the case the funnel cannot see.
@@ -7038,6 +7267,21 @@ mod tests {
             min,
             max,
         }
+    }
+
+    #[test]
+    fn a_record_carrying_an_exact_block_is_judged_on_it_alone() {
+        let exact = bounds([40.0, 5.0, 0.0], [41.0, 6.0, 9.0]);
+        let graph = bounds([0.0, 0.0, 0.0], [1.0, 1.0, 9.0]);
+        // Where a record carries both, they are the same box, so which one is
+        // picked cannot matter - but a record whose exact block refuses a body
+        // must not get to ask a second box about it either.
+        assert_eq!(body_placement_box(Some(exact), Some(graph)), Some(exact));
+        assert_eq!(body_placement_box(Some(exact), None), Some(exact));
+        // A record that carries no exact block is the whole of what the graph
+        // header's box adds.
+        assert_eq!(body_placement_box(None, Some(graph)), Some(graph));
+        assert_eq!(body_placement_box(None, None), None);
     }
 
     #[test]
