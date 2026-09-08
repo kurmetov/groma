@@ -6387,13 +6387,24 @@ fn metadata_model(
         // recall on `SWall`, `Floor` and `FamilyInstance` alike - while
         // dropping the records of those classes that are not model elements:
         // precision rises from 57.8% to 69.3% on `SWall`, 44.5% to 58.8% on
-        // `Floor` and 28.2% to 56.9% on `FamilyInstance`. What remains
-        // over-selected is not separable by any field this decode recovers.
+        // `Floor` and 28.2% to 56.9% on `FamilyInstance`. What remained
+        // over-selected after that read as not separable by any field this
+        // decode recovers; half of it turned out to be separable by one.
+        //
+        // The first way in - a declared category - was the leak. It admits the
+        // very records the third way in is careful to exclude: a type or a
+        // definition declares its category, an instance does not. Joining AR
+        // S1 again bears that out without a single exception - of the 11 291
+        // products we and Revit both export not one declares a category, while
+        // 3 222 of the records we export and Revit does not do. So the reading
+        // holds wherever it is applied, and it is applied here to every way in
+        // rather than to one of them.
         let is_model_element = is_model_element(element);
         let verified_geometry = element.verified_symbol_bounds.is_some();
         let is_space = is_space(element);
         !element.moribund
             && class_name(element) != Some("Level")
+            && !element.declares_a_category()
             && (element.category.is_some() || verified_geometry || is_model_element || is_space)
             && (include_unplaced
                 || element.level_id.is_some()
@@ -10036,6 +10047,94 @@ mod tests {
         // Only a declared category marks a record as a type or definition.
         assert!(elements[&902].declares_a_category());
         assert!(!elements[&900].declares_a_category());
+    }
+
+    /// A type or a definition is not a product, whichever way into the export
+    /// it takes. The join against Revit's own export of AR S1 says so without
+    /// an exception - of the 11 291 products we share with it not one declares
+    /// a category - so the reading belongs to the selection as a whole and not
+    /// to the one way in that happened to state it.
+    #[test]
+    fn a_record_declaring_its_category_is_never_a_candidate() {
+        let schema = named_classes(&[(12, "Element", None), (13, "SWall", None)]);
+        let mut elements = BTreeMap::new();
+        // An instance: a building class, in a phase, on a level, declaring no
+        // category of its own.
+        elements.insert(
+            100,
+            ExportedElement {
+                class_index: Some(13),
+                created_phase_id: Some(3),
+                level_id: Some(1),
+                ..ExportedElement::default()
+            },
+        );
+        // The type it stands on. Same class, same phase, same level - it is
+        // the declared category that tells the two apart.
+        elements.insert(
+            101,
+            ExportedElement {
+                class_index: Some(13),
+                created_phase_id: Some(3),
+                level_id: Some(1),
+                category: Some(-2_000_011),
+                category_source: Some("declared"),
+                ..ExportedElement::default()
+            },
+        );
+        // A definition carrying a verified body. The geometry way in used to
+        // admit it; the box it verifies against is in its own local frame.
+        elements.insert(
+            102,
+            ExportedElement {
+                class_index: Some(13),
+                category: Some(-2_000_011),
+                category_source: Some("declared"),
+                verified_symbol_bounds: Some(VerifiedSymbolBounds {
+                    symbol_element_id: 101,
+                    bounds: rvt_model::GElementBounds {
+                        offset: 0,
+                        min: [0.0, 0.0, 0.0],
+                        max: [1.0, 1.0, 1.0],
+                    },
+                }),
+                ..ExportedElement::default()
+            },
+        );
+        // An instance of a class the export does not know, admitted by the
+        // category it inherited from its family. That way in stays open.
+        elements.insert(
+            103,
+            ExportedElement {
+                class_index: Some(12),
+                created_phase_id: Some(3),
+                level_id: Some(1),
+                category: Some(-2_000_011),
+                category_source: Some("family"),
+                ..ExportedElement::default()
+            },
+        );
+
+        let recovered = RecoveredElements {
+            release: None,
+            catalog: None,
+            parameter_values_schema_bound: false,
+            schema: Some(schema),
+            partition_paths: Vec::new(),
+            parameter_names: BTreeMap::new(),
+            parameter_specs: BTreeMap::new(),
+            elements,
+        };
+        let (model, ..) = metadata_model(&recovered, false, None);
+        let selected = model
+            .elements
+            .iter()
+            .map(|element| element.id.0.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            selected,
+            ["100".to_owned(), "103".to_owned()].into_iter().collect(),
+        );
     }
 
     /// An element wears the build-up its type declares, and says which record
