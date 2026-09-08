@@ -14,8 +14,9 @@ use std::{
 use bim_core::{
     BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
     BimBrepRuling, BimBrepSurface, BimCategory, BimElement, BimElementId, BimElementType,
-    BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimModel, BimNumber, BimPlacement,
-    BimPoint3, BimProperty, BimPropertyValue, BimSource, BimSweptDisk, BimUnit,
+    BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimMaterial, BimMaterialLayer,
+    BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty,
+    BimPropertyValue, BimSource, BimSweptDisk, BimUnit,
 };
 use clap::{Parser, Subcommand};
 use ifc_export::{MetadataOptions, element_type_for_source, metadata_ifc, uuid_v5};
@@ -222,6 +223,21 @@ enum Command {
         /// Print this many classes, most bodies first.
         #[arg(long, default_value_t = 24)]
         classes: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+    /// Report the layer table compound host object types carry, and score each
+    /// candidate type-reference property against the class of what it names.
+    Layers {
+        file: PathBuf,
+        /// Print this many decoded layer tables in full, most layers first.
+        #[arg(long, default_value_t = 20)]
+        types: usize,
+        /// Also print one line per element carrying a type reference, so the
+        /// links can be joined against an independent answer.
+        #[arg(long)]
+        links: bool,
         /// Maximum decoded bytes accepted from one member.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
@@ -541,6 +557,12 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             classes,
             max_member_bytes,
         } => body_owners(&file, classes, max_member_bytes),
+        Command::Layers {
+            file,
+            types,
+            links,
+            max_member_bytes,
+        } => layers(&file, types, links, max_member_bytes),
         Command::Names {
             file,
             classes,
@@ -1966,7 +1988,59 @@ fn element(
 ///
 /// `RbsCurve.m_idType` was measured the same way; see the working notes for its
 /// numbers.
-const TYPE_ELEMENT_ID_PROPERTIES: &[&str] = &["m_masterSymbolId", "m_idType"];
+///
+/// A compound host object names its type under an `...AttributesId` property of
+/// its own chain, and the schema declares exactly five: `VWall`, `Floor`,
+/// `RoofBase`, `Ceiling` and `HostInfill`. All five are candidates here, each
+/// read by the same `record_declared_id`, so a class picks up only the one its
+/// own chain declares.
+///
+/// `VWall.m_WallAttributesId` is the wall's, measured the same way on AR S1 and
+/// S2 - the first architecture files the reader has seen - and then against
+/// Revit's own IFC export of those same models, which is an answer this project
+/// did not produce. Its 13 208 / 13 851 values on `SWall` name 111 / 116
+/// distinct elements and every one of them is a `WallType` descendant:
+/// `BasicWallType` 13 153 / 13 801, `WallAttributes` 40 / 40,
+/// `NewCurtainWallType` 15 / 10, three classes of one chain out of the file's
+/// 4 418. Joined to the reference export by element id, all 7 617 / 7 739 walls
+/// Revit exports have a type here, and it is the type Revit names for 7 615 /
+/// 7 739 of them. `rivet layers` is the instrument and
+/// `scripts/compare_wall_layers.py` is the join.
+const TYPE_ELEMENT_ID_PROPERTIES: &[&str] = DECLARED_ID_PROPERTIES
+    .split_at(TYPE_ELEMENT_ID_PROPERTY_COUNT)
+    .0;
+
+/// How many of [`DECLARED_ID_PROPERTIES`] name a type. They are its leading
+/// run, in the order a class picks from.
+const TYPE_ELEMENT_ID_PROPERTY_COUNT: usize = 7;
+
+/// `FamilySymbol.m_familyId`, the family a loadable type belongs to.
+const FAMILY_ID_PROPERTY: &str = "m_familyId";
+/// `FamilyBase.m_categoryId`, the category that family is of.
+const CATEGORY_ID_PROPERTY: &str = "m_categoryId";
+
+/// Every declared identifier property read out of a record's own header, in
+/// one walk. The type candidates come first so their order is
+/// [`TYPE_ELEMENT_ID_PROPERTIES`]'s and a class picks the first it declares.
+const DECLARED_ID_PROPERTIES: &[&str] = &[
+    "m_masterSymbolId",
+    "m_idType",
+    "m_WallAttributesId",
+    "m_floorAttributesId",
+    "m_roofAttributesId",
+    "m_ceilingAttributesId",
+    "m_AttributesId",
+    FAMILY_ID_PROPERTY,
+    CATEGORY_ID_PROPERTY,
+];
+
+/// The value read for one of [`DECLARED_ID_PROPERTIES`].
+fn declared_id(values: &[Option<i32>], property: &str) -> Option<i32> {
+    let at = DECLARED_ID_PROPERTIES
+        .iter()
+        .position(|candidate| *candidate == property)?;
+    *values.get(at)?
+}
 
 /// One element as it is emitted to JSON.
 #[derive(Debug, Default)]
@@ -1990,6 +2064,18 @@ struct ExportedElement {
     parameters: Vec<rvt_model::Parameter>,
     /// The element this one is an instance of, from its own declarations.
     type_element_id: Option<i32>,
+    /// Which of [`TYPE_ELEMENT_ID_PROPERTIES`] carried it, so a report can
+    /// score each candidate property on its own.
+    type_element_property: Option<&'static str>,
+    /// `FamilySymbol.m_familyId`: the family a type belongs to.
+    family_element_id: Option<i32>,
+    /// `FamilyBase.m_categoryId`: the category a family is of. A loadable
+    /// family's category lives here and nowhere else - neither the instance
+    /// nor its type declares one - so this is the only route to it.
+    declared_category_id: Option<i32>,
+    /// The layer table this element carries when it is a compound host
+    /// object's type. See [`rvt_model::CompoundStructure`].
+    compound_structures: Vec<rvt_model::CompoundStructure>,
     /// Parameters read from the record of this element's type. See
     /// `inherit_symbol_parameters`.
     type_parameters: Vec<rvt_model::Parameter>,
@@ -2033,6 +2119,17 @@ struct ExportedElement {
 impl ExportedElement {
     /// The element this one is an instance of: its declared type reference,
     /// or - for a record whose declarations did not yield one - the symbol its
+    /// Whether the element's *own* record declared a category.
+    ///
+    /// That is what separates a type or definition from an instance, and it is
+    /// the reading the export's selection rests on. A category reached through
+    /// the element's family or through a bounds-verified symbol is not a
+    /// declaration and must not be read as one - the whole point of those two
+    /// is to give an instance the category it does not declare.
+    fn declares_a_category(&self) -> bool {
+        self.category_source == Some("declared")
+    }
+
     /// bounds were verified against. See [`TYPE_ELEMENT_ID_PROPERTIES`].
     fn type_element_reference(&self) -> Option<u32> {
         self.type_element_id
@@ -3529,6 +3626,301 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
         }
     }
     Ok(())
+}
+
+/// Millimetres in one Revit internal foot.
+const MILLIMETRES_PER_FOOT: f64 = 304.8;
+
+/// What one candidate type-reference property named, for one class that
+/// declares it: how many values it carried, what classes they named, and how
+/// many distinct elements they named between them.
+#[derive(Default)]
+struct TypeLinkTally<'a> {
+    values: u64,
+    named_classes: BTreeMap<&'a str, u64>,
+    named_elements: BTreeSet<i32>,
+}
+
+/// Report the layer table compound host object types carry, and score every
+/// candidate type-reference property by the class of the element it names.
+///
+/// Both halves are measurements rather than output. A type reference is
+/// credible when its values land on one class out of the file's thousands, and
+/// a layer table is credible when its widths and materials reproduce an answer
+/// this decode did not produce: Revit's own IFC export of the same model
+/// carries an `IfcMaterialConstituentSet` per wall, with the layers in order,
+/// the material names, and each layer's share of the total width. `--links`
+/// prints the element-to-type pairs so that join can be made.
+fn layers(
+    path: &Path,
+    types: usize,
+    links_wanted: bool,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let recovered = recover_elements(path, max_member_bytes)?;
+    let schema = recovered.schema.as_ref();
+    let elements = &recovered.elements;
+    let class_of = |id: u32| -> Option<&str> {
+        elements
+            .get(&id)
+            .and_then(|element| element_class_name(element, schema))
+    };
+    let name_of = |id: u32| -> Option<&str> {
+        elements
+            .get(&id)
+            .and_then(|element| element.name.as_ref())
+            .map(|(name, _)| name.as_str())
+    };
+
+    report_type_links(elements, schema, &class_of);
+    if links_wanted {
+        println!();
+        for (id, element) in elements {
+            let (property, target) = match (element.type_element_property, element.type_element_id)
+            {
+                (Some(property), Some(target)) => (property, target),
+                // A record with no type reference still reports its family and
+                // its category, which is the other half of the same join.
+                _ if element.family_element_id.is_some()
+                    || element.declared_category_id.is_some() =>
+                {
+                    ("-", -1)
+                }
+                _ => continue,
+            };
+            let target_id = u32::try_from(target).ok();
+            println!(
+                "LINK {id}\t{owner}\t{property}\t{target}\t{class}\t{name}\t{family}\t{category}",
+                owner = element_class_name(element, schema).unwrap_or("-"),
+                class = target_id.and_then(&class_of).unwrap_or("-"),
+                name = target_id.and_then(&name_of).unwrap_or("-"),
+                family = element.family_element_id.unwrap_or(-1),
+                category = element.declared_category_id.unwrap_or(-1),
+            );
+        }
+    }
+    report_family_categories(elements, schema, &class_of);
+    report_layer_carriers(elements, schema);
+    report_layer_tables(elements, schema, types, &name_of);
+    Ok(())
+}
+
+/// The class of the element's own record, when the schema names one.
+fn element_class_name<'a>(
+    element: &ExportedElement,
+    schema: Option<&'a Schema>,
+) -> Option<&'a str> {
+    element
+        .class_index
+        .and_then(|index| schema?.class_by_index(index))
+        .map(|class| class.name.as_str())
+}
+
+/// What each candidate property names, per class that declares it. A real type
+/// reference lands on one class out of the file's thousands; a misread field
+/// scatters across them.
+fn report_type_links<'a>(
+    elements: &'a BTreeMap<u32, ExportedElement>,
+    schema: Option<&'a Schema>,
+    class_of: &impl Fn(u32) -> Option<&'a str>,
+) {
+    let mut links: BTreeMap<(&str, &str), TypeLinkTally<'a>> = BTreeMap::new();
+    for element in elements.values() {
+        let (Some(property), Some(target)) =
+            (element.type_element_property, element.type_element_id)
+        else {
+            continue;
+        };
+        let Some(owner) = element_class_name(element, schema) else {
+            continue;
+        };
+        let row = links.entry((property, owner)).or_default();
+        row.values += 1;
+        *row.named_classes
+            .entry(
+                u32::try_from(target)
+                    .ok()
+                    .and_then(class_of)
+                    .unwrap_or("<no such element>"),
+            )
+            .or_default() += 1;
+        row.named_elements.insert(target);
+    }
+    println!("Type references, by the property that carried them:");
+    let mut rows = links.into_iter().collect::<Vec<_>>();
+    rows.sort_by_key(|(_, row)| std::cmp::Reverse(row.values));
+    for ((property, owner), row) in rows {
+        let named = row
+            .named_classes
+            .iter()
+            .map(|(class, count)| format!("{class} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "  {property}\ton {owner}: {values} values naming {distinct} elements - {named}",
+            values = row.values,
+            distinct = row.named_elements.len(),
+        );
+    }
+}
+
+/// The route a loadable family's category takes: symbol -> family -> category,
+/// and what each hop reaches. See `inherit_family_categories`.
+fn report_family_categories<'a>(
+    elements: &'a BTreeMap<u32, ExportedElement>,
+    schema: Option<&'a Schema>,
+    class_of: &impl Fn(u32) -> Option<&'a str>,
+) {
+    let mut families: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+    let mut declaring: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut sources: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut without = 0_u64;
+    for element in elements.values() {
+        let owner = element_class_name(element, schema).unwrap_or("-");
+        if let Some(family) = element.family_element_id {
+            let named = u32::try_from(family)
+                .ok()
+                .and_then(class_of)
+                .unwrap_or("<no such element>");
+            *families.entry((owner, named)).or_default() += 1;
+        }
+        if element.declared_category_id.is_some() {
+            *declaring.entry(owner).or_default() += 1;
+        }
+        match element.category_source {
+            Some(source) => *sources.entry(source).or_default() += 1,
+            None if element.category.is_some() => *sources.entry("-").or_default() += 1,
+            None => without += 1,
+        }
+    }
+    println!();
+    println!("Family references, by the class that declares one and the class it names:");
+    let mut rows = families.into_iter().collect::<Vec<_>>();
+    rows.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    for ((owner, named), count) in rows.into_iter().take(8) {
+        println!("  m_familyId	on {owner}: {count} naming {named}");
+    }
+    println!("Records declaring a category identifier:");
+    let mut rows = declaring.into_iter().collect::<Vec<_>>();
+    rows.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    for (owner, count) in rows.into_iter().take(8) {
+        println!("  m_categoryId	on {owner}: {count}");
+    }
+    println!("Categories, by where they came from:");
+    for (source, count) in sources {
+        println!("  {source}: {count}");
+    }
+    println!("  no category: {without}");
+}
+
+/// Every class that can carry a layer table, whether or not one was read, so a
+/// class that carries none is visible rather than absent.
+fn report_layer_carriers(elements: &BTreeMap<u32, ExportedElement>, schema: Option<&Schema>) {
+    let mut carriers: BTreeMap<&str, (u64, u64, BTreeMap<usize, u64>)> = BTreeMap::new();
+    for element in elements.values() {
+        let Some(class) = element_class_name(element, schema) else {
+            continue;
+        };
+        let host_object_type = element.class_index.is_some_and(|index| {
+            schema.is_some_and(|schema| {
+                rvt_model::descends_from(
+                    schema,
+                    index,
+                    rvt_model::HOST_OBJECT_ATTRIBUTES_CLASS_NAME,
+                )
+            })
+        });
+        if !host_object_type {
+            continue;
+        }
+        let row = carriers.entry(class).or_default();
+        row.0 += 1;
+        if let Some(structure) = element.compound_structures.first() {
+            row.1 += 1;
+            *row.2.entry(structure.layers.len()).or_default() += 1;
+        }
+    }
+    println!();
+    println!("Layer tables, by the class of the type that carries them:");
+    let mut rows = carriers.into_iter().collect::<Vec<_>>();
+    rows.sort_by_key(|(_, row)| std::cmp::Reverse(row.0));
+    for (class, (ids, read, histogram)) in rows {
+        let counts = histogram
+            .iter()
+            .map(|(layers, ids)| format!("{layers}:{ids}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("  {class}\tids={ids}\twith a layer table={read}\tlayers {counts}");
+    }
+}
+
+/// The tables themselves, most layers first: this is what an independent
+/// answer is compared against.
+fn report_layer_tables<'a>(
+    elements: &'a BTreeMap<u32, ExportedElement>,
+    schema: Option<&'a Schema>,
+    types: usize,
+    name_of: &impl Fn(u32) -> Option<&'a str>,
+) {
+    let mut listed = elements
+        .iter()
+        .filter_map(|(id, element)| {
+            element
+                .compound_structures
+                .first()
+                .map(|structure| (*id, element, structure))
+        })
+        .collect::<Vec<_>>();
+    listed.sort_by(|left, right| {
+        right
+            .2
+            .layers
+            .len()
+            .cmp(&left.2.layers.len())
+            .then(left.0.cmp(&right.0))
+    });
+    println!();
+    println!(
+        "Decoded layer tables: {} of {} shown, widths in millimetres",
+        listed.len().min(types),
+        listed.len()
+    );
+    for (id, element, structure) in listed.iter().take(types) {
+        println!();
+        println!(
+            "TYPE {id}\t{class}\t{name}\tlayers={layers}\tcore=[{exterior},{interior}]\ttotal={total:.1}\tpattern={pattern}\tendCap={end_cap}\twrap={wrap}",
+            class = element_class_name(element, schema).unwrap_or("-"),
+            name = name_of(*id).unwrap_or("-"),
+            layers = structure.layers.len(),
+            exterior = structure.shell_layers_exterior,
+            interior = structure.shell_layers_interior,
+            total = structure.total_width_feet() * MILLIMETRES_PER_FOOT,
+            pattern = structure.coarse_scale_fill_pattern_id.unwrap_or(-1),
+            end_cap = structure.end_cap,
+            wrap = structure.opening_wrapping,
+        );
+        for (index, layer) in structure.layers.iter().enumerate() {
+            // Its own column: a marker appended to the material name would be
+            // read back as part of the name by anything joining this report
+            // against another answer.
+            let structural = if structure.structural_layer_index == Some(index) {
+                "\tstructural"
+            } else {
+                ""
+            };
+            println!(
+                "  LAYER {index}\t{width:.1}\tfunction={function}\tmaterial={material_id}\t{material}{structural}",
+                width = layer.width_feet * MILLIMETRES_PER_FOOT,
+                function = layer.function,
+                material_id = layer.material_id.unwrap_or(-1),
+                material = layer
+                    .material_id
+                    .and_then(|id| u32::try_from(id).ok())
+                    .and_then(name_of)
+                    .unwrap_or("-"),
+            );
+        }
+    }
 }
 
 fn names(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
@@ -5065,6 +5457,9 @@ fn recover_elements(
     let gnode_class_index = schema_class_index(schema.as_ref(), "GNode");
     let geometry_element_class_index = schema_class_index(schema.as_ref(), "GElement");
     let parameter_set_classes = parameter_set_class_indexes(schema.as_ref());
+    let compound_structure_classes = schema
+        .as_ref()
+        .and_then(rvt_model::CompoundStructureClassIndexes::detect);
     let brep_classes = (|| {
         Some(rvt_model::BrepClassIndexes {
             face: schema_class_index(schema.as_ref(), "Face")?,
@@ -5235,17 +5630,57 @@ fn recover_elements(
                         // The type an element is an instance of is a declared
                         // property, so it is read rather than inferred from
                         // geometry. See `TYPE_ELEMENT_ID_PROPERTIES`.
-                        if entry.type_element_id.is_none() {
-                            entry.type_element_id = schema.as_ref().and_then(|schema| {
-                                TYPE_ELEMENT_ID_PROPERTIES.iter().find_map(|property| {
-                                    rvt_model::record_declared_id(
-                                        schema,
-                                        header.class_index,
-                                        body,
-                                        property,
-                                    )
-                                })
-                            });
+                        if entry.type_element_id.is_none()
+                            || entry.family_element_id.is_none()
+                            || entry.declared_category_id.is_none()
+                        {
+                            if let Some(schema) = schema.as_ref() {
+                                let declared = rvt_model::record_declared_ids(
+                                    schema,
+                                    header.class_index,
+                                    body,
+                                    DECLARED_ID_PROPERTIES,
+                                );
+                                if entry.type_element_id.is_none() {
+                                    if let Some((property, id)) = TYPE_ELEMENT_ID_PROPERTIES
+                                        .iter()
+                                        .zip(&declared)
+                                        .find_map(|(property, id)| Some((*property, (*id)?)))
+                                    {
+                                        entry.type_element_id = Some(id);
+                                        entry.type_element_property = Some(property);
+                                    }
+                                }
+                                entry.family_element_id = entry
+                                    .family_element_id
+                                    .or_else(|| declared_id(&declared, FAMILY_ID_PROPERTY));
+                                entry.declared_category_id = entry
+                                    .declared_category_id
+                                    .or_else(|| declared_id(&declared, CATEGORY_ID_PROPERTY));
+                            }
+                        }
+                        // A compound host object's type owns its layer table,
+                        // and `HostObjAttr` is the class that declares it, so
+                        // the read is bound to that chain rather than to a
+                        // list of type classes.
+                        if entry.compound_structures.is_empty() {
+                            if let (Some(schema), Some(classes)) =
+                                (schema.as_ref(), compound_structure_classes)
+                            {
+                                if rvt_model::descends_from(
+                                    schema,
+                                    header.class_index,
+                                    rvt_model::HOST_OBJECT_ATTRIBUTES_CLASS_NAME,
+                                ) {
+                                    entry.compound_structures =
+                                        rvt_model::CompoundStructure::from_record(
+                                            schema,
+                                            header.class_index,
+                                            body,
+                                            classes,
+                                        );
+                                }
+                            }
                         }
                         if let Some(fields) = ElementFields::parse(body, header.id) {
                             let tail_end = fields.id_offset + 4 + ELEMENT_TAIL_BYTES;
@@ -5326,6 +5761,7 @@ fn recover_elements(
     verify_family_instance_placements(&mut elements);
     inherit_symbol_names(&mut elements);
     inherit_symbol_parameters(&mut elements);
+    inherit_family_categories(&mut elements, schema.as_ref());
 
     let (parameter_names, parameter_specs) = parameter_metadata(&elements);
     Ok(RecoveredElements {
@@ -5338,6 +5774,62 @@ fn recover_elements(
         parameter_specs,
         elements,
     })
+}
+
+/// Give a loadable family's elements the category their family declares.
+///
+/// A loadable family's category is on the family and nowhere else: neither the
+/// instance nor its type declares one, which is why 187 131 elements carry a
+/// category in this decode and not one of them is a product Revit exports. The
+/// route is `FamilyInstance.m_masterSymbolId` -> `FamilySymbol.m_familyId` ->
+/// `FamilyBase.m_categoryId`, all three declared identifier properties read out
+/// of each record's own header.
+///
+/// The family end is gated on the class chain rather than on the property name.
+/// Sixty-four classes declare an `m_categoryId` and most of them mean something
+/// else by it - a schedule's filter, a style's owner - so only a record that is
+/// a family is allowed to answer. It cannot reach anything else anyway, since
+/// the only ids consulted are those a symbol names as its family, but the gate
+/// keeps that a rule instead of a coincidence.
+///
+/// It only adds: an element that already has a category keeps it, so nothing
+/// measured before this can move.
+fn inherit_family_categories(
+    elements: &mut BTreeMap<u32, ExportedElement>,
+    schema: Option<&Schema>,
+) {
+    let family_category = elements
+        .iter()
+        .filter(|(_, element)| {
+            element.class_index.is_some_and(|index| {
+                schema.is_some_and(|schema| rvt_model::descends_from(schema, index, "FamilyBase"))
+            })
+        })
+        .filter_map(|(id, element)| Some((*id, element.declared_category_id?)))
+        .collect::<BTreeMap<_, _>>();
+    let symbol_category = elements
+        .iter()
+        .filter_map(|(id, element)| {
+            let family = u32::try_from(element.family_element_id?).ok()?;
+            Some((*id, *family_category.get(&family)?))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let inherited = elements
+        .iter()
+        .filter(|(_, element)| element.category.is_none())
+        .filter_map(|(id, element)| {
+            let category = symbol_category
+                .get(id)
+                .or_else(|| symbol_category.get(&element.type_element_reference()?))?;
+            Some((*id, *category))
+        })
+        .collect::<Vec<_>>();
+    for (id, category) in inherited {
+        if let Some(element) = elements.get_mut(&id) {
+            element.category = Some(category);
+            element.category_source = Some("family");
+        }
+    }
 }
 
 /// Give an instance the name of the symbol it was verified against.
@@ -5851,8 +6343,9 @@ fn metadata_model(
             // A model element is placed in a phase.
             && element.created_phase_id.is_some()
             // A record that declares its own category is a type or definition,
-            // not an instance; the instances declare none.
-            && element.category.is_none()
+            // not an instance; the instances declare none. A category the
+            // element inherited from its family is not a declaration.
+            && !element.declares_a_category()
     };
     // A room is a place, not a building element: it fails every clause of
     // `is_model_element` - no building class, no phase - and carries no
@@ -5861,7 +6354,7 @@ fn metadata_model(
     // instance from a definition: no declared category and no owning view.
     let is_space = |element: &ExportedElement| {
         element_type_for_source(class_name(element), None).is_spatial()
-            && element.category.is_none()
+            && !element.declares_a_category()
             && element.owner_view_id.is_none()
     };
     let is_candidate = |element: &ExportedElement| {
@@ -6229,7 +6722,7 @@ fn tally_class_geometry<'a>(
         let is_model_element = class_name(element).is_some_and(is_building_element_class)
             && element.owner_view_id.is_none()
             && element.created_phase_id.is_some()
-            && element.category.is_none();
+            && !element.declares_a_category();
         let row = rows.entry(name).or_default();
         if let Some(brep) = &element.brep {
             row.body_ids += 1;
@@ -6885,10 +7378,12 @@ fn normalize_element(
         .iter()
         .map(|parameter| normalize_property(parameter, parameter_names, parameter_specs, catalog))
         .collect();
-    let element_type = element_type_for_source(
-        class_name.as_deref(),
-        category.as_ref().map(|category| category.name.as_str()),
-    );
+    let element_type = curtain_wall_type(element, elements, schema).unwrap_or_else(|| {
+        element_type_for_source(
+            class_name.as_deref(),
+            category.as_ref().map(|category| category.name.as_str()),
+        )
+    });
     // A room is named by its number and called something else, and Revit's own
     // export writes the split that way round. Both are on the record, by their
     // built-in parameters rather than by a display name.
@@ -6932,7 +7427,99 @@ fn normalize_element(
         geometry,
         properties,
         type_properties,
+        material_layers: normalize_material_layers(element, elements),
     }
+}
+
+/// The three wall-type classes that make a wall a curtain wall. All three are
+/// siblings under `WallType`, so nothing in the class chain separates them
+/// from an ordinary wall type and they are named outright.
+const CURTAIN_WALL_TYPE_CLASSES: &[&str] =
+    &["CurtainWallType", "NewCurtainWallType", "NRCurtainWallType"];
+
+/// `CurtainWall` for a wall whose type is one of [`CURTAIN_WALL_TYPE_CLASSES`].
+///
+/// The wall's own class does not say so - a curtain wall is an `SWall` like any
+/// other - but its type does, and the type is reached by the same declared
+/// reference everything else uses. Measured against Revit's own export of AR
+/// S1: 15 walls name a `NewCurtainWallType` and Revit writes an
+/// `IfcCurtainWall` for exactly those 15, which were the only `IfcWall` we
+/// emitted where it did not.
+fn curtain_wall_type(
+    element: &ExportedElement,
+    elements: &BTreeMap<u32, ExportedElement>,
+    schema: Option<&Schema>,
+) -> Option<BimElementType> {
+    let type_id = element.type_element_reference()?;
+    let class = elements
+        .get(&type_id)?
+        .class_index
+        .and_then(|index| schema?.class_by_index(index))?;
+    CURTAIN_WALL_TYPE_CLASSES
+        .contains(&class.name.as_str())
+        .then_some(BimElementType::CurtainWall)
+}
+
+/// What the element is made of, from the layer table its type carries.
+///
+/// The table lives on the type, so an element reaches it through the same
+/// declared type reference the name and the parameters come through - and a
+/// type carrying its own table keeps it. `source_type_id` records which record
+/// it was read from, so an element wearing its type's build-up is never
+/// mistaken for one that declared it.
+///
+/// Widths cross into metres here, at the format boundary, and a width the
+/// conversion rejects drops its layer rather than being written unitless.
+fn normalize_material_layers(
+    element: &ExportedElement,
+    elements: &BTreeMap<u32, ExportedElement>,
+) -> Option<BimMaterialLayerSet> {
+    let (source_type_id, source, structure) = element.compound_structures.first().map_or_else(
+        || {
+            let id = element.type_element_reference()?;
+            let source = elements.get(&id)?;
+            let structure = source.compound_structures.first()?;
+            Some((Some(BimElementId(id.to_string())), source, structure))
+        },
+        |structure| Some((None, element, structure)),
+    )?;
+    let count = structure.layers.len();
+    let exterior = usize::try_from(structure.shell_layers_exterior).unwrap_or(count);
+    let interior = usize::try_from(structure.shell_layers_interior).unwrap_or(count);
+    let layers = structure
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(index, layer)| BimMaterialLayer {
+            material: layer.material_id.map(|id| BimMaterial {
+                id: Some(BimExternalId {
+                    system: "autodesk.revit.elementId".to_owned(),
+                    value: id.to_string(),
+                }),
+                name: u32::try_from(id)
+                    .ok()
+                    .and_then(|id| elements.get(&id))
+                    .and_then(|material| material.name.as_ref())
+                    .map(|(name, _)| name.clone()),
+            }),
+            thickness: BimNumber {
+                value: revit_catalog::internal_feet_to_metres(layer.width_feet).unwrap_or(f64::NAN),
+                unit: Some(metres_unit()),
+            },
+            is_core: index >= exterior && index < count.saturating_sub(interior),
+            is_structural: structure.structural_layer_index == Some(index),
+            source_function: Some(i64::from(layer.function)),
+        })
+        .filter(|layer| layer.thickness.value.is_finite())
+        .collect();
+    Some(BimMaterialLayerSet {
+        source_type_id,
+        // The build-up's name is the type's own - Revit does not name the
+        // structure separately - so it is taken from the record the layers
+        // were read from rather than from the element wearing them.
+        name: source.name.as_ref().map(|(name, _)| name.clone()),
+        layers,
+    })
 }
 
 /// A room's number and its name, from the built-in parameters that carry
@@ -7623,6 +8210,17 @@ impl ModelTally {
 /// A finite `f64` as JSON, and `null` for anything else. A decoded coordinate
 /// can be infinite or NaN where a reading went wrong, and writing that
 /// verbatim produces a file no JSON parser accepts.
+/// An external identifier as a JSON value: a number where the source's
+/// identifier is one, and a quoted string otherwise. Revit's are decimal, and
+/// the rest of this export writes them unquoted; this keeps that without
+/// assuming it of a namespace that might not be numeric.
+fn json_identifier(value: &str) -> String {
+    value.parse::<i64>().map_or_else(
+        |_| format!("\"{}\"", json_escape(value)),
+        |id| id.to_string(),
+    )
+}
+
 fn json_number(value: f64) -> String {
     if value.is_finite() {
         value.to_string()
@@ -8162,6 +8760,7 @@ fn write_element_json(
         )?;
         write!(writer, "]")?;
     }
+    write_material_layers_json(writer, normalized.material_layers.as_ref())?;
     write!(writer, ",\"records\":{}", element.record_count)?;
     if let Some((partition_index, member_index, offset)) = element.source {
         if let Some(partition) = metadata.partition_paths.get(partition_index) {
@@ -8173,6 +8772,63 @@ fn write_element_json(
         }
     }
     writeln!(writer, "}}")
+}
+
+/// The layered build-up, in the order the type lists it.
+///
+/// `source_type_id` says which record the layers were read from when the
+/// element wears its type's build-up rather than declaring one, so the two
+/// cases stay apart. `function` is the source's own code and is written under
+/// a name that claims nothing: nothing has established what its values mean.
+fn write_material_layers_json(
+    writer: &mut impl Write,
+    layers: Option<&BimMaterialLayerSet>,
+) -> io::Result<()> {
+    let Some(set) = layers else {
+        return Ok(());
+    };
+    if set.layers.is_empty() {
+        return Ok(());
+    }
+    write!(
+        writer,
+        ",\"material_layers\":{{\"count\":{}",
+        set.layers.len()
+    )?;
+    if let Some(total) = set.total_thickness() {
+        write!(writer, ",\"total_thickness\":{}", json_number(total.value))?;
+    }
+    if let Some(id) = &set.source_type_id {
+        write!(writer, ",\"source_type_id\":{}", json_identifier(&id.0))?;
+    }
+    write!(writer, ",\"unit\":\"metre\",\"layers\":[")?;
+    for (index, layer) in set.layers.iter().enumerate() {
+        let separator = if index > 0 { "," } else { "" };
+        write!(
+            writer,
+            "{separator}{{\"index\":{index},\"thickness\":{}",
+            json_number(layer.thickness.value)
+        )?;
+        if let Some(material) = &layer.material {
+            if let Some(id) = &material.id {
+                write!(writer, ",\"material_id\":{}", json_identifier(&id.value))?;
+            }
+            if let Some(name) = &material.name {
+                write!(writer, ",\"material\":\"{}\"", json_escape(name))?;
+            }
+        }
+        if layer.is_core {
+            write!(writer, ",\"core\":true")?;
+        }
+        if layer.is_structural {
+            write!(writer, ",\"structural\":true")?;
+        }
+        if let Some(function) = layer.source_function {
+            write!(writer, ",\"source_function\":{function}")?;
+        }
+        write!(writer, "}}")?;
+    }
+    write!(writer, "]}}")
 }
 
 fn write_geometry_json(
@@ -9249,6 +9905,216 @@ mod tests {
         attach_symbol_bounds(&mut disagreeing, Some(7));
         assert_eq!(disagreeing[&9].verified_symbol_bounds, None);
         assert_eq!(disagreeing[&9].category, Some(-2_000_151));
+    }
+
+    /// One class in a test schema: its index, its name, and the index and name
+    /// of its parent where it has one.
+    type NamedClass<'a> = (u16, &'a str, Option<(u16, &'a str)>);
+
+    /// A schema of empty classes, for a test that only needs class names and
+    /// the chain between them.
+    fn named_classes(classes: &[NamedClass<'_>]) -> Schema {
+        Schema {
+            classes: classes
+                .iter()
+                .map(|(index, name, parent)| rvt_schema::ClassDefinition {
+                    index: *index,
+                    name: (*name).to_owned(),
+                    name_bytes: name.as_bytes().to_vec(),
+                    parent: parent.map_or(TypeReference::None, |(index, name)| {
+                        TypeReference::Reference {
+                            index,
+                            name: name.to_owned(),
+                        }
+                    }),
+                    version: 1,
+                    properties: Vec::new(),
+                    guids: Vec::new(),
+                    unknown_word: 0,
+                    inline: false,
+                    offset: 0,
+                    end_offset: 0,
+                })
+                .collect(),
+            top_level_class_count: 0,
+            property_count: 0,
+            parsed_property_count: 0,
+            consumed_bytes: 0,
+            trailing_bytes: Vec::new(),
+            unresolved_references: Vec::new(),
+            inline_index_mismatches: Vec::new(),
+        }
+    }
+
+    /// The category reaches an instance through its type's family, and a
+    /// record declaring an `m_categoryId` that is not a family cannot answer.
+    #[test]
+    fn an_instance_takes_the_category_its_family_declares() {
+        // `class_by_index` addresses the list from `INITIAL_CLASS_INDEX`, so
+        // the classes must start there and stay contiguous.
+        let schema = named_classes(&[
+            (12, "Element", None),
+            (13, "FamilyBase", None),
+            (14, "Family", Some((13, "FamilyBase"))),
+            (15, "FamilySymbol", None),
+            (16, "FamilyInstance", None),
+            (17, "ScheduleSchema", None),
+        ]);
+        let mut elements = BTreeMap::new();
+        // The family, and an impostor of another class declaring the same
+        // property with a different value.
+        elements.insert(
+            700,
+            ExportedElement {
+                class_index: Some(14),
+                declared_category_id: Some(-2_000_126),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            701,
+            ExportedElement {
+                class_index: Some(17),
+                declared_category_id: Some(-2_000_100),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            800,
+            ExportedElement {
+                class_index: Some(15),
+                family_element_id: Some(700),
+                ..ExportedElement::default()
+            },
+        );
+        // A symbol naming the impostor gets nothing from it.
+        elements.insert(
+            801,
+            ExportedElement {
+                class_index: Some(15),
+                family_element_id: Some(701),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            900,
+            ExportedElement {
+                class_index: Some(16),
+                type_element_id: Some(800),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            901,
+            ExportedElement {
+                class_index: Some(16),
+                type_element_id: Some(801),
+                ..ExportedElement::default()
+            },
+        );
+        // An element that declared its own category keeps it.
+        elements.insert(
+            902,
+            ExportedElement {
+                class_index: Some(16),
+                type_element_id: Some(800),
+                category: Some(-2_000_151),
+                category_source: Some("declared"),
+                ..ExportedElement::default()
+            },
+        );
+
+        inherit_family_categories(&mut elements, Some(&schema));
+
+        assert_eq!(elements[&900].category, Some(-2_000_126));
+        assert_eq!(elements[&900].category_source, Some("family"));
+        // The type carries it too: its own family declares it.
+        assert_eq!(elements[&800].category, Some(-2_000_126));
+        assert_eq!(elements[&901].category, None, "a schedule is not a family");
+        assert_eq!(elements[&902].category, Some(-2_000_151));
+        assert_eq!(elements[&902].category_source, Some("declared"));
+        // Only a declared category marks a record as a type or definition.
+        assert!(elements[&902].declares_a_category());
+        assert!(!elements[&900].declares_a_category());
+    }
+
+    /// An element wears the build-up its type declares, and says which record
+    /// it came from; the type itself keeps its own without naming a source.
+    #[test]
+    fn an_element_reaches_the_layer_table_its_type_declares() {
+        let layer = |width_feet: f64, material: i32| rvt_model::CompoundLayer {
+            width_feet,
+            function: 1,
+            embedding_type: 0,
+            material_id: Some(material),
+            profile_id: None,
+            layer_id: 0,
+            cap: false,
+        };
+        let mut elements = BTreeMap::new();
+        elements.insert(
+            29_073,
+            ExportedElement {
+                name: Some(("(наружные)блок_т_t=200".to_owned(), "declared")),
+                compound_structures: vec![rvt_model::CompoundStructure {
+                    offset: 0,
+                    layers: vec![layer(0.0, 4_340_120), layer(0.656_167_979_002_624_7, 2_959)],
+                    coarse_scale_fill_pattern_id: None,
+                    end_cap: 0,
+                    opening_wrapping: 0,
+                    shell_layers_exterior: 1,
+                    shell_layers_interior: 0,
+                    variable_layer_index: None,
+                    structural_layer_index: Some(1),
+                }],
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            2_959,
+            ExportedElement {
+                name: Some(("SP_кладка_блоки".to_owned(), "declared")),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            5_390_966,
+            ExportedElement {
+                type_element_id: Some(29_073),
+                ..ExportedElement::default()
+            },
+        );
+
+        let wall = normalize_material_layers(&elements[&5_390_966], &elements).unwrap();
+        assert_eq!(
+            wall.source_type_id,
+            Some(BimElementId("29073".to_owned())),
+            "the record the layers were read from is named"
+        );
+        assert_eq!(wall.name.as_deref(), Some("(наружные)блок_т_t=200"));
+        assert_eq!(wall.layers.len(), 2);
+        // 200 mm, in metres, from Revit's internal feet.
+        let total = wall.total_thickness().unwrap();
+        assert!((total.value - 0.2).abs() < 1.0e-12, "{}", total.value);
+        assert_eq!(
+            total.unit.map(|unit| unit.id).as_deref(),
+            Some("autodesk.unit.unit:meters-1.0.0")
+        );
+        // The shell layer is outside the core; the structural one is in it.
+        assert!(!wall.layers[0].is_core);
+        assert!(wall.layers[1].is_core);
+        assert!(wall.layers[1].is_structural);
+        assert_eq!(
+            wall.layers[1].material.as_ref().unwrap().name.as_deref(),
+            Some("SP_кладка_блоки")
+        );
+        // A material this file does not hold keeps its identifier and has no name.
+        let unnamed = wall.layers[0].material.as_ref().unwrap();
+        assert_eq!(unnamed.name, None);
+        assert_eq!(unnamed.id.as_ref().unwrap().value, "4340120");
+
+        let declaring = normalize_material_layers(&elements[&29_073], &elements).unwrap();
+        assert_eq!(declaring.source_type_id, None);
     }
 
     #[test]

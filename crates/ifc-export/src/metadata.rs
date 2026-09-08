@@ -7,7 +7,8 @@ use std::{
 use bim_core::{
     BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
     BimBrepSurface, BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel,
-    BimLineSegment, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
+    BimLineSegment, BimMaterialLayer, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty,
+    BimPropertyValue,
 };
 
 use crate::{EntityRef, IfcGuid, StepFile, StepHeader, StepValue, mapping::resolved_element_type};
@@ -445,6 +446,7 @@ fn push_elements(
     representation_context: EntityRef,
     origin_axis: EntityRef,
 ) {
+    let mut materials = MaterialLibrary::default();
     let mut containment: BTreeMap<String, (EntityRef, Vec<EntityRef>)> = BTreeMap::new();
     // A space is part of the spatial structure, so its storey decomposes it
     // rather than containing it. Kept apart from the first pass so the two
@@ -499,7 +501,11 @@ fn push_elements(
             .1
             .push(entity);
         push_property_set(file, element, entity, options, owner);
+        if !spatial {
+            materials.associate(file, element, entity);
+        }
     }
+    materials.push_associations(file, options, owner);
     for (identity, (container, elements)) in containment {
         push_containment(file, options, owner, &identity, container, elements);
     }
@@ -671,6 +677,11 @@ fn push_element(
     if entity.has_predefined_type {
         attributes.push(enumeration("NOTDEFINED"));
     }
+    // STEP writes every attribute an entity declares, set or not, so the ones
+    // after `PredefinedType` are written unset rather than left off.
+    for _ in 0..entity.attributes_after_predefined_type {
+        attributes.push(omitted());
+    }
     file.push(entity.name, attributes)
 }
 
@@ -680,13 +691,19 @@ struct ProductEntity {
     name: &'static str,
     has_predefined_type: bool,
     /// Attributes the entity declares between `IfcElement.Tag` and its
-    /// `PredefinedType`. `IfcStairFlight` is the one in play here, with
-    /// `NumberOfRisers`, `NumberOfTreads`, `RiserHeight` and `TreadLength`.
+    /// `PredefinedType`. `IfcStairFlight` has four - `NumberOfRisers`,
+    /// `NumberOfTreads`, `RiserHeight` and `TreadLength` - and `IfcWindow` and
+    /// `IfcDoor` two apiece, `OverallHeight` and `OverallWidth`.
     attributes_before_predefined_type: usize,
+    /// Attributes the entity declares after its `PredefinedType`: a window's
+    /// `PartitioningType` and `UserDefinedPartitioningType`, a door's
+    /// `OperationType` and `UserDefinedOperationType`.
+    attributes_after_predefined_type: usize,
 }
 
 fn product_entity(element_type: BimElementType) -> ProductEntity {
     let mut attributes_before_predefined_type = 0;
+    let mut attributes_after_predefined_type = 0;
     let (name, has_predefined_type) = match element_type {
         BimElementType::PipeSegment => ("IFCPIPESEGMENT", true),
         BimElementType::PipeFitting => ("IFCPIPEFITTING", true),
@@ -705,6 +722,24 @@ fn product_entity(element_type: BimElementType) -> ProductEntity {
             attributes_before_predefined_type = 4;
             ("IFCSTAIRFLIGHT", true)
         }
+        BimElementType::CurtainWall => ("IFCCURTAINWALL", true),
+        BimElementType::Railing => ("IFCRAILING", true),
+        BimElementType::Column => ("IFCCOLUMN", true),
+        BimElementType::Member => ("IFCMEMBER", true),
+        BimElementType::Plate => ("IFCPLATE", true),
+        // A window and a door carry their overall size before the predefined
+        // type and a partitioning or operation type after it. None of the four
+        // is read from the source, so all four are written unset.
+        BimElementType::Window => {
+            attributes_before_predefined_type = 2;
+            attributes_after_predefined_type = 2;
+            ("IFCWINDOW", true)
+        }
+        BimElementType::Door => {
+            attributes_before_predefined_type = 2;
+            attributes_after_predefined_type = 2;
+            ("IFCDOOR", true)
+        }
         BimElementType::Unknown => ("IFCBUILDINGELEMENTPROXY", true),
         // A space never reaches here: `push_elements` sends a spatial type to
         // `push_space`, whose attributes are a spatial element's rather than
@@ -716,6 +751,7 @@ fn product_entity(element_type: BimElementType) -> ProductEntity {
         name,
         has_predefined_type,
         attributes_before_predefined_type,
+        attributes_after_predefined_type,
     }
 }
 
@@ -1693,6 +1729,135 @@ fn push_direction(file: &mut StepFile, direction: [f64; 3]) -> EntityRef {
     )
 }
 
+/// The material layer sets written so far, and the products that carry them.
+///
+/// A build-up belongs to a type, not to an element: 13 193 walls of AR S1 share
+/// 111 of them. Writing one `IfcMaterialLayerSet` per product would repeat the
+/// same layers thousands of times, so each distinct set is written once, keyed
+/// by the record it was read from, and one `IfcRelAssociatesMaterial` at the
+/// end relates every product that carries it - which is also what Revit's own
+/// export does.
+#[derive(Default)]
+struct MaterialLibrary {
+    /// `IfcMaterial` by the material's identity, so a material used by many
+    /// layers is written once.
+    materials: BTreeMap<String, EntityRef>,
+    /// `IfcMaterialLayerSet` by the set's identity, with the products carrying
+    /// it. `BTreeMap` rather than a hash so the output stays deterministic.
+    layer_sets: BTreeMap<String, (EntityRef, Vec<EntityRef>)>,
+}
+
+impl MaterialLibrary {
+    /// Record that `product` is made of `element`'s layers, writing the layer
+    /// set the first time it is seen.
+    fn associate(&mut self, file: &mut StepFile, element: &BimElement, product: EntityRef) {
+        let Some(set) = &element.material_layers else {
+            return;
+        };
+        if set.layers.is_empty() {
+            return;
+        }
+        // The build-up's own identity: the type it was read from where the
+        // element wears its type's, and the element itself where it declares
+        // one. Both name the same record, so a type and its instances share
+        // one set rather than writing two identical ones.
+        let identity = format!(
+            "layers:{}",
+            set.source_type_id.as_ref().unwrap_or(&element.id).0
+        );
+        let entry = match self.layer_sets.entry(identity) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let layers = set
+                    .layers
+                    .iter()
+                    .filter_map(|layer| push_material_layer(file, &mut self.materials, layer))
+                    .map(reference)
+                    .collect::<Vec<_>>();
+                if layers.is_empty() {
+                    return;
+                }
+                let layer_set = file.push(
+                    "IFCMATERIALLAYERSET",
+                    vec![
+                        StepValue::List(layers),
+                        optional_string(set.name.as_deref()),
+                        omitted(),
+                    ],
+                );
+                entry.insert((layer_set, Vec::new()))
+            }
+        };
+        entry.1.push(product);
+    }
+
+    /// One `IfcRelAssociatesMaterial` per distinct build-up.
+    fn push_associations(self, file: &mut StepFile, options: &MetadataOptions, owner: EntityRef) {
+        for (identity, (layer_set, products)) in self.layer_sets {
+            if products.is_empty() {
+                continue;
+            }
+            file.push(
+                "IFCRELASSOCIATESMATERIAL",
+                vec![
+                    global_id(options, &format!("material-relation:{identity}")),
+                    reference(owner),
+                    omitted(),
+                    omitted(),
+                    StepValue::List(products.into_iter().map(reference).collect()),
+                    reference(layer_set),
+                ],
+            );
+        }
+    }
+}
+
+/// One `IfcMaterialLayer`, with its `IfcMaterial` written once per material.
+///
+/// `LayerThickness` is `IfcNonNegativeLengthMeasure`, so the thickness must be
+/// in the file's length unit and not negative; a layer whose thickness is
+/// neither is dropped rather than written as something else. Zero is kept: a
+/// membrane is a real layer with no thickness.
+///
+/// `Category` and `Priority` are left unset. The source carries a layer
+/// function code but nothing has established what its values mean, and IFC's
+/// `Category` is an enumerated vocabulary - writing one would be a guess.
+fn push_material_layer(
+    file: &mut StepFile,
+    materials: &mut BTreeMap<String, EntityRef>,
+    layer: &BimMaterialLayer,
+) -> Option<EntityRef> {
+    if layer.thickness.unit.as_ref()?.id != "autodesk.unit.unit:meters-1.0.0"
+        || !layer.thickness.value.is_finite()
+        || layer.thickness.value < 0.0
+    {
+        return None;
+    }
+    let material =
+        layer.material.as_ref().and_then(|material| {
+            let name = material.name.as_deref()?;
+            let identity = material.id.as_ref().map_or_else(
+                || format!("name:{name}"),
+                |id| format!("id:{}", external_id(id)),
+            );
+            Some(*materials.entry(identity).or_insert_with(|| {
+                file.push("IFCMATERIAL", vec![string(name), omitted(), omitted()])
+            }))
+        });
+    Some(file.push(
+        "IFCMATERIALLAYER",
+        vec![
+            material.map_or_else(omitted, reference),
+            StepValue::Real(layer.thickness.value),
+            omitted(),
+            omitted(),
+            omitted(),
+            omitted(),
+            omitted(),
+        ],
+    ))
+}
+
 fn push_property_set(
     file: &mut StepFile,
     element: &BimElement,
@@ -1952,7 +2117,10 @@ fn enumeration(value: &str) -> StepValue {
 
 #[cfg(test)]
 mod tests {
-    use bim_core::{BimCategory, BimLineSegment, BimPlacement, BimSweptDisk, BimUnit};
+    use bim_core::{
+        BimCategory, BimLineSegment, BimMaterial, BimMaterialLayerSet, BimPlacement, BimSweptDisk,
+        BimUnit,
+    };
 
     use super::*;
 
@@ -2010,6 +2178,7 @@ mod tests {
                     }),
                 }],
                 type_properties: Vec::new(),
+                material_layers: None,
             }],
             relations: Vec::new(),
         }
@@ -2032,7 +2201,131 @@ mod tests {
             geometry: None,
             properties: Vec::new(),
             type_properties: Vec::new(),
+            material_layers: None,
         }
+    }
+
+    fn metres(value: f64) -> BimNumber {
+        BimNumber {
+            value,
+            unit: Some(BimUnit {
+                id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
+                name: "Meters".to_owned(),
+            }),
+        }
+    }
+
+    fn layer(name: &str, thickness: f64) -> BimMaterialLayer {
+        BimMaterialLayer {
+            material: Some(BimMaterial {
+                id: Some(BimExternalId {
+                    system: "autodesk.revit.elementId".to_owned(),
+                    value: name.to_owned(),
+                }),
+                name: Some(format!("Material {name}")),
+            }),
+            thickness: metres(thickness),
+            is_core: false,
+            is_structural: false,
+            source_function: Some(1),
+        }
+    }
+
+    /// Two walls of one type share one layer set and one relationship, and the
+    /// material every layer names is written once however many layers name it.
+    /// A window and a door declare attributes on both sides of
+    /// `PredefinedType`, and STEP writes every one of them. Counting the
+    /// arguments is the check that none is dropped and nothing lands in the
+    /// wrong slot.
+    #[test]
+    fn writes_every_attribute_a_window_and_a_door_declare() {
+        let mut model = model();
+        for (id, element_type) in [
+            ("10", BimElementType::Window),
+            ("11", BimElementType::Door),
+            ("12", BimElementType::Railing),
+        ] {
+            let mut product = element(id, "FamilyInstance", "OST_Windows");
+            product.element_type = element_type;
+            model.elements.push(product);
+        }
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        for (entity, attributes) in [("IFCWINDOW", 13), ("IFCDOOR", 13), ("IFCRAILING", 9)] {
+            let line = text
+                .lines()
+                .find(|line| line.contains(&format!("={entity}(")))
+                .unwrap_or_else(|| panic!("no {entity}"));
+            let arguments = line
+                .rsplit_once('(')
+                .unwrap()
+                .1
+                .trim_end_matches(");")
+                .matches(',')
+                .count()
+                + 1;
+            assert_eq!(arguments, attributes, "{line}");
+        }
+    }
+
+    #[test]
+    fn writes_one_layer_set_per_build_up_and_relates_every_product_to_it() {
+        let mut model = model();
+        let set = BimMaterialLayerSet {
+            source_type_id: Some(BimElementId("700".to_owned())),
+            name: Some("Wall 250".to_owned()),
+            layers: vec![layer("1", 0.0125), layer("2", 0.225), layer("1", 0.0125)],
+        };
+        for id in ["10", "11"] {
+            let mut wall = element(id, "SWall", "OST_Walls");
+            wall.element_type = BimElementType::Wall;
+            wall.material_layers = Some(set.clone());
+            model.elements.push(wall);
+        }
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches("=IFCMATERIALLAYERSET(").count(), 1);
+        assert_eq!(text.matches("=IFCMATERIALLAYER(").count(), 3);
+        assert_eq!(text.matches("=IFCRELASSOCIATESMATERIAL(").count(), 1);
+        // Two distinct materials over three layers.
+        assert_eq!(text.matches("=IFCMATERIAL(").count(), 2);
+        assert!(text.contains("'Wall 250'"));
+        let relation = text
+            .lines()
+            .find(|line| line.contains("=IFCRELASSOCIATESMATERIAL("))
+            .unwrap();
+        assert_eq!(relation.matches('#').count(), 5, "{relation}");
+    }
+
+    /// A layer whose thickness is not in the file's length unit is dropped
+    /// rather than written as a bare number in some other unit.
+    #[test]
+    fn drops_a_layer_whose_thickness_is_not_metric() {
+        let mut model = model();
+        let mut wall = element("10", "SWall", "OST_Walls");
+        wall.element_type = BimElementType::Wall;
+        let mut feet = layer("1", 0.75);
+        feet.thickness.unit = Some(BimUnit {
+            id: "autodesk.unit.unit:feet-1.0.0".to_owned(),
+            name: "Feet".to_owned(),
+        });
+        wall.material_layers = Some(BimMaterialLayerSet {
+            source_type_id: None,
+            name: None,
+            layers: vec![feet],
+        });
+        model.elements.push(wall);
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("=IFCMATERIALLAYER("));
+        assert!(!text.contains("=IFCMATERIALLAYERSET("));
+        assert!(!text.contains("=IFCRELASSOCIATESMATERIAL("));
     }
 
     #[test]

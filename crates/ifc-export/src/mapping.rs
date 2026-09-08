@@ -91,6 +91,55 @@ const SOURCE_MAPPINGS: &[SourceMapping] = &[
         category_name: "OST_MechanicalEquipment",
         element_type: BimElementType::DistributionFlowElement,
     },
+    // A loadable family's category, reached through its family. Every row here
+    // is measured against Revit's own export of AR S1, joined on the Revit
+    // element id, and every one of them has no spread: `OST_StairsRailing` is
+    // `IfcRailing` for 881 of 881 elements, `OST_Columns` `IfcColumn` for 192
+    // of 192, `OST_StructuralColumns` for 56 of 56, `OST_CurtainWallMullions`
+    // `IfcMember` for 134 of 134, `OST_CurtainWallPanels` `IfcPlate` for 37 of
+    // 37, `OST_Windows` `IfcWindow` for 474 of 474 and `OST_Doors` `IfcDoor`
+    // for 295 of 295. The class is required as well, because the category is
+    // only this decisive for an instance of a loadable family.
+    //
+    // Two categories the same join leaves alone: `OST_StructuralFraming`,
+    // which Revit exports as an `IfcBuildingElementProxy` for all 444 of them,
+    // and `OST_GenericModel`, which it turns into an `IfcOpeningElement` - a
+    // void, which cannot be written without the element it voids.
+    SourceMapping {
+        class_name: Some("FamilyInstance"),
+        category_name: "OST_StairsRailing",
+        element_type: BimElementType::Railing,
+    },
+    SourceMapping {
+        class_name: Some("FamilyInstance"),
+        category_name: "OST_Columns",
+        element_type: BimElementType::Column,
+    },
+    SourceMapping {
+        class_name: Some("FamilyInstance"),
+        category_name: "OST_StructuralColumns",
+        element_type: BimElementType::Column,
+    },
+    SourceMapping {
+        class_name: Some("FamilyInstance"),
+        category_name: "OST_CurtainWallMullions",
+        element_type: BimElementType::Member,
+    },
+    SourceMapping {
+        class_name: Some("FamilyInstance"),
+        category_name: "OST_CurtainWallPanels",
+        element_type: BimElementType::Plate,
+    },
+    SourceMapping {
+        class_name: Some("FamilyInstance"),
+        category_name: "OST_Windows",
+        element_type: BimElementType::Window,
+    },
+    SourceMapping {
+        class_name: Some("FamilyInstance"),
+        category_name: "OST_Doors",
+        element_type: BimElementType::Door,
+    },
 ];
 
 /// Infer a format-neutral element type from the source class/category pair.
@@ -270,6 +319,48 @@ mod tests {
             element_type_for_source(Some("FamilyInstance"), None),
             BimElementType::Unknown
         );
+    }
+
+    /// The loadable-family rows, each measured against Revit's own export of
+    /// AR S1 with no spread. See `SOURCE_MAPPINGS` for the counts.
+    #[test]
+    fn types_a_loadable_family_from_the_category_its_family_declares() {
+        for (category_name, element_type) in [
+            ("OST_StairsRailing", BimElementType::Railing),
+            ("OST_Columns", BimElementType::Column),
+            ("OST_StructuralColumns", BimElementType::Column),
+            ("OST_CurtainWallMullions", BimElementType::Member),
+            ("OST_CurtainWallPanels", BimElementType::Plate),
+            ("OST_Windows", BimElementType::Window),
+            ("OST_Doors", BimElementType::Door),
+        ] {
+            assert_eq!(
+                element_type_for_source(Some("FamilyInstance"), Some(category_name)),
+                element_type,
+                "{category_name}"
+            );
+            // The class is required with it: these are a loadable family's
+            // categories, and nothing establishes them for another class.
+            assert_eq!(
+                element_type_for_source(Some("SWall"), Some(category_name)),
+                BimElementType::Unknown,
+                "{category_name}"
+            );
+        }
+    }
+
+    /// Two categories the reference join deliberately leaves unmapped: Revit
+    /// exports structural framing as a proxy, and turns a generic model into
+    /// an opening, which is a void rather than a product.
+    #[test]
+    fn leaves_the_categories_revit_does_not_type_alone() {
+        for category_name in ["OST_StructuralFraming", "OST_GenericModel"] {
+            assert_eq!(
+                element_type_for_source(Some("FamilyInstance"), Some(category_name)),
+                BimElementType::Unknown,
+                "{category_name}"
+            );
+        }
     }
 
     #[test]

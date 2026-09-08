@@ -38,6 +38,63 @@ pub struct BimElement {
     /// and hold for every element of that type, which a consumer that merged
     /// the two could no longer tell.
     pub type_properties: Vec<BimProperty>,
+    /// What the element is made of, layer by layer, when its type declares a
+    /// layered build-up. A wall, floor, roof or ceiling has one; a component
+    /// does not.
+    pub material_layers: Option<BimMaterialLayerSet>,
+}
+
+/// A layered build-up, in order from one face to the other. The order is the
+/// source's own and carries the geometry: layer 0 is against one face of the
+/// host and the last is against the other.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BimMaterialLayerSet {
+    /// The type the layers were read from, when the element is not itself that
+    /// type. Two elements sharing this identifier share the build-up.
+    pub source_type_id: Option<BimElementId>,
+    pub name: Option<String>,
+    pub layers: Vec<BimMaterialLayer>,
+}
+
+impl BimMaterialLayerSet {
+    /// Total thickness, or `None` when the layers do not agree on a unit.
+    #[must_use]
+    pub fn total_thickness(&self) -> Option<BimNumber> {
+        let unit = self.layers.first()?.thickness.unit.clone();
+        self.layers
+            .iter()
+            .all(|layer| layer.thickness.unit == unit)
+            .then(|| BimNumber {
+                value: self.layers.iter().map(|layer| layer.thickness.value).sum(),
+                unit,
+            })
+    }
+}
+
+/// One layer of a [`BimMaterialLayerSet`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct BimMaterialLayer {
+    pub material: Option<BimMaterial>,
+    /// Zero for a membrane, which is a real layer with no thickness.
+    pub thickness: BimNumber,
+    /// Whether the layer lies inside the build-up's structural core rather
+    /// than in the shell on either side of it.
+    pub is_core: bool,
+    /// Whether the type names this layer as the one its structural material
+    /// comes from.
+    pub is_structural: bool,
+    /// The source's own layer-function code, unlabelled. Kept because the
+    /// source carries it and discarding it would lose data, but no meaning is
+    /// attached to the number here: nothing has established what its values
+    /// mean, so a consumer must not render it as a function name.
+    pub source_function: Option<i64>,
+}
+
+/// A material as the source names it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BimMaterial {
+    pub id: Option<BimExternalId>,
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -65,6 +122,18 @@ pub enum BimElementType {
     Roof,
     Stair,
     StairFlight,
+    // Loadable families, established by the category their family declares.
+    // The same reference join fixes these: each of the categories below maps
+    // to one IFC entity with no spread at all.
+    Railing,
+    Column,
+    Member,
+    Plate,
+    Window,
+    Door,
+    /// A wall whose type is a curtain-wall type: a framed assembly rather than
+    /// a layered build-up.
+    CurtainWall,
     /// A place rather than a building element: it bounds volume, is part of
     /// the spatial structure and is decomposed by the storey it sits on
     /// rather than contained in it.

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod brep;
+mod compound;
 mod elem_table;
 mod geometry;
 mod member;
@@ -11,6 +12,10 @@ pub use brep::{
     BrepArc, BrepClassIndexes, BrepCurve, BrepEdge, BrepExclusion, BrepFace, BrepLoop, BrepProfile,
     BrepRuling, BrepSurface, HoleTally, OrderingControl, SymbolBrep,
     assemble as assemble_symbol_brep,
+};
+pub use compound::{
+    COMPOUND_STRUCTURE_CLASS_NAME, COMPOUND_STRUCTURE_LAYER_CLASS_NAME, CompoundLayer,
+    CompoundStructure, CompoundStructureClassIndexes, HOST_OBJECT_ATTRIBUTES_CLASS_NAME,
 };
 pub use elem_table::{
     ElemTable, ElemTableError, ElemTableHeader, ElemTableLayout, ElemTableRecord, RecordFraming,
@@ -32,8 +37,8 @@ pub use parameter::{
 pub use serial::{
     FLAG_SAMPLE_WORDS, FlagWidthSample, RECORD_LENGTH_TRAILER_BYTES, SerialObject,
     SerialRecordWalk, SerialStop, SerialStreamWalk, SerialString, SerialTraceEntry, SerialWalk,
-    descends_from, record_declared_id, record_name, record_name_string, walk_object,
-    walk_object_stream, walk_record, walk_record_collecting, walk_record_flag_widths,
+    descends_from, record_declared_id, record_declared_ids, record_name, record_name_string,
+    walk_object, walk_object_stream, walk_record, walk_record_collecting, walk_record_flag_widths,
     walk_record_strings, walk_record_traced,
 };
 

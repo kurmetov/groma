@@ -546,6 +546,26 @@ pub fn record_declared_id(
     body: &[u8],
     property: &str,
 ) -> Option<i32> {
+    record_declared_ids(schema, class_index, body, &[property])
+        .into_iter()
+        .next()
+        .flatten()
+}
+
+/// The values of several named identifier properties, read in one walk.
+///
+/// Same rule as [`record_declared_id`] for each, and one entry per requested
+/// property in the order asked for. A class that declares a record's type, its
+/// family and its category names them under three different properties, and
+/// walking the declarations once for all of them costs what walking them once
+/// for one does.
+#[must_use]
+pub fn record_declared_ids(
+    schema: &Schema,
+    class_index: u16,
+    body: &[u8],
+    properties: &[&str],
+) -> Vec<Option<i32>> {
     let mut reader = Reader {
         schema,
         body,
@@ -565,15 +585,21 @@ pub fn record_declared_id(
         flag_samples: None,
     };
     let _stop = reader.read_class(class_index, 0).err();
-    let offset = reader
-        .trace
-        .as_ref()?
+    let trace = reader.trace.unwrap_or_default();
+    properties
         .iter()
-        .find(|entry| entry.property == property && entry.consumed == IDENTIFIER_REFERENCE_BYTES)
-        .map(|entry| entry.offset)?;
-    let bytes = body.get(offset..offset.checked_add(IDENTIFIER_REFERENCE_BYTES)?)?;
-    let value = i32::from_le_bytes(bytes.try_into().ok()?);
-    (value != INVALID_ELEMENT_ID).then_some(value)
+        .map(|property| {
+            let offset = trace
+                .iter()
+                .find(|entry| {
+                    entry.property == *property && entry.consumed == IDENTIFIER_REFERENCE_BYTES
+                })
+                .map(|entry| entry.offset)?;
+            let bytes = body.get(offset..offset.checked_add(IDENTIFIER_REFERENCE_BYTES)?)?;
+            let value = i32::from_le_bytes(bytes.try_into().ok()?);
+            (value != INVALID_ELEMENT_ID).then_some(value)
+        })
+        .collect()
 }
 
 /// Same as [`walk_record`], recording every property read.

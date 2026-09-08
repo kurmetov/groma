@@ -2051,3 +2051,267 @@ represented product.
 
 Confidence: high. The attribution is a three-way controlled comparison on the
 same tree, the counts balance exactly, and both IFC controls pass.
+
+### Result: a wall's layers are declared, and Revit's own export confirms them
+
+Observation: a wall is not one material. Until now the reader had no answer at
+all for how many layers a wall has, which they are, or how thick each one is,
+and neither did the JSON or the IFC export.
+
+Hypothesis: none of it needs reverse engineering. `Formats/Latest` declares
+`CompoundStructure` (class 788, 12 properties) and `CompoundStructureLayer`
+(789, 7 properties), and `HostObjAttr.m_pCompoundStructure` is the reference
+from a compound host object's type to the first. `m_pCompoundStructure` has
+loading mode 1, so the structure is one object of the record's node stream and
+arrives as its own `SerialObject`; `m_layers` is `item_mode` 5 with loading
+mode 0 and a static element class, so its layers are walked *inline* into that
+same object and their declared fields land in its collected values in
+declaration order - the same pairing-by-declaration the parameter sets are read
+with. Per layer that is one `Float64` (`m_layerWidth`), five `Integer32`
+(`m_layerFunction`, `m_embeddingType`, the `Identifier.m_id` inside each of
+`m_materialId` and `m_profileId`, and `m_layerId`) and one `Bool`.
+`CompoundStructure` declares no `Float64` of its own, so the number of
+collected doubles *is* the layer count and the integers past the layers are the
+structure's own scalars. `CompoundStructureClassIndexes::detect` checks both
+declaration lists before any of this is applied.
+
+The wall's own record has to name its type first, and `Element` declares no
+type property. The candidate was `VWall.m_WallAttributesId`, added to
+`TYPE_ELEMENT_ID_PROPERTIES` and measured the way `m_masterSymbolId` and
+`RbsCurve.m_idType` were.
+
+Experiment: `rivet layers` on AR S1 and S2, the two corpus files that ship the
+IFC Revit itself exported from the same model. That export is an answer this
+project did not produce and it carries, per wall, the Revit element id
+(`IfcWall.Tag`), the type's name (`IfcWall.Name`) and an
+`IfcMaterialConstituentSet` giving the layers in order with each one's material
+name and its share of the total width. `scripts/compare_wall_layers.py` joins
+the two by element id.
+
+Result, first the link:
+
+| | AR S1 | AR S2 |
+|---|---:|---:|
+| `m_WallAttributesId` values on `SWall` | 13 208 | 13 851 |
+| distinct elements they name | 111 | 116 |
+| of those elements, a `WallType` descendant | 111 | 116 |
+| walls in Revit's export | 7 617 | 7 739 |
+| of them, linked to a type by our decode | **7 617** | **7 739** |
+| naming the type Revit names | **7 615** | **7 739** |
+
+The values land on `BasicWallType` (13 153 / 13 801), `WallAttributes` (40 /
+40) and `NewCurtainWallType` (15 / 10), which are three classes of one chain
+out of the file's 4 418; a misread four-byte field cannot do that 27 000 times.
+The two disagreements on S1 are a pair of finish types whose names differ
+(`отделка_по_бетону_t=15` where Revit says `помещение_по_бетону_t=15`) and the
+layer tables of both agree exactly.
+
+Then the layers. Zero-width layers are dropped from our side first, because
+Revit's exporter omits them:
+
+| | AR S1 | AR S2 |
+|---|---:|---:|
+| walls with a constituent set on both sides | 5 144 | 5 394 |
+| same layer count | **5 144** | **5 394** |
+| same material names, in order | 5 136 | **5 394** |
+| every layer's share of the total agreeing to 1e-6 | **5 144** | **5 394** |
+| worst disagreement in any layer's share | 5.6e-17 | 5.6e-17 |
+
+The widths are right to floating-point exactness, not to a tolerance. The
+eight walls that disagree on a name are two wall types of S1 whose second layer
+we read as `SP_отделка_тип_A` where Revit's export says
+`SP_отделка_тип_B`; both materials exist in the file
+and are read correctly elsewhere, the layer widths of those types agree, and
+whether this is a model edit between the two files or a resolution the exporter
+performs is not established.
+
+Three further things the same run establishes, none of them assumed:
+
+* **The scalars are aligned.** `m_coarseScaleFillPatternElemId`, the first
+  integer past the layers, is -1 or a real element identifier (19, 2 701,
+  3 151 414, 3 296 016, 3 452 204) in all 335 tables; `m_endCap` is one of 0, 1
+  and 3 and `m_openingWrapping` is always 0. A one-field shift would put the
+  small enum in the identifier's place everywhere.
+* **`m_structuralMaterialLayerIndex` addresses the right layer.** 127 of 335
+  tables carry one; in 125 it points at the widest layer of its own type, and
+  in 105 that layer's `m_layerFunction` is 1.
+* **`m_layerFunction` stays unlabelled.** It takes the values 0-5 and 100 on
+  S1. Every one of the 230 layers with value 100 has zero width and none of the
+  552 layers with any other value does, which is what a membrane looks like -
+  but Revit's export writes an empty `IfcMaterialConstituent.Category`, so
+  there is no oracle for the enum and the reader carries the number through as
+  stored (rule 12).
+
+Reach, on AR S1 / S2: 335 / 336 layer tables, read on every `BasicWallType`
+(196 / 194), `WallAttributes` (57 / 57), `FloorAttributes` (68 / 71),
+`RoofAttributes` (11 / 11), `BuildingPadType` and `RoofSoffitType`.
+`CurtainWallType` (40), `NewCurtainWallType` (9) and `StackedWallType` (1)
+yield none, which is correct - a curtain wall is a grid and a stacked wall is
+made of sub-walls, neither has a layer table. `CompoundCeilingType` yields 1 of
+8, and that is the file's answer rather than a decode gap: `serial-probe
+--class CompoundCeilingType --record` explains all 8 records byte for byte, so
+the other 7 write a null `m_pCompoundStructure`.
+
+Confidence: high for the layer table - the layout is declaration-backed, the
+declarations are checked before the reading is applied, and 10 538 walls across
+two independently decoded files reproduce Revit's own answer for layer count
+and for every layer's thickness with no tolerance. High for the type link, on
+15 356 walls matched against the same answer. The `m_layerFunction` enum is
+explicitly *not* established.
+
+### Result: the layers reach JSON and IFC, and every compound host names its type
+
+Observation: the layer table decoded but went nowhere. Neither export emitted
+it, so nothing outside the instrument could see what a wall is made of.
+
+Hypothesis: the same `...AttributesId` reading covers every compound host, not
+just walls. `rivet schema --property AttributesId` returns exactly five
+declarations in the whole schema - `VWall.m_WallAttributesId`,
+`Floor.m_floorAttributesId`, `RoofBase.m_roofAttributesId`,
+`Ceiling.m_ceilingAttributesId` and `HostInfill.m_AttributesId` - so the
+candidate list is closed rather than open-ended, and each is read by the same
+`record_declared_id`, which returns nothing for a class that does not declare
+it.
+
+Experiment: all five added to `TYPE_ELEMENT_ID_PROPERTIES`; the layers carried
+into `bim-core` as `BimMaterialLayerSet` and out as `IfcMaterialLayerSet`; and
+the comparison against Revit's own export widened from `IfcWall` to every
+tagged product, so slabs and roofs are scored the same way walls were.
+
+Result. The new links land where they should: `m_floorAttributesId` carries
+1 183 values on `Floor` and every one names a `FloorAttributes`;
+`m_roofAttributesId` carries 3 and both elements they name are
+`RoofAttributes`. No file in the corpus holds a `Ceiling` or a `HostInfill`, so
+those two candidates are declared but unmeasured - they cost nothing and buy
+nothing here.
+
+Against Revit's own export, by product:
+
+| | AR S1 | AR S2 |
+|---|---|---|
+| `IfcWall` in the reference / linked / same type name | 7 610 / 7 610 / 7 608 | 7 733 / 7 733 / **7 733** |
+| `IfcSlab` | 539 / 527 / 523 | 556 / 544 / 540 |
+| `IfcRoof` | 3 / 3 / 3 | 3 / 3 / 3 |
+| `IfcPlate` | 37 / 37 / 37 | 20 / 20 / 20 |
+| products with a constituent set on both sides | 5 593 | 5 861 |
+| same layer count | 5 590 | 5 858 |
+| same material names, in order | 5 582 | **5 858** |
+| every layer's share agreeing to 1e-6 | 5 590 | 5 858 |
+
+Run twice on S1, once against the `rivet layers` report and once against our
+own `export-ifc` output: **identical numbers**, so nothing is lost between the
+decode and the file. (`IfcPlate` is the one exception, 37 linked from the
+report and 0 from our IFC: we type those products differently, so the join
+finds no association. That is the mapping gap, not the layers.)
+
+Every disagreement is one of three shapes, and each names a type that exists
+in the file: 3 slabs where Revit says `(полы)покрытие_t=100 2` and we say
+`(полы)покрытие_t=100`; one where it says `плита_бетон_t=900` and we say
+`t=200`; and on S1 only, 2 walls where it says `Помещение` and we say `Зона`,
+plus the 8 walls whose second layer's material differs. In every case Revit's
+answer is the *higher* element identifier - a type created later - and S2 has
+none of the wall-side disagreements at all. That is what an edit between the
+saved `.rvt` and the exported `.ifc` looks like; it is not established, and
+nothing here distinguishes it from a link this decode gets wrong on 6 of
+8 213 elements.
+
+The export itself: 14 379 products of AR S1 carry a layer set - 10 996
+`IfcWall`, 2 484 proxies, 896 `IfcSlab`, 3 `IfcRoof` - over 128 distinct
+`IfcMaterialLayerSet`, 236 `IfcMaterialLayer` and 58 `IfcMaterial`. A build-up
+belongs to a type, so each is written once and one `IfcRelAssociatesMaterial`
+relates every product that carries it. `ifcopenshell.validate --rules` reports
+"No validation issues found" on the 417 MB result, and on SMALL, which carries
+no compound structure at all and emits no material entity.
+
+What is deliberately not written: `IfcMaterialLayerSetUsage`, which needs the
+reference-line offset and direction sense that this decode does not read
+(`VWall.m_locLineOffset` and `m_wallKeyRef` are declared and untouched); and
+`IfcMaterialLayer.Category`, which is an enumerated vocabulary that
+`m_layerFunction` cannot be mapped onto while the enum is unlabelled.
+
+Confidence: high. Two independently decoded files, both paths measured against
+an answer this project did not produce, layer thicknesses agreeing to
+floating-point exactness, and the export validating clean.
+
+### Result: a loadable family's category is on its family, and it types the product
+
+Observation: 77.2% of the products we export carry the IFC entity Revit gives
+the same element, and every disagreement was one thing - a `FamilyInstance`
+falling back to `IfcBuildingElementProxy`: 1 188 railings, 741 openings, 248
+columns, 191 windows, 134 members, 37 plates, 13 doors. The working notes called
+closing it the highest-value change left.
+
+Hypothesis: the category is not missing, it is one hop further away than the
+type. Neither the instance nor its type declares one - `FamilySymbol` has 60
+declared properties and a category is not among them - but `FamilyBase`
+declares `m_categoryId` and `FamilySymbol` declares `m_familyId`. So the route
+is instance -> `m_masterSymbolId` -> symbol -> `m_familyId` -> family ->
+`m_categoryId`, three declared identifier properties read out of three records'
+own headers.
+
+Experiment: read all three with one walk per record
+(`rvt_model::record_declared_ids`), inherit along that route only, and measure
+what arrives - first against the catalogue, then against Revit's own export
+joined on the Revit element id (`scripts/compare_products.py`).
+
+Result. On AR S1 the route is intact: 5 030 of 5 043 `FamilySymbol` elements
+name a family and **every one of them names a `Family`**; 3 298 `Family`
+records declare a category. 9 912 elements gain a category through it, and all
+9 912 resolve to a name in the 2023 built-in catalogue - a misread identifier
+would land outside it.
+
+The join then says what each `(class, category)` pair is, and seven pairs have
+no spread at all:
+
+| pair | Revit's entity | elements |
+|---|---|---:|
+| `FamilyInstance` / `OST_StairsRailing` | `IfcRailing` | 881 of 881 |
+| `FamilyInstance` / `OST_Windows` | `IfcWindow` | 474 of 474 |
+| `FamilyInstance` / `OST_Doors` | `IfcDoor` | 295 of 295 |
+| `FamilyInstance` / `OST_Columns` | `IfcColumn` | 192 of 192 |
+| `FamilyInstance` / `OST_CurtainWallMullions` | `IfcMember` | 134 of 134 |
+| `FamilyInstance` / `OST_StructuralColumns` | `IfcColumn` | 56 of 56 |
+| `FamilyInstance` / `OST_CurtainWallPanels` | `IfcPlate` | 37 of 37 |
+
+Two more pairs are left unmapped *because* the same join says so:
+`OST_StructuralFraming` is an `IfcBuildingElementProxy` for all 444 of its
+elements, which is what we already emit, and `OST_GenericModel` becomes an
+`IfcOpeningElement` for all 142 - a void, which cannot be written without the
+element it voids.
+
+And one product is typed by its type's class rather than by a category: a wall
+whose type is a `NewCurtainWallType` is an `IfcCurtainWall`, 15 of 15, which
+were the only `IfcWall` we emitted where Revit did not.
+
+| | AR S1 | AR S2 |
+|---|---:|---:|
+| products matched by element id | 11 291 | 10 918 |
+| same IFC entity, before | 8 717 (77.2%) | - |
+| same IFC entity, now | **10 751 (95.2%)** | **10 457 (95.8%)** |
+
+`ifcopenshell.validate --rules` reports "No validation issues found" on both
+exports. A window and a door declare attributes on both sides of
+`PredefinedType`, so `push_element` now writes the trailing ones unset as well;
+a unit test counts the arguments of each entity it writes.
+
+**A selection rule had to be restated to keep this safe.** The export admits
+"a record that declares no category" as an instance rather than a definition.
+That clause was written as `category.is_none()`, which was the same thing while
+the only categories were declared ones - and inheriting 9 912 of them would
+have silently changed which elements are exported and which levels become
+storeys. It now reads `category_source != "declared"`, which is what the rule
+always meant. The corpus gate confirms it: 158 measurements on SMALL, MEDIUM
+and BIG, none regressed.
+
+What is left, and it is now one thing rather than seven: 341 elements of S1
+(307 railings and 34 doors) whose symbol names a family whose record decodes to
+**zero bytes** - `serial-probe --class Family --element 6654554` reports
+`0 bytes, exact=false, objects=0` for it. The chain is fine; the family's
+record is not being recovered at all. Two families account for all 341. The
+other residue is the 199 `IfcOpeningElement` we do not emit, which is by
+choice.
+
+Confidence: high for the route and the seven mapping rows - each is an
+exceptionless join against an answer this project did not produce, on two
+independently decoded files. The empty family record is an open decode gap,
+not a mapping one.
