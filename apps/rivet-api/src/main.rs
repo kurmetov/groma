@@ -349,6 +349,16 @@ fn serve_upload(
         Ok(received) => received,
         Err(message) => return request.respond(error(400, &message)),
     };
+
+    // The size ceiling is a plan drawn from this machine's capacity; this is
+    // the check against the moment. A conversion that cannot fit in the memory
+    // free right now is refused with a reason, because the alternative is the
+    // host swapping until someone reboots it.
+    let source_bytes = std::fs::metadata(&source).map_or(0, |file| file.len());
+    if let Err(message) = upload::room_to_convert(source_bytes, format) {
+        let _ = std::fs::remove_file(&source);
+        return request.respond(error(507, &message));
+    }
     let id = job_id();
     let job = Arc::new(Mutex::new(Job::new()));
     slot.remember(id.clone(), &job);
@@ -364,7 +374,7 @@ fn serve_upload(
         let _guard = running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match uploads.convert(&source, &stem) {
+        match uploads.convert(&source, &stem, format) {
             Ok(child) => upload::follow(child, &stem, &job),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
@@ -617,7 +627,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         );
         match uploads.as_ref() {
-            Some(slot) => println!("uploads convert with {}", slot.uploads.rivet.display()),
+            Some(slot) => {
+                println!("uploads convert with {}", slot.uploads.rivet.display());
+                // Said out loud, because "why was my file refused" should not
+                // need a reading of the source. An IFC is held in memory to be
+                // parsed and so stops sooner than an RVT does.
+                #[allow(clippy::cast_precision_loss)] // A figure printed to one decimal.
+                let gigabytes = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                println!(
+                    "largest upload: {:.1} GiB, or {:.1} GiB for an IFC (raise with --max-upload)",
+                    gigabytes(slot.uploads.max_bytes),
+                    gigabytes(slot.uploads.max_bytes.min(upload::max_ifc_bytes()))
+                );
+            }
             None => println!(
                 "uploads are refused: no `rivet` binary beside this one, and no --rivet given"
             ),

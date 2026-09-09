@@ -11,12 +11,117 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 /// Largest upload accepted, unless `--max-upload` says otherwise. The corpus
-/// runs to 450 MB a file, so the default has to clear that.
+/// runs to 450 MB a file, so the default has to clear that. An upload is
+/// streamed to disk a megabyte at a time and costs no memory to hold, so this
+/// guards the disk; what can be *converted* is [`max_ifc_bytes`].
 pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Largest IFC accepted by the current in-memory STEP reader. Its compact
-/// entity table still needs substantially more memory than the source text;
-/// refusing a larger file is preferable to letting an upload kill the host.
-pub const DEFAULT_MAX_IFC_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How much memory the STEP reader needs, as a multiple of the source text.
+///
+/// Measured on SMALL's own 643 MB IFC export: 2.20 GB peak, a 3.4x ratio,
+/// steady from 65 MB up to a synthetic 2.4 GiB. Four is that with headroom.
+const IFC_MEMORY_RATIO: u64 = 4;
+
+/// The share of the memory budget one conversion may plan to occupy.
+///
+/// A conversion is not the only thing on the machine. Sizing the ceiling to
+/// the *whole* budget is what turned a workstation with an editor and a
+/// browser open into a swapping brick: the arithmetic said the file fit, and
+/// it did, with nothing left for anything else. Half is what a single job may
+/// assume, and [`room_to_convert`] still checks the moment it starts.
+const CONVERSION_SHARE: u64 = 2;
+
+/// Smallest IFC ceiling, whatever the host says. Below this the reader is
+/// being denied files it has always managed.
+pub const MIN_MAX_IFC_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Largest IFC ceiling this will choose on its own.
+///
+/// Deliberately modest. A 2 GiB IFC already asks about 7 GB of memory to
+/// parse, which is a lot to spend without being told to; an operator who
+/// wants more says so with `--max-upload` on a host with the memory for it.
+/// Scaling this to a big machine's whole capacity - 14.8 GiB on a 59 GB box -
+/// is exactly the mistake that froze one.
+pub const MAX_AUTOMATIC_IFC_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The memory this process may actually use, in bytes.
+///
+/// Inside a container `/proc/meminfo` reports the *host's* memory, not the
+/// cgroup's limit, so a 4 GB container reads 59 GB and plans to use all of it
+/// until the kernel kills it. The cgroup limit is checked first for that
+/// reason, v2 then v1, and `MemTotal` is the fallback for a bare host.
+fn memory_budget() -> Option<u64> {
+    let cgroup = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .into_iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .find_map(|text| text.trim().parse::<u64>().ok())
+    // An unlimited cgroup reports "max" (v2) or a number near u64::MAX
+    // (v1), neither of which is a budget.
+    .filter(|limit| *limit < u64::MAX / 2);
+    cgroup
+        .or_else(|| meminfo_field("MemTotal:"))
+        .filter(|budget| *budget > 0)
+}
+
+/// One `/proc/meminfo` field, in bytes.
+fn meminfo_field(field: &str) -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = status.lines().find(|line| line.starts_with(field))?;
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|kilobytes| kilobytes.checked_mul(1024))
+}
+
+/// Largest IFC this host will be asked to convert.
+///
+/// The reader holds the whole entity table in memory, so the ceiling belongs
+/// to the machine rather than to a constant: 256 MB refused files a
+/// workstation converts in twelve seconds, and the same number is still too
+/// generous on a small container. This scales between the two and stops at
+/// [`MAX_AUTOMATIC_IFC_BYTES`], because a default should be safe on a busy
+/// machine rather than merely arithmetically possible on an idle one.
+#[must_use]
+pub fn max_ifc_bytes() -> u64 {
+    memory_budget()
+        .map_or(MIN_MAX_IFC_BYTES, |budget| {
+            budget / (IFC_MEMORY_RATIO * CONVERSION_SHARE)
+        })
+        .clamp(MIN_MAX_IFC_BYTES, MAX_AUTOMATIC_IFC_BYTES)
+}
+
+/// Whether there is memory free *now* to convert a source of `bytes`, or the
+/// message explaining why not.
+///
+/// The ceiling above is a plan made from capacity; this is the check against
+/// the moment. Refusing here costs the caller a clear error, where going ahead
+/// costs everyone the machine - and a host that swaps is not one anybody can
+/// see a progress bar on.
+pub fn room_to_convert(bytes: u64, format: Format) -> Result<(), String> {
+    if format != Format::Ifc {
+        return Ok(());
+    }
+    let Some(needed) = bytes.checked_mul(IFC_MEMORY_RATIO) else {
+        return Err("this file is too large to convert".to_owned());
+    };
+    let Some(free) = meminfo_field("MemAvailable:") else {
+        return Ok(());
+    };
+    if needed > free {
+        let megabytes = |value: u64| value / (1024 * 1024);
+        return Err(format!(
+            "converting this {} MB IFC needs about {} MB of memory and only {} MB is free; \
+             close something or try again",
+            megabytes(bytes),
+            megabytes(needed),
+            megabytes(free)
+        ));
+    }
+    Ok(())
+}
 
 /// What a model may be called once it is on disk. A name is derived from what
 /// the client sent rather than trusted: everything outside this set becomes an
@@ -84,6 +189,13 @@ impl Format {
     }
 }
 
+fn conversion_limit(format: Format, configured: u64) -> u64 {
+    match format {
+        Format::Ifc => configured.min(max_ifc_bytes()),
+        Format::Rvt => configured,
+    }
+}
+
 /// Where uploads and the scenes made from them live.
 #[derive(Clone, Debug)]
 pub struct Uploads {
@@ -135,11 +247,7 @@ impl Uploads {
         };
 
         let stem = sanitise(name);
-        let max_bytes = if format == Format::Ifc {
-            self.max_bytes.min(DEFAULT_MAX_IFC_BYTES)
-        } else {
-            self.max_bytes
-        };
+        let max_bytes = conversion_limit(format, self.max_bytes);
         let path = directory.join(format!("{stem}.{}", format.extension()));
         let mut file = std::fs::File::create(&path).map_err(|error| error.to_string())?;
         file.write_all(&head[..filled])
@@ -174,14 +282,32 @@ impl Uploads {
     /// # Errors
     ///
     /// Fails where the converter cannot be started.
-    pub fn convert(&self, source: &Path, scene_name: &str) -> std::io::Result<Child> {
+    pub fn convert(
+        &self,
+        source: &Path,
+        scene_name: &str,
+        format: Format,
+    ) -> std::io::Result<Child> {
         let scene = self.scenes.join(format!("{scene_name}.rvs"));
-        Command::new(&self.rivet)
+        let mut command = Command::new(&self.rivet);
+        command
             .arg("export-scene")
             .arg(source)
             .arg("--output")
             .arg(&scene)
-            .arg("--progress")
+            .arg("--progress");
+        // The converter guards its own reading with the same flag, and its
+        // default is the constant this server used to stop at. Without saying
+        // so, an IFC this server has just accepted would be refused by the
+        // process it hands it to - so the ceiling the upload was measured
+        // against is passed on. An RVT is left alone: there the flag bounds one
+        // decoded member rather than the source, and is not ours to raise.
+        if format == Format::Ifc {
+            command
+                .arg("--max-member-bytes")
+                .arg(max_ifc_bytes().to_string());
+        }
+        command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -298,7 +424,9 @@ pub fn follow(mut child: Child, scene_name: &str, job: &std::sync::Mutex<Job>) {
     if let Some(mut stderr) = child.stderr.take() {
         let _ = stderr.read_to_string(&mut stderr_text);
     }
-    let succeeded = status.is_ok_and(|status| status.success());
+    let finished = status.as_ref().ok().copied();
+    let succeeded = finished.is_some_and(|status| status.success());
+    let reason = failure_reason(finished, &stderr_text);
     update(&|held: &mut Job| {
         held.running = None;
         if succeeded {
@@ -306,18 +434,50 @@ pub fn follow(mut child: Child, scene_name: &str, job: &std::sync::Mutex<Job>) {
             held.scene = Some(scene_name.to_owned());
         } else {
             held.state = JobState::Failed;
-            held.error = Some(if stderr_text.trim().is_empty() {
-                "the conversion failed".to_owned()
-            } else {
-                stderr_text.trim().to_owned()
-            });
+            held.error = Some(reason.clone());
         }
     });
 }
 
+/// Why a conversion did not finish, in terms the page can show.
+///
+/// A converter killed for its memory says nothing on stderr - the kernel does
+/// not give it the chance - so the bare "the conversion failed" that used to
+/// appear was the one case where the reason mattered most and was least
+/// visible. A `SIGKILL` with no output is that case: under a container memory
+/// limit it is the cgroup's OOM killer, and on a bare host the kernel's.
+fn failure_reason(status: Option<std::process::ExitStatus>, stderr_text: &str) -> String {
+    let said = stderr_text.trim();
+    if !said.is_empty() {
+        return said.to_owned();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.and_then(|status| status.signal()) == Some(9) {
+            let budget = memory_budget().map_or_else(
+                || "this machine".to_owned(),
+                |bytes| format!("the {} MB available to it", bytes / (1024 * 1024)),
+            );
+            return format!(
+                "the converter ran out of memory and was killed. This model needs more than \
+                 {budget}. Geometry-heavy models cost far more than their file size suggests - \
+                 a 709 MB structural IFC measured here reached 39 GB, against 2.2 GB for a \
+                 643 MB one - so raise the limit for the container or convert it with the \
+                 `rivet export-scene` command directly."
+            );
+        }
+    }
+    let _ = status;
+    "the conversion failed".to_owned()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Format, sanitise};
+    use super::{
+        Format, MAX_AUTOMATIC_IFC_BYTES, MIN_MAX_IFC_BYTES, conversion_limit, max_ifc_bytes,
+        memory_budget, room_to_convert, sanitise,
+    };
 
     #[test]
     fn derives_a_name_that_cannot_leave_the_directory() {
@@ -341,5 +501,48 @@ mod tests {
         assert_eq!(Format::sniff(b"\n  ISO-10303-21;"), Some(Format::Ifc));
         assert_eq!(Format::sniff(b"PK\x03\x04 a zip"), None);
         assert_eq!(Format::sniff(b""), None);
+    }
+
+    #[test]
+    fn bounds_the_in_memory_ifc_reader_without_lowering_the_rvt_upload_cap() {
+        let configured = 2 * 1024 * 1024 * 1024;
+        assert_eq!(
+            conversion_limit(Format::Ifc, configured),
+            configured.min(max_ifc_bytes())
+        );
+        assert_eq!(conversion_limit(Format::Rvt, configured), configured);
+        // A stated limit below the ceiling still wins: this narrows, never
+        // widens, what was configured.
+        assert_eq!(conversion_limit(Format::Ifc, 1024), 1024);
+    }
+
+    #[test]
+    fn the_ifc_ceiling_stays_between_its_floor_and_a_modest_default() {
+        let ceiling = max_ifc_bytes();
+        assert!(ceiling >= MIN_MAX_IFC_BYTES, "{ceiling} is below the floor");
+        // The point of the clamp: a big machine must not talk this into a
+        // multi-gigabyte default just because the arithmetic allows it.
+        assert!(
+            ceiling <= MAX_AUTOMATIC_IFC_BYTES,
+            "{ceiling} is above what may be chosen without being asked"
+        );
+        // Reading twice gives the same answer - the ceiling is capacity, not
+        // whatever is free this second.
+        assert_eq!(max_ifc_bytes(), ceiling);
+        if std::path::Path::new("/proc/meminfo").exists() {
+            assert!(memory_budget().is_some_and(|budget| budget > 0));
+        }
+    }
+
+    #[test]
+    fn refuses_a_conversion_the_free_memory_will_not_hold() {
+        // An RVT is not held in memory this way and is never refused here.
+        assert!(room_to_convert(u64::MAX, Format::Rvt).is_ok());
+        // A small IFC always fits.
+        assert!(room_to_convert(1024, Format::Ifc).is_ok());
+        // One the size of the machine does not, and says so rather than
+        // taking the host down to find out.
+        let refusal = room_to_convert(u64::MAX / 2, Format::Ifc);
+        assert!(refusal.is_err(), "an impossible conversion was allowed");
     }
 }
