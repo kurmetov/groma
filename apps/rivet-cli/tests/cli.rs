@@ -1027,3 +1027,118 @@ fn export_json_carries_parameter_values() {
     assert!(line.contains("{\"id\":-1114242,\"name\":\"param_-1114242\",\"int\":0}"));
     assert!(line.contains("{\"id\":-1001203,\"name\":\"param_-1001203\",\"text\":\"153\"}"));
 }
+
+#[test]
+fn export_scene_writes_a_framed_scene_a_reader_can_locate() {
+    let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
+    let target = NamedTempFile::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-scene",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            target.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Scene written:"), "{stdout}");
+    assert!(
+        stdout.contains("Elements: 0 (0 carry geometry)"),
+        "{stdout}"
+    );
+
+    let written = std::fs::read(target.path()).unwrap();
+    assert!(written.starts_with(b"RIVETSCN"));
+    assert!(written.ends_with(b"RIVETEND"));
+
+    // A reader takes the last 24 bytes and follows them to the manifest. That
+    // is the whole contract for finding anything in the file, so the test
+    // walks it rather than trusting the writer's own report.
+    let trailer = written.len() - 24;
+    let offset = u64::from_le_bytes(written[trailer..trailer + 8].try_into().unwrap());
+    let stored = u32::from_le_bytes(written[trailer + 8..trailer + 12].try_into().unwrap());
+    let length = u32::from_le_bytes(written[trailer + 12..trailer + 16].try_into().unwrap());
+    let offset = usize::try_from(offset).unwrap();
+    let manifest = inflate(&written[offset..offset + stored as usize]);
+    assert_eq!(manifest.len(), length as usize);
+    let manifest = String::from_utf8(manifest).unwrap();
+    assert!(
+        manifest.contains("\"format\":\"rivet-scene\""),
+        "{manifest}"
+    );
+    assert!(manifest.contains("\"unit\":\"metre\""), "{manifest}");
+    assert!(manifest.contains("\"kind\":\"rvt\""), "{manifest}");
+    assert!(
+        manifest.contains("\"application\":\"Autodesk Revit\""),
+        "{manifest}"
+    );
+}
+
+#[test]
+fn export_scene_refuses_to_overwrite_the_source_rvt() {
+    let fixture = fixture();
+    let before = std::fs::read(fixture.path()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-scene",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            fixture.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("scene output must not overwrite the source model file")
+    );
+    assert_eq!(std::fs::read(fixture.path()).unwrap(), before);
+}
+
+#[test]
+fn export_scene_rejects_its_options_before_reading_the_file() {
+    // The source names a file that does not exist. Reporting the option and
+    // not the missing file is what proves the check runs first - on a real
+    // model the decode it precedes costs minutes.
+    for (flag, value, message) in [
+        ("--compression", "12", "compression must be between 0 and 9"),
+        (
+            "--chord-tolerance-mm",
+            "0",
+            "chord tolerance must be a positive number of millimetres",
+        ),
+        (
+            "--chunk-triangles",
+            "0",
+            "a chunk must hold at least one triangle",
+        ),
+        (
+            "--property-block",
+            "0",
+            "a property block must hold at least one element",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+            .args(["export-scene", "no/such/model.rvt", flag, value])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(message), "{flag}: {stderr}");
+    }
+}
+
+fn inflate(bytes: &[u8]) -> Vec<u8> {
+    let mut decoder = flate2::write::DeflateDecoder::new(Vec::new());
+    decoder.write_all(bytes).unwrap();
+    decoder.finish().unwrap()
+}

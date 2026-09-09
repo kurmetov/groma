@@ -69,6 +69,13 @@ name = "bim-core"
 version = "0.1.0"
 
 [[package]]
+name = "bim-mesh"
+version = "0.1.0"
+dependencies = [
+ "bim-core",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,6 +253,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ifc-import"
+version = "0.1.0"
+dependencies = [
+ "bim-core",
+ "bim-mesh",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -363,14 +378,17 @@ name = "rivet-cli"
 version = "0.1.0"
 dependencies = [
  "bim-core",
+ "bim-mesh",
  "cfb",
  "clap",
  "flate2",
  "ifc-export",
+ "ifc-import",
  "revit-catalog",
  "rvt-container",
  "rvt-model",
  "rvt-schema",
+ "scene-pack",
  "tempfile",
 ]
 
@@ -413,6 +431,17 @@ dependencies = [
 [[package]]
 name = "rvt-schema"
 version = "0.1.0"
+
+[[package]]
+name = "scene-pack"
+version = "0.1.0"
+dependencies = [
+ "bim-core",
+ "bim-mesh",
+ "flate2",
+ "ifc-export",
+ "serde_json",
+]
 
 [[package]]
 name = "serde"

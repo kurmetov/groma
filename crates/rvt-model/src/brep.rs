@@ -66,10 +66,23 @@ pub struct BrepClassIndexes {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SymbolBrep {
     pub faces: Vec<BrepFace>,
+    /// The `Face` object identifier of each entry of `faces`, in the same
+    /// order. Kept so a caller can ask the record what a resolved face
+    /// declares about itself - its `GFace` fields - without re-deriving which
+    /// object each face came from.
+    pub face_ids: Vec<u32>,
+    /// The bodies the record declares, in the order it declares them. See
+    /// [`BrepBody`]: a record is not one body, and reading it as one is what
+    /// made a wall's solid appear to disagree with the box on its own record.
+    pub bodies: Vec<BrepBody>,
     /// Faces present in the record that could not be resolved, and why.
     /// Preserved rather than discarded, per the project's "mark unknown
     /// structure explicitly" rule.
     pub excluded_faces: Vec<BrepExclusion>,
+    /// Faces the record declares that are on no boundary of it: they name no
+    /// loop and no edge names them. Kept apart from [`SymbolBrep::excluded_faces`]
+    /// because they are not a reading that failed - see [`assemble`].
+    pub unbounded_faces: Vec<u32>,
     /// Every edge the record declares that did not resolve. A face is excluded
     /// by the *first* failing edge its loop reaches, so face exclusions
     /// undercount and cannot say how badly a reading missed; these can.
@@ -156,6 +169,135 @@ impl SymbolBrep {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.faces.is_empty()
+    }
+
+    /// Whether what this holds can be claimed to be a closed solid.
+    ///
+    /// Every face the record declared has to have resolved, and every body's
+    /// boundary has to close on its own faces - see [`BrepBody::is_closed`].
+    /// The second half is what the old "no face was excluded" test could not
+    /// say: a record carrying a solid and a free surface beside it excluded
+    /// nothing and was still not a closed shell.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.excluded_faces.is_empty() && self.bodies.iter().all(BrepBody::is_closed)
+    }
+
+    /// Whether these faces bound a volume by their own loops: every edge one
+    /// of them draws is drawn by exactly one other.
+    ///
+    /// This is a geometric reading of closure and it answers a different
+    /// question from [`BrepBody::is_closed`]. That one is topological - it
+    /// asks whether every edge naming a face by `GEdge.m_pFace` finds its
+    /// other face in the same body - so a face the record declares and this
+    /// set leaves out always leaves it open, whether or not any loop here ever
+    /// used that edge. What an exporter needs to know is whether the faces it
+    /// is about to write close, and that is what this says.
+    ///
+    /// Edges are matched on their endpoints, quantised to
+    /// [`CLOSURE_TOLERANCE_FEET`] and taken unordered: the two faces that
+    /// share an edge traverse it in opposite directions.
+    #[must_use]
+    pub fn bounds_a_volume(&self) -> bool {
+        let key = |point: [f64; 3]| {
+            point.map(|value| {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    (value / CLOSURE_TOLERANCE_FEET).round() as i64
+                }
+            })
+        };
+        let mut uses: HashMap<([i64; 3], [i64; 3]), usize> = HashMap::new();
+        let mut edges = 0_usize;
+        for face in &self.faces {
+            for face_loop in &face.loops {
+                for edge in face_loop {
+                    let (start, end) = (key(edge.start), key(edge.end));
+                    let ends = if start <= end {
+                        (start, end)
+                    } else {
+                        (end, start)
+                    };
+                    *uses.entry(ends).or_default() += 1;
+                    edges += 1;
+                }
+            }
+        }
+        edges > 0 && uses.values().all(|uses| *uses == 2)
+    }
+
+    /// One declared body on its own.
+    ///
+    /// Its faces are this body's; the record-level tallies are carried over
+    /// unchanged, because a failed edge or an unread hole chain is recorded
+    /// against the record and cannot be attributed to one of its bodies after
+    /// the fact. The faces the record could not read are *not* carried over -
+    /// they belong to the record, and whether they leave this shell open is
+    /// what [`BrepBody::open_edges`] says.
+    #[must_use]
+    pub fn body(&self, index: usize) -> Option<Self> {
+        let body = self.bodies.get(index)?;
+        Some(Self {
+            faces: body
+                .faces
+                .iter()
+                .filter_map(|face| self.faces.get(*face).cloned())
+                .collect(),
+            face_ids: body
+                .faces
+                .iter()
+                .filter_map(|face| self.face_ids.get(*face).copied())
+                .collect(),
+            bodies: vec![BrepBody {
+                faces: (0..body.faces.len()).collect(),
+                ..body.clone()
+            }],
+            excluded_faces: Vec::new(),
+            // Like `excluded_faces`, these belong to the record and not to one
+            // of its shells: a face on no boundary is on this body's no more
+            // than on any other.
+            unbounded_faces: Vec::new(),
+            failed_edges: self.failed_edges.clone(),
+            ordering_control: self.ordering_control,
+            holes: self.holes.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrepBody {
+    /// The `GBRep` node that declares these faces. More than one body can
+    /// carry the same node: a node holding two shells declares two bodies.
+    pub node_id: u32,
+    /// Indices into [`SymbolBrep::faces`], in the order the node names them.
+    pub faces: Vec<usize>,
+    /// Edges naming a face of this body.
+    pub edges: usize,
+    /// Of those, edges whose `GEdge.m_pFace` leaves one side null: nothing is
+    /// on the other side, so the face is a free surface rather than part of a
+    /// solid.
+    pub one_sided_edges: usize,
+    /// Of those, edges naming a second face that is not in this body - one
+    /// that did not resolve. The shell has a hole where that face should be.
+    pub open_edges: usize,
+}
+
+impl BrepBody {
+    /// Whether this body's boundary closes: every edge two-sided, and the face
+    /// on the other side of each one read and in this body.
+    ///
+    /// This is a stronger statement than "the record excluded no face", and a
+    /// local one: it is about this shell, not about everything the record
+    /// happens to carry beside it.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.edges > 0 && self.one_sided_edges == 0 && self.open_edges == 0
+    }
+
+    /// Whether this body is a solid rather than a free surface.
+    #[must_use]
+    pub fn is_solid(&self) -> bool {
+        self.edges > 0 && self.one_sided_edges == 0
     }
 }
 
@@ -349,7 +491,12 @@ struct ResolvedEdge {
 /// or boundary could not be resolved are counted in
 /// [`SymbolBrep::excluded_faces`], not silently dropped.
 #[must_use]
-pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolBrep {
+#[allow(clippy::too_many_lines)] // One pass over the objects, then the bodies.
+pub fn assemble(
+    objects: &[SerialObject],
+    classes: &BrepClassIndexes,
+    body_classes: &[u16],
+) -> SymbolBrep {
     let by_id: HashMap<u32, &SerialObject> = objects
         .iter()
         .filter(|object| {
@@ -392,7 +539,11 @@ pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolB
     }
 
     let mut faces = Vec::new();
+    // The identifier of each entry of `faces`, so the bodies below can be
+    // stated as indices into it.
+    let mut face_ids = Vec::new();
     let mut excluded_faces = Vec::new();
+    let mut unbounded_faces = Vec::new();
     let mut ordering_control = OrderingControl::default();
     let mut holes = HoleTally::default();
     for face in objects
@@ -400,6 +551,36 @@ pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolB
         .filter(|object| object.class_index == classes.face)
     {
         let incidences = by_face.get(&face.object_id).map_or(&[][..], Vec::as_slice);
+        // A face that names no loop and that no edge names is on no boundary
+        // this record draws. `GEdge.m_pFace` names the face on each side of
+        // every edge, so a face no edge names borders nothing here, and there
+        // is no third place a boundary could be written. Counting it as a face
+        // this reader could not read would be a statement about the reader
+        // rather than about the file, and on AR S1 it was 60 886 of the 66 135
+        // "excluded" faces - which is to say the measurement that decides what
+        // to work on next was mostly not about faces at all.
+        //
+        // The file says the same thing a second way. Every one of these faces
+        // has `GInfo.m_flags & 0x80000` clear - 60 886 on AR S1, 4 591 on
+        // SMALL, 539 on MEDIUM, 1 350 on BIG, with no exception on any of them
+        // - and that bit is already established, by a different route and for
+        // a different purpose, as the mark separating a record's own faces
+        // from geometry joined into its shell (`FACE_INSIDE_THE_BOX_FLAG` in
+        // the CLI). Two independent readings agree they are not the solid's.
+        //
+        // Nothing here weakens what an exporter is told: these faces are not
+        // resolved, they are only not counted as failures, and the shell they
+        // are left out of still has to close on its own edges before anything
+        // is written from it.
+        if incidences.is_empty()
+            && face
+                .references
+                .first()
+                .is_none_or(|reference| reference.object_id == 0)
+        {
+            unbounded_faces.push(face.object_id);
+            continue;
+        }
         match assemble_face(face, classes, &by_id, &edges, &face_surfaces, incidences) {
             Ok((assembled, stopped)) => {
                 if assembled.loops.len() > 1 {
@@ -443,6 +624,7 @@ pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolB
                     }
                 }
                 faces.push(assembled);
+                face_ids.push(face.object_id);
             }
             Err(reason) => excluded_faces.push(BrepExclusion {
                 face_id: face.object_id,
@@ -450,13 +632,149 @@ pub fn assemble(objects: &[SerialObject], classes: &BrepClassIndexes) -> SymbolB
             }),
         }
     }
+    let bodies = declared_bodies(objects, classes, body_classes, &face_ids, &edges);
     SymbolBrep {
         faces,
+        face_ids,
+        bodies,
         excluded_faces,
+        unbounded_faces,
         failed_edges,
         ordering_control,
         holes,
     }
+}
+
+/// Union-find root of `index`, with path halving.
+fn find_root(parent: &mut [usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        parent[index] = parent[parent[index]];
+        index = parent[index];
+    }
+    index
+}
+
+/// Split the record's faces into the bodies it declares.
+///
+/// Two declarations do the splitting, and neither is a guess about the
+/// geometry:
+///
+/// - `GBRep.m_pFaces`. A `GElement` record is a node graph and `GBRep` -
+///   `Geometry` is the subclass the files write - is the node that owns faces.
+///   A wall record holds several: the solid, and one node per free surface
+///   beside it, which is what the planes of its compound structure's layers
+///   are stored as.
+/// - `GEdge.m_pFace`, which names the face on each side of an edge. Faces
+///   joined by an edge are one shell; a node holding two solids that touch
+///   nowhere holds two shells, and the box on the record singles out one of
+///   them. A wall with a sweep along it is exactly that case.
+///
+/// So a body here is one shell of one node. Faces that did not resolve are
+/// still placed, because an edge names them whether or not their surface or
+/// loop could be read.
+fn declared_bodies(
+    objects: &[SerialObject],
+    classes: &BrepClassIndexes,
+    body_classes: &[u16],
+    face_ids: &[u32],
+    edges: &HashMap<u32, Result<ResolvedEdge, EdgeFailure>>,
+) -> Vec<BrepBody> {
+    let index_of: HashMap<u32, usize> = face_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, index))
+        .collect();
+    let mut node_of: HashMap<u32, u32> = HashMap::new();
+    for node in objects
+        .iter()
+        .filter(|object| body_classes.contains(&object.class_index))
+    {
+        for reference in &node.references {
+            if reference.class_index == classes.face && reference.object_id != 0 {
+                node_of.entry(reference.object_id).or_insert(node.object_id);
+            }
+        }
+    }
+    if node_of.is_empty() {
+        return Vec::new();
+    }
+    // Union-find over the faces that resolved, joined by the edges naming two
+    // of them. A face that did not resolve joins nothing: it has no geometry
+    // to contribute and joining through it would merge two shells on the
+    // strength of a face neither of them could read. What it does instead is
+    // leave the shells it borders open, which `open_edges` below counts.
+    let mut parent: Vec<usize> = (0..face_ids.len()).collect();
+    let edge_objects = || {
+        objects
+            .iter()
+            .filter(|object| object.class_index == classes.edge && object.identifiers.len() == 6)
+    };
+    for edge in edge_objects() {
+        let named = &edge.identifiers[..2];
+        if named.contains(&0) {
+            continue;
+        }
+        // Only an edge that resolved joins two faces. An edge is read from
+        // both of the faces it names and accepted only when the two agree on
+        // the same 3D curve, so one that did not resolve is a contradiction
+        // between the incidence and the geometry - exactly the case where
+        // joining on it would weld a face onto a body it is nowhere near.
+        if !edges.get(&edge.object_id).is_some_and(Result::is_ok) {
+            continue;
+        }
+        let (Some(left), Some(right)) = (index_of.get(&named[0]), index_of.get(&named[1])) else {
+            continue;
+        };
+        // Only within one node: an edge crossing two `GBRep` nodes would be a
+        // contradiction between the two declarations, and joining on it would
+        // silently prefer one.
+        if node_of.get(&named[0]) != node_of.get(&named[1]) {
+            continue;
+        }
+        let (left, right) = (
+            find_root(&mut parent, *left),
+            find_root(&mut parent, *right),
+        );
+        parent[left] = right;
+    }
+
+    let mut bodies: Vec<BrepBody> = Vec::new();
+    let mut body_of_root: HashMap<usize, usize> = HashMap::new();
+    let mut body_of_face: HashMap<u32, usize> = HashMap::new();
+    for (index, face) in face_ids.iter().enumerate() {
+        let root = find_root(&mut parent, index);
+        let body = *body_of_root.entry(root).or_insert_with(|| {
+            bodies.push(BrepBody {
+                node_id: node_of.get(face).copied().unwrap_or_default(),
+                faces: Vec::new(),
+                edges: 0,
+                one_sided_edges: 0,
+                open_edges: 0,
+            });
+            bodies.len() - 1
+        });
+        bodies[body].faces.push(index);
+        body_of_face.insert(*face, body);
+    }
+    for edge in edge_objects() {
+        let named = &edge.identifiers[..2];
+        let one_sided = named.contains(&0);
+        let resolved = edges.get(&edge.object_id).is_some_and(Result::is_ok);
+        for (side, face) in named.iter().enumerate() {
+            let Some(index) = body_of_face.get(face).copied() else {
+                continue;
+            };
+            let partner = body_of_face.get(&named[1 - side]).copied();
+            let body = &mut bodies[index];
+            body.edges += 1;
+            if one_sided {
+                body.one_sided_edges += 1;
+            } else if !resolved || partner != Some(index) {
+                body.open_edges += 1;
+            }
+        }
+    }
+    bodies
 }
 
 /// Pair each `Face` with its surface's numeric data. `Face.m_pSurf`'s
@@ -1319,6 +1637,10 @@ fn assemble_face(
         // [`order_face_edges`]. A face without a loop object has no
         // `m_nextLoop` chain either, so its holes are read the same way its
         // outer bound is: as the further rings its own edges close into.
+        //
+        // A face with no edges either never arrives here: [`assemble`] takes
+        // it out first, because it is on no boundary rather than on one this
+        // could not order.
         return order_face_edges(incidences, edges).map(|rings| {
             (
                 BrepFace {
@@ -1691,6 +2013,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -1713,6 +2036,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -1736,6 +2060,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -1751,6 +2076,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -1766,6 +2092,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -1797,6 +2124,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: vec![flags],
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -1833,6 +2161,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: vec![flags],
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -1900,7 +2229,7 @@ mod tests {
 
     #[test]
     fn reads_an_edge_between_two_cylinders_from_both_parametrizations() {
-        let brep = assemble(&split_tube(None), &classes());
+        let brep = assemble(&split_tube(None), &classes(), &[]);
         let tube = brep
             .faces
             .iter()
@@ -1937,7 +2266,7 @@ mod tests {
         // comparing the path between them tells the two apart. They are
         // opposite halves of one circle.
         let pi = std::f64::consts::PI;
-        let brep = assemble(&split_tube(Some([(0.0, 5.0), (-pi, 5.0)])), &classes());
+        let brep = assemble(&split_tube(Some([(0.0, 5.0), (-pi, 5.0)])), &classes(), &[]);
         assert!(
             brep.faces.is_empty(),
             "a face resolved through a disagreement: {:?}",
@@ -2054,6 +2383,94 @@ mod tests {
 
     /// A unit square in the XY plane with a smaller square hole in it: the
     /// outer loop's `m_nextLoop` names the hole's loop, and both name face 1.
+    const GBREP: u16 = 2160;
+
+    /// A `GBRep` node naming the faces it owns, as `Geometry.m_pFaces` does.
+    fn body_node(id: u32, faces: &[u32]) -> SerialObject {
+        SerialObject {
+            object_id: id,
+            class_index: GBREP,
+            offset: 0,
+            bytes: 0,
+            references: faces.iter().map(|face| reference(*face, FACE)).collect(),
+            identifiers: Vec::new(),
+            numbers: Vec::new(),
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
+        }
+    }
+
+    /// One square face whose every edge names nothing on the other side: a
+    /// free surface, which is what a wall's layer planes are stored as.
+    fn free_square(face: u32, plane: u32, first_edge: u32) -> Vec<SerialObject> {
+        let corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let mut objects = vec![
+            plane_object(plane, [0.0, 0.0, 5.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            face_object(face, first_edge + 90, reference(plane, PLANE)),
+            loop_object(first_edge + 90, face, first_edge, first_edge + 3),
+        ];
+        for (index, corner) in corners.into_iter().enumerate() {
+            let next = if index == 3 {
+                first_edge + 90
+            } else {
+                first_edge + u32::try_from(index).unwrap() + 1
+            };
+            let previous = if index == 0 {
+                first_edge + 90
+            } else {
+                first_edge + u32::try_from(index).unwrap() - 1
+            };
+            objects.push(line_edge(
+                first_edge + u32::try_from(index).unwrap(),
+                face,
+                0,
+                [next, 0],
+                [previous, 0],
+                0,
+                corner,
+                corners[(index + 1) % 4],
+            ));
+        }
+        objects
+    }
+
+    #[test]
+    fn splits_a_record_into_the_bodies_its_nodes_and_edges_declare() {
+        // One node holding a square, and a second holding a free surface -
+        // the shape of every wall record in the corpus.
+        let mut objects = square_with_a_hole(0);
+        objects.extend(free_square(3, 901, 200));
+        objects.push(body_node(500, &[1]));
+        objects.push(body_node(501, &[3]));
+        let brep = assemble(&objects, &classes(), &[GBREP]);
+        assert_eq!(brep.faces.len(), 2);
+        assert_eq!(brep.bodies.len(), 2);
+
+        let square = &brep.bodies[0];
+        assert_eq!(square.node_id, 500);
+        assert_eq!(square.faces, [0]);
+        // Its edges name a second face the record does not hold, so it is a
+        // solid whose boundary does not close.
+        assert!(square.is_solid());
+        assert!(!square.is_closed());
+        assert_eq!(square.one_sided_edges, 0);
+        assert_eq!(square.open_edges, 8);
+
+        let free = &brep.bodies[1];
+        assert_eq!(free.node_id, 501);
+        assert_eq!(free.faces, [1]);
+        assert!(!free.is_solid());
+        assert_eq!(free.one_sided_edges, 4);
+
+        // One body on its own carries only its own faces.
+        let only = brep.body(1).unwrap();
+        assert_eq!(only.faces.len(), 1);
+        assert_eq!(only.faces[0], brep.faces[1]);
+        assert!(!only.is_closed());
+    }
+
     fn square_with_a_hole(next_loop_of_the_hole: u32) -> Vec<SerialObject> {
         let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
         let face = face_object(1, 10, reference(900, PLANE));
@@ -2077,7 +2494,7 @@ mod tests {
 
     #[test]
     fn reads_a_face_hole_from_the_next_loop_chain() {
-        let brep = assemble(&square_with_a_hole(0), &classes());
+        let brep = assemble(&square_with_a_hole(0), &classes(), &[]);
         assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
         assert_eq!(brep.faces.len(), 1);
         let face = &brep.faces[0];
@@ -2099,7 +2516,7 @@ mod tests {
     fn stops_a_loop_chain_that_returns_to_a_loop_it_has_read() {
         // The hole names the outer loop as its own next, which is a cycle. The
         // face keeps both loops it did read rather than being excluded.
-        let brep = assemble(&square_with_a_hole(10), &classes());
+        let brep = assemble(&square_with_a_hole(10), &classes(), &[]);
         assert_eq!(brep.faces.len(), 1);
         assert_eq!(brep.faces[0].loops.len(), 2);
         assert_eq!(
@@ -2134,7 +2551,7 @@ mod tests {
         let mut objects = vec![plane, face, corner_loop];
         objects.extend(edges);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
         assert_eq!(brep.faces.len(), 1);
         let face = &brep.faces[0];
@@ -2180,7 +2597,7 @@ mod tests {
         let mut objects = vec![plane, face, corner_loop];
         objects.extend(edges);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
         let start = brep.faces[0].loops[0][0].start;
         assert!(distance(start, [0.0, 0.0, 0.0]) < 1.0e-9);
@@ -2204,7 +2621,7 @@ mod tests {
         let mut objects = vec![plane, face];
         objects.extend(edges);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
         let ring = &brep.faces[0].loops[0];
         assert_eq!(ring.len(), 4);
@@ -2239,7 +2656,7 @@ mod tests {
         let mut objects = vec![plane, face];
         objects.extend(edges);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
         let loops = &brep.faces[0].loops;
         assert_eq!(loops.len(), 2);
@@ -2279,7 +2696,7 @@ mod tests {
         let mut objects = vec![plane, face];
         objects.extend(edges);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.faces.is_empty());
         assert_eq!(
             brep.excluded_faces[0].reason,
@@ -2307,7 +2724,7 @@ mod tests {
         let mut objects = vec![plane, face];
         objects.extend(edges);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.faces.is_empty());
         assert_eq!(
             brep.excluded_faces[0].reason,
@@ -2315,13 +2732,44 @@ mod tests {
         );
     }
 
-    /// A face no edge names keeps the exclusion it always had.
+    /// A face that names no loop and that no edge names is on no boundary the
+    /// record draws, so it is not a face this reader failed to read. It is
+    /// reported as what it is and does not make the record incomplete.
     #[test]
-    fn keeps_the_old_reason_for_a_loopless_face_with_no_edges() {
+    fn a_face_no_loop_and_no_edge_names_is_not_an_exclusion() {
         let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
         let face = face_object(1, 0, reference(900, PLANE));
-        let brep = assemble(&[plane, face], &classes());
-        assert_eq!(brep.excluded_faces[0].reason, "face has no first loop");
+        let brep = assemble(&[plane, face], &classes(), &[]);
+        assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
+        assert_eq!(brep.unbounded_faces, vec![1]);
+        assert!(brep.faces.is_empty());
+    }
+
+    /// And it does not buy the record its closure: a shell that is still open
+    /// on its own edges stays open, so nothing reaches an exporter that could
+    /// not before.
+    #[test]
+    fn a_face_on_no_boundary_does_not_close_the_record_it_sits_in() {
+        let plane = plane_object(900, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let square = face_object(1, 10, reference(900, PLANE));
+        let square_loop = loop_object(10, 1, 100, 103);
+        // A second face nothing bounds: no loop of its own, and the edges
+        // above name faces 1 and 3, never this one.
+        let stray = face_object(2, 0, reference(900, PLANE));
+        let mut objects = vec![plane, square, square_loop, stray];
+        objects.extend([
+            line_edge(100, 1, 3, [101, 0], [10, 0], 0, (0.0, 0.0), (1.0, 0.0)),
+            line_edge(101, 1, 3, [102, 0], [100, 0], 0, (1.0, 0.0), (1.0, 1.0)),
+            line_edge(102, 1, 3, [103, 0], [101, 0], 0, (1.0, 1.0), (0.0, 1.0)),
+            line_edge(103, 1, 3, [10, 0], [102, 0], 0, (0.0, 1.0), (0.0, 0.0)),
+        ]);
+
+        let brep = assemble(&objects, &classes(), &[]);
+        assert_eq!(brep.unbounded_faces, vec![2]);
+        assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
+        // One square is a boundary with one side and no volume: the record is
+        // not a closed solid and saying so is the whole point of the gate.
+        assert!(!brep.bounds_a_volume());
     }
 
     /// The control the reconstruction is allowed on: a face that declares a
@@ -2340,7 +2788,7 @@ mod tests {
         let mut objects = vec![plane, face, corner_loop];
         objects.extend(edges);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert_eq!(
             brep.ordering_control,
             OrderingControl {
@@ -2363,7 +2811,7 @@ mod tests {
         let mut objects = vec![plane, face, corner_loop];
         objects.extend(edges);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.faces.is_empty());
         assert_eq!(brep.excluded_faces.len(), 1);
         assert_eq!(brep.excluded_faces[0].face_id, 1);
@@ -2373,7 +2821,7 @@ mod tests {
     fn excludes_a_face_with_no_supported_surface() {
         // A class this does not read at all - not Plane, CylSurf or SurfRev.
         let face = face_object(1, 10, reference(5, 9999));
-        let brep = assemble(&[face], &classes());
+        let brep = assemble(&[face], &classes(), &[]);
         assert!(brep.faces.is_empty());
         assert_eq!(
             brep.excluded_faces[0].reason,
@@ -2406,6 +2854,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         };
         let cap_face = face_object(1, 10, reference(900, PLANE));
         // A placeholder Face for id 2 so the cylinder surface has something
@@ -2431,7 +2880,7 @@ mod tests {
             plane, cylinder, cap_face, cyl_face, cap_loop, arc_edge, radius_a, radius_b,
         ];
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         let cap = brep
             .faces
             .iter()
@@ -2473,6 +2922,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -2504,6 +2954,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -2561,6 +3012,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -2589,6 +3041,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 
@@ -2643,7 +3096,7 @@ mod tests {
 
     #[test]
     fn reads_a_cone_from_a_line_revolved_about_the_axis() {
-        let brep = assemble(&quarter_cone(), &classes());
+        let brep = assemble(&quarter_cone(), &classes(), &[]);
         let cone = brep.faces.first().expect("the cone face resolved");
         assert!(matches!(
             cone.surface,
@@ -2689,7 +3142,7 @@ mod tests {
                 ((0.0, 4.0), (0.0, 2.0)),
             ],
         );
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         let cone = brep.faces.first().expect("the ConeSurf face resolved");
         let BrepSurface::Revolution {
             center, profile, ..
@@ -2742,7 +3195,7 @@ mod tests {
 
     #[test]
     fn reads_a_torus_from_an_arc_revolved_about_the_axis() {
-        let brep = assemble(&quarter_torus(), &classes());
+        let brep = assemble(&quarter_torus(), &classes(), &[]);
         let torus = brep.faces.first().expect("the torus face resolved");
         let edges = &torus.loops[0];
         assert_eq!(edges.len(), 4);
@@ -2803,7 +3256,7 @@ mod tests {
         diagonal.numbers[4] = half; // u at the last point
         diagonal.numbers[5] = 1.0; // v at the last point
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.faces.is_empty(), "{:?}", brep.faces);
         assert_eq!(
             brep.excluded_faces[0].reason,
@@ -2818,7 +3271,7 @@ mod tests {
         // reason a face with no surface at all gets.
         let mut objects = quarter_cone();
         objects.retain(|object| object.class_index != G_LINE);
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.faces.is_empty());
         assert_eq!(
             brep.excluded_faces[0].reason,
@@ -2853,7 +3306,7 @@ mod tests {
         objects.push(inner);
         objects.push(outer);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
         let face = brep.faces.first().expect("the ruled face resolved");
         let BrepSurface::Ruled { first, second } = face.surface else {
@@ -2924,7 +3377,7 @@ mod tests {
         );
         objects.push(rim);
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.excluded_faces.is_empty(), "{:?}", brep.excluded_faces);
         let face = brep.faces.first().expect("the ruled face resolved");
         let BrepSurface::Ruled { first, second } = face.surface else {
@@ -2964,7 +3417,7 @@ mod tests {
             ],
         );
 
-        let brep = assemble(&objects, &classes());
+        let brep = assemble(&objects, &classes(), &[]);
         assert!(brep.faces.is_empty());
         assert_eq!(
             brep.excluded_faces

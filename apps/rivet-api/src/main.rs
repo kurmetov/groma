@@ -7,7 +7,9 @@
 //! serving the artefact keeps every answer traceable to the export it came
 //! from. Point `--data` at a directory of `<model>.jsonl` files.
 
+mod scenes;
 mod store;
+mod upload;
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -16,8 +18,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use clap::Parser;
+use scenes::{SceneError, Scenes};
 use store::{Model, Query};
 use tiny_http::{Header, Request, Response, Server};
+use upload::{DEFAULT_MAX_UPLOAD_BYTES, Job, Uploads};
+
+/// The viewer page, embedded so the binary needs nothing beside it.
+const VIEWER_HTML: &str = include_str!("../../../web/viewer.html");
 
 /// Page size a request gets when it asks for none.
 const DEFAULT_LIMIT: usize = 50;
@@ -43,6 +50,18 @@ struct Cli {
     /// Load every model at startup instead of on first use.
     #[arg(long)]
     preload: bool,
+    /// Directory of `<scene>.rvs` files written by `rivet export-scene`. With
+    /// one, `/viewer` draws them; without one, the scene routes are absent.
+    #[arg(long)]
+    scenes: Option<PathBuf>,
+    /// The `rivet` binary that converts an uploaded model. Defaults to the one
+    /// beside this executable; without either, uploading is refused and the
+    /// scenes already on disk are still served.
+    #[arg(long)]
+    rivet: Option<PathBuf>,
+    /// Largest upload accepted, in bytes.
+    #[arg(long, default_value_t = DEFAULT_MAX_UPLOAD_BYTES)]
+    max_upload: u64,
 }
 
 /// Models available on disk, loaded on first use and then kept.
@@ -138,6 +157,16 @@ fn json_response(status: u16, body: &serde_json::Value) -> Response<Cursor<Vec<u
 
 fn error(status: u16, message: &str) -> Response<Cursor<Vec<u8>>> {
     json_response(status, &serde_json::json!({ "error": message }))
+}
+
+fn header(name: &str, value: &str) -> Header {
+    Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap_or_else(|()| {
+        Header::from_bytes(&b"X-Rivet"[..], &b"header"[..]).expect("static header")
+    })
+}
+
+fn content_type(value: &str) -> Header {
+    header("Content-Type", value)
 }
 
 /// Split a target into its path segments and its decoded query pairs.
@@ -263,9 +292,188 @@ fn elements_response(
     json_response(200, &body)
 }
 
-fn handle(store: &Store, request: Request) -> std::io::Result<()> {
+/// The conversions this server has been asked for, and the one slot they run
+/// in.
+///
+/// A decode holds gigabytes - 3.4 GB on a 230 MB architectural model - so two
+/// at once is how a machine with this open in two tabs runs out of memory. The
+/// second upload waits rather than competing.
+struct ConversionSlot {
+    uploads: Uploads,
+    running: Arc<Mutex<()>>,
+    jobs: Mutex<BTreeMap<String, Arc<Mutex<Job>>>>,
+}
+
+impl ConversionSlot {
+    fn job(&self, id: &str) -> Option<Arc<Mutex<Job>>> {
+        self.jobs.lock().ok()?.get(id).cloned()
+    }
+
+    /// Remember a job, and forget the oldest once there are many: this is a
+    /// viewer, not a queue, and a session's worth is all anyone asks about.
+    fn remember(&self, id: String, job: &Arc<Mutex<Job>>) {
+        if let Ok(mut jobs) = self.jobs.lock() {
+            while jobs.len() >= 32 {
+                let Some(oldest) = jobs.keys().next().cloned() else {
+                    break;
+                };
+                jobs.remove(&oldest);
+            }
+            jobs.insert(id, Arc::clone(job));
+        }
+    }
+}
+
+/// Receive a model and start converting it. The reply names a job the page
+/// then asks about, rather than holding the connection open for the minute a
+/// large model takes.
+fn serve_upload(
+    slot: Option<&ConversionSlot>,
+    params: &BTreeMap<String, String>,
+    mut request: Request,
+) -> std::io::Result<()> {
+    let Some(slot) = slot else {
+        return request.respond(error(
+            503,
+            "this server cannot convert uploads: no rivet binary was found beside it, \
+             and none was given with --rivet",
+        ));
+    };
+    if request.method() != &tiny_http::Method::Post {
+        return request.respond(error(405, "upload is a POST"));
+    }
+    let name = params.get("name").map_or("model", String::as_str);
+
+    let received = slot.uploads.receive(name, request.as_reader());
+    let (source, format, stem) = match received {
+        Ok(received) => received,
+        Err(message) => return request.respond(error(400, &message)),
+    };
+    let id = job_id();
+    let job = Arc::new(Mutex::new(Job::new()));
+    slot.remember(id.clone(), &job);
+    let response = json_response(
+        202,
+        &serde_json::json!({ "job": id, "scene": stem, "format": format.extension() }),
+    );
+
+    let uploads = slot.uploads.clone();
+    let running = Arc::clone(&slot.running);
+    std::thread::spawn(move || {
+        // One at a time, so two tabs cannot decode two models at once.
+        let _guard = running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match uploads.convert(&source, &stem) {
+            Ok(child) => upload::follow(child, &stem, &job),
+            Err(failure) => {
+                if let Ok(mut held) = job.lock() {
+                    held.state = upload::JobState::Failed;
+                    held.error = Some(format!("the converter could not be started: {failure}"));
+                }
+            }
+        }
+    });
+    request.respond(response)
+}
+
+/// An identifier for one conversion. It only has to be unlike the others this
+/// process hands out, which a counter and the clock together are.
+fn job_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let count = NEXT.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    format!("{now:x}-{count}")
+}
+
+/// Answer one scene request, by range where one was asked for.
+///
+/// A viewer reads this format by range - 24 bytes of trailer, then the
+/// manifest, then the chunks it means to draw - so the range path is the
+/// normal one here, not an optimisation.
+fn serve_scene(scenes: Option<&Scenes>, name: &str, request: Request) -> std::io::Result<()> {
+    let Some(scenes) = scenes else {
+        return request.respond(error(404, "this server was started without --scenes"));
+    };
+    let wanted = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Range"))
+        .and_then(|header| scenes::parse_range(header.value.as_str()));
+    match scenes.read(name, wanted) {
+        Ok((bytes, range, total)) => {
+            let mut response = Response::from_data(bytes)
+                .with_header(content_type("application/octet-stream"))
+                .with_header(header("Accept-Ranges", "bytes"));
+            if wanted.is_some() {
+                response = response.with_status_code(206).with_header(header(
+                    "Content-Range",
+                    &format!("bytes {}-{}/{total}", range.start, range.end),
+                ));
+            }
+            request.respond(response)
+        }
+        Err(SceneError::NotFound) => request.respond(error(404, "unknown scene")),
+        // A 416 must state the length, so a reader that got it wrong can
+        // correct itself rather than only learning that it failed.
+        Err(SceneError::NotSatisfiable(total)) => request.respond(
+            error(416, "range not satisfiable")
+                .with_header(header("Content-Range", &format!("bytes */{total}"))),
+        ),
+        Err(SceneError::Io(failure)) => {
+            eprintln!("scene {name}: {failure}");
+            request.respond(error(500, "the scene could not be read"))
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // One match over the routes this server serves.
+fn handle(
+    store: &Store,
+    scenes: Option<&Scenes>,
+    uploads: Option<&ConversionSlot>,
+    request: Request,
+) -> std::io::Result<()> {
     let (segments, params) = parse_target(request.url());
     let route = segments.iter().map(String::as_str).collect::<Vec<_>>();
+
+    // The viewer and its scenes are answered before the JSON routes: a scene
+    // is bytes served by range, not a document, and the page is HTML.
+    match route.as_slice() {
+        ["viewer"] => {
+            let content_type =
+                Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+                    .expect("static header");
+            return request.respond(
+                Response::from_data(VIEWER_HTML)
+                    .with_header(content_type)
+                    // The viewer is embedded in this binary. A local server
+                    // restart must publish its new UI immediately rather than
+                    // leave a browser running a cached copy of the old one.
+                    .with_header(header("Cache-Control", "no-store, max-age=0")),
+            );
+        }
+        ["scenes"] => {
+            let names = scenes.map(Scenes::available).unwrap_or_default();
+            return request.respond(json_response(200, &serde_json::json!({ "scenes": names })));
+        }
+        ["scenes", name] => return serve_scene(scenes, name, request),
+        ["upload"] => return serve_upload(uploads, &params, request),
+        ["jobs", id] => {
+            let answer = uploads.and_then(|slot| slot.job(id)).map(|job| {
+                job.lock()
+                    .map_or_else(|held| held.into_inner().to_json(), |held| held.to_json())
+            });
+            return request.respond(match answer {
+                Some(body) => json_response(200, &body),
+                None => error(404, "unknown job"),
+            });
+        }
+        _ => {}
+    }
 
     // `/documents` streams NDJSON and is the one route with no page cap, so it
     // is answered before the JSON routes.
@@ -303,7 +511,13 @@ fn handle(store: &Store, request: Request) -> std::io::Result<()> {
                     "/models/{model}/rooms",
                     "/models/{model}/levels",
                     "/models/{model}/documents",
+                    "/viewer",
+                    "/scenes",
+                    "/scenes/{scene}",
+                    "/upload?name=",
+                    "/jobs/{job}",
                 ],
+                "scenes": scenes.map(Scenes::available).unwrap_or_default(),
             }),
         ),
         ["models"] => json_response(200, &serde_json::json!({ "models": store.available() })),
@@ -353,6 +567,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !cli.data.is_dir() {
         return Err(format!("--data is not a directory: {}", cli.data.display()).into());
     }
+    let scenes = match cli.scenes.clone() {
+        Some(directory) if !directory.is_dir() => {
+            return Err(format!("--scenes is not a directory: {}", directory.display()).into());
+        }
+        Some(directory) => Some(Arc::new(Scenes::new(directory))),
+        None => None,
+    };
+    let uploads = scenes.as_ref().and_then(|_| {
+        let rivet = cli
+            .rivet
+            .clone()
+            .or_else(upload::rivet_beside_this_executable)?;
+        Some(Arc::new(ConversionSlot {
+            uploads: Uploads {
+                scenes: cli.scenes.clone()?,
+                rivet,
+                max_bytes: cli.max_upload,
+            },
+            running: Arc::new(Mutex::new(())),
+            jobs: Mutex::new(BTreeMap::new()),
+        }))
+    });
     let store = Arc::new(Store::new(cli.data.clone()));
     let available = store.available();
     if cli.preload {
@@ -368,14 +604,46 @@ fn main() -> Result<(), Box<dyn Error>> {
         cli.data.display(),
         available.len()
     );
+    if let Some(scenes) = scenes.as_ref() {
+        let names = scenes.available();
+        println!(
+            "viewer on http://{}/viewer ({} scene(s): {})",
+            cli.addr,
+            names.len(),
+            if names.is_empty() {
+                "none yet - upload one, or run `rivet export-scene`".to_owned()
+            } else {
+                names.join(", ")
+            }
+        );
+        match uploads.as_ref() {
+            Some(slot) => println!("uploads convert with {}", slot.uploads.rivet.display()),
+            None => println!(
+                "uploads are refused: no `rivet` binary beside this one, and no --rivet given"
+            ),
+        }
+        // The upload route writes files and runs a converter, so it is worth
+        // saying plainly when it is reachable from anywhere but this machine.
+        if !cli.addr.starts_with("127.")
+            && !cli.addr.starts_with("localhost")
+            && !cli.addr.starts_with("[::1]")
+        {
+            println!(
+                "warning: {} is not loopback, so anyone who can reach it can upload and convert",
+                cli.addr
+            );
+        }
+    }
     let server = Arc::new(server);
     let mut workers = Vec::new();
     for _ in 0..cli.threads.max(1) {
         let server = Arc::clone(&server);
         let store = Arc::clone(&store);
+        let scenes = scenes.clone();
+        let uploads = uploads.clone();
         workers.push(std::thread::spawn(move || {
             for request in server.incoming_requests() {
-                if let Err(error) = handle(&store, request) {
+                if let Err(error) = handle(&store, scenes.as_deref(), uploads.as_deref(), request) {
                     eprintln!("request failed: {error}");
                 }
             }

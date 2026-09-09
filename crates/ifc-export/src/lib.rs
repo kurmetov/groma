@@ -6,7 +6,7 @@ mod mapping;
 mod metadata;
 
 pub use mapping::element_type_for_source;
-pub use metadata::{MetadataError, MetadataOptions, metadata_ifc};
+pub use metadata::{MetadataError, MetadataOptions, ifc_entity_name, metadata_ifc};
 
 const IFC64: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
 

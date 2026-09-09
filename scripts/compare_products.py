@@ -37,7 +37,7 @@ def tagged_products(path):
         if not _layers.is_tagged_product(entity):
             continue
         fields = _layers.arguments(match.group(3))
-        if len(fields) < 8:
+        if len(fields) < 8 or not _layers.carries_global_id(fields):
             continue
         tag = fields[7].strip().strip("'")
         if not tag.isdigit():

@@ -18,6 +18,7 @@ use bim_core::{
     BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty,
     BimPropertyValue, BimSource, BimSweptDisk, BimUnit,
 };
+use bim_mesh::MeshOptions;
 use clap::{Parser, Subcommand};
 use ifc_export::{MetadataOptions, element_type_for_source, metadata_ifc, uuid_v5};
 use revit_catalog::Catalog;
@@ -34,6 +35,7 @@ use rvt_model::{
     RecordFraming, RecordHeader, RecordLayout, RecordString, RvtPoint3,
 };
 use rvt_schema::{Schema, TypeReference};
+use scene_pack::{PackOptions, SourceInfo, write_scene};
 
 /// Leading bytes summarized per envelope when looking for a record header.
 const LEADING_PATTERN_BYTES: usize = 8;
@@ -158,7 +160,8 @@ enum Command {
         /// Restrict the walk to one partition stream.
         #[arg(long)]
         partition: Option<String>,
-        /// Maximum decoded bytes accepted from one member.
+        /// Maximum decoded bytes accepted from one RVT member, or source bytes
+        /// accepted from an IFC file.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
         /// Print per-record offsets for this many members.
@@ -212,6 +215,15 @@ enum Command {
         /// Print this many excluded-face reasons, most frequent first.
         #[arg(long, default_value_t = 12)]
         reasons: usize,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
+    /// Score every mark a `GFace` declares against the one answer that is
+    /// independent of it: whether the face lies inside the box its own record
+    /// carries.
+    FaceMarkProbe {
+        file: PathBuf,
         /// Maximum decoded bytes accepted from one member.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
@@ -407,6 +419,43 @@ enum Command {
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
     },
+    /// Export the binary scene a viewer loads: the elements, the triangles
+    /// their geometry tessellates to, and their properties.
+    ExportScene {
+        file: PathBuf,
+        /// Write to this path instead of replacing the `.rvt` extension with `.rvs`.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Include categorized records without a recovered level association.
+        #[arg(long)]
+        include_unplaced: bool,
+        /// Stop after this many exported elements.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// The furthest a triangle may sit from the surface it approximates,
+        /// in millimetres.
+        #[arg(long, default_value_t = 4.0)]
+        chord_tolerance_mm: f64,
+        /// How many times a triangle may be split to reach that tolerance.
+        #[arg(long, default_value_t = 2)]
+        refinement_depth: u8,
+        /// Close a chunk once it holds this many triangles.
+        #[arg(long, default_value_t = 250_000)]
+        chunk_triangles: usize,
+        /// How many elements share one lazily fetched block of properties.
+        #[arg(long, default_value_t = 128)]
+        property_block: usize,
+        /// Deflate effort, 0 to 9.
+        #[arg(long, default_value_t = 6)]
+        compression: u32,
+        /// Announce each stage on stdout as one JSON object the moment it
+        /// ends, for a caller driving a progress display.
+        #[arg(long)]
+        progress: bool,
+        /// Maximum decoded bytes accepted from one member.
+        #[arg(long, default_value_t = 256 * 1024 * 1024)]
+        max_member_bytes: u64,
+    },
     /// Print record bodies of one class as hex, for field analysis.
     Bodies {
         file: PathBuf,
@@ -552,6 +601,10 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             reasons,
             max_member_bytes,
         } => brep(&file, reasons, max_member_bytes),
+        Command::FaceMarkProbe {
+            file,
+            max_member_bytes,
+        } => face_mark_probe(&file, max_member_bytes),
         Command::BodyOwners {
             file,
             classes,
@@ -656,6 +709,33 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             model_namespace.as_deref(),
             include_unplaced,
             limit,
+            max_member_bytes,
+        ),
+        Command::ExportScene {
+            file,
+            output,
+            include_unplaced,
+            limit,
+            chord_tolerance_mm,
+            refinement_depth,
+            chunk_triangles,
+            property_block,
+            compression,
+            progress,
+            max_member_bytes,
+        } => export_scene(
+            &file,
+            output.as_deref(),
+            include_unplaced,
+            limit,
+            &SceneArguments {
+                chord_tolerance_mm,
+                refinement_depth,
+                chunk_triangles,
+                property_block,
+                compression,
+            },
+            progress,
             max_member_bytes,
         ),
         Command::Bodies {
@@ -2018,6 +2098,13 @@ const TYPE_ELEMENT_ID_PROPERTY_COUNT: usize = 7;
 const FAMILY_ID_PROPERTY: &str = "m_familyId";
 /// `FamilyBase.m_categoryId`, the category that family is of.
 const CATEGORY_ID_PROPERTY: &str = "m_categoryId";
+/// `InsertableInst.m_hostId`, the element an insert is cut into.
+const HOST_ID_PROPERTY: &str = "m_hostId";
+/// `DesignOption.m_DesignOptionSetId`, the set an option belongs to.
+const DESIGN_OPTION_SET_ID_PROPERTY: &str = "m_DesignOptionSetId";
+/// `DesignOptionSet.m_mainDesignOption`, the one option of a set that is part
+/// of the model. Every other option of the set is an alternative to it.
+const MAIN_DESIGN_OPTION_PROPERTY: &str = "m_mainDesignOption";
 
 /// Every declared identifier property read out of a record's own header, in
 /// one walk. The type candidates come first so their order is
@@ -2032,6 +2119,9 @@ const DECLARED_ID_PROPERTIES: &[&str] = &[
     "m_AttributesId",
     FAMILY_ID_PROPERTY,
     CATEGORY_ID_PROPERTY,
+    DESIGN_OPTION_SET_ID_PROPERTY,
+    MAIN_DESIGN_OPTION_PROPERTY,
+    HOST_ID_PROPERTY,
 ];
 
 /// The value read for one of [`DECLARED_ID_PROPERTIES`].
@@ -2043,6 +2133,9 @@ fn declared_id(values: &[Option<i32>], property: &str) -> Option<i32> {
 }
 
 /// One element as it is emitted to JSON.
+// A flat record of what the file said about one element, so each flag is an
+// independent reading and there is no state here for them to be folded into.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 struct ExportedElement {
     class_index: Option<u16>,
@@ -2057,6 +2150,16 @@ struct ExportedElement {
     owner_view_id: Option<i32>,
     created_phase_id: Option<i32>,
     design_option_id: Option<i32>,
+    /// `Element.m_unplacedOwnerId`: the element that owns this one while it is
+    /// not placed in the model in its own right. On the corpus it names a
+    /// group definition and nothing else; see `stands_in_the_model`.
+    unplaced_owner_id: Option<i32>,
+    /// `InsertableInst.m_hostId`: the element this insert is cut into.
+    host_id: Option<i32>,
+    /// `DesignOption.m_DesignOptionSetId` when this element is an option.
+    design_option_set_id: Option<i32>,
+    /// `DesignOptionSet.m_mainDesignOption` when this element is an option set.
+    main_design_option_id: Option<i32>,
     /// `Plane.m_origin[2]` for a `Level`, in Revit internal feet.
     elevation_feet: Option<f64>,
     /// First readable string in the body, with how it was located.
@@ -2086,7 +2189,22 @@ struct ExportedElement {
     fitting_axis_candidate: Option<FittingCenterLineFields>,
     family_instance_placement_candidates: Vec<FamilyInstancePlacementFields>,
     family_instance_placement: Option<FamilyInstancePlacementFields>,
+    /// The placement this element's `GInstance` declares, from
+    /// [`GInstanceTransformFields::from_instance_info`].
     ginstance_transform: Option<GInstanceTransformFields>,
+    /// What the byte scan the declared reading replaced would have found.
+    /// Measurement only - see [`GeometryStatistics`] - so the two readings can
+    /// be compared on the corpus rather than one being asserted to cover the
+    /// other.
+    scanned_ginstance_transform: Option<GInstanceTransformFields>,
+    /// How many `InstInfoBase` placements this element's records declare
+    /// between them. More than one means the element is placed as several
+    /// instances and no single transform describes it.
+    declared_instance_placements: usize,
+    /// The placements themselves, from the last record that declared any -
+    /// the same record whose box became `placement_bounds`, so the two can be
+    /// asked about each other. See `report_nested_placements`.
+    declared_placements: Vec<GInstanceTransformFields>,
     geometry_graph: Option<GElementGraphFields>,
     geometry_bounds: Option<GElementBounds>,
     placement_bounds: Option<GElementBounds>,
@@ -2109,6 +2227,12 @@ struct ExportedElement {
     /// What each box on the record the kept body came from says about it. See
     /// [`BodyBoxResiduals`]: measurement for a possible second placement tier.
     brep_box_residuals: BodyBoxResiduals,
+    /// The box [`ExportedElement::brep`] was judged against, from the same
+    /// record as that body. Kept so a near miss can be anatomised - a body
+    /// that is the box's size but somewhere else is a transform we do not
+    /// read, one smaller than its box is geometry we did not decode - without
+    /// crossing one record's body with another record's box.
+    brep_placement_box: Option<GElementBounds>,
     /// `m_moribund` from the `Element` tail: the element is marked deleted.
     moribund: bool,
     locked: bool,
@@ -2117,8 +2241,6 @@ struct ExportedElement {
 }
 
 impl ExportedElement {
-    /// The element this one is an instance of: its declared type reference,
-    /// or - for a record whose declarations did not yield one - the symbol its
     /// Whether the element's *own* record declared a category.
     ///
     /// That is what separates a type or definition from an instance, and it is
@@ -2130,6 +2252,8 @@ impl ExportedElement {
         self.category_source == Some("declared")
     }
 
+    /// The element this one is an instance of: its declared type reference,
+    /// or - for a record whose declarations did not yield one - the symbol its
     /// bounds were verified against. See [`TYPE_ELEMENT_ID_PROPERTIES`].
     fn type_element_reference(&self) -> Option<u32> {
         self.type_element_id
@@ -2614,20 +2738,8 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
             "the class schema is required for this probe",
         )
     })?;
-    let classes = (|| {
-        Some(rvt_model::BrepClassIndexes {
-            face: schema_class_index(Some(&schema), "Face")?,
-            edge_loop: schema_class_index(Some(&schema), "EdgeLoop")?,
-            edge: schema_class_index(Some(&schema), "Edge")?,
-            plane: schema_class_index(Some(&schema), "Plane")?,
-            cyl_surf: schema_class_index(Some(&schema), "CylSurf")?,
-            cone_surf: schema_class_index(Some(&schema), "ConeSurf")?,
-            surf_rev: schema_class_index(Some(&schema), "SurfRev")?,
-            ruled_surf: schema_class_index(Some(&schema), "RuledSurf")?,
-            g_line: schema_class_index(Some(&schema), "GLine")?,
-            g_arc: schema_class_index(Some(&schema), "GArc")?,
-        })
-    })();
+    let classes = brep_class_indexes(Some(&schema));
+    let body_classes = brep_body_classes(Some(&schema));
     let geometry_element_class_index = schema_class_index(Some(&schema), "GElement");
     let (Some(classes), Some(geometry_element_class_index)) =
         (classes, geometry_element_class_index)
@@ -2670,6 +2782,37 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
     // slot the name sits in. A face is reached by the walk because something
     // referenced it, and if the two kinds are reached from different places
     // that is what they are.
+    // Whether a `GBRep` node holds a shell or a set of free surfaces. Every
+    // `Edge` names the two faces it separates, so the solid's faces are the
+    // ones some edge names; a node no edge reaches declares no shell. What
+    // such a node would be is already written down in `declared_bodies`: one
+    // node per free surface beside the solid, which is how a wall stores the
+    // planes of its compound structure. If the loopless faces fall that way -
+    // a whole node at a time - they are not a boundary the walk failed to
+    // read, they are a different declaration being counted as one.
+    // The mark that already separates a wall's own faces from the cut
+    // geometry joined into its shell, asked of both kinds of face - see
+    // `FACE_INSIDE_THE_BOX_FLAG`. If the loopless faces are the cut side, the
+    // file has already said so and this is not a boundary to go looking for.
+    // Whether a face that declares no loop is nonetheless ordered by the file.
+    // `GEdge` names, for each of the two faces it separates, the next edge
+    // around that face - `identifiers[2 + side]`. Where those are live the ring
+    // is declared and the endpoint reconstruction is not needed; where they are
+    // null there is nothing to read and an ambiguous corner has to be refused.
+    // This is the question to settle before anything is invented for the 4 353
+    // faces that corner refuses.
+    let mut loopless_next_links = BTreeMap::<&'static str, u64>::new();
+    let mut loopless_flags = BTreeMap::<String, u64>::new();
+    let mut loop_bearing_flags = BTreeMap::<String, u64>::new();
+    let mut node_kind = BTreeMap::<&'static str, u64>::new();
+    let mut node_faces_by_kind = BTreeMap::<&'static str, u64>::new();
+    // Faces per node, for the nodes no edge reaches: a free surface should be
+    // one face, and a count that is not says the reading is something else.
+    let mut free_node_faces = BTreeMap::<usize, u64>::new();
+    let mut free_nodes_per_record = BTreeMap::<usize, u64>::new();
+    // The loopless faces, split by whether their node holds a shell. Only the
+    // ones in a shell node are a boundary this walk owes an answer for.
+    let mut loopless_by_node = BTreeMap::<&'static str, u64>::new();
     let mut null_parents = BTreeMap::<String, u64>::new();
     let mut loop_bearing_parents = BTreeMap::<String, u64>::new();
     // Whether the shell the loop-bearing faces make is self-contained. Every
@@ -2818,6 +2961,152 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
                                 )
                             ));
                     }
+                }
+
+                // Which faces an edge names, and which faces each node holds.
+                let mut edge_named: BTreeSet<u32> = BTreeSet::new();
+                for edge in objects.iter().filter(|object| {
+                    object.class_index == classes.edge && object.identifiers.len() == 6
+                }) {
+                    for face in &edge.identifiers[..2] {
+                        if *face != 0 {
+                            edge_named.insert(*face);
+                        }
+                    }
+                }
+                let mut node_of_face: BTreeMap<u32, u32> = BTreeMap::new();
+                let mut faces_of_node: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+                for node in objects
+                    .iter()
+                    .filter(|object| body_classes.contains(&object.class_index))
+                {
+                    for reference in &node.references {
+                        if reference.class_index != classes.face || reference.object_id == 0 {
+                            continue;
+                        }
+                        node_of_face
+                            .entry(reference.object_id)
+                            .or_insert(node.object_id);
+                        faces_of_node
+                            .entry(node.object_id)
+                            .or_default()
+                            .push(reference.object_id);
+                    }
+                }
+                let mut edges_of_face: BTreeMap<u32, Vec<(u32, usize)>> = BTreeMap::new();
+                for edge in objects.iter().filter(|object| {
+                    object.class_index == classes.edge && object.identifiers.len() == 6
+                }) {
+                    for (side, face) in edge.identifiers[..2].iter().enumerate() {
+                        if *face != 0 {
+                            edges_of_face
+                                .entry(*face)
+                                .or_default()
+                                .push((edge.object_id, side));
+                        }
+                    }
+                }
+                let by_edge_id: BTreeMap<u32, &rvt_model::SerialObject> = objects
+                    .iter()
+                    .filter(|object| object.class_index == classes.edge)
+                    .map(|object| (object.object_id, object))
+                    .collect();
+                for face in objects.iter().filter(|object| {
+                    object.class_index == classes.face
+                        && object
+                            .references
+                            .first()
+                            .is_none_or(|reference| reference.object_id == 0)
+                }) {
+                    let Some(incidences) = edges_of_face.get(&face.object_id) else {
+                        continue;
+                    };
+                    let live = incidences
+                        .iter()
+                        .filter(|(edge, side)| {
+                            by_edge_id.get(edge).is_some_and(|edge| {
+                                edge.identifiers
+                                    .get(2 + side)
+                                    .is_some_and(|next| *next != 0)
+                            })
+                        })
+                        .count();
+                    let verdict = if live == incidences.len() {
+                        "every edge names the next one around this face"
+                    } else if live == 0 {
+                        "no edge names a next one around this face"
+                    } else {
+                        "some do and some do not"
+                    };
+                    *loopless_next_links.entry(verdict).or_default() += 1;
+                }
+                let mut free_nodes = 0_usize;
+                let mut free_node_ids: BTreeSet<u32> = BTreeSet::new();
+                for (node, node_face_ids) in &faces_of_node {
+                    let bounded = node_face_ids
+                        .iter()
+                        .filter(|face| edge_named.contains(face))
+                        .count();
+                    let kind = if bounded == node_face_ids.len() {
+                        "every face of the node is named by an edge"
+                    } else if bounded == 0 {
+                        "no face of the node is named by an edge"
+                    } else {
+                        "some faces of the node are named by an edge and some are not"
+                    };
+                    *node_kind.entry(kind).or_default() += 1;
+                    *node_faces_by_kind.entry(kind).or_default() += node_face_ids.len() as u64;
+                    if bounded == 0 {
+                        free_nodes += 1;
+                        free_node_ids.insert(*node);
+                        *free_node_faces.entry(node_face_ids.len()).or_default() += 1;
+                    }
+                }
+                *free_nodes_per_record.entry(free_nodes).or_default() += 1;
+                for face in objects
+                    .iter()
+                    .filter(|object| object.class_index == classes.face)
+                {
+                    let loopless = face
+                        .references
+                        .first()
+                        .is_none_or(|reference| reference.object_id == 0)
+                        && !edge_named.contains(&face.object_id);
+                    // Read through `GFaceMarks` rather than off an index, so
+                    // this asks the same question `place_body_less_its_cut_faces`
+                    // asks and a face whose walk was truncated is not read as
+                    // one declaring zeroes.
+                    let marks = GFaceMarks::read(face);
+                    let key = format!(
+                        "{} / {:?}",
+                        match marks {
+                            Some(marks) if marks.info_flags & FACE_INSIDE_THE_BOX_FLAG != 0 =>
+                                "inside the box",
+                            Some(_) => "not inside the box",
+                            None => "the face's marks did not all read",
+                        },
+                        face.alternate_integers
+                    );
+                    *if loopless {
+                        loopless_flags.entry(key).or_default()
+                    } else {
+                        loop_bearing_flags.entry(key).or_default()
+                    } += 1;
+                }
+                for face in objects.iter().filter(|object| {
+                    object.class_index == classes.face
+                        && object
+                            .references
+                            .first()
+                            .is_none_or(|reference| reference.object_id == 0)
+                        && !edge_named.contains(&object.object_id)
+                }) {
+                    let verdict = match node_of_face.get(&face.object_id) {
+                        None => "no node names the face",
+                        Some(node) if free_node_ids.contains(node) => "in a node no edge reaches",
+                        Some(_) => "in a node that holds a shell",
+                    };
+                    *loopless_by_node.entry(verdict).or_default() += 1;
                 }
 
                 // Every surface and identifier a loop-bearing face in this
@@ -3105,10 +3394,11 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
                     // Whether the loop is the record's *only* complaint. A
                     // record excluded for something else as well is not
                     // completed by ordering edges.
-                    let only_the_loop = rvt_model::assemble_symbol_brep(&objects, &classes)
-                        .excluded_faces
-                        .iter()
-                        .all(|exclusion| exclusion.reason == "face has no first loop");
+                    let only_the_loop =
+                        rvt_model::assemble_symbol_brep(&objects, &classes, &body_classes)
+                            .excluded_faces
+                            .iter()
+                            .all(|exclusion| exclusion.reason == "face has no first loop");
                     short_only_for_want_of_a_loop += u64::from(only_the_loop);
                     recoverable_records += u64::from(all_have_edges && only_the_loop);
                 }
@@ -3117,7 +3407,7 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
                 // is what a fix would actually buy: a face excluded for
                 // carrying no first loop has already resolved its surface,
                 // because `assemble_face` reads that first.
-                let assembled = rvt_model::assemble_symbol_brep(&objects, &classes);
+                let assembled = rvt_model::assemble_symbol_brep(&objects, &classes, &body_classes);
                 for exclusion in &assembled.excluded_faces {
                     if exclusion.reason != "face has no first loop" {
                         continue;
@@ -3211,6 +3501,37 @@ fn loop_owner_probe(path: &Path, rows: usize, max_member_bytes: u64) -> Result<(
     let mut split = record_split.into_iter().collect::<Vec<_>>();
     split.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
     for (verdict, count) in split {
+        println!("  {count}\t{verdict}");
+    }
+    println!("\nWhat each `GBRep` node holds, by whether an edge reaches its faces:");
+    let mut kinds = node_kind.into_iter().collect::<Vec<_>>();
+    kinds.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    for (kind, count) in kinds {
+        let faces = node_faces_by_kind.get(kind).copied().unwrap_or_default();
+        println!("  {count}\tnodes, {faces} faces\t{kind}");
+    }
+    println!("  faces per node, for the nodes no edge reaches (faces: nodes):");
+    for (faces, nodes) in &free_node_faces {
+        println!("  {faces}\t{nodes}");
+    }
+    println!("  such nodes per record (nodes: records):");
+    for (nodes, records) in &free_nodes_per_record {
+        println!("  {nodes}\t{records}");
+    }
+    println!("\n  what a face with no loop, but with edges, is ordered by:");
+    let mut links = loopless_next_links.into_iter().collect::<Vec<_>>();
+    links.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    for (verdict, count) in links {
+        println!("  {count}\t{verdict}");
+    }
+    println!("\n  the marks a face with no loop and no edge naming it carries:");
+    print_scalar_rows(&loopless_flags, rows);
+    println!("  and those every other face carries:");
+    print_scalar_rows(&loop_bearing_flags, rows);
+    println!("\n  where a face with no loop and no edge naming it sits:");
+    let mut placed = loopless_by_node.into_iter().collect::<Vec<_>>();
+    placed.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+    for (verdict, count) in placed {
         println!("  {count}\t{verdict}");
     }
     println!(
@@ -3340,20 +3661,8 @@ fn print_loop_owner_rows(rows: &BTreeMap<&'static str, [u64; 2]>, limit: usize) 
 fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
     let container = RvtContainer::open(path)?;
     let schema = read_schema(&container)?;
-    let classes = (|| {
-        Some(rvt_model::BrepClassIndexes {
-            face: schema_class_index(schema.as_ref(), "Face")?,
-            edge_loop: schema_class_index(schema.as_ref(), "EdgeLoop")?,
-            edge: schema_class_index(schema.as_ref(), "Edge")?,
-            plane: schema_class_index(schema.as_ref(), "Plane")?,
-            cyl_surf: schema_class_index(schema.as_ref(), "CylSurf")?,
-            cone_surf: schema_class_index(schema.as_ref(), "ConeSurf")?,
-            surf_rev: schema_class_index(schema.as_ref(), "SurfRev")?,
-            ruled_surf: schema_class_index(schema.as_ref(), "RuledSurf")?,
-            g_line: schema_class_index(schema.as_ref(), "GLine")?,
-            g_arc: schema_class_index(schema.as_ref(), "GArc")?,
-        })
-    })();
+    let classes = brep_class_indexes(schema.as_ref());
+    let body_classes = brep_body_classes(schema.as_ref());
     // The solid lives in a `GElement` record, and only there. Reading every
     // record that merely contains a `Face` object instead would tally tens of
     // thousands of truncated node streams as exclusions and measure nothing.
@@ -3386,6 +3695,17 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
     let mut gaps: Vec<f64> = Vec::new();
     let mut gaps_with_a_cylinder = 0_u64;
     let mut gaps_in_exact_records = 0_u64;
+    // Faces the record declares that are on no boundary of it - see
+    // `SymbolBrep::unbounded_faces`. Reported, because "not a failure" is not
+    // the same as "not there", and a change that started counting them as
+    // faces again should be visible here rather than in a shortfall elsewhere.
+    let mut unbounded = 0_u64;
+    let mut records_with_unbounded = 0_u64;
+    // Of the records that excluded no face, how many hold faces that actually
+    // close - the geometric test an exporter applies, against the topological
+    // one this tally is otherwise about. The two are far apart and the gap is
+    // worth having in front of whoever reads this next.
+    let mut complete_and_a_volume = 0_u64;
     let mut exact_records = 0_u64;
     let mut exact_complete = 0_u64;
     for_each_member(
@@ -3417,13 +3737,18 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
                 // arbitrary - which is a different failure from a geometry rule
                 // being wrong, and has to be counted apart from one.
                 let exact = record_walk.is_exact();
-                let assembled = rvt_model::assemble_symbol_brep(&objects, &classes);
+                let assembled = rvt_model::assemble_symbol_brep(&objects, &classes, &body_classes);
+                unbounded += assembled.unbounded_faces.len() as u64;
+                records_with_unbounded += u64::from(!assembled.unbounded_faces.is_empty());
                 if assembled.is_empty() && assembled.excluded_faces.is_empty() {
                     continue;
                 }
                 records += 1;
                 exact_records += u64::from(exact);
                 complete += u64::from(assembled.excluded_faces.is_empty());
+                if assembled.excluded_faces.is_empty() {
+                    complete_and_a_volume += u64::from(assembled.bounds_a_volume());
+                }
                 exact_complete += u64::from(exact && assembled.excluded_faces.is_empty());
                 faces += assembled.faces.len() as u64;
                 excluded += assembled.excluded_faces.len() as u64;
@@ -3497,6 +3822,10 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
     println!("  whose declarations tiled the body exactly: {exact_records}");
     println!("  every face resolved: {complete}");
     println!("    of those, in an exactly-tiled record: {exact_complete}");
+    println!("  complete records bounding a volume: {complete_and_a_volume}");
+    println!(
+        "  faces on no boundary of their record: {unbounded}, in {records_with_unbounded} records"
+    );
     println!("Faces resolved: {faces}");
     println!("  loops: {loops}, edges: {edges}, of which arcs: {arcs}, polylines: {polylines}");
     println!(
@@ -4248,6 +4577,7 @@ fn serial_probe(
                     let (result, objects) =
                         rvt_model::walk_record_collecting(&schema, class_index, body);
                     report_boundary_topology(&schema, header.id, body.len(), &result, &objects);
+                    report_declared_bodies(&schema, body, &objects);
                 }
                 if record_mode {
                     let result = rvt_model::walk_record(&schema, class_index, body);
@@ -4676,6 +5006,414 @@ fn carries_faces(schema: &Schema, walk: &rvt_model::SerialRecordWalk) -> bool {
     })
 }
 
+/// What bodies one record declares, and how each stands against the box the
+/// same record carries.
+///
+/// This is the per-record form of the question [`place_declared_body`] answers
+/// in bulk: a record is a set of `GBRep` nodes, and the reason a body appears
+/// to disagree with its box is nearly always that two of them were read as
+/// one.
+fn report_declared_bodies(
+    schema: &Schema,
+    record_body: &[u8],
+    objects: &[rvt_model::SerialObject],
+) {
+    let Some(classes) = brep_class_indexes(Some(schema)) else {
+        return;
+    };
+    let assembled =
+        rvt_model::assemble_symbol_brep(objects, &classes, &brep_body_classes(Some(schema)));
+    if assembled.bodies.is_empty() {
+        return;
+    }
+    let bounds = schema_class_index(Some(schema), "GNode").and_then(|gnode| {
+        GElementGraphFields::parse(record_body, |class_index| {
+            schema_class_is_a(schema, class_index, gnode)
+        })
+    });
+    println!(
+        "    bodies declared by GBRep nodes: {} (box {})",
+        assembled.bodies.len(),
+        bounds.as_ref().map_or_else(
+            || "not read".to_owned(),
+            |graph| format!("{:?} {:?}", graph.bounds.min, graph.bounds.max)
+        )
+    );
+    for (index, declared) in assembled.bodies.iter().enumerate() {
+        let sub = assembled.body(index);
+        let extent = sub.as_ref().and_then(body_extent_feet);
+        let residual = sub
+            .as_ref()
+            .zip(bounds.as_ref())
+            .and_then(|(sub, graph)| body_bounds_residual_feet(sub, &graph.bounds));
+        println!(
+            "      node {} faces={} edges={} one-sided={} open={} solid={} closed={} extent={extent:?} residual={residual:?}",
+            declared.node_id,
+            declared.faces.len(),
+            declared.edges,
+            declared.one_sided_edges,
+            declared.open_edges,
+            declared.is_solid(),
+            declared.is_closed(),
+        );
+        let Some(sub) = sub else { continue };
+        for (face, face_id) in sub.faces.iter().zip(&sub.face_ids) {
+            let Some(marks) = objects
+                .iter()
+                .find(|object| object.object_id == *face_id)
+                .and_then(GFaceMarks::read)
+            else {
+                continue;
+            };
+            let extent = faces_extent_feet(std::slice::from_ref(face));
+            let outside = extent.zip(bounds.as_ref()).map(|(extent, graph)| {
+                face_reaches_outside(extent, &graph.bounds, BODY_BOUNDS_TOLERANCE_FEET)
+            });
+            println!("        face {face_id} {marks} outside={outside:?} extent={extent:?}");
+        }
+    }
+}
+
+/// One candidate mark a face might carry, and what it is read from.
+///
+/// Each is a field the schema declares on `GFace` or on the `GInfo` every
+/// `GNode` opens with - nothing here is searched for or inferred from the
+/// geometry. What the probe asks of each is the same question: does it fire on
+/// exactly the faces that reach outside the box the record itself carries?
+struct FaceMark {
+    name: &'static str,
+    fires: fn(&GFaceMarks) -> bool,
+}
+
+const FACE_MARKS: &[FaceMark] = &[
+    FaceMark {
+        name: "m_cutType != 0",
+        fires: |marks| marks.cut_type != 0,
+    },
+    FaceMark {
+        name: "m_renderStyleId is null",
+        fires: |marks| marks.render_style_id < 0,
+    },
+    FaceMark {
+        name: "GInfo.m_flags & 0x80000 clear",
+        fires: |marks| marks.info_flags & FACE_INSIDE_THE_BOX_FLAG == 0,
+    },
+    FaceMark {
+        name: "m_faceFlags_v9 & 0x2 set",
+        fires: |marks| marks.face_flags & 0x2 != 0,
+    },
+];
+
+/// What one mark scored, over every face the file declares and every record
+/// whose bodies miss its box.
+#[derive(Clone, Copy, Debug, Default)]
+struct FaceMarkScore {
+    /// Faces the mark fires on that reach outside their record's box.
+    marked_outside: u64,
+    /// Faces it fires on that lie inside it.
+    marked_inside: u64,
+    /// Faces outside the box that it does not fire on.
+    unmarked_outside: u64,
+    /// Records whose bodies miss the box and where dropping the faces this
+    /// mark fires on leaves exactly one body reproducing it. This is what the
+    /// mark is for, and the number to read.
+    records_recovered: u64,
+    /// ...of which the recovered body's boundary closes, and of which it is a
+    /// solid. A body that only closes once its own geometry is thrown away is
+    /// not a wall.
+    records_recovered_closed: u64,
+    records_recovered_solid: u64,
+    /// ...and of which the kept faces bound a volume by their own loops. See
+    /// [`rvt_model::SymbolBrep::bounds_a_volume`]: this is the closure an exporter needs, and
+    /// the topological one cannot see it because the trimmed faces are still
+    /// named by the edges that reach them.
+    records_recovered_bounded: u64,
+    /// Records where the trim leaves more than one body on the box, so the
+    /// answer is ambiguous and nothing can be selected.
+    records_ambiguous: u64,
+    /// The control, measured on records the box already resolves: how many
+    /// would stop being resolved if the same trim were applied there too.
+    /// A trim is only ever a second pass, so this costs nothing - it says how
+    /// much real geometry the mark would take if it were a first one.
+    placed_records_broken: u64,
+}
+
+/// Score every declared face mark against the record's own box.
+///
+/// A `GElement` record's box bounds what the element draws. A body that
+/// reaches outside it holds faces that are not the element's surface - on a
+/// wall, the geometry of the openings cut into it, which the file joins into
+/// the same shell. This asks each field the format declares on a face whether
+/// it separates those two sets, and reports the one measurement that can
+/// accept such a rule: how many records whose bodies miss the box land exactly
+/// one body on it once the marked faces are dropped.
+///
+/// The trim is measured the way it would be applied - the marked `Face`
+/// objects are removed and the record is assembled again - so the body counts
+/// its own edges afterwards and can say whether what is left still closes.
+#[allow(clippy::too_many_lines)] // One streaming pass plus its report.
+fn face_mark_probe(path: &Path, max_member_bytes: u64) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let schema = read_schema(&container)?;
+    let classes = brep_class_indexes(schema.as_ref());
+    let body_classes = brep_body_classes(schema.as_ref());
+    let geometry_element_class_index = schema_class_index(schema.as_ref(), "GElement");
+    let gnode_class_index = schema_class_index(schema.as_ref(), "GNode");
+    let (Some(schema), Some(classes), Some(geometry_element_class_index), Some(gnode_class_index)) = (
+        schema.as_ref(),
+        classes,
+        geometry_element_class_index,
+        gnode_class_index,
+    ) else {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the schema does not declare the boundary-representation classes",
+        )));
+    };
+    let partition_paths = partition_paths(&container);
+
+    let mut records = 0_u64;
+    let mut records_placed = 0_u64;
+    let mut records_ambiguous = 0_u64;
+    let mut bodies = 0_u64;
+    let mut faces_read = 0_u64;
+    let mut faces_declared = 0_u64;
+    let mut faces_outside = 0_u64;
+    let mut scores = vec![FaceMarkScore::default(); FACE_MARKS.len()];
+    // Which bodies of an assembly reproduce the box, and whether that is
+    // exactly one - the same test `place_declared_body` applies.
+    let placed_bodies = |assembled: &rvt_model::SymbolBrep, bounds: &GElementBounds| {
+        (0..assembled.bodies.len())
+            .filter(|index| {
+                assembled
+                    .body(*index)
+                    .is_some_and(|body| body_is_placed_in(&body, bounds))
+            })
+            .collect::<Vec<_>>()
+    };
+    for_each_member(
+        &container,
+        &partition_paths,
+        max_member_bytes,
+        |_, _, _, layout, walk, payload| {
+            for record in &walk.records {
+                let Some(header) = RecordHeader::parse(payload, record, layout) else {
+                    continue;
+                };
+                if header.class_index != geometry_element_class_index {
+                    continue;
+                }
+                let body = payload
+                    .get(record.body_offset()..record.end())
+                    .unwrap_or_default();
+                let Some(graph) = GElementGraphFields::parse(body, |class_index| {
+                    schema_class_is_a(schema, class_index, gnode_class_index)
+                }) else {
+                    continue;
+                };
+                if !graph.bounds.is_volumetric() {
+                    continue;
+                }
+                let (_walk, objects) =
+                    rvt_model::walk_record_collecting(schema, header.class_index, body);
+                if !objects
+                    .iter()
+                    .any(|object| object.class_index == classes.face)
+                {
+                    continue;
+                }
+                let assembled = rvt_model::assemble_symbol_brep(&objects, &classes, &body_classes);
+                if assembled.bodies.is_empty() {
+                    continue;
+                }
+                records += 1;
+                bodies += assembled.bodies.len() as u64;
+                let placed = placed_bodies(&assembled, &graph.bounds);
+                records_placed += u64::from(placed.len() == 1);
+                records_ambiguous += u64::from(placed.len() > 1);
+
+                // The face-level cross-tab, over the faces the record's bodies
+                // hold: what each mark fires on, against whether the face
+                // reaches outside the box.
+                let marks: std::collections::HashMap<u32, GFaceMarks> = objects
+                    .iter()
+                    .filter(|object| object.class_index == classes.face)
+                    .filter_map(|object| {
+                        GFaceMarks::read(object).map(|marks| (object.object_id, marks))
+                    })
+                    .collect();
+                faces_declared += objects
+                    .iter()
+                    .filter(|object| object.class_index == classes.face)
+                    .count() as u64;
+                faces_read += assembled.faces.len() as u64;
+                for (face, face_id) in assembled.faces.iter().zip(&assembled.face_ids) {
+                    let outside =
+                        faces_extent_feet(std::slice::from_ref(face)).is_some_and(|extent| {
+                            face_reaches_outside(extent, &graph.bounds, BODY_BOUNDS_TOLERANCE_FEET)
+                        });
+                    faces_outside += u64::from(outside);
+                    let Some(face_marks) = marks.get(face_id) else {
+                        continue;
+                    };
+                    for (mark, score) in FACE_MARKS.iter().zip(&mut scores) {
+                        match ((mark.fires)(face_marks), outside) {
+                            (true, true) => score.marked_outside += 1,
+                            (true, false) => score.marked_inside += 1,
+                            (false, true) => score.unmarked_outside += 1,
+                            (false, false) => {}
+                        }
+                    }
+                }
+
+                // The trim, assembled the way it would be applied.
+                for (mark, score) in FACE_MARKS.iter().zip(&mut scores) {
+                    let trimmed_objects = objects
+                        .iter()
+                        .filter(|object| {
+                            object.class_index != classes.face
+                                || !marks.get(&object.object_id).is_some_and(mark.fires)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if trimmed_objects.len() == objects.len() {
+                        continue;
+                    }
+                    let trimmed =
+                        rvt_model::assemble_symbol_brep(&trimmed_objects, &classes, &body_classes);
+                    let trimmed_placed = placed_bodies(&trimmed, &graph.bounds);
+                    if placed.len() == 1 {
+                        score.placed_records_broken += u64::from(trimmed_placed.len() != 1);
+                        continue;
+                    }
+                    match trimmed_placed[..] {
+                        [index] => {
+                            score.records_recovered += 1;
+                            if let Some(body) = trimmed.bodies.get(index) {
+                                score.records_recovered_closed += u64::from(body.is_closed());
+                                score.records_recovered_solid += u64::from(body.is_solid());
+                            }
+                            if let Some(body) = trimmed.body(index) {
+                                score.records_recovered_bounded +=
+                                    u64::from(body.bounds_a_volume());
+                            }
+                        }
+                        [_, _, ..] => score.records_ambiguous += 1,
+                        [] => {}
+                    }
+                }
+            }
+        },
+    )?;
+
+    let share = |part: u64, whole: u64| {
+        if whole == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                part as f64 * 100.0 / whole as f64
+            }
+        }
+    };
+    println!("File: {}", path.display());
+    println!("GElement records with a volumetric box and a declared body: {records}");
+    println!("  bodies declared: {bodies}");
+    println!(
+        "  records where exactly one body reproduces the box: {records_placed} ({:.1}%)",
+        share(records_placed, records)
+    );
+    println!("  records where more than one does: {records_ambiguous}");
+    println!("  faces declared: {faces_declared}, of them resolved and in a body: {faces_read}");
+    println!(
+        "  faces reaching outside their record's box: {faces_outside} ({:.1}%)",
+        share(faces_outside, faces_read)
+    );
+    println!("Each mark against that answer:");
+    for (mark, score) in FACE_MARKS.iter().zip(&scores) {
+        println!("  {}", mark.name);
+        println!(
+            "    fires on {} faces outside the box and {} inside it; {} outside faces it misses",
+            score.marked_outside, score.marked_inside, score.unmarked_outside
+        );
+        println!(
+            "    records recovered: {} (bounding a volume {}, two-sided {}, closed {}), left ambiguous: {}",
+            score.records_recovered,
+            score.records_recovered_bounded,
+            score.records_recovered_solid,
+            score.records_recovered_closed,
+            score.records_ambiguous
+        );
+        println!(
+            "    records the box already resolves that the same trim would break: {}",
+            score.placed_records_broken
+        );
+    }
+    Ok(())
+}
+
+/// What one `GFace` declares about itself, beside its geometry.
+///
+/// Every field here is read from the object's own declarations in the order
+/// the schema lists them: `GNode.m_GInfo` contributes `m_tag`,
+/// `m_controlCommand`, `m_categoryId` and the alternate `m_flags`, and `GFace`
+/// itself contributes `m_cutType`, the alternate `m_faceFlags_v9` and
+/// `m_renderStyleId`. Nothing is searched for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GFaceMarks {
+    tag: i32,
+    cut_type: i32,
+    render_style_id: i32,
+    info_flags: i64,
+    face_flags: i64,
+}
+
+impl GFaceMarks {
+    /// Read them off a `Face` object, or `None` when the walk did not deliver
+    /// every field - a truncated object is not a face declaring zeroes.
+    fn read(object: &rvt_model::SerialObject) -> Option<Self> {
+        let [
+            tag,
+            _control_command,
+            _category_id,
+            cut_type,
+            render_style_id,
+        ] = object.integers[..].try_into().ok()?;
+        let [info_flags, face_flags] = object.alternate_integers[..].try_into().ok()?;
+        Some(Self {
+            tag,
+            cut_type,
+            render_style_id,
+            info_flags,
+            face_flags,
+        })
+    }
+}
+
+impl std::fmt::Display for GFaceMarks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "tag={} cutType={} renderStyle={} flags=0x{:x} faceFlags=0x{:x}",
+            self.tag, self.cut_type, self.render_style_id, self.info_flags, self.face_flags
+        )
+    }
+}
+
+/// Whether a face's own extent reaches outside the record's box by more than
+/// `tolerance`. A face that lies inside it is part of what the box bounds; one
+/// that reaches past it cannot be.
+fn face_reaches_outside(
+    extent: ([f64; 3], [f64; 3]),
+    bounds: &GElementBounds,
+    tolerance: f64,
+) -> bool {
+    let (min, max) = extent;
+    (0..3).any(|axis| {
+        min[axis] < bounds.min[axis] - tolerance || max[axis] > bounds.max[axis] + tolerance
+    })
+}
+
 /// Summarize one record's node stream and check that its boundary topology
 /// closes: every edge naming two faces that exist, every loop naming a face,
 /// every face naming a loop. Nothing is inferred - only what was read.
@@ -4715,15 +5453,25 @@ fn report_boundary_topology(
     for object in objects.iter().filter(|object| {
         matches!(
             name_of(object.class_index),
-            "RuledSurf" | "GLine" | "GArc" | "GEllipse" | "Face" | "Edge"
+            "RuledSurf"
+                | "GLine"
+                | "GArc"
+                | "GEllipse"
+                | "Face"
+                | "Edge"
+                | "InstanceInfo"
+                | "GInstance"
+                | "Geometry"
         )
     }) {
         println!(
-            "    object {} {} refs={:?} ids={:?} numbers={:?}",
+            "    object {} {} refs={:?} ids={:?} ints={:?} alts={:?} numbers={:?}",
             object.object_id,
             name_of(object.class_index),
             object.references,
             object.identifiers,
+            object.integers,
+            object.alternate_integers,
             object.numbers
         );
     }
@@ -5448,32 +6196,24 @@ fn recover_elements(
     let plane_class_index = schema_class_index(schema.as_ref(), "Plane");
     let pipe_curve_class_index = schema_class_index(schema.as_ref(), "RbsPipeCurve");
     let family_instance_class_index = schema_class_index(schema.as_ref(), "FamilyInstance");
-    let family_symbol_class_index = schema_class_index(schema.as_ref(), "FamilySymbol");
     let curve_driver_class_index = schema_class_index(schema.as_ref(), "RbsCurveDriver");
     let pipe_fitting_center_line_class_index =
         schema_class_index(schema.as_ref(), "PipeFittingCenterLine");
     let gline_class_index = schema_class_index(schema.as_ref(), "GLine");
     let ginstance_class_index = schema_class_index(schema.as_ref(), "GInstance");
+    // `InstInfoBase` is what declares the placement itself - `m_Trf`,
+    // `m_symbolId`, `m_GRepId` - and `InstanceInfo` is the subclass the
+    // records actually write, so the reading is narrowed to the base class and
+    // accepts anything descending from it.
+    let inst_info_base_class_index = schema_class_index(schema.as_ref(), "InstInfoBase");
     let gnode_class_index = schema_class_index(schema.as_ref(), "GNode");
     let geometry_element_class_index = schema_class_index(schema.as_ref(), "GElement");
     let parameter_set_classes = parameter_set_class_indexes(schema.as_ref());
     let compound_structure_classes = schema
         .as_ref()
         .and_then(rvt_model::CompoundStructureClassIndexes::detect);
-    let brep_classes = (|| {
-        Some(rvt_model::BrepClassIndexes {
-            face: schema_class_index(schema.as_ref(), "Face")?,
-            edge_loop: schema_class_index(schema.as_ref(), "EdgeLoop")?,
-            edge: schema_class_index(schema.as_ref(), "Edge")?,
-            plane: plane_class_index?,
-            cyl_surf: schema_class_index(schema.as_ref(), "CylSurf")?,
-            cone_surf: schema_class_index(schema.as_ref(), "ConeSurf")?,
-            surf_rev: schema_class_index(schema.as_ref(), "SurfRev")?,
-            ruled_surf: schema_class_index(schema.as_ref(), "RuledSurf")?,
-            g_line: schema_class_index(schema.as_ref(), "GLine")?,
-            g_arc: schema_class_index(schema.as_ref(), "GArc")?,
-        })
-    })();
+    let brep_body_class_indices = brep_body_classes(schema.as_ref());
+    let brep_classes = brep_class_indexes(schema.as_ref());
     let partition_paths = partition_paths(&container);
     let (calibrations, parameter_ids) = calibrate_names(
         &container,
@@ -5514,8 +6254,16 @@ fn recover_elements(
                                 })
                             })
                         });
-                        let placement_bounds = exact_bounds
-                            .or_else(|| graph.as_ref().map(|graph| graph.bounds))
+                        // The declared box first. `GRep.m_bBox` is read at
+                        // its own offset now, so it is the record's box as the
+                        // format states it; the duplicated-block scan below it
+                        // is a search for the same field, and a search can
+                        // land on a different pair of blocks entirely in a
+                        // record whose two boxes differ.
+                        let placement_bounds = graph
+                            .as_ref()
+                            .map(|graph| graph.bounds)
+                            .or(exact_bounds)
                             .or_else(|| GElementBounds::parse_near_duplicate(body));
                         if let Some(bounds) = exact_bounds {
                             entry.geometry_bounds = Some(bounds);
@@ -5525,7 +6273,7 @@ fn recover_elements(
                         if let Some(bounds) = placement_bounds {
                             entry.placement_bounds = Some(bounds);
                             if let Some(ginstance_class_index) = ginstance_class_index {
-                                entry.ginstance_transform = GInstanceTransformFields::parse(
+                                entry.scanned_ginstance_transform = GInstanceTransformFields::parse(
                                     body,
                                     ginstance_class_index,
                                     &bounds,
@@ -5535,7 +6283,34 @@ fn recover_elements(
                         if let (Some(schema), Some(classes)) = (schema.as_ref(), &brep_classes) {
                             let (_walk, objects) =
                                 rvt_model::walk_record_collecting(schema, header.class_index, body);
-                            let brep = rvt_model::assemble_symbol_brep(&objects, classes);
+                            if let Some(base) = inst_info_base_class_index {
+                                let declared = objects
+                                    .iter()
+                                    .filter(|object| {
+                                        schema_class_is_a(schema, object.class_index, base)
+                                    })
+                                    .filter_map(GInstanceTransformFields::from_instance_info)
+                                    .collect::<Vec<_>>();
+                                entry.declared_instance_placements += declared.len();
+                                if !declared.is_empty() {
+                                    entry.declared_placements.clone_from(&declared);
+                                }
+                                // One placement is the case every consumer
+                                // here is written for: the element is that
+                                // instance. A record declaring several is a
+                                // real thing - a nested family writes one per
+                                // sub-instance - and is counted rather than
+                                // resolved, because picking one of them would
+                                // be picking arbitrarily.
+                                if let [only] = declared[..] {
+                                    entry.ginstance_transform.get_or_insert(only);
+                                }
+                            }
+                            let brep = rvt_model::assemble_symbol_brep(
+                                &objects,
+                                classes,
+                                &brep_body_class_indices,
+                            );
                             if !brep.is_empty() {
                                 // Counted as well as kept: one id can carry
                                 // more than one body-bearing record.
@@ -5545,9 +6320,26 @@ fn recover_elements(
                                 // would cross one record's body with another's
                                 // box: on AR S1, 13 208 wall ids carry 25 486
                                 // body-bearing records between them.
-                                let placed = body_placement_box(exact_bounds, graph_bounds)
-                                    .is_some_and(|bounds| body_is_placed_in(&brep, &bounds));
+                                let placement_box = body_placement_box(exact_bounds, graph_bounds);
+                                let (brep, placed) =
+                                    place_declared_body(brep, placement_box.as_ref());
+                                // Second pass, and only where the first found
+                                // nothing: a record whose solid the file joins
+                                // to the geometry of what was cut out of it.
+                                // See `place_body_less_its_cut_faces`.
+                                let (brep, placed) = if placed {
+                                    (brep, placed)
+                                } else {
+                                    place_body_less_its_cut_faces(
+                                        &objects,
+                                        classes,
+                                        &brep_body_class_indices,
+                                        placement_box.as_ref(),
+                                    )
+                                    .map_or((brep, placed), |trimmed| (trimmed, true))
+                                };
                                 if keep_body(&brep, placed, entry) {
+                                    entry.brep_placement_box = placement_box;
                                     entry.brep_box_residuals = BodyBoxResiduals {
                                         exact: exact_bounds.and_then(|bounds| {
                                             body_bounds_residual_feet(&brep, &bounds)
@@ -5633,6 +6425,9 @@ fn recover_elements(
                         if entry.type_element_id.is_none()
                             || entry.family_element_id.is_none()
                             || entry.declared_category_id.is_none()
+                            || entry.design_option_set_id.is_none()
+                            || entry.main_design_option_id.is_none()
+                            || entry.host_id.is_none()
                         {
                             if let Some(schema) = schema.as_ref() {
                                 let declared = rvt_model::record_declared_ids(
@@ -5657,6 +6452,17 @@ fn recover_elements(
                                 entry.declared_category_id = entry
                                     .declared_category_id
                                     .or_else(|| declared_id(&declared, CATEGORY_ID_PROPERTY));
+                                entry.design_option_set_id =
+                                    entry.design_option_set_id.or_else(|| {
+                                        declared_id(&declared, DESIGN_OPTION_SET_ID_PROPERTY)
+                                    });
+                                entry.main_design_option_id =
+                                    entry.main_design_option_id.or_else(|| {
+                                        declared_id(&declared, MAIN_DESIGN_OPTION_PROPERTY)
+                                    });
+                                entry.host_id = entry
+                                    .host_id
+                                    .or_else(|| declared_id(&declared, HOST_ID_PROPERTY));
                             }
                         }
                         // A compound host object's type owns its layer table,
@@ -5726,6 +6532,8 @@ fn recover_elements(
                                 entry.created_phase_id.or(fields.created_phase_id);
                             entry.design_option_id =
                                 entry.design_option_id.or(fields.design_option_id);
+                            entry.unplaced_owner_id =
+                                entry.unplaced_owner_id.or(fields.unplaced_owner_id);
                         }
                         if Some(header.class_index) == level_class_index {
                             if let Some(plane_index) = plane_class_index {
@@ -5756,7 +6564,7 @@ fn recover_elements(
         )?;
     }
 
-    attach_symbol_bounds(&mut elements, family_symbol_class_index);
+    attach_symbol_bounds(&mut elements);
     attach_fitting_axes(&mut elements, catalog);
     verify_family_instance_placements(&mut elements);
     inherit_symbol_names(&mut elements);
@@ -5830,6 +6638,71 @@ fn inherit_family_categories(
             element.category_source = Some("family");
         }
     }
+
+    // A system family has no `FamilyBase` record to reach: a pipe's type is an
+    // `RbsPipeType`, and it declares the category itself. So an element that
+    // still has none takes the one its own declared type declares - the same
+    // hop as above with the family step absent, and the only route by which a
+    // pipe, a duct or a cable tray is ever named as one.
+    //
+    // Not where the element's class already answers. `SWall` types a wall by
+    // itself and no mapping row mentions `OST_Walls`, so handing a wall the
+    // category its type declares turns it into a proxy: measured against
+    // Revit's own export of AR S1, 1 638 walls, 79 slabs and 3 roofs lost
+    // their entity that way and agreement fell 95.2% -> 80.0%. With this
+    // clause the same run is 95.2% -> 95.2% on S1 and 95.8% -> **96.6%** on
+    // S2, the gain being 89 railings that reach their family's category
+    // through their type for the first time.
+    let types_itself_by_class = |element: &ExportedElement| {
+        let class_name = element.class_index.and_then(|index| {
+            schema
+                .and_then(|schema| schema.class_by_index(index))
+                .map(|class| class.name.as_str())
+        });
+        element_type_for_source(class_name, None) != BimElementType::Unknown
+    };
+    let type_category = elements
+        .iter()
+        .filter(|(_, element)| element.declares_a_category())
+        .filter_map(|(id, element)| Some((*id, element.category?)))
+        .collect::<BTreeMap<_, _>>();
+    let inherited = elements
+        .iter()
+        .filter(|(_, element)| element.category.is_none() && !types_itself_by_class(element))
+        .filter_map(|(id, element)| {
+            Some((*id, *type_category.get(&element.type_element_reference()?)?))
+        })
+        .collect::<Vec<_>>();
+    for (id, category) in inherited {
+        if let Some(element) = elements.get_mut(&id) {
+            element.category = Some(category);
+            element.category_source = Some("type");
+        }
+    }
+}
+
+/// The design options that are alternatives to the model rather than part of
+/// it.
+///
+/// A design option set names the one of its options that is in the model,
+/// `DesignOptionSet.m_mainDesignOption`; the rest are alternatives to it, and
+/// what stands in them is not what the file describes as built. Both hops are
+/// declared identifier properties read out of each record's own header, so an
+/// option whose set cannot be reached is simply not called secondary - this
+/// only ever subtracts what it can name.
+fn secondary_design_options(elements: &BTreeMap<u32, ExportedElement>) -> BTreeSet<i32> {
+    let main_option = elements
+        .iter()
+        .filter_map(|(id, element)| Some((*id, element.main_design_option_id?)))
+        .collect::<BTreeMap<_, _>>();
+    elements
+        .iter()
+        .filter_map(|(id, element)| {
+            let set = u32::try_from(element.design_option_set_id?).ok()?;
+            let option = i32::try_from(*id).ok()?;
+            (*main_option.get(&set)? != option).then_some(option)
+        })
+        .collect()
 }
 
 /// Give an instance the name of the symbol it was verified against.
@@ -5925,26 +6798,19 @@ fn verify_family_instance_placements(elements: &mut BTreeMap<u32, ExportedElemen
     }
 }
 
-fn attach_symbol_bounds(
-    elements: &mut BTreeMap<u32, ExportedElement>,
-    family_symbol_class_index: Option<u16>,
-) {
-    let Some(family_symbol_class_index) = family_symbol_class_index else {
-        return;
-    };
+fn attach_symbol_bounds(elements: &mut BTreeMap<u32, ExportedElement>) {
+    // Every element that carries a box, not only those of one class. What an
+    // instance is placed from is whatever its `InstInfoBase.m_symbolId` names,
+    // and on AR S1 that is a `FamilySymbol` for most of them but also a
+    // `MasterImportSymbol`, a `SysMullionFamSym` and a `SysPanelFamSym`. The
+    // link is verified by the boxes agreeing, which no unrelated element's box
+    // does by chance to 1e-8 ft on all six coordinates, so the class of what
+    // is named adds nothing to it.
     let symbols = elements
         .iter()
         .filter_map(|(id, element)| {
-            if element.class_index != Some(family_symbol_class_index) {
-                return None;
-            }
             let bounds = element.geometry_graph.as_ref()?.bounds;
-            // A symbol box that is flat on an axis carries no volume and cannot
-            // become an `IfcBoundingBox`, so it is refused here rather than
-            // counted and then silently dropped by the IFC writer.
-            bounds
-                .is_volumetric()
-                .then_some((*id, (element.category, bounds)))
+            Some((*id, (element.category, bounds)))
         })
         .collect::<BTreeMap<_, _>>();
 
@@ -6107,7 +6973,7 @@ fn export_ifc(
     }
 
     let recovered = recover_elements(path, max_member_bytes)?;
-    let geometry_statistics = geometry_statistics(&recovered.elements);
+    let geometry_statistics = geometry_statistics(&recovered.elements, recovered.schema.as_ref());
     let namespace = if let Some(value) = model_namespace {
         parse_uuid(value)?
     } else {
@@ -6179,6 +7045,7 @@ fn export_ifc(
         geometry_statistics.verified_symbol_bounds
     );
     report_symbol_link_funnel(&geometry_statistics);
+    report_nested_assembly_funnel(&geometry_statistics);
     println!(
         "Mapped family instances with verified placement: {mapped_family_instance_placements} of {mapped_family_instances}"
     );
@@ -6190,6 +7057,387 @@ fn export_ifc(
         );
     }
     Ok(())
+}
+
+/// The knobs `export-scene` exposes, kept together so that neither the
+/// dispatch nor the exporter grows an argument list nobody can read.
+struct SceneArguments {
+    chord_tolerance_mm: f64,
+    refinement_depth: u8,
+    chunk_triangles: usize,
+    property_block: usize,
+    compression: u32,
+}
+
+fn export_scene(
+    path: &Path,
+    output: Option<&Path>,
+    include_unplaced: bool,
+    limit: Option<usize>,
+    arguments: &SceneArguments,
+    progress: bool,
+    max_member_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let output = output.map_or_else(|| path.with_extension("rvs"), Path::to_path_buf);
+    if same_existing_file(path, &output)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "scene output must not overwrite the source model file",
+        )
+        .into());
+    }
+    let options = pack_options(arguments)?;
+    // Three stages, timed separately because they fail and scale for
+    // different reasons: reading the container and walking its records, then
+    // selecting and typing the model, then tessellating and packing it. A
+    // caller driving a progress display needs them apart, and so does anyone
+    // asking where a slow conversion went.
+    let mut stage = Stage::new(progress);
+
+    // The format is read from the file's own leading bytes, so a scene is
+    // built from what a file is rather than from what it is called.
+    if looks_like_step(path)? {
+        return export_scene_from_ifc(
+            path,
+            &output,
+            limit,
+            arguments,
+            &options,
+            &mut stage,
+            max_member_bytes,
+        );
+    }
+
+    stage.begins("decode");
+    let recovered = recover_elements(path, max_member_bytes)?;
+    stage.finished("decode");
+    stage.begins("model");
+    let (model, included_properties, included_type_properties, _) =
+        metadata_model(&recovered, include_unplaced, limit);
+    stage.finished("model");
+    let source = SourceInfo {
+        name: path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        kind: "rvt".to_owned(),
+        application: model
+            .source
+            .as_ref()
+            .map(|source| source.application.clone()),
+        release: model
+            .source
+            .as_ref()
+            .and_then(|source| source.release.clone()),
+    };
+
+    stage.begins("tessellate");
+    let mut writer = BufWriter::new(File::create(&output)?);
+    let stats = write_scene(&model, &source, &options, &mut writer)?;
+    writer.flush()?;
+    stage.finished("tessellate");
+
+    println!("Scene written: {}", output.display());
+    println!("Building storeys: {}", model.levels.len());
+    println!(
+        "Elements: {} ({} carry geometry)",
+        stats.elements, stats.elements_with_geometry
+    );
+    println!(
+        "Triangles: {} across {} vertices in {} chunks",
+        stats.triangles, stats.vertices, stats.chunks
+    );
+    println!("Declared edges: {}", stats.edges);
+    if stats.skipped_faces > 0 {
+        // A face the tessellator declined is reported rather than replaced by
+        // a box, so that the count here and the geometry in the file always
+        // describe the same thing.
+        println!(
+            "Faces the tessellator could not read: {}",
+            stats.skipped_faces
+        );
+    }
+    println!("Bytes: {} ({})", stats.bytes, describe_bytes(stats.bytes));
+    if stats.triangles > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        // Both counts are bounded by the file that was just written.
+        let per_triangle = stats.bytes as f64 / stats.triangles as f64;
+        println!("Bytes per triangle: {per_triangle:.2}");
+    }
+    println!("Recovered Revit properties: {included_properties}");
+    println!("Recovered Revit properties from the element's type: {included_type_properties}");
+    stage.total();
+    Ok(())
+}
+
+/// A clock over the conversion's stages.
+///
+/// With `--progress` each stage announces its beginning and its end on stdout
+/// as one JSON object, flushed immediately, so a caller can show the stage
+/// that is running as well as the ones that finished. Without it the same
+/// numbers are printed as prose at the end, because a person reading a
+/// terminal wants the summary and not a log.
+struct Stage {
+    started: std::time::Instant,
+    began: std::time::Instant,
+    progress: bool,
+    elapsed: Vec<(&'static str, f64)>,
+}
+
+impl Stage {
+    fn new(progress: bool) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            started: now,
+            began: now,
+            progress,
+            elapsed: Vec::new(),
+        }
+    }
+
+    fn announce(&self, value: &str) {
+        if self.progress {
+            println!("{value}");
+            let _ = io::stdout().flush();
+        }
+    }
+
+    fn begins(&mut self, name: &'static str) {
+        self.began = std::time::Instant::now();
+        self.announce(&format!(
+            "{{\"stage\":\"{name}\",\"event\":\"begin\",\"totalSeconds\":{:.3}}}",
+            self.started.elapsed().as_secs_f64()
+        ));
+    }
+
+    fn finished(&mut self, name: &'static str) {
+        let seconds = self.began.elapsed().as_secs_f64();
+        self.elapsed.push((name, seconds));
+        self.announce(&format!(
+            "{{\"stage\":\"{name}\",\"event\":\"end\",\"seconds\":{seconds:.3},\"totalSeconds\":{:.3}}}",
+            self.started.elapsed().as_secs_f64()
+        ));
+    }
+
+    fn total(&self) {
+        if self.progress {
+            return;
+        }
+        for (name, seconds) in &self.elapsed {
+            println!("{}: {seconds:.2}s", stage_label(name));
+        }
+        println!("Total: {:.2}s", self.started.elapsed().as_secs_f64());
+    }
+}
+
+fn stage_label(name: &str) -> &'static str {
+    match name {
+        "decode" => "Decode",
+        "model" => "Model",
+        "tessellate" => "Tessellate and pack",
+        _ => "Stage",
+    }
+}
+
+/// Read the command's arguments as pack options, refusing the values the
+/// format cannot express before a long decode has been paid for.
+/// Whether a file is an ISO 10303-21 exchange file - which is what an IFC is
+/// written as - read from its own first bytes.
+///
+/// A byte-order mark and leading whitespace are both stepped over: an IFC
+/// arrives from many systems, and one that wrote a BOM is still an IFC.
+fn looks_like_step(path: &Path) -> io::Result<bool> {
+    use std::io::Read as _;
+
+    let mut head = [0_u8; 64];
+    let mut filled = 0;
+    let mut file = File::open(path)?;
+    while filled < head.len() {
+        match file.read(&mut head[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    let head = &head[..filled];
+    let head = head.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(head);
+    Ok(String::from_utf8_lossy(head)
+        .trim_start()
+        .starts_with("ISO-10303-21"))
+}
+
+/// Build a scene from an IFC file.
+///
+/// The stages are named as the RVT conversion names them, because they answer
+/// the same three questions - what did reading the file cost, what did making
+/// a model of it cost, what did drawing it cost - and a caller driving a
+/// progress display should not have to know which format it was handed.
+#[allow(clippy::too_many_lines)] // One pass: decode, convert, mesh, pack.
+fn export_scene_from_ifc(
+    path: &Path,
+    output: &Path,
+    limit: Option<usize>,
+    arguments: &SceneArguments,
+    options: &PackOptions,
+    stage: &mut Stage,
+    max_bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let source_bytes = std::fs::metadata(path)?.len();
+    if source_bytes > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "IFC source is {source_bytes} bytes, above the configured {max_bytes}-byte \
+                 safe parsing limit; raise --max-member-bytes only on a host with enough memory"
+            ),
+        )
+        .into());
+    }
+    stage.begins("decode");
+    let bytes = std::fs::read(path)?;
+    let parsed = ifc_import::parse(&bytes).map_err(io::Error::other)?;
+    let entities = parsed.entities.len();
+    let skipped = parsed.skipped;
+    drop(bytes);
+    stage.finished("decode");
+
+    stage.begins("model");
+    let import = ifc_import::convert(
+        &parsed,
+        &ifc_import::Options {
+            chord_tolerance: arguments.chord_tolerance_mm / 1000.0,
+        },
+    );
+    let mut model = import.model;
+    // Every product a file states is kept: unlike a decoded RVT, an IFC
+    // states its own containment, so an element without a storey is one the
+    // file placed elsewhere rather than one this failed to place.
+    if let Some(limit) = limit {
+        model.elements.truncate(limit);
+    }
+    drop(parsed);
+    stage.finished("model");
+
+    let source = SourceInfo {
+        name: path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        kind: "ifc".to_owned(),
+        application: model
+            .source
+            .as_ref()
+            .map(|source| source.application.clone()),
+        release: model
+            .source
+            .as_ref()
+            .and_then(|source| source.release.clone()),
+    };
+
+    stage.begins("tessellate");
+    let mut writer = BufWriter::new(File::create(output)?);
+    let stats = write_scene(&model, &source, options, &mut writer)?;
+    writer.flush()?;
+    stage.finished("tessellate");
+
+    println!("Scene written: {}", output.display());
+    println!("Entities read: {entities}");
+    if skipped > 0 {
+        println!("Entities this reader could not read: {skipped}");
+    }
+    if !import.read.stated_length_unit {
+        println!("The file declared no length unit; its numbers are read as metres.");
+    }
+    println!("Building storeys: {}", model.levels.len());
+    println!(
+        "Elements: {} ({} carry geometry)",
+        stats.elements, stats.elements_with_geometry
+    );
+    if import.read.without_geometry > 0 {
+        println!(
+            "Products whose representation held nothing this reads: {}",
+            import.read.without_geometry
+        );
+    }
+    if import.read.unread_items > 0 {
+        println!(
+            "Representation items this reader does not read: {}",
+            import.read.unread_items
+        );
+    }
+    if import.read.approximated_items > 0 {
+        // A boolean result is drawn as the solid it cuts from, so these are
+        // shapes that are shown larger than the file states them.
+        println!(
+            "Solids drawn without a cut the file states: {}",
+            import.read.approximated_items
+        );
+    }
+    if import.read.openings > 0 {
+        println!(
+            "Openings, which are voids rather than bodies: {}",
+            import.read.openings
+        );
+    }
+    if import.read.unread_placements > 0 {
+        println!(
+            "Placements this reader could not resolve: {}",
+            import.read.unread_placements
+        );
+    }
+    println!(
+        "Triangles: {} across {} vertices in {} chunks",
+        stats.triangles, stats.vertices, stats.chunks
+    );
+    println!("Declared edges: {}", stats.edges);
+    if stats.skipped_faces > 0 {
+        println!(
+            "Faces the tessellator could not read: {}",
+            stats.skipped_faces
+        );
+    }
+    println!("Bytes: {} ({})", stats.bytes, describe_bytes(stats.bytes));
+    stage.total();
+    Ok(())
+}
+
+fn pack_options(arguments: &SceneArguments) -> Result<PackOptions, io::Error> {
+    let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
+    if !(arguments.chord_tolerance_mm.is_finite() && arguments.chord_tolerance_mm > 0.0) {
+        return Err(invalid(
+            "chord tolerance must be a positive number of millimetres",
+        ));
+    }
+    if arguments.chunk_triangles == 0 {
+        return Err(invalid("a chunk must hold at least one triangle"));
+    }
+    if arguments.property_block == 0 {
+        return Err(invalid("a property block must hold at least one element"));
+    }
+    if arguments.compression > 9 {
+        return Err(invalid("compression must be between 0 and 9"));
+    }
+    Ok(PackOptions {
+        mesh: MeshOptions {
+            chord_tolerance: arguments.chord_tolerance_mm / 1000.0,
+            refinement_depth: arguments.refinement_depth,
+            ..MeshOptions::default()
+        },
+        chunk_triangle_budget: arguments.chunk_triangles,
+        property_block: arguments.property_block,
+        compression: arguments.compression,
+    })
+}
+
+/// A byte count in the largest unit that keeps it above one.
+fn describe_bytes(bytes: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    // The count is a file length; the scale it is divided by is exact.
+    let mut value = bytes as f64;
+    for unit in ["B", "KiB", "MiB"] {
+        if value < 1024.0 {
+            return format!("{value:.1} {unit}");
+        }
+        value /= 1024.0;
+    }
+    format!("{value:.1} GiB")
 }
 
 fn mapped_family_instance_placement_counts(
@@ -6233,6 +7481,22 @@ fn is_building_element_class(class_name: &str) -> bool {
             | "FamilyInstance"
     )
 }
+
+/// The base class of a run of a building system: a pipe, a duct, a conduit, a
+/// cable tray, a flexible run of any of them, and the insulation and lining
+/// that follow one.
+///
+/// The list above is what the AR reference join established, and it is a list
+/// of the classes *that file* builds a building out of. It says nothing about
+/// a plumbing model, and applied to one it excluded the runs themselves: of
+/// SMALL's 8 882 records descending from this class, 6 955 carry a decoded
+/// body and not one reached the export, so the ВК file exported 6 628
+/// `IfcPipeFitting` connecting nothing. Every clause that separates a model
+/// element from a definition holds on them exactly as it does on a wall - all
+/// 8 882 carry a phase, none is owned by a view or by a group definition, none
+/// is moribund, and the 1 220 that declare their own category are the
+/// definitions the same rule already drops.
+const SYSTEM_RUN_CLASS: &str = "RbsCurve";
 
 /// The storeys of *this* model, and the map that folds every recovered `Level`
 /// onto the one that represents it.
@@ -6318,6 +7582,7 @@ fn building_storeys(
     (levels, canonical_level)
 }
 
+#[allow(clippy::too_many_lines)] // The selection's clauses, each with its measurement.
 fn metadata_model(
     recovered: &RecoveredElements,
     include_unplaced: bool,
@@ -6332,12 +7597,51 @@ fn metadata_model(
                 .map(|class| class.name.as_str())
         })
     };
+    let secondary_options = secondary_design_options(&recovered.elements);
+    // Whether the element stands in the model the file describes as built, as
+    // against a copy of it kept somewhere else in the same database.
+    //
+    // Two places keep such copies, and an element in either declares which:
+    //
+    // - A group definition. `Element.m_unplacedOwnerId` names it, and it names
+    //   nothing else: of the 36 391 elements of AR S1 and the 26 259 of AR S2
+    //   that carry one, every single one names an `ElementGroupType`, 235 and
+    //   212 distinct definitions. Revit places a group by copying its
+    //   definition's members into the model; those copies are the elements it
+    //   exports, and they carry no owner. Joined to Revit's own export the
+    //   split is exact - of the 11 291 / 10 918 products we and Revit both
+    //   emit not one names a group definition, while 4 215 / 3 925 of the
+    //   products we emit and Revit does not do. It is the single largest thing
+    //   we were over-exporting.
+    // - A secondary design option. See [`secondary_design_options`]: 17
+    //   products on each file, and again none on either join.
+    let stands_in_the_model = |element: &ExportedElement| {
+        element.unplaced_owner_id.is_none()
+            && !element
+                .design_option_id
+                .is_some_and(|option| secondary_options.contains(&option))
+    };
     // A model element of a building class, as against a type definition, an
     // annotation or a view artefact of the same class. Each clause is
-    // independently meaningful and the three together keep every product Revit
+    // independently meaningful and together they keep every product Revit
     // exports - 100% recall on `SWall`, `Floor` and `FamilyInstance` alike.
-    let is_model_element = |element: &ExportedElement| {
+    // A class the model is built out of: one of the building classes the
+    // reference join established, or a run of a building system - see
+    // [`SYSTEM_RUN_CLASS`], which is read as a class chain rather than a name
+    // so that a duct, a conduit and a cable tray are admitted by the same
+    // reading that admits a pipe.
+    let is_building_element = |element: &ExportedElement| {
         class_name(element).is_some_and(is_building_element_class)
+            || element
+                .class_index
+                .zip(recovered.schema.as_ref())
+                .is_some_and(|(class_index, schema)| {
+                    rvt_model::descends_from(schema, class_index, SYSTEM_RUN_CLASS)
+                })
+    };
+    let is_model_element = |element: &ExportedElement| {
+        stands_in_the_model(element)
+            && is_building_element(element)
             // Owned by a view, so annotation or a detail item, not the model.
             && element.owner_view_id.is_none()
             // A model element is placed in a phase.
@@ -6403,8 +7707,20 @@ fn metadata_model(
         let verified_geometry = element.verified_symbol_bounds.is_some();
         let is_space = is_space(element);
         !element.moribund
+            && stands_in_the_model(element)
             && class_name(element) != Some("Level")
             && !element.declares_a_category()
+            // A record a view owns is drawn on a sheet, not built: a legend
+            // component, a detail item, an annotation. `is_model_element`
+            // has always said so, but the two ways in that bypass it - a
+            // category, or verified geometry - did not, and a legend has
+            // both a body and a symbol whose bounds verify. On AR S1 that
+            // let four `LegendComponent` records through, and because a
+            // legend is drawn beside the sheet rather than in the building
+            // they sat 1.5 km out, stretching the model's extent from 27 m
+            // to 1 525 m along y. Applied here it holds for every way in,
+            // as the category clause below already does.
+            && element.owner_view_id.is_none()
             && (element.category.is_some() || verified_geometry || is_model_element || is_space)
             && (include_unplaced
                 || element.level_id.is_some()
@@ -6499,6 +7815,108 @@ fn body_bounds_residual_feet(brep: &rvt_model::SymbolBrep, bounds: &GElementBoun
     })
 }
 
+/// Which of a record's bodies is the element's, and whether it is placed.
+///
+/// A `GElement` record is not one body. It declares them - each is a `GBRep`
+/// node naming its own faces - and a wall's record typically declares the
+/// solid plus a free surface for each plane its compound structure separates
+/// on. Read as one body those union together, and the union reaches outside
+/// the box the same record declares: on AR S1 that is 1 576 walls whose body
+/// was refused for missing a box it does not describe.
+///
+/// The box says which body is the element's. Where exactly one declared body
+/// reproduces it, that body is the record's geometry and the rest are the free
+/// surfaces beside it. Where none does, the whole assembly stands as before -
+/// a record whose solid is split across two nodes is not resolved by this and
+/// is left exactly as it was.
+fn place_declared_body(
+    brep: rvt_model::SymbolBrep,
+    bounds: Option<&GElementBounds>,
+) -> (rvt_model::SymbolBrep, bool) {
+    let Some(bounds) = bounds else {
+        return (brep, false);
+    };
+    let mut matching = (0..brep.bodies.len()).filter(|index| {
+        brep.body(*index)
+            .is_some_and(|body| body_is_placed_in(&body, bounds))
+    });
+    if let (Some(index), None) = (matching.next(), matching.next()) {
+        if let Some(body) = brep.body(index) {
+            return (body, true);
+        }
+    }
+    let placed = body_is_placed_in(&brep, bounds);
+    (brep, placed)
+}
+
+/// The bit of a face's own `GInfo.m_flags` that is set on the faces the
+/// record's box bounds and clear on the rest.
+///
+/// What Revit calls it is not established - the flags word carries no
+/// declaration beyond its name - so it is named here for what it separates,
+/// and it was chosen by measurement rather than read off one record.
+/// `rivet face-mark-probe` scores every mark a `GFace` declares against the
+/// one answer that is independent of them: whether the face reaches outside
+/// the box its own record carries. On AR S1 this bit is clear on 9 828 faces
+/// that do and set on all but 1 039 of the 355 361 that do not, and dropping
+/// the faces it leaves clear lands 4 303 records' bodies exactly on their box,
+/// 4 295 of them bounding a volume by their own loops.
+///
+/// The alternatives are refuted by the same probe, and that is where they are
+/// recorded: `GFace.m_cutType`, which the notebook nominated, is zero on every
+/// face of every record that would need it and recovers nothing;
+/// `m_faceFlags_v9 & 0x2` recovers a similar count of records and **not one**
+/// of them bounds a volume, so it cuts into the wall rather than around it;
+/// and a null `m_renderStyleId` fires on 214 185 faces that are inside the box.
+const FACE_INSIDE_THE_BOX_FLAG: i64 = 0x0008_0000;
+
+/// Place the body a record's box bounds, after dropping the faces that are not
+/// in it.
+///
+/// A wall's record does not hold the wall alone. Where something is cut out of
+/// it, the file joins the cut geometry into the same shell: element 4975869 of
+/// AR S1 declares one closed shell of 26 faces of which the wall is 22, the
+/// other four being the far caps of two window voids, 0.12 m past one face of
+/// the wall and 0.25 m past the other. `GBRep.m_pFaces` and `GEdge.m_pFace`
+/// cannot separate those - the file declares them as one shell - so the wall
+/// had no body at all: nothing reproduced the box, and the box alone is not
+/// offered as an extent.
+///
+/// The faces themselves say which is which, in [`FACE_INSIDE_THE_BOX_FLAG`].
+/// Dropping the ones that lack it and assembling the record again is what this
+/// does, and the result is accepted only when it meets the test the first pass
+/// applies plus one more: exactly one body reproduces the box, and its faces
+/// bound a volume by their own loops
+/// ([`rvt_model::SymbolBrep::bounds_a_volume`]) - so a trim that opens a shell
+/// is refused rather than exported. Nothing that places on
+/// the first pass reaches this, so no body placed today can change.
+fn place_body_less_its_cut_faces(
+    objects: &[rvt_model::SerialObject],
+    classes: &rvt_model::BrepClassIndexes,
+    body_classes: &[u16],
+    bounds: Option<&GElementBounds>,
+) -> Option<rvt_model::SymbolBrep> {
+    let bounds = bounds?;
+    let mut dropped = 0_usize;
+    let kept = objects
+        .iter()
+        .filter(|object| {
+            let cut = object.class_index == classes.face
+                && GFaceMarks::read(object)
+                    .is_some_and(|marks| marks.info_flags & FACE_INSIDE_THE_BOX_FLAG == 0);
+            dropped += usize::from(cut);
+            !cut
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if dropped == 0 {
+        return None;
+    }
+    let trimmed = rvt_model::assemble_symbol_brep(&kept, classes, body_classes);
+    let (trimmed, placed) = place_declared_body(trimmed, Some(bounds));
+    (placed && trimmed.bounds_a_volume()).then_some(trimmed)
+}
+
 /// Whether a body is already placed, by reproducing the bounds block carried
 /// by the same `GElement` record.
 fn body_is_placed_in(brep: &rvt_model::SymbolBrep, bounds: &GElementBounds) -> bool {
@@ -6526,7 +7944,7 @@ fn body_placement_box(
     exact: Option<GElementBounds>,
     graph: Option<GElementBounds>,
 ) -> Option<GElementBounds> {
-    exact.or(graph)
+    graph.or(exact)
 }
 
 /// What every box on a body's own record says about where that body sits.
@@ -6630,6 +8048,13 @@ struct ClassGeometry {
 /// approximation - a curved body could otherwise never be told from one in
 /// the wrong frame.
 fn body_extent_feet(brep: &rvt_model::SymbolBrep) -> Option<([f64; 3], [f64; 3])> {
+    faces_extent_feet(&brep.faces)
+}
+
+/// The extent of a set of faces, in the frame they were read in. `None` when
+/// any point is not finite, so a body carrying one unreadable coordinate never
+/// reports a plausible box.
+fn faces_extent_feet(faces: &[rvt_model::BrepFace]) -> Option<([f64; 3], [f64; 3])> {
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
     let include = |point: [f64; 3], min: &mut [f64; 3], max: &mut [f64; 3]| {
@@ -6642,7 +8067,7 @@ fn body_extent_feet(brep: &rvt_model::SymbolBrep) -> Option<([f64; 3], [f64; 3])
         }
         true
     };
-    for face in &brep.faces {
+    for face in faces {
         for face_loop in &face.loops {
             for edge in face_loop {
                 for point in [edge.start, edge.end] {
@@ -6873,9 +8298,27 @@ fn body_owners(path: &Path, classes: usize, max_member_bytes: u64) -> Result<(),
     );
 
     print_body_box_residuals(&recovered.elements);
+    print_near_miss_anatomy(
+        &recovered.elements,
+        |element| {
+            element.class_index.and_then(|index| {
+                schema
+                    .and_then(|schema| schema.class_by_index(index))
+                    .map(|class| class.name.as_str())
+            })
+        },
+        classes,
+    );
 
     print_body_owner_table(&rows, classes);
     print_model_element_body_table(&rows, &total, classes);
+    // The same funnel the export prints, here too: this is the command for
+    // reading what the decode is worth, and the nested-family path is decoded
+    // geometry that does or does not reach an element.
+    report_nested_assembly_funnel(&geometry_statistics(
+        &recovered.elements,
+        recovered.schema.as_ref(),
+    ));
     Ok(())
 }
 
@@ -6937,6 +8380,122 @@ fn print_body_box_residuals(elements: &BTreeMap<u32, ExportedElement>) {
             print!("\t{count}");
         }
         println!();
+    }
+}
+
+/// What a body that misses its own record's box actually differs by.
+///
+/// A residual alone cannot say why: the same tenth of a foot is a body sitting
+/// somewhere else, a body that is the wrong size, or a body missing a face.
+/// Each is a different repair, so each is counted separately. The three
+/// readings are independent of one another and of the residual buckets above.
+fn print_near_miss_anatomy<'a>(
+    elements: &BTreeMap<u32, ExportedElement>,
+    class_name: impl Fn(&ExportedElement) -> Option<&'a str>,
+    classes: usize,
+) {
+    #[derive(Default)]
+    struct Anatomy {
+        misses: usize,
+        /// The body has the box's extent on every axis and sits elsewhere:
+        /// a transform the decode does not apply.
+        same_size_shifted: usize,
+        /// The body lies inside the box on every axis: geometry not decoded,
+        /// or a box drawn around more than this body.
+        inside_the_box: usize,
+        /// ...and of those, how many are bodies with an excluded face, which
+        /// is the reading that would explain it.
+        inside_and_incomplete: usize,
+        /// The body reaches outside its own box on some axis.
+        outside_the_box: usize,
+        /// Bodies whose id carries more than one body-bearing record, so the
+        /// box may belong to a body this one displaced.
+        from_a_multi_record_id: usize,
+        /// What the record declares - see [`place_declared_body`]: how many
+        /// bodies, how many of those reproduce the box, and how many are
+        /// solids rather than free surfaces.
+        declared_bodies: usize,
+        bodies_matching_the_box: usize,
+        solid_bodies: usize,
+        /// Records with no declared body at all: nothing to select from.
+        with_no_declared_body: usize,
+    }
+    let mut rows: BTreeMap<&str, Anatomy> = BTreeMap::new();
+    let mut total = Anatomy::default();
+    for element in elements.values() {
+        let (Some(brep), Some(bounds)) = (&element.brep, element.brep_placement_box) else {
+            continue;
+        };
+        let Some(residual) = body_bounds_residual_feet(brep, &bounds) else {
+            continue;
+        };
+        if residual <= BODY_BOUNDS_TOLERANCE_FEET {
+            continue;
+        }
+        let Some((min, max)) = body_extent_feet(brep) else {
+            continue;
+        };
+        let size_residual = (0..3)
+            .map(|axis| ((max[axis] - min[axis]) - (bounds.max[axis] - bounds.min[axis])).abs())
+            .fold(0.0_f64, f64::max);
+        let inside = (0..3).all(|axis| {
+            min[axis] >= bounds.min[axis] - BODY_BOUNDS_TOLERANCE_FEET
+                && max[axis] <= bounds.max[axis] + BODY_BOUNDS_TOLERANCE_FEET
+        });
+        let matching = (0..brep.bodies.len())
+            .filter(|index| {
+                brep.body(*index)
+                    .is_some_and(|body| body_is_placed_in(&body, &bounds))
+            })
+            .count();
+        let solids = brep.bodies.iter().filter(|body| body.is_solid()).count();
+        let row = rows
+            .entry(class_name(element).unwrap_or(UNRESOLVED_CLASS))
+            .or_default();
+        for row in [row, &mut total] {
+            row.misses += 1;
+            row.same_size_shifted += usize::from(size_residual <= BODY_BOUNDS_TOLERANCE_FEET);
+            row.inside_the_box += usize::from(inside);
+            row.inside_and_incomplete += usize::from(inside && !brep.excluded_faces.is_empty());
+            row.outside_the_box += usize::from(!inside);
+            row.from_a_multi_record_id += usize::from(element.brep_records > 1);
+            row.declared_bodies += brep.bodies.len();
+            row.bodies_matching_the_box += matching;
+            row.solid_bodies += solids;
+            row.with_no_declared_body += usize::from(brep.bodies.is_empty());
+        }
+    }
+    let mut by_misses = rows.iter().collect::<Vec<_>>();
+    by_misses.sort_by(|left, right| {
+        right
+            .1
+            .misses
+            .cmp(&left.1.misses)
+            .then_with(|| left.0.cmp(right.0))
+    });
+    println!("\nWhat a body missing its own box differs by:");
+    println!(
+        "class\tmisses\tsame size, moved\tinside it\toutside it\tmulti-record id\t\
+         declared bodies\t=box\tsolid\tno body"
+    );
+    let listed = by_misses
+        .into_iter()
+        .take(classes)
+        .map(|(name, row)| (*name, row))
+        .chain(std::iter::once(("total", &total)));
+    for (name, row) in listed {
+        println!(
+            "{name}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.misses,
+            row.same_size_shifted,
+            row.inside_the_box,
+            row.outside_the_box,
+            row.from_a_multi_record_id,
+            row.declared_bodies,
+            row.bodies_matching_the_box,
+            row.solid_bodies,
+            row.with_no_declared_body
+        );
     }
 }
 
@@ -7015,7 +8574,7 @@ fn print_model_element_body_table(
     );
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct GeometryStatistics {
     pipe_candidates: usize,
     pipe_candidates_with_bounds: usize,
@@ -7026,6 +8585,20 @@ struct GeometryStatistics {
     verified_family_instance_placements: usize,
     verified_ginstance_transforms: usize,
     verified_symbol_bounds: usize,
+    /// What an element declaring several placements says about itself. A
+    /// nested family writes one `InstInfoBase` per sub-instance, and no single
+    /// transform describes it, so the export reads none of them. These count
+    /// what a reading of all of them would have to stand on: the box on the
+    /// element's own record against the hull of its sub-instances' symbol
+    /// boxes, each carried through its own transform - the same cross-check
+    /// that verifies the single-placement case, asked of the whole set.
+    elements_with_several_placements_naming_symbols: usize,
+    elements_with_several_placements_whose_symbols_are_known: usize,
+    elements_with_several_placements_matching_their_box: usize,
+    /// Of those, how many sub-instances they place between them, and how many
+    /// of the symbols carry a decoded body: what emitting them would draw.
+    placements_of_elements_with_several: usize,
+    placements_whose_symbol_has_a_body: usize,
     /// Funnel from "an instance names a symbol" to "that body is placed in the
     /// world", so a shortfall can be attributed to the gate that caused it
     /// rather than guessed at. Each field counts the instances that passed
@@ -7038,9 +8611,45 @@ struct GeometryStatistics {
     /// The bounds cross-check on its own, with the category-equality gate not
     /// applied, so the two gates can be told apart.
     instances_whose_bounds_match_ignoring_category: usize,
+    /// The same check run on each pairing of the two boxes each record
+    /// declares - `GRep.m_bBox` and `GRep.m_tightbBox` - so which box the
+    /// chain is actually about is read rather than assumed.
+    bounds_match_by_box_pair: [usize; 4],
     /// Of the instances whose symbol has a body, how the category gate fails.
     instances_whose_symbol_has_no_category: usize,
     instances_whose_category_differs_from_the_symbol: usize,
+    /// The declared `InstInfoBase` placement against the byte scan it
+    /// replaced, so the two readings are compared rather than one being
+    /// assumed to cover the other.
+    elements_declaring_a_placement: usize,
+    elements_declaring_several_placements: usize,
+    placements_read_both_ways: usize,
+    placements_the_two_readings_agree_on: usize,
+    placements_only_the_scan_found: usize,
+    /// Where the nested-family path stops, by the refusal it names. The hull
+    /// check is the verification; everything after it is an element the file
+    /// says is that set of sub-instances and whose bodies did not come out.
+    nested_refusals: BTreeMap<&'static str, usize>,
+    /// For an element held back by a member that does not close, what each of
+    /// its members' bodies actually is. This is the backlog those elements are
+    /// waiting on, stated per member rather than per element.
+    nested_member_bodies: BTreeMap<&'static str, usize>,
+    /// For an element held back by a member with no body at all, what that
+    /// member is instead. A sub-instance whose own symbol carries no faces is
+    /// not necessarily geometry this file lacks: it may be one more hop away,
+    /// which is a reading to add rather than a backlog to wait on.
+    nested_members_without_a_body: BTreeMap<&'static str, usize>,
+    /// The node classes such a member's graph does carry. A graph with a box
+    /// and no faces still declares something, and what it declares says
+    /// whether a body is missing or was never written: on AR S1 it is `GLine`
+    /// and `GArc`, so those members draw curves and no reading will give them
+    /// a solid.
+    nested_bodiless_member_nodes: BTreeMap<String, usize>,
+    /// What the elements a missing body holds back are, by class. This is the
+    /// row that says whether a file's shortfall is nested families at all: on
+    /// AR S1 it is 3 555 `ElementGroup` against 183 `FamilyInstance`, and a
+    /// group is not a product here in the first place.
+    nested_refused_classes: BTreeMap<String, usize>,
 }
 
 /// Report the funnel from "an instance names a symbol" to "that body is
@@ -7078,10 +8687,55 @@ fn report_symbol_link_funnel(statistics: &GeometryStatistics) {
         statistics.instances_whose_symbol_has_no_category,
         statistics.instances_whose_category_differs_from_the_symbol
     );
+    println!(
+        "  placement declared by InstInfoBase: {} ({} elements declare several), \
+         found only by the scan it replaced: {}",
+        statistics.elements_declaring_a_placement,
+        statistics.elements_declaring_several_placements,
+        statistics.placements_only_the_scan_found
+    );
+    println!(
+        "  read both ways: {}, agreeing: {}",
+        statistics.placements_read_both_ways, statistics.placements_the_two_readings_agree_on
+    );
+    println!(
+        "  elements declaring several, all naming a symbol: {} ({} placements), symbols decoded: {}, hull of the transformed symbol boxes = the element's box: {} ({} of those placements carry a body)",
+        statistics.elements_with_several_placements_naming_symbols,
+        statistics.placements_of_elements_with_several,
+        statistics.elements_with_several_placements_whose_symbols_are_known,
+        statistics.elements_with_several_placements_matching_their_box,
+        statistics.placements_whose_symbol_has_a_body
+    );
+    for (index, label) in [
+        "instance bBox = symbol bBox",
+        "instance bBox = symbol tight",
+        "instance tight = symbol bBox",
+        "instance tight = symbol tight",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        println!("  {label}: {}", statistics.bounds_match_by_box_pair[index]);
+    }
 }
 
-fn geometry_statistics(elements: &BTreeMap<u32, ExportedElement>) -> GeometryStatistics {
+#[allow(clippy::too_many_lines)] // One pass over the elements, tallying each funnel.
+fn geometry_statistics(
+    elements: &BTreeMap<u32, ExportedElement>,
+    schema: Option<&Schema>,
+) -> GeometryStatistics {
     let mut statistics = GeometryStatistics::default();
+    let class_name = |class_index: Option<u16>| {
+        class_index
+            .and_then(|index| schema.and_then(|schema| schema.class_by_index(index)))
+            .map_or_else(
+                || {
+                    class_index
+                        .map_or_else(|| "no class".to_owned(), |index| format!("class {index}"))
+                },
+                |class| class.name.clone(),
+            )
+    };
     for element in elements.values() {
         if let Some(line) = element.pipe_line_candidate {
             statistics.pipe_candidates += 1;
@@ -7134,15 +8788,220 @@ fn geometry_statistics(elements: &BTreeMap<u32, ExportedElement>) -> GeometrySta
                         statistics.instances_whose_bounds_match_ignoring_category += 1;
                     }
                 }
+                if let (Some(transform), Some(instance), Some(symbol)) = (
+                    element.ginstance_transform,
+                    element.geometry_graph.as_ref(),
+                    symbol.and_then(|symbol| symbol.geometry_graph.as_ref()),
+                ) {
+                    for (index, (instance_box, symbol_box)) in [
+                        (&instance.bounds, &symbol.bounds),
+                        (&instance.bounds, &symbol.tight_bounds),
+                        (&instance.tight_bounds, &symbol.bounds),
+                        (&instance.tight_bounds, &symbol.tight_bounds),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        statistics.bounds_match_by_box_pair[index] +=
+                            usize::from(instance_box.matches_transformed(symbol_box, &transform));
+                    }
+                }
             }
+        }
+        statistics.elements_declaring_a_placement +=
+            usize::from(element.declared_instance_placements > 0);
+        statistics.elements_declaring_several_placements +=
+            usize::from(element.declared_instance_placements > 1);
+        if element.declared_placements.len() > 1 {
+            let symbols = element
+                .declared_placements
+                .iter()
+                .map(|placement| {
+                    let symbol = elements.get(&placement.symbol_element_id?)?;
+                    Some((*placement, symbol.geometry_graph.as_ref()?.bounds, symbol))
+                })
+                .collect::<Option<Vec<_>>>();
+            if element
+                .declared_placements
+                .iter()
+                .all(|placement| placement.symbol_element_id.is_some())
+            {
+                statistics.elements_with_several_placements_naming_symbols += 1;
+                statistics.placements_of_elements_with_several += element.declared_placements.len();
+            }
+            if let (Some(symbols), Some(bounds)) = (symbols, element.placement_bounds) {
+                statistics.elements_with_several_placements_whose_symbols_are_known += 1;
+                statistics.placements_whose_symbol_has_a_body += symbols
+                    .iter()
+                    .filter(|(_, _, symbol)| symbol.brep.is_some())
+                    .count();
+                let mut min = [f64::INFINITY; 3];
+                let mut max = [f64::NEG_INFINITY; 3];
+                for (placement, symbol_bounds, _) in &symbols {
+                    let (low, high) = GElementBounds::transformed(symbol_bounds, placement);
+                    for axis in 0..3 {
+                        min[axis] = min[axis].min(low[axis]);
+                        max[axis] = max[axis].max(high[axis]);
+                    }
+                }
+                statistics.elements_with_several_placements_matching_their_box += usize::from(
+                    min.into_iter()
+                        .chain(max)
+                        .zip(bounds.min.into_iter().chain(bounds.max))
+                        .all(|(ours, theirs)| {
+                            ours.is_finite() && (ours - theirs).abs() <= BODY_BOUNDS_TOLERANCE_FEET
+                        }),
+                );
+            }
+        }
+        match (
+            element.ginstance_transform,
+            element.scanned_ginstance_transform,
+        ) {
+            (Some(declared), Some(scanned)) => {
+                statistics.placements_read_both_ways += 1;
+                statistics.placements_the_two_readings_agree_on += usize::from(
+                    declared.basis == scanned.basis
+                        && declared.origin == scanned.origin
+                        && declared.symbol_element_id == scanned.symbol_element_id,
+                );
+            }
+            (None, Some(_)) => statistics.placements_only_the_scan_found += 1,
+            (Some(_) | None, None) => {}
         }
         statistics.verified_family_instance_placements +=
             usize::from(element.family_instance_placement.is_some());
         statistics.verified_ginstance_transforms +=
             usize::from(element.ginstance_transform.is_some());
         statistics.verified_symbol_bounds += usize::from(element.verified_symbol_bounds.is_some());
+        let refusal = match nested_assembly(element, elements) {
+            Ok(_) => "the assembly is written",
+            Err(NestedRefusal::NotSeveral) => continue,
+            Err(NestedRefusal::NoElementBounds) => "the element declares no box",
+            Err(NestedRefusal::SymbolMissing) => "a placement names no recovered symbol",
+            Err(NestedRefusal::SymbolBoundsMissing) => "a named symbol carries no box",
+            Err(NestedRefusal::HullDisagreed) => {
+                "the hull of the symbol boxes is not the element's"
+            }
+            Err(NestedRefusal::MemberHasNoBody) => "a member's symbol carries no decoded body",
+            Err(NestedRefusal::MemberNotConverted) => "a member's body would not convert",
+            Err(NestedRefusal::MemberIncomplete) => "a member's body does not close",
+        };
+        *statistics.nested_refusals.entry(refusal).or_default() += 1;
+        if refusal == "a member's symbol carries no decoded body" {
+            *statistics
+                .nested_refused_classes
+                .entry(class_name(element.class_index))
+                .or_default() += 1;
+        }
+        if refusal == "a member's symbol carries no decoded body" {
+            for placement in &element.declared_placements {
+                let member = placement
+                    .symbol_element_id
+                    .and_then(|symbol| elements.get(&symbol));
+                let verdict = match member {
+                    None => "the placement names no recovered element",
+                    Some(member) if member.brep.is_some() => "carries a body",
+                    Some(member) if member.brep_records > 0 => "decoded a body that was not kept",
+                    Some(member) if member.declared_placements.len() > 1 => {
+                        "declares several placements of its own"
+                    }
+                    Some(member) if member.ginstance_transform.is_some() => {
+                        "names one symbol of its own"
+                    }
+                    Some(member) if member.geometry_graph.is_some() => {
+                        for node in member
+                            .geometry_graph
+                            .iter()
+                            .flat_map(|graph| graph.top_level_nodes.iter())
+                        {
+                            *statistics
+                                .nested_bodiless_member_nodes
+                                .entry(class_name(Some(node.class_index)))
+                                .or_default() += 1;
+                        }
+                        "carries a graph with no face-bearing record"
+                    }
+                    Some(_) => "carries no geometry record at all",
+                };
+                *statistics
+                    .nested_members_without_a_body
+                    .entry(verdict)
+                    .or_default() += 1;
+            }
+        }
+        if refusal != "a member's body does not close" {
+            continue;
+        }
+        for placement in &element.declared_placements {
+            let member = placement
+                .symbol_element_id
+                .and_then(|symbol| elements.get(&symbol));
+            let verdict = match member.and_then(|member| member.brep.as_ref()) {
+                None => "no decoded body",
+                Some(brep) if brep.is_closed() => "closes: every face read and every shell closed",
+                Some(brep) if brep.bounds_a_volume() => "bounds a volume by its own loops",
+                Some(brep) if brep.excluded_faces.is_empty() => "every face read, no shell closed",
+                Some(brep)
+                    if brep
+                        .excluded_faces
+                        .iter()
+                        .all(|exclusion| exclusion.reason == "face has no first loop") =>
+                {
+                    "excludes only faces no edge names"
+                }
+                Some(_) => "excludes a face of the shell",
+            };
+            *statistics.nested_member_bodies.entry(verdict).or_default() += 1;
+        }
     }
     statistics
+}
+
+/// Report where the nested-family path stops. The hull check is what verifies
+/// the set is the element, so a refusal after it is geometry the file offers
+/// and this reader did not take.
+fn report_nested_assembly_funnel(statistics: &GeometryStatistics) {
+    println!("Elements declaring several placements, by what the assembly path did:");
+    let mut refusals = statistics.nested_refusals.iter().collect::<Vec<_>>();
+    refusals.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+    for (refusal, count) in refusals {
+        println!("  {count}\t{refusal}");
+    }
+    if !statistics.nested_members_without_a_body.is_empty() {
+        println!("  the members of the elements a missing body held back:");
+        let mut members = statistics
+            .nested_members_without_a_body
+            .iter()
+            .collect::<Vec<_>>();
+        members.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        for (verdict, count) in members {
+            println!("  {count}\t{verdict}");
+        }
+        println!("  the classes of the elements a missing body holds back:");
+        let mut classes = statistics.nested_refused_classes.iter().collect::<Vec<_>>();
+        classes.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        for (class, count) in classes.into_iter().take(8) {
+            println!("  {count}\t{}", escape_terminal_text(class));
+        }
+        println!("  the node classes those members' graphs carry:");
+        let mut nodes = statistics
+            .nested_bodiless_member_nodes
+            .iter()
+            .collect::<Vec<_>>();
+        nodes.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        for (class, count) in nodes.into_iter().take(8) {
+            println!("  {count}\t{}", escape_terminal_text(class));
+        }
+    }
+    if !statistics.nested_member_bodies.is_empty() {
+        println!("  the members of the elements a body held back:");
+        let mut members = statistics.nested_member_bodies.iter().collect::<Vec<_>>();
+        members.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        for (verdict, count) in members {
+            println!("  {count}\t{verdict}");
+        }
+    }
 }
 
 fn trusted_source_properties(element: &BimElement) -> Vec<BimProperty> {
@@ -7299,6 +9158,41 @@ fn schema_class_index(schema: Option<&Schema>, name: &str) -> Option<u16> {
     schema
         .and_then(|schema| schema.class_by_name(name))
         .map(|class| class.index)
+}
+
+/// The boundary-representation class indices, resolved by name once. The
+/// module that uses them never looks a class up itself.
+fn brep_class_indexes(schema: Option<&Schema>) -> Option<rvt_model::BrepClassIndexes> {
+    Some(rvt_model::BrepClassIndexes {
+        face: schema_class_index(schema, "Face")?,
+        edge_loop: schema_class_index(schema, "EdgeLoop")?,
+        edge: schema_class_index(schema, "Edge")?,
+        plane: schema_class_index(schema, "Plane")?,
+        cyl_surf: schema_class_index(schema, "CylSurf")?,
+        cone_surf: schema_class_index(schema, "ConeSurf")?,
+        surf_rev: schema_class_index(schema, "SurfRev")?,
+        ruled_surf: schema_class_index(schema, "RuledSurf")?,
+        g_line: schema_class_index(schema, "GLine")?,
+        g_arc: schema_class_index(schema, "GArc")?,
+    })
+}
+
+/// Every class index that is a `GBRep`, which is the node that owns faces.
+/// The records write its subclass `Geometry`, so the answer is a set rather
+/// than one index, and [`rvt_model::assemble_symbol_brep`] takes it as one.
+fn brep_body_classes(schema: Option<&Schema>) -> Vec<u16> {
+    let Some(schema) = schema else {
+        return Vec::new();
+    };
+    let Some(g_brep) = schema_class_index(Some(schema), "GBRep") else {
+        return Vec::new();
+    };
+    schema
+        .classes
+        .iter()
+        .filter(|class| schema_class_is_a(schema, class.index, g_brep))
+        .map(|class| class.index)
+        .collect()
 }
 
 fn schema_class_is_a(schema: &Schema, class_index: u16, ancestor_index: u16) -> bool {
@@ -7623,6 +9517,110 @@ fn carries_family_symbol_geometry(element_type: BimElementType) -> bool {
     !matches!(element_type, BimElementType::PipeSegment)
 }
 
+/// The bodies of an element that the file places as several instances.
+///
+/// A nested family writes one `InstInfoBase` per sub-instance, so no single
+/// transform describes the element and the single-placement path above cannot
+/// answer for it. What answers is the same cross-check one hop wider: the hull
+/// of every sub-instance's symbol box, each carried through its own declared
+/// transform, against the box on the element's own record. On AR S1 that hull
+/// reproduces the box on 4 118 of the 4 280 elements whose symbols all decode,
+/// and on AR S2 on 2 906 of 3 069, to 1e-6 ft on all six coordinates - the
+/// standard the single instance is accepted on, asked of the whole set.
+///
+/// Every member has to be a closed body, for the reason the single path gives:
+/// an incomplete shell is not something to ship. An element one of whose
+/// sub-instances did not decode is therefore left to the paths below rather
+/// than drawn in part, since a fifth of a nested family is not the element.
+/// Why a nested family's set of placements did not become an assembly.
+///
+/// The path refuses in several places and they are not the same failure: a set
+/// the hull check rejects is not the element, while one it accepts whose
+/// member bodies did not decode is the element with the geometry missing. The
+/// export ignores this, but nothing can be improved that is not first counted,
+/// so the refusal is named rather than folded into a `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NestedRefusal {
+    /// Fewer than two declared placements: not a nested family by this route.
+    NotSeveral,
+    /// The element declares no box to check a hull against.
+    NoElementBounds,
+    /// A placement names no symbol, or one this file did not recover.
+    SymbolMissing,
+    /// A named symbol carries no graph bounds, so its box cannot be placed.
+    SymbolBoundsMissing,
+    /// The hull of the placed symbol boxes is not the element's box.
+    HullDisagreed,
+    /// The hull agrees and a member's symbol carries no decoded body.
+    MemberHasNoBody,
+    /// A member's body would not convert to metres.
+    MemberNotConverted,
+    /// A member's body decoded but does not close: see `BimBrep::complete`.
+    MemberIncomplete,
+}
+
+fn nested_assembly(
+    element: &ExportedElement,
+    elements: &BTreeMap<u32, ExportedElement>,
+) -> Result<Vec<BimBrep>, NestedRefusal> {
+    let placements = &element.declared_placements;
+    if placements.len() < 2 {
+        return Err(NestedRefusal::NotSeveral);
+    }
+    let bounds = element
+        .placement_bounds
+        .ok_or(NestedRefusal::NoElementBounds)?;
+    let symbols = placements
+        .iter()
+        .map(|placement| {
+            let symbol = elements.get(&placement.symbol_element_id?)?;
+            Some((*placement, symbol))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or(NestedRefusal::SymbolMissing)?;
+
+    // The verification, before anything is built: the set has to be the
+    // element, which is what reproducing the element's own box says.
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    for (placement, symbol) in &symbols {
+        let symbol_bounds = symbol
+            .geometry_graph
+            .as_ref()
+            .ok_or(NestedRefusal::SymbolBoundsMissing)?
+            .bounds;
+        let (low, high) = GElementBounds::transformed(&symbol_bounds, placement);
+        for axis in 0..3 {
+            min[axis] = min[axis].min(low[axis]);
+            max[axis] = max[axis].max(high[axis]);
+        }
+    }
+    let hull_agrees = min
+        .into_iter()
+        .chain(max)
+        .zip(bounds.min.into_iter().chain(bounds.max))
+        .all(|(ours, theirs)| {
+            ours.is_finite() && (ours - theirs).abs() <= BODY_BOUNDS_TOLERANCE_FEET
+        });
+    if !hull_agrees {
+        return Err(NestedRefusal::HullDisagreed);
+    }
+
+    let mut parts = Vec::with_capacity(symbols.len());
+    for (placement, symbol) in &symbols {
+        let local = symbol.brep.as_ref().ok_or(NestedRefusal::MemberHasNoBody)?;
+        let brep = normalize_brep(local, placement).ok_or(NestedRefusal::MemberNotConverted)?;
+        if !brep.complete {
+            return Err(NestedRefusal::MemberIncomplete);
+        }
+        parts.push(brep);
+    }
+    if parts.is_empty() {
+        return Err(NestedRefusal::MemberHasNoBody);
+    }
+    Ok(parts)
+}
+
 fn normalize_geometry(
     element: &ExportedElement,
     element_type: BimElementType,
@@ -7673,15 +9671,33 @@ fn normalize_geometry(
     // which would otherwise pile their bodies at the origin.
     if element.brep_is_placed && element.category_source != Some("declared") {
         if let Some(brep) = element.brep.as_ref().and_then(normalize_placed_brep) {
-            // Complete bodies only, for the reason the symbol path gives
-            // below: IfcOpenShell refuses a large share of open shells.
+            // Closed bodies only, for the reason the symbol path gives below:
+            // IfcOpenShell refuses a large share of open shells.
             if brep.complete {
                 return Some(BimGeometry::Brep(brep));
             }
         }
+        // A body that reproduced its record's box but does not close is still
+        // an element of that exact extent - the box is verified by the same
+        // agreement that placed the body - so it carries the box, exactly as
+        // an instance whose symbol body does not close carries its symbol's.
+        if let Some(bounds) = element
+            .brep_placement_box
+            .filter(rvt_model::GElementBounds::is_volumetric)
+        {
+            return Some(BimGeometry::BoundingBox(BimBoundingBox {
+                min: point(bounds.min)?,
+                max: point(bounds.max)?,
+            }));
+        }
     }
     if !carries_family_symbol_geometry(element_type) {
         return None;
+    }
+    // Several declared placements, verified as a set. See `nested_assembly`:
+    // this is the only path for an element no single transform describes.
+    if let Ok(parts) = nested_assembly(element, elements) {
+        return Some(BimGeometry::Assembly(parts));
     }
     let symbol = element.verified_symbol_bounds?;
     if let (Some(local_brep), Some(transform)) = (
@@ -7703,10 +9719,19 @@ fn normalize_geometry(
             }
         }
     }
-    Some(BimGeometry::BoundingBox(BimBoundingBox {
-        min: point(symbol.bounds.min)?,
-        max: point(symbol.bounds.max)?,
-    }))
+    // A box flat on an axis is an extent, not a volume, and the IFC writer
+    // will not make an `IfcBoundingBox` of one; saying so here keeps a product
+    // from carrying a representation that silently holds nothing.
+    symbol
+        .bounds
+        .is_volumetric()
+        .then(|| {
+            Some(BimGeometry::BoundingBox(BimBoundingBox {
+                min: point(symbol.bounds.min)?,
+                max: point(symbol.bounds.max)?,
+            }))
+        })
+        .flatten()
 }
 
 /// The rigid transform of a body that is already placed. Reusing
@@ -7945,7 +9970,13 @@ fn normalize_brep(
     }
     Some(BimBrep {
         faces,
-        complete: local.excluded_faces.is_empty(),
+        // Closed means the boundary closes, not merely that the record
+        // excluded no face - see `SymbolBrep::is_closed`. A body trimmed of
+        // the cut geometry the file joined to it can never satisfy that test,
+        // because the faces it dropped are still named by the edges that
+        // reach them; what it can satisfy is the same claim read off the faces
+        // being written - see `SymbolBrep::bounds_a_volume`.
+        complete: local.is_closed() || local.bounds_a_volume(),
     })
 }
 
@@ -8599,6 +10630,13 @@ fn write_bounds_json(writer: &mut impl Write, element: &ExportedElement) -> io::
             "graph_bounds",
             element.geometry_graph.as_ref().map(|graph| &graph.bounds),
         ),
+        (
+            "tight_bounds",
+            element
+                .geometry_graph
+                .as_ref()
+                .map(|graph| &graph.tight_bounds),
+        ),
     ] {
         if let Some(text) = bounds.and_then(box_json) {
             write!(writer, ",\"{key}\":{text}")?;
@@ -8676,6 +10714,28 @@ fn write_curve_candidates_json(
     Ok(())
 }
 
+/// The identifiers an element carries, each written only where it has one.
+fn write_element_id_fields(writer: &mut impl Write, element: &ExportedElement) -> io::Result<()> {
+    for (key, value) in [
+        ("category", element.category),
+        ("level_id", element.level_id),
+        ("family_id", element.family_id.or(element.header_family_id)),
+        ("type_id", element.type_element_id),
+        ("owner_view_id", element.owner_view_id),
+        ("created_phase_id", element.created_phase_id),
+        ("design_option_id", element.design_option_id),
+        ("unplaced_owner_id", element.unplaced_owner_id),
+        ("design_option_set_id", element.design_option_set_id),
+        ("main_design_option_id", element.main_design_option_id),
+        ("host_id", element.host_id),
+    ] {
+        if let Some(value) = value {
+            write!(writer, ",\"{key}\":{value}")?;
+        }
+    }
+    Ok(())
+}
+
 fn write_element_json(
     writer: &mut impl Write,
     id: u32,
@@ -8705,19 +10765,7 @@ fn write_element_json(
     if let Some(source) = element.category_source {
         write!(writer, ",\"category_source\":\"{source}\"")?;
     }
-    for (key, value) in [
-        ("category", element.category),
-        ("level_id", element.level_id),
-        ("family_id", element.family_id.or(element.header_family_id)),
-        ("type_id", element.type_element_id),
-        ("owner_view_id", element.owner_view_id),
-        ("created_phase_id", element.created_phase_id),
-        ("design_option_id", element.design_option_id),
-    ] {
-        if let Some(value) = value {
-            write!(writer, ",\"{key}\":{value}")?;
-        }
-    }
+    write_element_id_fields(writer, element)?;
     write_resolved_reference_names(writer, element, elements)?;
     if let Some(category) = &normalized.category {
         write!(
@@ -8874,6 +10922,20 @@ fn write_geometry_json(
                 ",\"geometry\":{{\"kind\":\"bounding_box\",\"min_meters\":[{},{},{}],\"max_meters\":[{},{},{}]}}",
                 min[0], min[1], min[2], max[0], max[1], max[2]
             )
+        }
+        // Each member of an assembly is a body in its own right, so the dump
+        // states them as the bodies they are rather than inventing a shape
+        // that holds them.
+        Some(BimGeometry::Assembly(parts)) => {
+            write!(writer, ",\"geometry\":{{\"kind\":\"assembly\",\"bodies\":[")?;
+            for (index, part) in parts.iter().enumerate() {
+                if index > 0 {
+                    write!(writer, ",")?;
+                }
+                write!(writer, "{{\"faces\":{}", part.faces.len())?;
+                write!(writer, ",\"closed\":{}}}", part.complete)?;
+            }
+            write!(writer, "]}}")
         }
         Some(BimGeometry::Brep(brep)) => {
             let (mut lines, mut arcs, mut polylines) = (0_usize, 0_usize, 0_usize);
@@ -9806,6 +11868,7 @@ mod tests {
                     geometry_graph: Some(GElementGraphFields {
                         top_level_nodes: Vec::new(),
                         bounds: symbol_bounds(max),
+                        tight_bounds: symbol_bounds(max),
                     }),
                     ..ExportedElement::default()
                 },
@@ -9835,7 +11898,7 @@ mod tests {
         };
 
         let mut volumetric = model([1.0, 2.0, 3.0]);
-        attach_symbol_bounds(&mut volumetric, Some(7));
+        attach_symbol_bounds(&mut volumetric);
         assert_eq!(
             volumetric[&9].verified_symbol_bounds,
             Some(VerifiedSymbolBounds {
@@ -9844,9 +11907,24 @@ mod tests {
             })
         );
 
+        // A symbol box flat on an axis is still a verified link - the two
+        // boxes agree, which is the whole of what the link claims - but it is
+        // an extent and not a volume, so it becomes no representation. The
+        // refusal belongs where the box would be written, not where the link
+        // is made.
         let mut flat = model([1.0, 2.0, -3.0]);
-        attach_symbol_bounds(&mut flat, Some(7));
-        assert_eq!(flat[&9].verified_symbol_bounds, None);
+        attach_symbol_bounds(&mut flat);
+        assert_eq!(
+            flat[&9].verified_symbol_bounds,
+            Some(VerifiedSymbolBounds {
+                symbol_element_id: 5,
+                bounds: symbol_bounds([1.0, 2.0, -3.0]),
+            })
+        );
+        assert_eq!(
+            normalize_geometry(&flat[&9], BimElementType::Unknown, &flat),
+            None
+        );
     }
 
     #[test]
@@ -9871,6 +11949,7 @@ mod tests {
                     geometry_graph: Some(GElementGraphFields {
                         top_level_nodes: Vec::new(),
                         bounds: symbol_bounds,
+                        tight_bounds: symbol_bounds,
                     }),
                     ..ExportedElement::default()
                 },
@@ -9900,20 +11979,20 @@ mod tests {
         };
 
         let mut inherited = model(None);
-        attach_symbol_bounds(&mut inherited, Some(7));
+        attach_symbol_bounds(&mut inherited);
         assert!(inherited[&9].verified_symbol_bounds.is_some());
         assert_eq!(inherited[&9].category, Some(-2_008_049));
         assert_eq!(inherited[&9].category_source, Some("symbol"));
 
         // A category the element declared is kept, and its provenance with it.
         let mut declared = model(Some(-2_008_049));
-        attach_symbol_bounds(&mut declared, Some(7));
+        attach_symbol_bounds(&mut declared);
         assert!(declared[&9].verified_symbol_bounds.is_some());
         assert_eq!(declared[&9].category_source, None);
 
         // Two categories that disagree refuse the link outright.
         let mut disagreeing = model(Some(-2_000_151));
-        attach_symbol_bounds(&mut disagreeing, Some(7));
+        attach_symbol_bounds(&mut disagreeing);
         assert_eq!(disagreeing[&9].verified_symbol_bounds, None);
         assert_eq!(disagreeing[&9].category, Some(-2_000_151));
     }
@@ -10457,16 +12536,16 @@ mod tests {
     }
 
     #[test]
-    fn a_record_carrying_an_exact_block_is_judged_on_it_alone() {
+    fn a_body_is_judged_on_the_box_its_record_declares() {
         let exact = bounds([40.0, 5.0, 0.0], [41.0, 6.0, 9.0]);
         let graph = bounds([0.0, 0.0, 0.0], [1.0, 1.0, 9.0]);
-        // Where a record carries both, they are the same box, so which one is
-        // picked cannot matter - but a record whose exact block refuses a body
-        // must not get to ask a second box about it either.
-        assert_eq!(body_placement_box(Some(exact), Some(graph)), Some(exact));
+        // `GRep.m_bBox`, read at its declared offset, is the record's box.
+        // The duplicated-block scan is a search for that same field, and on a
+        // record whose two boxes differ it can land on a different pair of
+        // blocks entirely, so it is what gives way when the two disagree.
+        assert_eq!(body_placement_box(Some(exact), Some(graph)), Some(graph));
         assert_eq!(body_placement_box(Some(exact), None), Some(exact));
-        // A record that carries no exact block is the whole of what the graph
-        // header's box adds.
+        // A record whose node array could not be read still has the scan.
         assert_eq!(body_placement_box(None, Some(graph)), Some(graph));
         assert_eq!(body_placement_box(None, None), None);
     }

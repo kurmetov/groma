@@ -108,6 +108,13 @@ pub enum BimElementType {
     FireSuppressionTerminal,
     Alarm,
     CableCarrierFitting,
+    /// A run of a building system, named by the category its own type
+    /// declares: a pipe, a duct, or a conduit or cable tray carrying cable.
+    /// No reference export measures these - the corpus has none for a plumbing
+    /// or electrical model - so what stands behind them is the category the
+    /// element's type declares and the geometry the run itself carries.
+    DuctSegment,
+    CableCarrierSegment,
     /// Source category that is certainly an MEP distribution element without
     /// naming the device. Recorded as the supertype rather than guessed.
     DistributionElement,
@@ -161,6 +168,12 @@ pub enum BimGeometry {
     /// source decoder could not resolve are omitted rather than guessed, so
     /// this is not always a claim of a closed, watertight solid.
     Brep(BimBrep),
+    /// Several closed solids that together are one element: a nested family
+    /// places one sub-instance per body, and no single one of them describes
+    /// the element. Every member is a closed shell - an incomplete one is left
+    /// out rather than shipped, exactly as a lone body is - so an exporter may
+    /// write them as one representation of several solid items.
+    Assembly(Vec<BimBrep>),
 }
 
 /// A boundary representation in world coordinates.

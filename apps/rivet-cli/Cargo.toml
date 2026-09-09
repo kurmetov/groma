@@ -12,9 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 bim-core = { path = "../../crates/bim-core" }
+bim-mesh = { path = "../../crates/bim-mesh" }
 clap.workspace = true
 ifc-export = { path = "../../crates/ifc-export" }
+ifc-import = { path = "../../crates/ifc-import" }
 revit-catalog = { path = "../../crates/revit-catalog" }
+scene-pack = { path = "../../crates/scene-pack" }
 rvt-container = { path = "../../crates/rvt-container" }
 rvt-model = { path = "../../crates/rvt-model" }
 rvt-schema = { path = "../../crates/rvt-schema" }

@@ -1,0 +1,17 @@
+[package]
+name = "scene-pack"
+description = "Binary viewer scene format for canonical BIM models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bim-core = { path = "../bim-core" }
+bim-mesh = { path = "../bim-mesh" }
+ifc-export = { path = "../ifc-export" }
+flate2.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

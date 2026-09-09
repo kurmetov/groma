@@ -167,6 +167,7 @@ pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk
         integers: Vec::new(),
         strings: Vec::new(),
         small_integers: Vec::new(),
+        alternate_integers: Vec::new(),
         node_headers: false,
         record_narrow_pending: true,
         trace: None,
@@ -201,6 +202,7 @@ pub fn walk_object_stream(schema: &Schema, class_index: u16, body: &[u8]) -> Ser
         integers: Vec::new(),
         strings: Vec::new(),
         small_integers: Vec::new(),
+        alternate_integers: Vec::new(),
         node_headers: false,
         record_narrow_pending: true,
         trace: None,
@@ -385,6 +387,11 @@ pub struct SerialObject {
     /// declaration order and sign-extended to `i64`. Small flag/enum fields
     /// such as `GEdge.m_flags` live here rather than in `numbers`.
     pub small_integers: Vec<i64>,
+    /// Every alternate integer this object read, in declaration order and
+    /// zero-extended to `i64`: `GInfo.m_flags`, `GFace.m_faceFlags_v9` and
+    /// the rest. These are bitfields, so the bytes are kept as written rather
+    /// than sign-extended - a top bit set is bit 31, not a negative number.
+    pub alternate_integers: Vec<i64>,
 }
 
 /// Same as [`walk_record`], keeping each object the node stream held.
@@ -576,6 +583,7 @@ pub fn record_declared_ids(
         integers: Vec::new(),
         strings: Vec::new(),
         small_integers: Vec::new(),
+        alternate_integers: Vec::new(),
         node_headers: false,
         record_narrow_pending: true,
         trace: Some(Vec::new()),
@@ -772,6 +780,7 @@ fn walk_record_inner(
         integers: Vec::new(),
         strings: Vec::new(),
         small_integers: Vec::new(),
+        alternate_integers: Vec::new(),
         node_headers: false,
         record_narrow_pending: true,
         trace: trace.then(Vec::new),
@@ -812,6 +821,7 @@ fn walk_record_inner(
         let first_integer = reader.integers.len();
         let first_string = reader.strings.len();
         let first_small_integer = reader.small_integers.len();
+        let first_alternate = reader.alternate_integers.len();
         stop = reader.read_class(reference.class_index, 1).err();
         if collect {
             objects.push(SerialObject {
@@ -825,6 +835,7 @@ fn walk_record_inner(
                 integers: reader.integers[first_integer..].to_vec(),
                 strings: reader.strings[first_string..].to_vec(),
                 small_integers: reader.small_integers[first_small_integer..].to_vec(),
+                alternate_integers: reader.alternate_integers[first_alternate..].to_vec(),
             });
         }
     }
@@ -862,6 +873,8 @@ struct Reader<'a> {
     strings: Vec<String>,
     /// Every `Bool`, `Integer8` or `Integer16` read, sign-extended to `i64`.
     small_integers: Vec<i64>,
+    /// Every alternate integer read, zero-extended to `i64`.
+    alternate_integers: Vec<i64>,
     /// Whether the walk is inside the node stream rather than the record's
     /// own declared properties.
     node_headers: bool,
@@ -1087,11 +1100,14 @@ impl Reader<'_> {
                         }
                     }
                 }
+                self.push_alternate(width);
                 self.advance(width).ok_or_else(truncated)
             }
-            FieldType::Integer16Alternate => self
-                .advance(ALTERNATE_INTEGER16_BYTES)
-                .ok_or_else(truncated),
+            FieldType::Integer16Alternate => {
+                self.push_alternate(ALTERNATE_INTEGER16_BYTES);
+                self.advance(ALTERNATE_INTEGER16_BYTES)
+                    .ok_or_else(truncated)
+            }
             FieldType::Float64 => {
                 let bytes = self
                     .body
@@ -1142,6 +1158,27 @@ impl Reader<'_> {
                 self.advance(width).ok_or_else(truncated)
             }
         }
+    }
+
+    /// Keep the value of an alternate integer about to be stepped over.
+    ///
+    /// The bytes are taken as written and zero-extended: these fields are
+    /// bitfields - `GInfo.m_flags`, `GFace.m_faceFlags_v9` - so bit 31 set is
+    /// a bit, not a sign. A field the body is too short for keeps nothing,
+    /// which is the same thing the walk does with it.
+    fn push_alternate(&mut self, width: usize) {
+        let Some(bytes) = self
+            .offset
+            .checked_add(width)
+            .and_then(|end| self.body.get(self.offset..end))
+        else {
+            return;
+        };
+        let mut value = 0_u32;
+        for (index, byte) in bytes.iter().take(4).enumerate() {
+            value |= u32::from(*byte) << (8 * index);
+        }
+        self.alternate_integers.push(i64::from(value));
     }
 
     fn advance(&mut self, bytes: usize) -> Option<()> {

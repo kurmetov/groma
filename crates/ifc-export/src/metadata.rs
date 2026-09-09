@@ -701,6 +701,17 @@ struct ProductEntity {
     attributes_after_predefined_type: usize,
 }
 
+/// The IFC entity a model element of this type is written as.
+///
+/// This is the one mapping `export-ifc` applies, published so that anything
+/// else - a viewer, a report - can say what an element would become without
+/// running the export and without keeping a second copy of the rules that
+/// could drift from this one.
+#[must_use]
+pub fn ifc_entity_name(element_type: BimElementType) -> &'static str {
+    product_entity(element_type).name
+}
+
 fn product_entity(element_type: BimElementType) -> ProductEntity {
     let mut attributes_before_predefined_type = 0;
     let mut attributes_after_predefined_type = 0;
@@ -712,6 +723,8 @@ fn product_entity(element_type: BimElementType) -> ProductEntity {
         BimElementType::FireSuppressionTerminal => ("IFCFIRESUPPRESSIONTERMINAL", true),
         BimElementType::Alarm => ("IFCALARM", true),
         BimElementType::CableCarrierFitting => ("IFCCABLECARRIERFITTING", true),
+        BimElementType::DuctSegment => ("IFCDUCTSEGMENT", true),
+        BimElementType::CableCarrierSegment => ("IFCCABLECARRIERSEGMENT", true),
         BimElementType::DistributionElement => ("IFCDISTRIBUTIONELEMENT", false),
         BimElementType::DistributionFlowElement => ("IFCDISTRIBUTIONFLOWELEMENT", false),
         BimElementType::Wall => ("IFCWALL", true),
@@ -826,6 +839,13 @@ fn push_geometry(
             placement_elevation,
             metric_placement,
         ),
+        BimGeometry::Assembly(parts) => push_assembly(
+            file,
+            parts,
+            representation_context,
+            placement_elevation,
+            metric_placement,
+        ),
     }
 }
 
@@ -833,13 +853,12 @@ fn push_geometry(
 /// closed-solid claim always corresponds to every source face resolving;
 /// otherwise `IfcShellBasedSurfaceModel`/`IfcOpenShell` over whichever faces
 /// did resolve, which is schema-valid for a shell known to be incomplete.
-fn push_brep(
+fn push_brep_item(
     file: &mut StepFile,
     brep: &BimBrep,
-    representation_context: EntityRef,
     placement_elevation: f64,
     metric_placement: Option<MetricPlacement>,
-) -> Option<EntityRef> {
+) -> Option<(EntityRef, &'static str)> {
     if brep.faces.is_empty() {
         return None;
     }
@@ -875,19 +894,79 @@ fn push_brep(
             "SurfaceModel",
         )
     };
-    let body = file.push(
-        "IFCSHAPEREPRESENTATION",
-        vec![
-            reference(representation_context),
-            string("Body"),
-            string(representation_type),
-            StepValue::List(vec![reference(item)]),
-        ],
+    Some((item, representation_type))
+}
+
+/// One body's shape representation, from the item [`push_brep_item`] wrote.
+fn push_brep(
+    file: &mut StepFile,
+    brep: &BimBrep,
+    representation_context: EntityRef,
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    let (item, representation_type) =
+        push_brep_item(file, brep, placement_elevation, metric_placement)?;
+    let body = push_body_representation(
+        file,
+        representation_context,
+        representation_type,
+        vec![item],
     );
     Some(file.push(
         "IFCPRODUCTDEFINITIONSHAPE",
         vec![omitted(), omitted(), StepValue::List(vec![reference(body)])],
     ))
+}
+
+/// The several closed solids of one element, as one `Body` representation.
+///
+/// A nested family is placed as several sub-instances and no single body
+/// describes it; `IfcShapeRepresentation.Items` is a set, so the members go in
+/// as several items of one representation rather than as several
+/// representations, which is what keeps the `RepresentationType` a true
+/// statement about all of them. Only members that write as `AdvancedBrep` are
+/// taken: mixing a surface model in under that type would make the type say
+/// something false about the item beside it.
+fn push_assembly(
+    file: &mut StepFile,
+    parts: &[BimBrep],
+    representation_context: EntityRef,
+    placement_elevation: f64,
+    metric_placement: Option<MetricPlacement>,
+) -> Option<EntityRef> {
+    let mut items = Vec::with_capacity(parts.len());
+    for part in parts {
+        match push_brep_item(file, part, placement_elevation, metric_placement) {
+            Some((item, "AdvancedBrep")) => items.push(item),
+            _ => return None,
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let body = push_body_representation(file, representation_context, "AdvancedBrep", items);
+    Some(file.push(
+        "IFCPRODUCTDEFINITIONSHAPE",
+        vec![omitted(), omitted(), StepValue::List(vec![reference(body)])],
+    ))
+}
+
+fn push_body_representation(
+    file: &mut StepFile,
+    representation_context: EntityRef,
+    representation_type: &str,
+    items: Vec<EntityRef>,
+) -> EntityRef {
+    file.push(
+        "IFCSHAPEREPRESENTATION",
+        vec![
+            reference(representation_context),
+            string("Body"),
+            string(representation_type),
+            StepValue::List(items.into_iter().map(reference).collect()),
+        ],
+    )
 }
 
 /// # Note on `SameSense`

@@ -1,7 +1,10 @@
 /target/
 
-# Confidential/local Revit corpora and any derived artifacts.
-/data/test/
+# Confidential/local Revit corpora and any derived artifacts. The whole of
+# /data/ is local working material - the corpus, the scenes packed from it and
+# the IFC exported from it - and none of it belongs in the repository.
+/data/
+*.rvs
 *.[rR][vV][tT]
 *.[rR][fF][aA]
 *.[rR][tT][eE]

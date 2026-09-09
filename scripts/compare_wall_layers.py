@@ -123,7 +123,7 @@ def read_reference_export(path):
         if not is_tagged_product(entity):
             continue
         fields = arguments(rest)
-        if len(fields) < 8:
+        if len(fields) < 8 or not carries_global_id(fields):
             continue
         tag = fields[7].strip().strip("'")
         if not tag.isdigit():
@@ -149,11 +149,28 @@ def is_tagged_product(entity):
 
     Everything relational, material or type-level is excluded; what is left is
     `IfcElement` and its subtypes, which all declare `Tag` in that slot.
+
+    The name alone is not enough - `IfcOwnerHistory` passes every one of these
+    tests and its eighth attribute is a Unix timestamp, which reads as a Revit
+    element id - so a caller must also check that the first attribute is a
+    `GlobalId`. See [`carries_global_id`].
     """
     return not any(
         entity.startswith(prefix)
         for prefix in ("IFCREL", "IFCMATERIAL", "IFCPROPERTY", "IFCQUANTITY")
     ) and not entity.endswith("TYPE")
+
+
+def carries_global_id(fields):
+    """Whether the instance's first attribute is an `IfcGloballyUniqueId`.
+
+    Every `IfcRoot` subtype opens with one, written as 22 base64 characters.
+    Nothing else in the file does, which is what separates a product from the
+    `IfcOwnerHistory` that otherwise passes [`is_tagged_product`].
+    """
+    return bool(fields) and bool(
+        re.fullmatch(r"'[0-9A-Za-z_$]{22}'", fields[0].strip())
+    )
 
 
 def read_our_export(path):

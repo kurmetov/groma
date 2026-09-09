@@ -39,6 +39,36 @@ const SOURCE_MAPPINGS: &[SourceMapping] = &[
         category_name: "OST_PipeCurves",
         element_type: BimElementType::PipeSegment,
     },
+    // The other runs of a building system, by the category their own type
+    // declares. `OST_PipeCurves` above is the same reading one class narrower;
+    // these are what the electrical and ventilation models are made of, and
+    // the corpus has no reference export for either, so they rest on the
+    // category alone - see `BimElementType::DuctSegment`.
+    SourceMapping {
+        class_name: Some("RbsFlexPipeCurve"),
+        category_name: "OST_FlexPipeCurves",
+        element_type: BimElementType::PipeSegment,
+    },
+    SourceMapping {
+        class_name: Some("RbsDuctCurve"),
+        category_name: "OST_DuctCurves",
+        element_type: BimElementType::DuctSegment,
+    },
+    SourceMapping {
+        class_name: Some("RbsFlexDuctCurve"),
+        category_name: "OST_FlexDuctCurves",
+        element_type: BimElementType::DuctSegment,
+    },
+    SourceMapping {
+        class_name: Some("RbsConduitCurve"),
+        category_name: "OST_Conduit",
+        element_type: BimElementType::CableCarrierSegment,
+    },
+    SourceMapping {
+        class_name: Some("CableTray"),
+        category_name: "OST_CableTray",
+        element_type: BimElementType::CableCarrierSegment,
+    },
     SourceMapping {
         class_name: None,
         category_name: "OST_PipeFitting",

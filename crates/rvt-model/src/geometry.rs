@@ -13,6 +13,8 @@ const BOUNDS_TOLERANCE_FEET: f64 = 1.0e-8;
 const GELEMENT_NODE_COUNT_OFFSET: usize = 14;
 const GELEMENT_NODE_REFERENCES_OFFSET: usize = 18;
 const GELEMENT_NODE_REFERENCE_BYTES: usize = 6;
+/// Six `f64`: one `GRep` box, minimum then maximum.
+const BOUNDS_BLOCK_BYTES: usize = 6 * 8;
 const MAX_GELEMENT_TOP_LEVEL_NODES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -155,6 +157,44 @@ pub struct GInstanceTransformFields {
 }
 
 impl GInstanceTransformFields {
+    /// Read the placement a `GInstance` declares, from the `InstInfoBase`
+    /// object its `m_instanceInfo` names.
+    ///
+    /// `InstInfoBase` declares exactly this: `m_Trf` - a `Trf` of `m_3x3`
+    /// (three rows of three `Float64`) and `m_or` (three more) - then
+    /// `m_symbolId` and `m_GRepId`. So the twelve numbers the walk read off
+    /// the object are the transform in declaration order and the first integer
+    /// is the symbol, with nothing located by scanning.
+    ///
+    /// This is what [`Self::parse`] was reaching for by searching the record's
+    /// bytes for a rigid twelve-double block. That search could only ever
+    /// answer for a record holding exactly one `GInstance` and one candidate
+    /// block, and it needed a box to test the origin against; reading the
+    /// declaration has none of those limits.
+    ///
+    /// The basis is still required to be a right-handed orthonormal frame.
+    /// `GInstance.m_bHasScale` says a scaled instance exists, and everything
+    /// downstream - the box cross-check and the body transform - is written
+    /// for a rigid motion, so a scaled or mirrored frame is refused here
+    /// rather than silently carried through as if it were rigid.
+    #[must_use]
+    pub fn from_instance_info(object: &crate::SerialObject) -> Option<Self> {
+        let numbers: [f64; 12] = object.numbers.get(..12)?.try_into().ok()?;
+        let (basis, origin) = read_trf(numbers)?;
+        let symbol_element_id = object
+            .integers
+            .first()
+            .copied()
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|id| *id > 0);
+        Some(Self {
+            offset: object.offset,
+            basis,
+            origin,
+            symbol_element_id,
+        })
+    }
+
     /// Recover one right-handed rigid `Trf` after a schema-resolved
     /// `GInstance` marker and require its origin to lie in the independently
     /// serialized element bounds.
@@ -175,23 +215,8 @@ impl GInstanceTransformFields {
             if values.into_iter().any(|value| !value.is_finite()) {
                 continue;
             }
-            let basis = [
-                [values[0], values[1], values[2]],
-                [values[3], values[4], values[5]],
-                [values[6], values[7], values[8]],
-            ];
-            if basis
-                .into_iter()
-                .any(|direction| (squared_norm(direction) - 1.0).abs() > DIRECTION_TOLERANCE)
-                || dot(basis[0], basis[1]).abs() > DIRECTION_TOLERANCE
-                || dot(basis[0], basis[2]).abs() > DIRECTION_TOLERANCE
-                || dot(basis[1], basis[2]).abs() > DIRECTION_TOLERANCE
-                || (determinant(basis) - 1.0).abs() > DIRECTION_TOLERANCE
-            {
+            let Some((basis, origin)) = read_trf(values) else {
                 continue;
-            }
-            let origin = RvtPoint3 {
-                coordinates_feet: [values[9], values[10], values[11]],
             };
             if !bounds.contains_point(origin) {
                 continue;
@@ -340,17 +365,35 @@ pub struct GElementNodeReference {
     pub class_index: u16,
 }
 
-/// Structurally located `GElement` graph header and its local or world bounds.
+/// Structurally located `GElement` graph header and the two boxes `GRep`
+/// declares after it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GElementGraphFields {
     pub top_level_nodes: Vec<GElementNodeReference>,
+    /// `GRep.m_bBox`: the box the placement chain is checked against, because
+    /// it is the one Revit derives the same way an instance's is - the hull of
+    /// the symbol's own box carried through the instance transform.
     pub bounds: GElementBounds,
+    /// `GRep.m_tightbBox`: the box around what the record actually draws. It
+    /// is inside `bounds` and often strictly inside it - a rotated instance is
+    /// the standard case - and that difference is why the two were once read
+    /// as one duplicated block and both were lost whenever they disagreed.
+    pub tight_bounds: GElementBounds,
 }
 
 impl GElementGraphFields {
     /// Decode the leading `GGroup.m_subNodes` reference array and the two
     /// immediately following `GRep` bounds blocks. The caller resolves node
     /// classes against the active schema and accepts only `GNode` subclasses.
+    ///
+    /// The two blocks are `GRep.m_bBox` and `GRep.m_tightbBox`, each read at
+    /// its own declared offset. They were previously required to be equal to
+    /// each other, which was a checksum on the offset rather than a reading of
+    /// the field: it cost the box of every record whose tight box is smaller
+    /// than its loose one, which is most instances placed at an angle. What
+    /// stands in for that check is the relation the two fields have by
+    /// definition - the tight box lies inside the loose one - which a
+    /// mislocated read fails just as loudly.
     #[must_use]
     pub fn parse(body: &[u8], mut accepts_node_class: impl FnMut(u16) -> bool) -> Option<Self> {
         let node_count = usize::try_from(read_u32(body, GELEMENT_NODE_COUNT_OFFSET)?).ok()?;
@@ -378,9 +421,24 @@ impl GElementGraphFields {
                 class_index,
             });
         }
+        let bounds = GElementBounds::parse_at(body, bounds_offset)?;
+        if !bounds
+            .min
+            .into_iter()
+            .zip(bounds.max)
+            .any(|(low, high)| high - low > BOUNDS_TOLERANCE_FEET)
+        {
+            return None;
+        }
+        let tight_bounds =
+            GElementBounds::parse_at(body, bounds_offset.checked_add(BOUNDS_BLOCK_BYTES)?)?;
+        if !bounds.contains_box(&tight_bounds) {
+            return None;
+        }
         Some(Self {
             top_level_nodes,
-            bounds: GElementBounds::parse_adjacent_at(body, bounds_offset, BOUNDS_TOLERANCE_FEET)?,
+            bounds,
+            tight_bounds,
         })
     }
 }
@@ -498,6 +556,22 @@ impl GElementBounds {
     /// instance transform reproduces this world-axis-aligned box.
     #[must_use]
     pub fn matches_transformed(&self, local: &Self, transform: &GInstanceTransformFields) -> bool {
+        let (transformed_min, transformed_max) = Self::transformed(local, transform);
+        transformed_min
+            .into_iter()
+            .chain(transformed_max)
+            .zip(self.min.into_iter().chain(self.max))
+            .all(|(expected, actual)| {
+                expected.is_finite()
+                    && actual.is_finite()
+                    && (expected - actual).abs() <= BOUNDS_TOLERANCE_FEET
+            })
+    }
+
+    /// The world-axis-aligned box around `local` carried through `transform`:
+    /// the hull of its eight transformed corners.
+    #[must_use]
+    pub fn transformed(local: &Self, transform: &GInstanceTransformFields) -> ([f64; 3], [f64; 3]) {
         let mut transformed_min = [f64::INFINITY; 3];
         let mut transformed_max = [f64::NEG_INFINITY; 3];
         for corner in 0_u8..8 {
@@ -529,48 +603,83 @@ impl GElementBounds {
                 transformed_max[axis] = transformed_max[axis].max(value);
             }
         }
-        transformed_min
-            .into_iter()
-            .chain(transformed_max)
-            .zip(self.min.into_iter().chain(self.max))
-            .all(|(expected, actual)| {
-                expected.is_finite()
-                    && actual.is_finite()
-                    && (expected - actual).abs() <= BOUNDS_TOLERANCE_FEET
-            })
+        (transformed_min, transformed_max)
     }
 
-    fn parse_adjacent_at(body: &[u8], offset: usize, tolerance: f64) -> Option<Self> {
-        const BLOCK_BYTES: usize = 6 * 8;
-        let first = read_f64_array::<6>(body, offset)?;
-        let second = read_f64_array::<6>(body, offset.checked_add(BLOCK_BYTES)?)?;
-        if first
-            .into_iter()
-            .zip(second)
-            .any(|(left, right)| !left.is_finite() || (left - right).abs() > tolerance)
-        {
+    /// Read one six-`f64` bounds block at a declared offset. Finite, and a
+    /// minimum that is not above its maximum on any axis; a block flat on
+    /// every axis is a point rather than a region and is accepted here, since
+    /// `GRep.m_tightbBox` is legitimately empty for a record that draws
+    /// nothing.
+    fn parse_at(body: &[u8], offset: usize) -> Option<Self> {
+        let values = read_f64_array::<6>(body, offset)?;
+        if values.into_iter().any(|value| !value.is_finite()) {
             return None;
         }
-        let min = [
-            first[0].min(second[0]),
-            first[1].min(second[1]),
-            first[2].min(second[2]),
-        ];
-        let max = [
-            first[3].max(second[3]),
-            first[4].max(second[4]),
-            first[5].max(second[5]),
-        ];
-        if min.into_iter().zip(max).any(|(low, high)| low > high)
-            || !min
-                .into_iter()
-                .zip(max)
-                .any(|(low, high)| high - low > tolerance)
-        {
+        let min = [values[0], values[1], values[2]];
+        let max = [values[3], values[4], values[5]];
+        if min.into_iter().zip(max).any(|(low, high)| low > high) {
             return None;
         }
         Some(Self { offset, min, max })
     }
+
+    /// Whether `inner` lies inside this box on every axis, which is what
+    /// `GRep.m_tightbBox` is to `GRep.m_bBox`.
+    #[must_use]
+    pub fn contains_box(&self, inner: &Self) -> bool {
+        (0..3).all(|axis| {
+            inner.min[axis] >= self.min[axis] - BOUNDS_TOLERANCE_FEET
+                && inner.max[axis] <= self.max[axis] + BOUNDS_TOLERANCE_FEET
+        })
+    }
+}
+
+/// Read a serialized `Trf`: `m_3x3` then `m_or`, twelve `Float64` in
+/// declaration order.
+///
+/// `m_3x3` is three tuples of three, and they are the matrix's **rows** - so
+/// the local X, Y and Z axes are its columns, and that is how they are
+/// returned. The two readings are transposes of each other and, for a
+/// rotation, inverses; a box hull cannot tell them apart when the rotation is
+/// a multiple of a quarter turn about an axis, which is why reading them the
+/// wrong way round survived so long. Measured on AR S1 by the one thing that
+/// does separate them - the instance's own box against its symbol's box
+/// carried through the transform, all six coordinates to 1e-8 ft: **5 220 of
+/// 5 625** instance/symbol pairs agree this way against 3 516 the other, and
+/// the 3 516 are a subset of the 5 220, so this reading loses nothing and adds
+/// the 1 704 rotated instances the other silently refused.
+fn read_trf(numbers: [f64; 12]) -> Option<([[f64; 3]; 3], RvtPoint3)> {
+    if numbers.into_iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let basis = [
+        [numbers[0], numbers[3], numbers[6]],
+        [numbers[1], numbers[4], numbers[7]],
+        [numbers[2], numbers[5], numbers[8]],
+    ];
+    if !is_right_handed_orthonormal(basis) {
+        return None;
+    }
+    Some((
+        basis,
+        RvtPoint3 {
+            coordinates_feet: [numbers[9], numbers[10], numbers[11]],
+        },
+    ))
+}
+
+/// Whether a 3x3 frame is a rotation: unit rows, mutually perpendicular, and
+/// right-handed. Everything downstream treats an instance transform as a rigid
+/// motion, so this is the condition for reading one as such.
+fn is_right_handed_orthonormal(basis: [[f64; 3]; 3]) -> bool {
+    !(basis
+        .into_iter()
+        .any(|direction| (squared_norm(direction) - 1.0).abs() > DIRECTION_TOLERANCE)
+        || dot(basis[0], basis[1]).abs() > DIRECTION_TOLERANCE
+        || dot(basis[0], basis[2]).abs() > DIRECTION_TOLERANCE
+        || dot(basis[1], basis[2]).abs() > DIRECTION_TOLERANCE
+        || (determinant(basis) - 1.0).abs() > DIRECTION_TOLERANCE)
 }
 
 fn unique_circular_section(body: &[u8], curve_driver_class_index: u16) -> Option<f64> {
@@ -840,6 +949,68 @@ mod tests {
         assert_eq!(transform.symbol_element_id, Some(417_391));
         assert!(bounds.contains_point(transform.origin));
         assert!((determinant(transform.basis) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reads_the_placement_an_instance_declares_with_the_axes_as_columns() {
+        // `Trf.m_3x3` is three rows of three, so the local axes are the
+        // matrix's columns. Here the rows are a quarter turn about Z one way,
+        // which makes the axes the same turn the other way - the one case a
+        // box hull cannot tell apart, and the reason reading it the wrong way
+        // round went unnoticed.
+        let object = crate::SerialObject {
+            object_id: u32::MAX,
+            class_index: 2_307,
+            offset: 176,
+            bytes: 112,
+            references: Vec::new(),
+            identifiers: Vec::new(),
+            numbers: vec![
+                0.0, 1.0, 0.0, //
+                -1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, //
+                10.0, 20.0, 30.0,
+            ],
+            integers: vec![417_391, 0],
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
+        };
+        let transform = GInstanceTransformFields::from_instance_info(&object).unwrap();
+        assert_eq!(transform.offset, 176);
+        assert_eq!(transform.symbol_element_id, Some(417_391));
+        for (actual, expected) in transform
+            .basis
+            .into_iter()
+            .flatten()
+            .chain(transform.origin.coordinates_feet)
+            .zip([
+                0.0, -1.0, 0.0, //
+                1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, //
+                10.0, 20.0, 30.0,
+            ])
+        {
+            assert!((actual - expected).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn refuses_a_declared_placement_that_is_not_a_rotation() {
+        let scaled = crate::SerialObject {
+            object_id: u32::MAX,
+            class_index: 2_307,
+            offset: 0,
+            bytes: 0,
+            references: Vec::new(),
+            identifiers: Vec::new(),
+            numbers: vec![2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            integers: vec![5, 0],
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
+        };
+        assert!(GInstanceTransformFields::from_instance_info(&scaled).is_none());
     }
 
     #[test]

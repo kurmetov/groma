@@ -491,6 +491,7 @@ mod tests {
             integers: Vec::new(),
             strings: Vec::new(),
             small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
         }
     }
 

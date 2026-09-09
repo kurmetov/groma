@@ -9,9 +9,9 @@
 # change bought and what, if anything, it sold.
 #
 # label	metric	value	better
-BIG	brep.bodies_complete	9709	higher
+BIG	brep.bodies_complete	9758	higher
 BIG	brep.edges_unresolved	4096	lower
-BIG	brep.faces_excluded	6404	lower
+BIG	brep.faces_excluded	5054	lower
 BIG	brep.faces_resolved	108023	higher
 BIG	brep.records_with_body	10534	higher
 BIG	class.CategoryElem.exact	263493	higher
@@ -63,9 +63,9 @@ BIG	class.VarSketch.walked	15678	higher
 BIG	gelement.face_records	10534	higher
 BIG	gelement.face_records_exact	10534	higher
 BIG	gelement.faces	114427	higher
-MEDIUM	brep.bodies_complete	7533	higher
+MEDIUM	brep.bodies_complete	7558	higher
 MEDIUM	brep.edges_unresolved	3202	lower
-MEDIUM	brep.faces_excluded	2852	lower
+MEDIUM	brep.faces_excluded	2313	lower
 MEDIUM	brep.faces_resolved	45712	higher
 MEDIUM	brep.records_with_body	7712	higher
 MEDIUM	class.CategoryElem.exact	111235	higher
@@ -115,9 +115,9 @@ MEDIUM	class.TextNoteAttributes.walked	14467	higher
 MEDIUM	gelement.face_records	7712	higher
 MEDIUM	gelement.face_records_exact	7712	higher
 MEDIUM	gelement.faces	48564	higher
-SMALL	brep.bodies_complete	12946	higher
+SMALL	brep.bodies_complete	13745	higher
 SMALL	brep.edges_unresolved	72	lower
-SMALL	brep.faces_excluded	5210	lower
+SMALL	brep.faces_excluded	619	lower
 SMALL	brep.faces_resolved	111562	higher
 SMALL	brep.records_with_body	13886	higher
 SMALL	class.Alignment.exact	4667	higher

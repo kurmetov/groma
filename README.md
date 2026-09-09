@@ -67,6 +67,7 @@ cargo run -p rivet-cli -- export-json model.rvt --output model.jsonl
 cargo run -p rivet-cli -- export-json model.rvt --full --output model.jsonl
 cargo run -p rivet-cli -- export-ifc model.rvt --output model.ifc
 python -m ifcopenshell.validate model.ifc --rules
+cargo run -p rivet-cli -- export-scene model.rvt --output model.rvs
 ```
 
 `schema` reports the generic class hierarchy and property counts without
@@ -133,6 +134,19 @@ classes referenced by the element and exactly one matching run is present;
 legacy unbound results from unsupported releases stay out of IFC. Pass
 `--model-namespace <UUID>` to keep IDs stable if the source file moves,
 otherwise the canonical RVT path determines the namespace.
+`export-scene` writes the binary scene a viewer loads: the same recovered
+elements and levels `export-ifc` maps, the triangles their geometry tessellates
+to, and their properties. Geometry is tessellated once, in Rust, to a chord
+tolerance given in millimetres (`--chord-tolerance-mm`, 4 by default), so a
+browser copies buffers to the GPU rather than parsing them. Elements are
+ordered along a Morton curve and cut into chunks (`--chunk-triangles`), which
+is what lets positions be sixteen-bit offsets inside a chunk's own box and lets
+a viewer cull or stream a chunk whole. Properties sit in separate blocks of
+`--property-block` elements, fetched only when something is selected. Every
+section is raw deflate, which a browser decompresses natively through
+`DecompressionStream("deflate-raw")`; the manifest is located by a 24-byte
+trailer, so a reader needs two range requests before the first triangle. A face
+the tessellator cannot read is counted and reported, never replaced by a box.
 Unknown stream bytes are always available through `dump-stream` and the
 `rvt-container` API.
 
@@ -144,6 +158,8 @@ Unknown stream bytes are always available through `dump-stream` and the
 - `bim-core`: format-independent BIM types
 - `revit-catalog`: versioned Revit identifiers and Forge unit conversion
 - `ifc-export`: IFC4 model builder, GlobalId and STEP writer
+- `bim-mesh`: tessellation of canonical BIM geometry into triangle meshes
+- `scene-pack`: the binary viewer scene format
 - `rivet-cli`: command-line interface
 
 See [`docs/architecture.md`](docs/architecture.md) and
