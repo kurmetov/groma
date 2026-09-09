@@ -338,6 +338,24 @@ fn tessellate_face(face: &BimBrepFace, options: &MeshOptions, mesh: &mut Mesh) -
             );
             return true;
         }
+        // One loop that winds once round bounds a patch, not a band: the
+        // exporter walks half the circumference at one end of the tube, steps
+        // along the axis, and walks the rest at the other, so two such faces
+        // tile the wall between them. Unwrapped, that loop is a path across
+        // one period which starts and ends at the same second parameter, and
+        // the face is what lies between the path and that line - which is a
+        // band with one side held constant.
+        if encircling.len() == 1 && unwrapped.len() == 1 {
+            // The path must cross the period once without turning back: then
+            // it has a single second parameter at each point along the way,
+            // and what lies between it and its own start line is the face. A
+            // loop that doubles back is some other shape this does not read.
+            let Some(path) = one_way_round(encircling[0], period) else {
+                return false;
+            };
+            build_winding_patch(&surface, &path, period, mesh);
+            return true;
+        }
         return false;
     }
 
@@ -422,6 +440,86 @@ fn unwrap_ring(surface: &Surface, points: &[Vec3], period: Option<f64>) -> Ring 
         uv,
         encircles,
         area,
+    }
+}
+
+/// A winding loop as a path that crosses the period once in one direction, or
+/// `None` where it turns back on itself.
+///
+/// The direction the source wound it in is not fixed, so a path running the
+/// other way is reversed rather than refused.
+fn one_way_round(ring: &Ring, period: f64) -> Option<Ring> {
+    let first = *ring.uv.first()?;
+    let last = *ring.uv.last()?;
+    let mut steps: Vec<f64> = ring
+        .uv
+        .windows(2)
+        .map(|pair| pair[1][0] - pair[0][0])
+        .collect();
+    // The step that closes the loop crosses the seam the way the rest of it
+    // was walked: a loop wound the other way comes back a period below where
+    // it started, not above.
+    let travelled: f64 = steps.iter().sum();
+    let closing = if travelled >= 0.0 {
+        first[0] + period - last[0]
+    } else {
+        first[0] - period - last[0]
+    };
+    steps.push(closing);
+    // The seam step closes the loop, so the tolerance is scaled to the period
+    // rather than absolute: a point either side of a corner may wobble.
+    let slack = period * 1e-9;
+    let rising = steps.iter().all(|step| *step >= -slack);
+    let falling = steps.iter().all(|step| *step <= slack);
+    if rising == falling {
+        // Either it turns back, or it never moves at all.
+        return None;
+    }
+    if rising {
+        return Some(Ring {
+            uv: ring.uv.clone(),
+            encircles: true,
+            area: ring.area,
+        });
+    }
+    let mut uv = ring.uv.clone();
+    uv.reverse();
+    // Reversed, the path now starts where it used to end and still has to
+    // begin at the seam it will close a period later.
+    Some(Ring {
+        uv,
+        encircles: true,
+        area: ring.area,
+    })
+}
+
+/// The face bounded by a loop that winds once round the surface.
+///
+/// The loop is walked as a path across one period, and the face is what lies
+/// between that path and the second parameter the path set out from. Stitching
+/// at the path's own points rather than at even steps keeps the corner where
+/// it changes ends exactly where the source put it; where the path already
+/// runs along that line the quads there are empty, which is the half of the
+/// wall the neighbouring face covers.
+fn build_winding_patch(surface: &Surface, ring: &Ring, period: f64, mesh: &mut Mesh) {
+    let Some(first) = ring.uv.first().copied() else {
+        return;
+    };
+    let held = first[1];
+    let count = ring.uv.len();
+    for index in 0..count {
+        let a = ring.uv[index];
+        let b = if index + 1 < count {
+            ring.uv[index + 1]
+        } else {
+            [first[0] + period, held]
+        };
+        let lower_a = surface.push_uv(mesh, a);
+        let lower_b = surface.push_uv(mesh, b);
+        let upper_a = surface.push_uv(mesh, [a[0], held]);
+        let upper_b = surface.push_uv(mesh, [b[0], held]);
+        mesh.push_triangle(lower_a, lower_b, upper_b);
+        mesh.push_triangle(lower_a, upper_b, upper_a);
     }
 }
 
@@ -715,15 +813,12 @@ fn tessellate_bounding_box(box3: &BimBoundingBox, mesh: &mut Mesh) {
 mod tests {
     use super::{MeshOptions, tessellate};
     use bim_core::{
-        BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepSurface,
-        BimGeometry, BimLineSegment, BimNumber, BimPoint3, BimSweptDisk, BimUnit,
+        BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace,
+        BimBrepSurface, BimGeometry, BimLineSegment, BimNumber, BimPoint3, BimSweptDisk, BimUnit,
     };
 
     fn metres_unit() -> BimUnit {
-        BimUnit {
-            id: super::METRES.to_owned(),
-            name: "Meters".to_owned(),
-        }
+        BimUnit::new(super::METRES, "Meters")
     }
 
     fn at(coordinates: [f64; 3]) -> BimPoint3 {
@@ -835,6 +930,27 @@ mod tests {
         }
     }
 
+    /// The total area of a mesh's triangles. A fold in the parameter plane
+    /// shows up here as a multiple, where a bounding box would not move.
+    fn area(mesh: &super::Mesh) -> f64 {
+        mesh.indices
+            .chunks_exact(3)
+            .map(|face| {
+                let corner = |i: usize| {
+                    let at = face[i] as usize * 3;
+                    [
+                        mesh.positions[at],
+                        mesh.positions[at + 1],
+                        mesh.positions[at + 2],
+                    ]
+                };
+                let (a, b, c) = (corner(0), corner(1), corner(2));
+                let normal = super::cross(super::subtract(b, a), super::subtract(c, a));
+                f64::sqrt(super::dot(normal, normal)) / 2.0
+            })
+            .sum()
+    }
+
     fn volume(mesh: &super::Mesh) -> f64 {
         mesh.signed_volume6() / 6.0
     }
@@ -862,13 +978,132 @@ mod tests {
         assert!(volume(&mesh) > 0.0);
     }
 
+    /// A cylinder wall Revit states as one loop that winds once round, rather
+    /// than as the two rim circles of a band: it runs along the axis, half way
+    /// round at one end, back along the axis, and the other half at the other.
+    /// This is the commonest face in a model full of holes, and reading it as
+    /// a band left every such wall out of the mesh.
+    fn half_tube(radius: f64, height: f64) -> BimBrepFace {
+        let axis = |angle: f64, z: f64| [radius * f64::cos(angle), radius * f64::sin(angle), z];
+        let arc = |start: [f64; 3], end: [f64; 3], z: f64, from: f64, to: f64| BimBrepEdge {
+            start: at(start),
+            end: at(end),
+            curve: BimBrepCurve::Arc(BimBrepArc {
+                center: at([0.0, 0.0, z]),
+                x_axis: [1.0, 0.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+                radius: BimNumber {
+                    value: radius,
+                    unit: Some(metres_unit()),
+                },
+                start_angle: from,
+                end_angle: to,
+            }),
+        };
+        let pi = std::f64::consts::PI;
+        BimBrepFace {
+            surface: BimBrepSurface::Cylinder {
+                center: at([0.0, 0.0, 0.0]),
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+                radius: BimNumber {
+                    value: radius,
+                    unit: Some(metres_unit()),
+                },
+            },
+            loops: vec![vec![
+                line(axis(0.0, height), axis(0.0, 0.0)),
+                arc(axis(0.0, 0.0), axis(pi, 0.0), 0.0, 0.0, pi),
+                line(axis(pi, 0.0), axis(pi, height)),
+                arc(axis(pi, height), axis(0.0, height), height, -pi, 0.0),
+            ]],
+        }
+    }
+
+    #[test]
+    fn a_wall_stated_as_one_winding_loop_is_read_rather_than_dropped() {
+        let radius = 0.1;
+        let height = 0.003;
+        let brep = BimBrep {
+            faces: vec![half_tube(radius, height)],
+            complete: false,
+        };
+        let mesh = tessellate(&BimGeometry::Brep(brep), &MeshOptions::default());
+        assert_eq!(mesh.skipped_faces, 0, "the winding loop was refused");
+        assert!(mesh.triangle_count() > 0, "no triangles were built");
+
+        // Every vertex must sit on the cylinder it was cut from, and inside
+        // the band: a seam handled wrongly throws points off the surface.
+        for xyz in mesh.positions.chunks_exact(3) {
+            let off_axis = f64::hypot(xyz[0], xyz[1]);
+            assert!(
+                (off_axis - radius).abs() < 1e-9,
+                "a vertex left the cylinder: {off_axis} against {radius}"
+            );
+            assert!(
+                (-1e-9..=height + 1e-9).contains(&xyz[2]),
+                "a vertex left the band: {}",
+                xyz[2]
+            );
+        }
+
+        // Half the circumference, times the height: the patch covers one side
+        // of the tube, not nothing and not the whole of it.
+        let area = area(&mesh);
+        // Half the circumference times the height. The facets are inscribed
+        // in the arc, so the patch comes out a little under that and never
+        // over: a fold in the parameter plane shows up here as a multiple.
+        let expected = std::f64::consts::PI * radius * height;
+        assert!(
+            (expected * 0.97..=expected).contains(&area),
+            "the patch covers {area}, not the {expected} of half a tube"
+        );
+    }
+
+    #[test]
+    fn a_winding_loop_wound_the_other_way_reads_the_same() {
+        // The direction the exporter wound the loop in is not fixed, and a
+        // wall must not appear or vanish with it.
+        let radius = 0.1;
+        let height = 0.003;
+        let mut face = half_tube(radius, height);
+        face.loops[0].reverse();
+        for edge in &mut face.loops[0] {
+            std::mem::swap(&mut edge.start, &mut edge.end);
+            if let BimBrepCurve::Arc(arc) = &mut edge.curve {
+                std::mem::swap(&mut arc.start_angle, &mut arc.end_angle);
+            }
+        }
+        let brep = BimBrep {
+            faces: vec![face],
+            complete: false,
+        };
+        let mesh = tessellate(&BimGeometry::Brep(brep), &MeshOptions::default());
+        assert_eq!(
+            mesh.skipped_faces, 0,
+            "the reversed winding loop was refused"
+        );
+
+        let forward = tessellate(
+            &BimGeometry::Brep(BimBrep {
+                faces: vec![half_tube(radius, height)],
+                complete: false,
+            }),
+            &MeshOptions::default(),
+        );
+        let (there, back) = (area(&forward), area(&mesh));
+        assert!(
+            (there - back).abs() < there * 1e-9,
+            "the same wall covers {there} one way round and {back} the other"
+        );
+    }
+
     #[test]
     fn a_face_in_an_unreadable_unit_is_counted_rather_than_guessed() {
         let mut brep = unit_cube();
-        brep.faces[0].loops[0][0].start.unit = BimUnit {
-            id: "autodesk.unit.unit:feet-1.0.0".to_owned(),
-            name: "Feet".to_owned(),
-        };
+        brep.faces[0].loops[0][0].start.unit =
+            BimUnit::new("autodesk.unit.unit:feet-1.0.0", "Feet");
         let mesh = tessellate(&BimGeometry::Brep(brep), &MeshOptions::default());
         assert_eq!(mesh.skipped_faces, 1);
         assert_eq!(mesh.triangle_count(), 10);
