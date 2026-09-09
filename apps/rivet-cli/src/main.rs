@@ -452,7 +452,8 @@ enum Command {
         /// ends, for a caller driving a progress display.
         #[arg(long)]
         progress: bool,
-        /// Maximum decoded bytes accepted from one member.
+        /// Maximum decoded bytes accepted from one RVT member, or source
+        /// bytes accepted from an IFC file.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
     },
@@ -2205,6 +2206,16 @@ struct ExportedElement {
     /// the same record whose box became `placement_bounds`, so the two can be
     /// asked about each other. See `report_nested_placements`.
     declared_placements: Vec<GInstanceTransformFields>,
+    /// The box of the record that supplied [`ExportedElement::ginstance_transform`].
+    ///
+    /// `ginstance_transform` keeps the *first* record's single placement and
+    /// `placement_bounds` keeps the *last* record's box, so on an id whose
+    /// records declare a placement more than once between them those come
+    /// from two different records - the same crossing the body-to-box pairing
+    /// a few lines below is careful to avoid, and it was costing the symbol
+    /// link every one of SMALL's 819 refusals. This is set in the same step
+    /// as the transform, so the two are always one record's.
+    instance_placement_bounds: Option<GElementBounds>,
     geometry_graph: Option<GElementGraphFields>,
     geometry_bounds: Option<GElementBounds>,
     placement_bounds: Option<GElementBounds>,
@@ -6400,7 +6411,14 @@ fn recover_elements(
                                 // resolved, because picking one of them would
                                 // be picking arbitrarily.
                                 if let [only] = declared[..] {
-                                    entry.ginstance_transform.get_or_insert(only);
+                                    // Not `get_or_insert`: the box has to come
+                                    // from the record that supplied the
+                                    // transform, so both are set in the one
+                                    // step or neither is.
+                                    if entry.ginstance_transform.is_none() {
+                                        entry.ginstance_transform = Some(only);
+                                        entry.instance_placement_bounds = placement_bounds;
+                                    }
                                 }
                             }
                             let brep = rvt_model::assemble_symbol_brep(
@@ -6922,7 +6940,16 @@ fn attach_symbol_bounds(elements: &mut BTreeMap<u32, ExportedElement>) {
         else {
             continue;
         };
-        let Some(instance_bounds) = element.placement_bounds else {
+        // The box of the record that declared this transform, and only as a
+        // fallback the id's last box. An id whose records declare a placement
+        // more than once between them carries a box per record, and asking one
+        // record's transform about another record's box is comparing two
+        // records: on SMALL it refused 819 links, every one of which agrees
+        // when the pair is kept together.
+        let Some(instance_bounds) = element
+            .instance_placement_bounds
+            .or(element.placement_bounds)
+        else {
             continue;
         };
         // The bounds cross-check is the verification: all six coordinates of
@@ -7646,10 +7673,7 @@ fn building_storeys(
             elevation: element.elevation_feet.and_then(|value| {
                 Some(BimNumber {
                     value: revit_catalog::internal_feet_to_metres(value)?,
-                    unit: Some(BimUnit {
-                        id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                        name: "Meters".to_owned(),
-                    }),
+                    unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
                 })
             }),
         })
@@ -8712,6 +8736,33 @@ struct GeometryStatistics {
     /// declares - `GRep.m_bBox` and `GRep.m_tightbBox` - so which box the
     /// chain is actually about is read rather than assumed.
     bounds_match_by_box_pair: [usize; 4],
+    /// The instances the box cross-check refuses, and what refuses them. The
+    /// check is the only verification the symbol link has, so a refusal is
+    /// either a link that is not real or a box that is not the one to compare
+    /// - and those are opposite conclusions. Each field counts the same
+    /// refusals from a different side: whether the element declares more than
+    /// one placement (so its box is the hull of several and no single symbol
+    /// reproduces it), which box contains which, and how far apart the two
+    /// are.
+    instances_failing_the_box_cross_check: usize,
+    failing_with_several_placements: usize,
+    /// The instance's box holds the transformed symbol box: it draws that and
+    /// something more.
+    failing_whose_box_holds_the_symbols: usize,
+    /// The other way round: the symbol's box carried over reaches outside the
+    /// instance's, so what is placed is less than the symbol declares.
+    failing_whose_box_is_inside_the_symbols: usize,
+    /// Neither contains the other - the two boxes are somewhere else.
+    failing_with_neither_box_inside: usize,
+    /// Of the refusals, how many would agree against the id's last box - the
+    /// pairing this gate used to use. It is kept the other way round now, so
+    /// a file where the old crossing answered something this one does not is
+    /// visible rather than silent.
+    failing_that_agree_with_the_id_s_last_box: usize,
+    /// The largest of the six coordinate differences, in feet, bucketed by
+    /// [`BOX_GAP_BUCKETS`]. A gap of millimetres is a box read slightly wrong;
+    /// a gap of feet is a different object.
+    box_gap_buckets: [usize; BOX_GAP_BUCKETS.len()],
     /// Of the instances whose symbol has a body, how the category gate fails.
     instances_whose_symbol_has_no_category: usize,
     instances_whose_category_differs_from_the_symbol: usize,
@@ -8749,6 +8800,78 @@ struct GeometryStatistics {
     nested_refused_classes: BTreeMap<String, usize>,
 }
 
+/// How far apart the instance's box and the symbol's carried over may be, as
+/// `(name, largest gap in it)` in Revit internal feet. The first bucket is the
+/// tolerance the cross-check itself applies, so nothing a refusal produces can
+/// land in it; the rest separate a box read slightly wrong from a box that
+/// belongs to something else.
+const BOX_GAP_BUCKETS: [(&str, f64); 7] = [
+    ("<=1e-8", 1.0e-8),
+    ("<=1e-6", 1.0e-6),
+    ("<=1mm", 0.003_281),
+    ("<=1cm", 0.032_81),
+    ("<=10cm", 0.328_1),
+    ("<=1m", 3.281),
+    (">1m", f64::INFINITY),
+];
+
+/// Record one refusal of the box cross-check from every side that could
+/// explain it. Nothing here changes a verdict: it is the reading that says
+/// whether the 819 refusals on SMALL are links that are not real or boxes that
+/// are not the ones to compare.
+fn tally_box_cross_check_refusal(
+    statistics: &mut GeometryStatistics,
+    element: &ExportedElement,
+    instance_bounds: &GElementBounds,
+    symbol_bounds: &GElementBounds,
+    transform: &GInstanceTransformFields,
+) {
+    // The tolerance `GElementBounds::matches_transformed` applies, repeated
+    // here because containment has to be asked with the same slack the
+    // equality was.
+    const TOLERANCE_FEET: f64 = 1.0e-8;
+    statistics.instances_failing_the_box_cross_check += 1;
+    statistics.failing_with_several_placements +=
+        usize::from(element.declared_instance_placements > 1);
+    let (low, high) = GElementBounds::transformed(symbol_bounds, transform);
+    let holds = (0..3).all(|axis| {
+        instance_bounds.min[axis] <= low[axis] + TOLERANCE_FEET
+            && instance_bounds.max[axis] >= high[axis] - TOLERANCE_FEET
+    });
+    let inside = (0..3).all(|axis| {
+        instance_bounds.min[axis] >= low[axis] - TOLERANCE_FEET
+            && instance_bounds.max[axis] <= high[axis] + TOLERANCE_FEET
+    });
+    match (holds, inside) {
+        // Equal on every axis is what `matches_transformed` accepts, so it
+        // cannot reach here; if it ever did it would be a tolerance mismatch
+        // between the two and belongs with "holds".
+        (true, _) => statistics.failing_whose_box_holds_the_symbols += 1,
+        (false, true) => statistics.failing_whose_box_is_inside_the_symbols += 1,
+        (false, false) => statistics.failing_with_neither_box_inside += 1,
+    }
+    let gap = low
+        .into_iter()
+        .chain(high)
+        .zip(instance_bounds.min.into_iter().chain(instance_bounds.max))
+        .map(|(expected, actual)| (expected - actual).abs())
+        .fold(0.0_f64, f64::max);
+    let bucket = BOX_GAP_BUCKETS
+        .iter()
+        .position(|(_, largest)| gap <= *largest)
+        .unwrap_or(BOX_GAP_BUCKETS.len() - 1);
+    statistics.box_gap_buckets[bucket] += 1;
+    // The same question against the id's last box, which is what this gate
+    // compared against before the pair was kept together.
+    if let (Some(transform), Some(last_bounds)) =
+        (element.ginstance_transform, element.placement_bounds)
+    {
+        if last_bounds.matches_transformed(symbol_bounds, &transform) {
+            statistics.failing_that_agree_with_the_id_s_last_box += 1;
+        }
+    }
+}
+
 /// Report the funnel from "an instance names a symbol" to "that body is
 /// placed in the world". A shortfall in exported geometry is almost always one
 /// of these gates, and reading which one is what stops the next change being a
@@ -8778,6 +8901,24 @@ fn report_symbol_link_funnel(statistics: &GeometryStatistics) {
     println!(
         "  bounds match with the category gate not applied: {}",
         statistics.instances_whose_bounds_match_ignoring_category
+    );
+    println!(
+        "  the cross-check refuses {}: {} declare several placements, \
+         the instance box holds the symbol's {}, is inside it {}, neither {}",
+        statistics.instances_failing_the_box_cross_check,
+        statistics.failing_with_several_placements,
+        statistics.failing_whose_box_holds_the_symbols,
+        statistics.failing_whose_box_is_inside_the_symbols,
+        statistics.failing_with_neither_box_inside
+    );
+    let mut gaps = String::new();
+    for (index, (name, _)) in BOX_GAP_BUCKETS.iter().enumerate() {
+        let _ = write!(gaps, " {name}:{}", statistics.box_gap_buckets[index]);
+    }
+    println!("  by the largest of the six coordinate gaps, in feet:{gaps}");
+    println!(
+        "  of the refusals, agreeing with the id's last box instead: {}",
+        statistics.failing_that_agree_with_the_id_s_last_box
     );
     println!(
         "  category gate: symbol has none {}, differs {}",
@@ -8857,7 +8998,11 @@ fn geometry_statistics(
             let symbol = elements.get(&symbol_id);
             if symbol.is_some_and(|symbol| symbol.brep.is_some()) {
                 statistics.instances_whose_symbol_has_a_body += 1;
-                if element.placement_bounds.is_some() {
+                if element
+                    .instance_placement_bounds
+                    .or(element.placement_bounds)
+                    .is_some()
+                {
                     statistics.instances_with_a_symbol_body_and_own_bounds += 1;
                 }
                 if element.category.is_some()
@@ -8876,13 +9021,23 @@ fn geometry_statistics(
                 }
                 if let (Some(transform), Some(instance_bounds), Some(symbol_bounds)) = (
                     element.ginstance_transform,
-                    element.placement_bounds,
+                    element
+                        .instance_placement_bounds
+                        .or(element.placement_bounds),
                     symbol
                         .and_then(|symbol| symbol.geometry_graph.as_ref())
                         .map(|graph| graph.bounds),
                 ) {
                     if instance_bounds.matches_transformed(&symbol_bounds, &transform) {
                         statistics.instances_whose_bounds_match_ignoring_category += 1;
+                    } else {
+                        tally_box_cross_check_refusal(
+                            &mut statistics,
+                            element,
+                            &instance_bounds,
+                            &symbol_bounds,
+                            &transform,
+                        );
                     }
                 }
                 if let (Some(transform), Some(instance), Some(symbol)) = (
@@ -10078,10 +10233,10 @@ fn normalize_brep(
 }
 
 fn metres_unit() -> BimUnit {
-    BimUnit {
-        id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-        name: "Meters".to_owned(),
-    }
+    // Shared rather than built: the per-point closures in `normalize_brep`
+    // call this for every coordinate they convert, and a model runs to
+    // hundreds of millions of them.
+    BimUnit::metres()
 }
 
 fn normalize_property(
@@ -10108,10 +10263,10 @@ fn normalize_property(
             let (value, unit) = normalized.map_or((*number, None), |(specification, value)| {
                 (
                     value,
-                    Some(BimUnit {
-                        id: specification.storage_unit.to_owned(),
-                        name: specification.storage_unit_name.to_owned(),
-                    }),
+                    Some(BimUnit::new(
+                        specification.storage_unit,
+                        specification.storage_unit_name,
+                    )),
                 )
             });
             BimPropertyValue::Number(BimNumber { value, unit })
@@ -12372,7 +12527,7 @@ mod tests {
         let total = wall.total_thickness().unwrap();
         assert!((total.value - 0.2).abs() < 1.0e-12, "{}", total.value);
         assert_eq!(
-            total.unit.map(|unit| unit.id).as_deref(),
+            total.unit.as_ref().map(|unit| unit.id.as_str()),
             Some("autodesk.unit.unit:meters-1.0.0")
         );
         // The shell layer is outside the core; the structural one is in it.

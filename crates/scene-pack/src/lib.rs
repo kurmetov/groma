@@ -312,10 +312,7 @@ mod tests {
     };
 
     fn metres() -> BimUnit {
-        BimUnit {
-            id: bim_mesh::METRES.to_owned(),
-            name: "Meters".to_owned(),
-        }
+        BimUnit::new(bim_mesh::METRES, "Meters")
     }
 
     fn at(coordinates: [f64; 3]) -> BimPoint3 {
@@ -405,6 +402,39 @@ mod tests {
         assert_eq!(parsed["format"], "rivet-scene");
         assert_eq!(parsed["elements"]["ids"][0], "77");
         assert_eq!(parsed["chunks"].as_array().expect("chunks").len(), 1);
+    }
+
+    #[test]
+    fn an_ifc_scene_keeps_the_exact_source_entity_class() {
+        let mut element = boxy("77", [0.0; 3]);
+        // Beam has no dedicated canonical kind. Folding it through that kind
+        // would call it IFCBUILDINGELEMENTPROXY and make the viewer's only
+        // useful IFC filter lie about the source file.
+        element.class_name = Some("IFCBEAM".to_owned());
+        element.element_type = BimElementType::Unknown;
+        let model = BimModel {
+            elements: vec![element],
+            ..BimModel::default()
+        };
+        let mut bytes = Vec::new();
+        write_scene(
+            &model,
+            &SourceInfo {
+                name: "beam.ifc".to_owned(),
+                kind: "ifc".to_owned(),
+                ..SourceInfo::default()
+            },
+            &PackOptions::default(),
+            &mut bytes,
+        )
+        .expect("in-memory writer");
+        let tail = bytes.len() - super::TRAILER_BYTES;
+        let offset = u64::from_le_bytes(bytes[tail..tail + 8].try_into().expect("eight bytes"));
+        let stored = u32::from_le_bytes(bytes[tail + 8..tail + 12].try_into().expect("four bytes"));
+        let manifest = inflate(&bytes[offset as usize..offset as usize + stored as usize]);
+        let parsed: serde_json::Value = serde_json::from_slice(&manifest).expect("manifest JSON");
+        assert_eq!(parsed["ifcClasses"][0]["name"], "IFCBEAM");
+        assert_eq!(parsed["elements"]["ifcClasses"][0], 0);
     }
 
     fn inflate(bytes: &[u8]) -> Vec<u8> {

@@ -389,6 +389,7 @@ dependencies = [
  "rvt-model",
  "rvt-schema",
  "scene-pack",
+ "serde_json",
  "tempfile",
 ]
 

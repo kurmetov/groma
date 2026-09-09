@@ -7,6 +7,41 @@ fn fixture() -> NamedTempFile {
     fixture_with_schema(&schema_fixture())
 }
 
+fn ifc_fixture() -> NamedTempFile {
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(
+        b"ISO-10303-21;\n\
+          HEADER;\n\
+          FILE_SCHEMA(('IFC4'));\n\
+          ENDSEC;\n\
+          DATA;\n\
+          #1=IFCCARTESIANPOINT((0.,0.,0.));\n\
+          #2=IFCDIRECTION((0.,0.,1.));\n\
+          #3=IFCDIRECTION((1.,0.,0.));\n\
+          #4=IFCAXIS2PLACEMENT3D(#1,#2,#3);\n\
+          #5=IFCLOCALPLACEMENT($,#4);\n\
+          #6=IFCCARTESIANPOINT((0.,0.));\n\
+          #7=IFCDIRECTION((1.,0.));\n\
+          #8=IFCAXIS2PLACEMENT2D(#6,#7);\n\
+          #9=IFCRECTANGLEPROFILEDEF(.AREA.,$,#8,2.,1.);\n\
+          #10=IFCDIRECTION((0.,0.,1.));\n\
+          #11=IFCEXTRUDEDAREASOLID(#9,#4,#10,3.);\n\
+          #12=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#11));\n\
+          #13=IFCPRODUCTDEFINITIONSHAPE($,$,(#12));\n\
+          #14=IFCWALL('wall-guid',$,'Fixture wall',$,$,#5,#13,$,$);\n\
+          #15=IFCBUILDINGSTOREY('level-guid',$,'Ground floor',$,$,#5,$,$,$,0.);\n\
+          #16=IFCRELCONTAINEDINSPATIALSTRUCTURE('rel-guid',$,$,$,(#14),#15);\n\
+          #17=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n\
+          #18=IFCUNITASSIGNMENT((#17));\n\
+          #19=IFCPROJECT('project-guid',$,'Fixture project',$,$,$,$,(),#18);\n\
+          ENDSEC;\n\
+          END-ISO-10303-21;\n",
+    )
+    .unwrap();
+    file.flush().unwrap();
+    file
+}
+
 fn fixture_with_schema(schema: &[u8]) -> NamedTempFile {
     fixture_with_schema_and_partition(schema, b"partition")
 }
@@ -1079,6 +1114,64 @@ fn export_scene_writes_a_framed_scene_a_reader_can_locate() {
         manifest.contains("\"application\":\"Autodesk Revit\""),
         "{manifest}"
     );
+}
+
+#[test]
+fn export_scene_reads_ifc_geometry_levels_and_source_classes() {
+    let fixture = ifc_fixture();
+    let target = NamedTempFile::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-scene",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            target.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Entities read: 19"), "{stdout}");
+    assert!(stdout.contains("Building storeys: 1"), "{stdout}");
+    assert!(
+        stdout.contains("Elements: 1 (1 carry geometry)"),
+        "{stdout}"
+    );
+
+    let written = std::fs::read(target.path()).unwrap();
+    let trailer = written.len() - 24;
+    let offset = u64::from_le_bytes(written[trailer..trailer + 8].try_into().unwrap());
+    let stored = u32::from_le_bytes(written[trailer + 8..trailer + 12].try_into().unwrap());
+    let offset = usize::try_from(offset).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&inflate(&written[offset..offset + stored as usize])).unwrap();
+    assert_eq!(manifest["source"]["kind"], "ifc");
+    assert_eq!(manifest["counts"]["withGeometry"], 1);
+    assert_eq!(manifest["levels"][0]["name"], "Ground floor");
+    assert_eq!(manifest["ifcClasses"][0]["name"], "IFCWALL");
+}
+
+#[test]
+fn export_scene_refuses_an_ifc_above_the_safe_parsing_limit_before_reading_it() {
+    let fixture = ifc_fixture();
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-scene",
+            fixture.path().to_str().unwrap(),
+            "--max-member-bytes",
+            "8",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("safe parsing limit"), "{stderr}");
 }
 
 #[test]

@@ -8,10 +8,9 @@
 //! the cut solid is drawn, the cut is not.
 
 use bim_core::{
-    BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepSurface, BimGeometry,
-    BimLineSegment, BimNumber, BimPoint3, BimSweptDisk, BimUnit,
+    BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
+    BimBrepSurface, BimGeometry, BimLineSegment, BimNumber, BimPoint3, BimSweptDisk, BimUnit,
 };
-use bim_mesh::METRES;
 
 use crate::curve::{Sampler, arc_steps, close_enough};
 use crate::place::{
@@ -22,10 +21,8 @@ use crate::step::{Entity, Parsed, Value};
 
 #[must_use]
 pub fn metres() -> BimUnit {
-    BimUnit {
-        id: METRES.to_owned(),
-        name: "Meters".to_owned(),
-    }
+    // Shared, not built: this is called for every coordinate of every body.
+    BimUnit::metres()
 }
 
 #[must_use]
@@ -381,7 +378,10 @@ impl<'parsed> Builder<'parsed> {
     }
 
     fn face(&mut self, entity: &Entity, place: &Affine) -> Option<BimBrepFace> {
-        if entity.type_name != "IFCFACE" && entity.type_name != "IFCADVANCEDFACE" {
+        if entity.type_name == "IFCADVANCEDFACE" {
+            return self.advanced_face(entity, place);
+        }
+        if entity.type_name != "IFCFACE" {
             return None;
         }
         let mut outer: Option<Vec<Vec3>> = None;
@@ -427,6 +427,372 @@ impl<'parsed> Builder<'parsed> {
             inner.remove(widest)
         };
         planar_face(&outer, &inner)
+    }
+
+    /// An `IfcAdvancedFace`: exact surface plus topological edge loops.
+    ///
+    /// Unlike a faceted face, its bounds are `IfcEdgeLoop`s and may contain
+    /// arcs. The two orientation flags on an edge are composed here, and the
+    /// face-bound flag is applied once to the completed loop.
+    fn advanced_face(&self, entity: &Entity, place: &Affine) -> Option<BimBrepFace> {
+        let same_sense = truth(entity.attribute(2)?)?;
+        let surface = self
+            .parsed()
+            .follow(entity.attribute(1))
+            .and_then(|surface| self.advanced_surface(surface, place, same_sense))?;
+        let mut outer: Option<Vec<BimBrepEdge>> = None;
+        let mut inner = Vec::new();
+        for member in entity.attribute(0)?.as_list()? {
+            let bound = self.parsed().follow(Some(member))?;
+            let loop_entity = self.parsed().follow(bound.attribute(0))?;
+            let mut edges = self.edge_loop(loop_entity, place)?;
+            if !truth(bound.attribute(1)?)? {
+                reverse_loop(&mut edges);
+            }
+            if bound.type_name == "IFCFACEOUTERBOUND" && outer.is_none() {
+                outer = Some(edges);
+            } else {
+                inner.push(edges);
+            }
+        }
+        // `IfcFace` permits bounds without naming one `IfcFaceOuterBound`.
+        // Preserve that valid form; the mesher independently picks the loop
+        // with the widest parameter-space extent as the outer boundary.
+        let outer = outer.or_else(|| (!inner.is_empty()).then(|| inner.remove(0)))?;
+        let mut loops = Vec::with_capacity(inner.len() + 1);
+        loops.push(outer);
+        loops.extend(inner);
+        Some(BimBrepFace { surface, loops })
+    }
+
+    /// The analytic surface an advanced face lies on, in world coordinates.
+    fn advanced_surface(
+        &self,
+        entity: &Entity,
+        place: &Affine,
+        same_sense: bool,
+    ) -> Option<BimBrepSurface> {
+        match entity.type_name.as_str() {
+            "IFCPLANE" => {
+                let frame = self.placed_axis(entity.attribute(0), place)?;
+                let x = normalize(frame.basis[0])?;
+                let mut y = normalize(frame.basis[1])?;
+                if !same_sense {
+                    y = scale(y, -1.0);
+                }
+                Some(BimBrepSurface::Plane {
+                    origin: point3(frame.origin),
+                    x_axis: x,
+                    y_axis: y,
+                })
+            }
+            "IFCCYLINDRICALSURFACE" => {
+                let frame = self.placed_axis(entity.attribute(0), place)?;
+                let factor = frame.uniform_scale()?;
+                let radius = entity.attribute(1)?.as_number()? * self.sampler.units.length * factor;
+                if !(radius.is_finite() && radius > 0.0) {
+                    return None;
+                }
+                let x = normalize(frame.basis[0])?;
+                let mut y = normalize(frame.basis[1])?;
+                if !same_sense {
+                    y = scale(y, -1.0);
+                }
+                Some(BimBrepSurface::Cylinder {
+                    center: point3(frame.origin),
+                    x_axis: x,
+                    y_axis: y,
+                    z_axis: normalize(frame.basis[2])?,
+                    radius: number_in_metres(radius),
+                })
+            }
+            "IFCSPHERICALSURFACE" | "IFCTOROIDALSURFACE" => {
+                let frame = self.placed_axis(entity.attribute(0), place)?;
+                let factor = frame.uniform_scale()?;
+                let (major, minor) = if entity.type_name == "IFCSPHERICALSURFACE" {
+                    (0.0, entity.attribute(1)?.as_number()?)
+                } else {
+                    (
+                        entity.attribute(1)?.as_number()?,
+                        entity.attribute(2)?.as_number()?,
+                    )
+                };
+                let major = major * self.sampler.units.length * factor;
+                let minor = minor * self.sampler.units.length * factor;
+                if !(major.is_finite() && minor.is_finite() && minor > 0.0 && major >= 0.0) {
+                    return None;
+                }
+                let x = normalize(frame.basis[0])?;
+                let mut y = normalize(frame.basis[1])?;
+                if !same_sense {
+                    y = scale(y, -1.0);
+                }
+                Some(BimBrepSurface::Revolution {
+                    center: point3(frame.origin),
+                    x_axis: x,
+                    y_axis: y,
+                    z_axis: normalize(frame.basis[2])?,
+                    profile: BimBrepProfile::Arc {
+                        center: point3([major, 0.0, 0.0]),
+                        x_axis: [1.0, 0.0, 0.0],
+                        y_axis: [0.0, 0.0, 1.0],
+                        radius: number_in_metres(minor),
+                    },
+                })
+            }
+            "IFCSURFACEOFREVOLUTION" => self.surface_of_revolution(entity, place, same_sense),
+            _ => None,
+        }
+    }
+
+    fn placed_axis(&self, value: Option<&Value>, place: &Affine) -> Option<Affine> {
+        let local = self
+            .parsed()
+            .follow(value)
+            .and_then(|axis| axis_placement(self.parsed(), axis, &self.sampler.units))?;
+        Some(place.then(&local))
+    }
+
+    /// `IfcSurfaceOfRevolution`, whose profile is stated in `Position` and
+    /// whose revolution axis is independently stated by `AxisPosition`.
+    fn surface_of_revolution(
+        &self,
+        entity: &Entity,
+        place: &Affine,
+        same_sense: bool,
+    ) -> Option<BimBrepSurface> {
+        // A non-conformal outer placement turns circles of revolution into
+        // shapes the canonical analytic surface cannot state.
+        place.uniform_scale()?;
+        let position = self.placed_axis(entity.attribute(1), place)?;
+        let axis = self.parsed().follow(entity.attribute(2))?;
+        if axis.type_name != "IFCAXIS1PLACEMENT" {
+            return None;
+        }
+        let center = self
+            .parsed()
+            .follow(axis.attribute(0))
+            .and_then(cartesian_point)
+            .map(|point| place.point(scale(point, self.sampler.units.length)))?;
+        let z = self
+            .parsed()
+            .follow(axis.attribute(1))
+            .and_then(direction)
+            .map(|axis| place.direction(axis))
+            .and_then(normalize)?;
+        // Position's first direction is the radial zero. Square it to the
+        // separately stated axis: the schema requires that relation, but
+        // doing it explicitly prevents numeric drift from skewing the frame.
+        let radial = position.basis[0];
+        let x = normalize(subtract(radial, scale(z, dot(radial, z))))?;
+        let mut y = cross(z, x);
+        let profile_entity = self.parsed().follow(entity.attribute(0))?;
+        let profile = self.revolved_profile(profile_entity, &position, center, [x, y, z])?;
+        if !same_sense {
+            y = scale(y, -1.0);
+        }
+        Some(BimBrepSurface::Revolution {
+            center: point3(center),
+            x_axis: x,
+            y_axis: y,
+            z_axis: z,
+            profile,
+        })
+    }
+
+    fn revolved_profile(
+        &self,
+        profile: &Entity,
+        position: &Affine,
+        center: Vec3,
+        axes: [Vec3; 3],
+    ) -> Option<BimBrepProfile> {
+        if profile.type_name != "IFCARBITRARYOPENPROFILEDEF" {
+            return None;
+        }
+        let curve = self.parsed().follow(profile.attribute(2))?;
+        let basis = if curve.type_name == "IFCTRIMMEDCURVE" {
+            self.parsed().follow(curve.attribute(0))?
+        } else {
+            curve
+        };
+        if basis.type_name == "IFCCIRCLE" {
+            return self.revolved_circle_profile(basis, position, center, axes);
+        }
+        let sampled = self.sampler.curve(curve)?;
+        let first = position.point(*sampled.first()?);
+        let last = position.point(*sampled.last()?);
+        let local_first = local_coordinates(first, center, axes);
+        let local_last = local_coordinates(last, center, axes);
+        Some(BimBrepProfile::Line {
+            origin: point3(local_first),
+            direction: normalize(subtract(local_last, local_first))?,
+        })
+    }
+
+    fn revolved_circle_profile(
+        &self,
+        circle: &Entity,
+        position: &Affine,
+        center: Vec3,
+        axes: [Vec3; 3],
+    ) -> Option<BimBrepProfile> {
+        let circle_axis = self
+            .parsed()
+            .follow(circle.attribute(0))
+            .and_then(|axis| axis_placement(self.parsed(), axis, &self.sampler.units))?;
+        let world = position.then(&circle_axis);
+        let factor = world.uniform_scale()?;
+        let radius = circle.attribute(1)?.as_number()? * self.sampler.units.length * factor;
+        if !(radius.is_finite() && radius > 0.0) {
+            return None;
+        }
+        Some(BimBrepProfile::Arc {
+            center: point3(local_coordinates(world.origin, center, axes)),
+            x_axis: local_direction(normalize(world.basis[0])?, axes),
+            y_axis: local_direction(normalize(world.basis[1])?, axes),
+            radius: number_in_metres(radius),
+        })
+    }
+
+    fn edge_loop(&self, entity: &Entity, place: &Affine) -> Option<Vec<BimBrepEdge>> {
+        if entity.type_name != "IFCEDGELOOP" {
+            return None;
+        }
+        let edges = entity
+            .attribute(0)?
+            .as_list()?
+            .iter()
+            .map(|value| {
+                self.parsed()
+                    .follow(Some(value))
+                    .and_then(|edge| self.oriented_edge(edge, place))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!edges.is_empty()).then_some(edges)
+    }
+
+    fn oriented_edge(&self, entity: &Entity, place: &Affine) -> Option<BimBrepEdge> {
+        if entity.type_name != "IFCORIENTEDEDGE" {
+            return None;
+        }
+        let orientation = truth(entity.attribute(3)?)?;
+        let edge = self.parsed().follow(entity.attribute(2))?;
+        if edge.type_name != "IFCEDGECURVE" {
+            return None;
+        }
+        let same_sense = truth(edge.attribute(3)?)?;
+        let first = self.vertex(edge.attribute(0), place)?;
+        let second = self.vertex(edge.attribute(1), place)?;
+        let (start, end) = if orientation {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let geometry = self.parsed().follow(edge.attribute(2))?;
+        let curve = self.edge_curve(geometry, start, end, same_sense == orientation, place)?;
+        Some(BimBrepEdge {
+            start: point3(start),
+            end: point3(end),
+            curve,
+        })
+    }
+
+    fn vertex(&self, value: Option<&Value>, place: &Affine) -> Option<Vec3> {
+        let vertex = self.parsed().follow(value)?;
+        if vertex.type_name != "IFCVERTEXPOINT" {
+            return None;
+        }
+        let point = self
+            .parsed()
+            .follow(vertex.attribute(0))
+            .and_then(cartesian_point)?;
+        Some(place.point(scale(point, self.sampler.units.length)))
+    }
+
+    fn edge_curve(
+        &self,
+        geometry: &Entity,
+        start: Vec3,
+        end: Vec3,
+        forward: bool,
+        place: &Affine,
+    ) -> Option<BimBrepCurve> {
+        match geometry.type_name.as_str() {
+            "IFCLINE" => Some(BimBrepCurve::Line),
+            "IFCCIRCLE" => self.circle_edge(geometry, start, end, forward, place),
+            _ => {
+                let mut points: Vec<Vec3> = self
+                    .sampler
+                    .curve(geometry)?
+                    .into_iter()
+                    .map(|point| place.point(point))
+                    .collect();
+                if !forward {
+                    points.reverse();
+                }
+                if points.len() < 2 {
+                    return None;
+                }
+                points[0] = start;
+                let last = points.len() - 1;
+                points[last] = end;
+                if points.len() == 2 {
+                    Some(BimBrepCurve::Line)
+                } else {
+                    Some(BimBrepCurve::Polyline(
+                        points.into_iter().map(point3).collect(),
+                    ))
+                }
+            }
+        }
+    }
+
+    fn circle_edge(
+        &self,
+        circle: &Entity,
+        start: Vec3,
+        end: Vec3,
+        mut forward: bool,
+        place: &Affine,
+    ) -> Option<BimBrepCurve> {
+        let frame = self.placed_axis(circle.attribute(0), place)?;
+        let factor = frame.uniform_scale()?;
+        let radius = circle.attribute(1)?.as_number()? * self.sampler.units.length * factor;
+        if !(radius.is_finite() && radius > 0.0) {
+            return None;
+        }
+        let x = normalize(frame.basis[0])?;
+        let z = normalize(frame.basis[2])?;
+        let y = cross(z, x);
+        // A reflected conformal placement changes the source circle's
+        // increasing parameter direction relative to `cross(z, x)`.
+        if dot(y, normalize(frame.basis[1])?) < 0.0 {
+            forward = !forward;
+        }
+        let angle_of = |point: Vec3| {
+            let local = subtract(point, frame.origin);
+            dot(local, y).atan2(dot(local, x))
+        };
+        let first = angle_of(start);
+        let mut last = angle_of(end);
+        if forward {
+            while last <= first + f64::EPSILON {
+                last += std::f64::consts::TAU;
+            }
+        } else {
+            while last >= first - f64::EPSILON {
+                last -= std::f64::consts::TAU;
+            }
+        }
+        Some(BimBrepCurve::Arc(BimBrepArc {
+            center: point3(frame.origin),
+            x_axis: x,
+            z_axis: z,
+            radius: number_in_metres(radius),
+            start_angle: first,
+            end_angle: last,
+        }))
     }
 
     fn polygonal_face_set(&mut self, entity: &Entity, place: &Affine) {
@@ -669,6 +1035,54 @@ impl<'parsed> Builder<'parsed> {
                 (!regions.is_empty()).then_some(regions)
             }
             _ => None,
+        }
+    }
+}
+
+fn truth(value: &Value) -> Option<bool> {
+    match value.as_enumeration()? {
+        "T" => Some(true),
+        "F" => Some(false),
+        _ => None,
+    }
+}
+
+fn number_in_metres(value: f64) -> BimNumber {
+    BimNumber {
+        value,
+        unit: Some(metres()),
+    }
+}
+
+/// A world point written in an orthonormal frame's coordinates.
+fn local_coordinates(point: Vec3, origin: Vec3, axes: [Vec3; 3]) -> Vec3 {
+    let delta = subtract(point, origin);
+    [
+        dot(delta, axes[0]),
+        dot(delta, axes[1]),
+        dot(delta, axes[2]),
+    ]
+}
+
+/// A world direction written in an orthonormal frame's coordinates.
+fn local_direction(direction: Vec3, axes: [Vec3; 3]) -> Vec3 {
+    [
+        dot(direction, axes[0]),
+        dot(direction, axes[1]),
+        dot(direction, axes[2]),
+    ]
+}
+
+fn reverse_loop(edges: &mut [BimBrepEdge]) {
+    edges.reverse();
+    for edge in edges {
+        std::mem::swap(&mut edge.start, &mut edge.end);
+        match &mut edge.curve {
+            BimBrepCurve::Line => {}
+            BimBrepCurve::Arc(arc) => {
+                std::mem::swap(&mut arc.start_angle, &mut arc.end_angle);
+            }
+            BimBrepCurve::Polyline(points) => points.reverse(),
         }
     }
 }
@@ -945,4 +1359,157 @@ pub fn tube(path: &[Vec3], radius: f64, tolerance: f64) -> Option<BimBrep> {
         faces,
         complete: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Builder, IDENTITY};
+    use crate::curve::Sampler;
+    use crate::step::parse;
+    use crate::units::Units;
+    use bim_core::{BimBrepCurve, BimBrepProfile, BimBrepSurface};
+
+    fn file(data: &str) -> crate::step::Parsed {
+        let text = format!("ISO-10303-21;\nDATA;\n{data}ENDSEC;\nEND-ISO-10303-21;\n");
+        parse(text.as_bytes()).expect("a STEP file")
+    }
+
+    fn builder(parsed: &crate::step::Parsed) -> Builder<'_> {
+        Builder::new(Sampler {
+            parsed,
+            units: Units::default(),
+            tolerance: 0.004,
+        })
+    }
+
+    #[test]
+    fn reads_an_advanced_plane_with_its_edge_loop() {
+        let parsed = file(
+            "#1=IFCCARTESIANPOINT((0.,0.,0.));\n\
+             #2=IFCDIRECTION((0.,0.,1.));\n\
+             #3=IFCDIRECTION((1.,0.,0.));\n\
+             #4=IFCAXIS2PLACEMENT3D(#1,#2,#3);\n\
+             #5=IFCPLANE(#4);\n\
+             #10=IFCCARTESIANPOINT((0.,0.,0.));\n\
+             #11=IFCCARTESIANPOINT((2.,0.,0.));\n\
+             #12=IFCCARTESIANPOINT((2.,1.,0.));\n\
+             #13=IFCCARTESIANPOINT((0.,1.,0.));\n\
+             #14=IFCVERTEXPOINT(#10);\n\
+             #15=IFCVERTEXPOINT(#11);\n\
+             #16=IFCVERTEXPOINT(#12);\n\
+             #17=IFCVERTEXPOINT(#13);\n\
+             #20=IFCLINE($,$);\n\
+             #21=IFCEDGECURVE(#14,#15,#20,.T.);\n\
+             #22=IFCEDGECURVE(#15,#16,#20,.T.);\n\
+             #23=IFCEDGECURVE(#16,#17,#20,.T.);\n\
+             #24=IFCEDGECURVE(#17,#14,#20,.T.);\n\
+             #31=IFCORIENTEDEDGE(*,*,#21,.T.);\n\
+             #32=IFCORIENTEDEDGE(*,*,#22,.T.);\n\
+             #33=IFCORIENTEDEDGE(*,*,#23,.T.);\n\
+             #34=IFCORIENTEDEDGE(*,*,#24,.T.);\n\
+             #40=IFCEDGELOOP((#31,#32,#33,#34));\n\
+             #41=IFCFACEOUTERBOUND(#40,.T.);\n\
+             #42=IFCADVANCEDFACE((#41),#5,.T.);\n\
+             #43=IFCCLOSEDSHELL((#42));\n\
+             #44=IFCADVANCEDBREP(#43);\n",
+        );
+        let mut builder = builder(&parsed);
+        builder.item(parsed.get(44).expect("advanced brep"), &IDENTITY, 0);
+        assert_eq!(builder.bodies.unread_items, 0);
+        assert_eq!(builder.bodies.shells.len(), 1);
+        let shell = &builder.bodies.shells[0];
+        assert!(shell.complete);
+        assert_eq!(shell.faces.len(), 1);
+        assert_eq!(shell.faces[0].loops[0].len(), 4);
+        assert!(matches!(
+            shell.faces[0].surface,
+            BimBrepSurface::Plane { .. }
+        ));
+    }
+
+    #[test]
+    fn composes_edge_sense_and_recovers_a_full_circle_from_equal_vertices() {
+        let parsed = file(
+            "#1=IFCCARTESIANPOINT((0.,0.,0.));\n\
+             #2=IFCDIRECTION((0.,0.,1.));\n\
+             #3=IFCDIRECTION((1.,0.,0.));\n\
+             #4=IFCAXIS2PLACEMENT3D(#1,#2,#3);\n\
+             #5=IFCCIRCLE(#4,1.);\n\
+             #6=IFCCARTESIANPOINT((1.,0.,0.));\n\
+             #7=IFCVERTEXPOINT(#6);\n\
+             #8=IFCEDGECURVE(#7,#7,#5,.T.);\n\
+             #9=IFCORIENTEDEDGE(*,*,#8,.F.);\n",
+        );
+        let edge = builder(&parsed)
+            .oriented_edge(parsed.get(9).expect("oriented edge"), &IDENTITY)
+            .expect("a circle edge");
+        let BimBrepCurve::Arc(arc) = edge.curve else {
+            panic!("the circle must stay analytic");
+        };
+        assert!((arc.end_angle - arc.start_angle + std::f64::consts::TAU).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reads_cylinder_sphere_and_torus_surfaces_without_faceting_them() {
+        let parsed = file(
+            "#1=IFCCARTESIANPOINT((1.,2.,3.));\n\
+             #2=IFCDIRECTION((0.,0.,1.));\n\
+             #3=IFCDIRECTION((1.,0.,0.));\n\
+             #4=IFCAXIS2PLACEMENT3D(#1,#2,#3);\n\
+             #5=IFCCYLINDRICALSURFACE(#4,2.);\n\
+             #6=IFCSPHERICALSURFACE(#4,3.);\n\
+             #7=IFCTOROIDALSURFACE(#4,5.,1.);\n",
+        );
+        let builder = builder(&parsed);
+        let cylinder = builder
+            .advanced_surface(parsed.get(5).expect("cylinder"), &IDENTITY, true)
+            .expect("cylinder surface");
+        let BimBrepSurface::Cylinder { radius, .. } = cylinder else {
+            panic!("cylinder");
+        };
+        assert_eq!(radius.value, 2.0);
+
+        for (id, major, minor) in [(6, 0.0, 3.0), (7, 5.0, 1.0)] {
+            let surface = builder
+                .advanced_surface(parsed.get(id).expect("surface"), &IDENTITY, true)
+                .expect("surface of revolution");
+            let BimBrepSurface::Revolution { profile, .. } = surface else {
+                panic!("revolution");
+            };
+            let BimBrepProfile::Arc { center, radius, .. } = profile else {
+                panic!("arc profile");
+            };
+            assert_eq!(center.coordinates[0], major);
+            assert_eq!(radius.value, minor);
+        }
+    }
+
+    #[test]
+    fn reads_the_line_profile_of_a_surface_of_revolution() {
+        let parsed = file(
+            "#1=IFCCARTESIANPOINT((0.,0.,0.));\n\
+             #2=IFCDIRECTION((0.,-1.,0.));\n\
+             #3=IFCDIRECTION((1.,0.,0.));\n\
+             #4=IFCAXIS2PLACEMENT3D(#1,#2,#3);\n\
+             #5=IFCDIRECTION((0.,0.,1.));\n\
+             #6=IFCAXIS1PLACEMENT(#1,#5);\n\
+             #7=IFCCARTESIANPOINT((2.,3.));\n\
+             #8=IFCCARTESIANPOINT((4.,7.));\n\
+             #9=IFCPOLYLINE((#7,#8));\n\
+             #10=IFCARBITRARYOPENPROFILEDEF(.CURVE.,$,#9);\n\
+             #11=IFCSURFACEOFREVOLUTION(#10,#4,#6);\n",
+        );
+        let surface = builder(&parsed)
+            .advanced_surface(parsed.get(11).expect("surface"), &IDENTITY, true)
+            .expect("surface of revolution");
+        let BimBrepSurface::Revolution { profile, .. } = surface else {
+            panic!("revolution");
+        };
+        let BimBrepProfile::Line { origin, direction } = profile else {
+            panic!("line profile");
+        };
+        assert_eq!(origin.coordinates, [2.0, 0.0, 3.0]);
+        assert!((direction[0] - 1.0 / 5.0_f64.sqrt()).abs() < 1e-12);
+        assert!((direction[2] - 2.0 / 5.0_f64.sqrt()).abs() < 1e-12);
+    }
 }
