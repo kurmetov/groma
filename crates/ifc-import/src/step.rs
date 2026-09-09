@@ -8,6 +8,7 @@
 //! quietly turned into a default.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// One attribute of an entity instance.
 #[derive(Clone, Debug, PartialEq)]
@@ -20,15 +21,18 @@ pub enum Value {
     Reference(u64),
     Integer(i64),
     Real(f64),
-    Text(String),
+    Text(Box<str>),
     /// `.T.`, `.ELEMENT.` - an enumeration or a boolean, without its dots.
-    Enumeration(String),
+    /// Shared like a type name: a file states a handful of these millions of
+    /// times over.
+    Enumeration(TypeName),
     /// The members of a list, held exactly rather than in a vector with room
     /// to grow: a file of this size is mostly lists of two or three, and the
     /// slack a vector keeps is the difference between reading one and not.
     List(Box<[Value]>),
-    /// `IFCPOSITIVELENGTHMEASURE(3.5)`: a value wearing its type.
-    Typed(String, Box<Value>),
+    /// `IFCPOSITIVELENGTHMEASURE(3.5)`: a value wearing its type. The name is
+    /// shared, for the same reason an entity's is.
+    Typed(TypeName, Box<Value>),
 }
 
 impl Value {
@@ -93,10 +97,105 @@ impl Value {
     }
 }
 
+/// The name of an entity's type, held once per distinct name rather than
+/// once per instance.
+///
+/// A file of nine million instances states only a few dozen type names between
+/// them - 53 in SMALL's 9.5 million - so a `String` on every instance spent
+/// two allocations and some fifty bytes each to record six bits of
+/// information. This shares one allocation per name and keeps comparing
+/// against a `&str` the way a `String` did.
+///
+/// Held as `Arc<String>` rather than `Arc<str>`: the latter is a fat pointer
+/// and would cost sixteen bytes on every instance and inside every value that
+/// names a type. One extra indirection per name, at a few dozen names, buys
+/// eight bytes back on each of the millions that point at them - and is what
+/// brings [`Value`] itself down to twenty-four.
+#[derive(Clone, Debug)]
+pub struct TypeName(Arc<String>);
+
+impl TypeName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for TypeName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TypeName {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(&self.0)
+    }
+}
+
+impl PartialEq for TypeName {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for TypeName {}
+
+impl PartialEq<str> for TypeName {
+    fn eq(&self, other: &str) -> bool {
+        self.0.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for TypeName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.as_str() == *other
+    }
+}
+
+/// Every distinct type name seen so far, keyed by the bytes it was written as.
+///
+/// Keyed by the raw spelling rather than the upper-cased result, so the common
+/// case costs one lookup and no allocation at all. Two spellings of one name
+/// would take two entries and hand back equal text, which at a few dozen names
+/// is not worth a second pass to avoid.
+#[derive(Default)]
+struct Names<'bytes> {
+    /// Type and typed-value names, upper-cased as they always were.
+    types: HashMap<&'bytes [u8], Arc<String>>,
+    /// Dotted enumerations, kept exactly as written. Held apart from the
+    /// upper-cased names so sharing cannot change what a file said.
+    enumerations: HashMap<&'bytes [u8], Arc<String>>,
+}
+
+impl<'bytes> Names<'bytes> {
+    /// A type or typed-value name, upper-cased as this reader always did.
+    fn intern(&mut self, raw: &'bytes [u8]) -> TypeName {
+        if let Some(found) = self.types.get(raw) {
+            return TypeName(Arc::clone(found));
+        }
+        let text = Arc::new(String::from_utf8_lossy(raw).to_uppercase());
+        self.types.insert(raw, Arc::clone(&text));
+        TypeName(text)
+    }
+
+    /// A dotted enumeration, exactly as the file wrote it.
+    fn intern_exact(&mut self, raw: &'bytes [u8]) -> TypeName {
+        if let Some(found) = self.enumerations.get(raw) {
+            return TypeName(Arc::clone(found));
+        }
+        let text = Arc::new(String::from_utf8_lossy(raw).into_owned());
+        self.enumerations.insert(raw, Arc::clone(&text));
+        TypeName(text)
+    }
+}
+
 /// One `#id = TYPE(...);` instance.
 #[derive(Clone, Debug)]
 pub struct Entity {
-    pub type_name: String,
+    pub type_name: TypeName,
     pub attributes: Box<[Value]>,
 }
 
@@ -157,6 +256,7 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
         bytes,
         at: 0,
         length: bytes.len(),
+        names: Names::default(),
     };
     reader.skip_whitespace();
     if !reader.take_keyword("ISO-10303-21") {
@@ -164,7 +264,12 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
     }
 
     let mut parsed = Parsed {
-        entities: HashMap::new(),
+        // Sized from the source rather than grown into. Every doubling copies
+        // the table and holds the old one while it does, so the last one alone
+        // would add more to the peak than the entities it makes room for; 64
+        // bytes an instance is what this corpus averages, and guessing a
+        // little high costs a fraction of what one rehash does.
+        entities: HashMap::with_capacity(bytes.len() / 64),
         skipped: 0,
         application: None,
         schema: None,
@@ -221,9 +326,10 @@ struct Reader<'bytes> {
     bytes: &'bytes [u8],
     at: usize,
     length: usize,
+    names: Names<'bytes>,
 }
 
-impl Reader<'_> {
+impl<'bytes> Reader<'bytes> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.at).copied()
     }
@@ -346,7 +452,13 @@ impl Reader<'_> {
         ))
     }
 
-    fn read_name(&mut self) -> Option<String> {
+    fn read_name(&mut self) -> Option<TypeName> {
+        let raw = self.read_name_bytes()?;
+        Some(self.names.intern(raw))
+    }
+
+    /// The bytes of a name, still borrowed from the source.
+    fn read_name_bytes(&mut self) -> Option<&'bytes [u8]> {
         self.skip_whitespace();
         let start = self.at;
         while self.at < self.length
@@ -356,8 +468,7 @@ impl Reader<'_> {
         {
             self.at += 1;
         }
-        (self.at > start)
-            .then(|| String::from_utf8_lossy(&self.bytes[start..self.at]).to_uppercase())
+        (self.at > start).then(|| &self.bytes[start..self.at])
     }
 
     fn read_unsigned(&mut self) -> Option<u64> {
@@ -400,7 +511,7 @@ impl Reader<'_> {
                 self.at += 1;
                 self.read_unsigned().map(Value::Reference)
             }
-            b'\'' => Some(Value::Text(self.read_text())),
+            b'\'' => Some(Value::Text(self.read_text().into_boxed_str())),
             b'$' => {
                 self.at += 1;
                 Some(Value::Unset)
@@ -415,9 +526,9 @@ impl Reader<'_> {
                 while self.at < self.length && self.bytes[self.at] != b'.' {
                     self.at += 1;
                 }
-                let text = String::from_utf8_lossy(&self.bytes[start..self.at]).into_owned();
+                let raw = &self.bytes[start..self.at];
                 self.at = (self.at + 1).min(self.length);
-                Some(Value::Enumeration(text))
+                Some(Value::Enumeration(self.names.intern_exact(raw)))
             }
             byte if byte.is_ascii_digit() || byte == b'-' || byte == b'+' => self.read_number(),
             byte if byte.is_ascii_alphabetic() || byte == b'_' => {
@@ -564,6 +675,17 @@ mod tests {
         #2=IFCWALL('3vB2Y_$AH0Bhq',#1,$,*,.SOLIDWALL.,'It''s a wall');\n\
         ENDSEC;\n\
         END-ISO-10303-21;\n";
+
+    /// The two types a nine-million-entity file holds millions of. Their size
+    /// is the parse's memory, so it is pinned here rather than left to whoever
+    /// next adds a variant: `Value` is one pointer-pair plus a tag, and a
+    /// wider variant would cost this corpus hundreds of megabytes.
+    #[test]
+    fn the_hot_types_stay_narrow() {
+        assert_eq!(std::mem::size_of::<super::Value>(), 24);
+        assert_eq!(std::mem::size_of::<super::Entity>(), 24);
+        assert_eq!(std::mem::size_of::<super::TypeName>(), 8);
+    }
 
     #[test]
     fn reads_the_header_and_the_instances() {
