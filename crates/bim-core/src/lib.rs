@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::sync::{Arc, OnceLock};
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BimModel {
     /// Application/release that supplied the data, retained for provenance.
@@ -371,11 +373,61 @@ pub struct BimNumber {
     pub unit: Option<BimUnit>,
 }
 
+/// The names of a unit, held once and pointed at.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct BimUnit {
+pub struct BimUnitNames {
     /// Stable external identifier, for example a Forge unit type ID.
     pub id: String,
     pub name: String,
+}
+
+/// A unit of measure, as a shared handle.
+///
+/// Every [`BimPoint3`] carries one, and a model has essentially one unit, so
+/// the two `String`s this used to hold inline were the single largest cost in
+/// a decoded model: 72 bytes and two allocations per point, spelling
+/// "autodesk.unit.unit:meters-1.0.0" and "Meters" over and over. A structural
+/// model with 58.7 million declared edges reached 39 GB of memory that way,
+/// against 2.2 GB for a model of the same file size and a twelfth the
+/// geometry. One pointer instead - 8 bytes, no allocation per point - and
+/// cloning is a refcount bump.
+///
+/// It still reads like the struct it replaced: `unit.id` and `unit.name` work
+/// through [`Deref`](std::ops::Deref).
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct BimUnit(Arc<BimUnitNames>);
+
+impl BimUnit {
+    /// A unit from its two names. Allocates, so a caller on a hot path should
+    /// hold the result and clone it rather than calling this per point.
+    #[must_use]
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self(Arc::new(BimUnitNames {
+            id: id.into(),
+            name: name.into(),
+        }))
+    }
+
+    /// Metres, the unit every length in a decoded model is carried in.
+    ///
+    /// Made once for the life of the process and handed out by clone, because
+    /// the per-point closures that convert a body call this for every
+    /// coordinate they read.
+    #[must_use]
+    pub fn metres() -> Self {
+        static METRES: OnceLock<BimUnit> = OnceLock::new();
+        METRES
+            .get_or_init(|| Self::new("autodesk.unit.unit:meters-1.0.0", "Meters"))
+            .clone()
+    }
+}
+
+impl std::ops::Deref for BimUnit {
+    type Target = BimUnitNames;
+
+    fn deref(&self) -> &BimUnitNames {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -405,10 +457,7 @@ mod tests {
         };
         let unitless = BimNumber {
             value: 12.0,
-            unit: Some(BimUnit {
-                id: "autodesk.unit.unit:general-1.0.1".to_owned(),
-                name: "General".to_owned(),
-            }),
+            unit: Some(BimUnit::new("autodesk.unit.unit:general-1.0.1", "General")),
         };
         assert_ne!(unknown, unitless);
     }

@@ -123,7 +123,7 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
         elements.push(BimElement {
             id: identity(parsed, id, entity),
             element_type: element_type(&entity.type_name),
-            class_name: Some(entity.type_name.clone()),
+            class_name: Some(entity.type_name.as_str().to_owned()),
             name: text(entity.attribute(2)),
             // A space is named by its number and described by its name, which
             // is what `LongName` carries for every spatial element.
@@ -568,24 +568,24 @@ fn push_quantity(
         "IFCQUANTITYLENGTH" => (number * units.length, Some(metres())),
         "IFCQUANTITYAREA" => (
             number,
-            Some(BimUnit {
-                id: "autodesk.unit.unit:squareMeters-1.0.1".to_owned(),
-                name: "Square meters".to_owned(),
-            }),
+            Some(BimUnit::new(
+                "autodesk.unit.unit:squareMeters-1.0.1",
+                "Square meters",
+            )),
         ),
         "IFCQUANTITYVOLUME" => (
             number,
-            Some(BimUnit {
-                id: "autodesk.unit.unit:cubicMeters-1.0.1".to_owned(),
-                name: "Cubic meters".to_owned(),
-            }),
+            Some(BimUnit::new(
+                "autodesk.unit.unit:cubicMeters-1.0.1",
+                "Cubic meters",
+            )),
         ),
         "IFCQUANTITYWEIGHT" => (
             number,
-            Some(BimUnit {
-                id: "autodesk.unit.unit:kilograms-1.0.0".to_owned(),
-                name: "Kilograms".to_owned(),
-            }),
+            Some(BimUnit::new(
+                "autodesk.unit.unit:kilograms-1.0.0",
+                "Kilograms",
+            )),
         ),
         "IFCQUANTITYCOUNT" => (number, None),
         _ => return,
@@ -602,7 +602,7 @@ fn push_quantity(
 /// left as the file wrote it.
 fn measure(value: &Value, units: Units) -> Option<BimPropertyValue> {
     match value {
-        Value::Text(text) => Some(BimPropertyValue::Text(text.clone())),
+        Value::Text(text) => Some(BimPropertyValue::Text(text.to_string())),
         Value::Integer(number) => Some(BimPropertyValue::Integer(*number)),
         Value::Real(number) => Some(BimPropertyValue::Number(BimNumber {
             value: *number,

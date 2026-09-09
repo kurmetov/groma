@@ -2224,10 +2224,7 @@ mod tests {
                 name: Some("Этаж 1".to_owned()),
                 elevation: Some(BimNumber {
                     value: 3.048,
-                    unit: Some(BimUnit {
-                        id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                        name: "Meters".to_owned(),
-                    }),
+                    unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
                 }),
             }],
             elements: vec![BimElement {
@@ -2250,10 +2247,7 @@ mod tests {
                     specification: Some("autodesk.spec.aec:length-2.0.0".to_owned()),
                     value: BimPropertyValue::Number(BimNumber {
                         value: 2.5,
-                        unit: Some(BimUnit {
-                            id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                            name: "Meters".to_owned(),
-                        }),
+                        unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
                     }),
                 }],
                 type_properties: Vec::new(),
@@ -2287,10 +2281,7 @@ mod tests {
     fn metres(value: f64) -> BimNumber {
         BimNumber {
             value,
-            unit: Some(BimUnit {
-                id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                name: "Meters".to_owned(),
-            }),
+            unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
         }
     }
 
@@ -2388,10 +2379,7 @@ mod tests {
         let mut wall = element("10", "SWall", "OST_Walls");
         wall.element_type = BimElementType::Wall;
         let mut feet = layer("1", 0.75);
-        feet.thickness.unit = Some(BimUnit {
-            id: "autodesk.unit.unit:feet-1.0.0".to_owned(),
-            name: "Feet".to_owned(),
-        });
+        feet.thickness.unit = Some(BimUnit::new("autodesk.unit.unit:feet-1.0.0", "Feet"));
         wall.material_layers = Some(BimMaterialLayerSet {
             source_type_id: None,
             name: None,
@@ -2681,25 +2669,16 @@ mod tests {
             directrix: BimLineSegment {
                 start: BimPoint3 {
                     coordinates: [1.0, 2.0, 3.5],
-                    unit: BimUnit {
-                        id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                        name: "Meters".to_owned(),
-                    },
+                    unit: BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters"),
                 },
                 end: BimPoint3 {
                     coordinates: [1.0, 2.0, 4.5],
-                    unit: BimUnit {
-                        id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                        name: "Meters".to_owned(),
-                    },
+                    unit: BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters"),
                 },
             },
             radius: BimNumber {
                 value: 0.01,
-                unit: Some(BimUnit {
-                    id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                    name: "Meters".to_owned(),
-                }),
+                unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
             },
         }));
 
@@ -2729,10 +2708,7 @@ mod tests {
         model.elements[0].placement = Some(BimPlacement {
             origin: BimPoint3 {
                 coordinates: [1.0, 2.0, 3.0],
-                unit: BimUnit {
-                    id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                    name: "Meters".to_owned(),
-                },
+                unit: BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters"),
             },
             reference_direction: [1.0, 0.0, 0.0],
             axis: [0.0, 0.0, 1.0],
@@ -2740,17 +2716,11 @@ mod tests {
         model.elements[0].geometry = Some(BimGeometry::AxisLine(BimLineSegment {
             start: BimPoint3 {
                 coordinates: [1.0, 2.0, 3.5],
-                unit: BimUnit {
-                    id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                    name: "Meters".to_owned(),
-                },
+                unit: BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters"),
             },
             end: BimPoint3 {
                 coordinates: [1.0, 2.0, 4.5],
-                unit: BimUnit {
-                    id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                    name: "Meters".to_owned(),
-                },
+                unit: BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters"),
             },
         }));
 
@@ -2775,18 +2745,12 @@ mod tests {
         model.elements[0].placement = Some(BimPlacement {
             origin: BimPoint3 {
                 coordinates: [10.0, 20.0, 30.0],
-                unit: BimUnit {
-                    id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                    name: "Meters".to_owned(),
-                },
+                unit: BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters"),
             },
             reference_direction: [1.0, 0.0, 0.0],
             axis: [0.0, 0.0, 1.0],
         });
-        let metres = BimUnit {
-            id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-            name: "Meters".to_owned(),
-        };
+        let metres = BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters");
         model.elements[0].geometry = Some(BimGeometry::BoundingBox(BimBoundingBox {
             min: BimPoint3 {
                 coordinates: [-0.1, -0.2, -0.3],
@@ -2815,20 +2779,14 @@ mod tests {
     fn metres_point(coordinates: [f64; 3]) -> BimPoint3 {
         BimPoint3 {
             coordinates,
-            unit: BimUnit {
-                id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                name: "Meters".to_owned(),
-            },
+            unit: BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters"),
         }
     }
 
     fn metres_number(value: f64) -> BimNumber {
         BimNumber {
             value,
-            unit: Some(BimUnit {
-                id: "autodesk.unit.unit:meters-1.0.0".to_owned(),
-                name: "Meters".to_owned(),
-            }),
+            unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
         }
     }
 
