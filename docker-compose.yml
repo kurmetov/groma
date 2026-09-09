@@ -1,0 +1,32 @@
+# Run the viewer:  docker compose up --build
+# Then open:       http://127.0.0.1:8800/viewer
+
+services:
+  rivet:
+    build: .
+    # Run as the person who started it, not as the image's own user. A bind
+    # mount keeps the host's ownership - the `chown` in the Dockerfile applies
+    # to the image's empty directory and is covered over - so a container user
+    # the host does not know cannot write scenes into it, and an upload fails
+    # with "Permission denied (os error 13)" while reading still works.
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "127.0.0.1:8800:8800"
+    volumes:
+      # Scenes and uploads outlive the container. Put your .rvt/.ifc files in
+      # ./data/scenes to have them served without uploading.
+      - ./data/scenes:/data/scenes
+      - ./data/api:/data/models
+    # What a conversion costs is set by how much *geometry* a model holds, not
+    # by its file size: a 643 MB IFC of pipework peaked at 2.1 GB here, while a
+    # 743 MB structural model - 25.7 million triangles of rebar - peaked at
+    # 17.7 GB. So this is sized for a real structural model, not for the bytes.
+    #
+    # The server reads this limit from the cgroup rather than the host's
+    # memory, so it is the honest ceiling: lower it on a smaller machine and
+    # the server lowers what it accepts with it. Whatever it is set to, the
+    # cgroup kills a runaway conversion and the host survives - which is the
+    # whole reason to run this in a container.
+    mem_limit: 24g
+    memswap_limit: 24g
+    restart: unless-stopped

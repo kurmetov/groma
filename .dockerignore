@@ -1,0 +1,9 @@
+target
+data
+.git
+.venv
+.venv-ifc
+**/__pycache__
+*.rvt
+*.ifc
+*.rvs
