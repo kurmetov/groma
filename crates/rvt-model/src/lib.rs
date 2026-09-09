@@ -9,8 +9,8 @@ mod parameter;
 mod serial;
 
 pub use brep::{
-    BrepArc, BrepClassIndexes, BrepCurve, BrepEdge, BrepExclusion, BrepFace, BrepLoop, BrepProfile,
-    BrepRuling, BrepSurface, HoleTally, OrderingControl, SymbolBrep,
+    BrepArc, BrepClassIndexes, BrepCurve, BrepEdge, BrepExclusion, BrepFace, BrepLoop,
+    BrepOpenness, BrepProfile, BrepRuling, BrepSurface, HoleTally, OrderingControl, SymbolBrep,
     assemble as assemble_symbol_brep,
 };
 pub use compound::{

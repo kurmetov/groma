@@ -3649,6 +3649,28 @@ fn print_loop_owner_rows(rows: &BTreeMap<&'static str, [u64; 2]>, limit: usize) 
     }
 }
 
+/// Face-count buckets for the openness breakdown, as `(name, largest count in
+/// it)`. The single digits are called out on their own because they are the
+/// shapes that say what a record is: one face is a plane, and six is the face
+/// count of a box.
+const FACE_BUCKETS: [(&str, usize); 7] = [
+    ("1", 1),
+    ("2", 2),
+    ("3-5", 5),
+    ("6", 6),
+    ("7-12", 12),
+    ("13-50", 50),
+    ("51+", usize::MAX),
+];
+
+/// Which [`FACE_BUCKETS`] entry a face count falls in.
+fn face_bucket(faces: usize) -> usize {
+    FACE_BUCKETS
+        .iter()
+        .position(|(_, largest)| faces <= *largest)
+        .unwrap_or(FACE_BUCKETS.len() - 1)
+}
+
 /// Tally what the boundary-representation assembly gets and what it drops,
 /// over every record of a file.
 ///
@@ -3706,6 +3728,28 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
     // one this tally is otherwise about. The two are far apart and the gap is
     // worth having in front of whoever reads this next.
     let mut complete_and_a_volume = 0_u64;
+    // And of the ones that do not, what their bodies say about why - see
+    // `rvt_model::BrepOpenness`. A record is not one body, so most of this gap
+    // is expected to be records carrying a solid *and* something beside it;
+    // the point of the breakdown is to say how much of it is that and how much
+    // is a shell with a face missing from it.
+    let mut openness: BTreeMap<rvt_model::BrepOpenness, u64> = BTreeMap::new();
+    let mut openness_faces: BTreeMap<rvt_model::BrepOpenness, [u64; FACE_BUCKETS.len()]> =
+        BTreeMap::new();
+    // Of each class, the records holding a face some of whose edges no loop of
+    // theirs uses. That is a hole nobody read, and it is the one reading that
+    // would leave a body closed on its edges and open on its loops without
+    // anything being wrong with the edges themselves - so it separates the two
+    // halves of `BrepOpenness::ClosedOnItsEdgesOnly` rather than leaving them
+    // named together.
+    let mut openness_short: BTreeMap<rvt_model::BrepOpenness, u64> = BTreeMap::new();
+    // And of each class, the records that close topologically all the same.
+    // That is the other half of the exporter's own test
+    // (`is_closed() || bounds_a_volume()`), so it says which of these classes
+    // is already reaching the export and which is refused outright.
+    let mut openness_closed: BTreeMap<rvt_model::BrepOpenness, u64> = BTreeMap::new();
+    let mut one_sided_edges = 0_u64;
+    let mut edges_out_of_their_body = 0_u64;
     let mut exact_records = 0_u64;
     let mut exact_complete = 0_u64;
     for_each_member(
@@ -3747,7 +3791,22 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
                 exact_records += u64::from(exact);
                 complete += u64::from(assembled.excluded_faces.is_empty());
                 if assembled.excluded_faces.is_empty() {
-                    complete_and_a_volume += u64::from(assembled.bounds_a_volume());
+                    if assembled.bounds_a_volume() {
+                        complete_and_a_volume += 1;
+                    } else {
+                        let reading = assembled.openness();
+                        *openness.entry(reading).or_default() += 1;
+                        openness_faces.entry(reading).or_default()
+                            [face_bucket(assembled.faces.len())] += 1;
+                        *openness_short.entry(reading).or_default() +=
+                            u64::from(assembled.holes.edges_short > 0);
+                        *openness_closed.entry(reading).or_default() +=
+                            u64::from(assembled.is_closed());
+                        for body in &assembled.bodies {
+                            one_sided_edges += body.one_sided_edges as u64;
+                            edges_out_of_their_body += body.open_edges as u64;
+                        }
+                    }
                 }
                 exact_complete += u64::from(exact && assembled.excluded_faces.is_empty());
                 faces += assembled.faces.len() as u64;
@@ -3823,6 +3882,44 @@ fn brep(path: &Path, reasons: usize, max_member_bytes: u64) -> Result<(), Box<dy
     println!("  every face resolved: {complete}");
     println!("    of those, in an exactly-tiled record: {exact_complete}");
     println!("  complete records bounding a volume: {complete_and_a_volume}");
+    let not_a_volume = complete - complete_and_a_volume;
+    // The backlog proper: a record whose best body neither bounds a volume nor
+    // pairs its curves up is one nothing here can hand an exporter, and it is
+    // the only one of the classes below that a further reading could move.
+    let without_a_closed_body = openness
+        .iter()
+        .filter(|(reading, _)| {
+            !matches!(
+                reading,
+                rvt_model::BrepOpenness::BoundsAVolume
+                    | rvt_model::BrepOpenness::ClosesCurveForCurve
+            )
+        })
+        .map(|(_, count)| *count)
+        .sum::<u64>();
+    println!("  complete records that do not bound a volume: {not_a_volume}");
+    println!("    of those, none of their bodies closes at all: {without_a_closed_body}");
+    for (reading, count) in &openness {
+        println!("    {count}\t{}", reading.label());
+        let mut row = String::new();
+        for (index, (name, _)) in FACE_BUCKETS.iter().enumerate() {
+            let faces = openness_faces
+                .get(reading)
+                .map_or(0, |buckets| buckets[index]);
+            let _ = write!(row, " {name}:{faces}");
+        }
+        println!("      faces per record:{row}");
+        println!(
+            "      of them, holding a face whose loops leave an edge over: {}, \
+             closing on their edges: {}",
+            openness_short.get(reading).copied().unwrap_or(0),
+            openness_closed.get(reading).copied().unwrap_or(0)
+        );
+    }
+    println!(
+        "    edges with nothing on the far side: {one_sided_edges}, \
+         edges naming a face outside their body: {edges_out_of_their_body}"
+    );
     println!(
         "  faces on no boundary of their record: {unbounded}, in {records_with_unbounded} records"
     );

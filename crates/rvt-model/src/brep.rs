@@ -165,6 +165,73 @@ pub struct OrderingControl {
     pub not_comparable: usize,
 }
 
+/// What the bodies a record declares say about why its faces do not bound a
+/// volume, best reading first.
+///
+/// Nothing here reads a byte: every field it consults - `BrepBody::edges`,
+/// `one_sided_edges`, `open_edges`, and the loops the faces already carry -
+/// is assembled before it runs. It exists because "every face resolved" and
+/// "bounds a volume by its own loops" were 40 489 and 14 979 records on AR S1
+/// and the 25 510 between them were one undivided number, so a record that
+/// legitimately holds no solid and a solid missing a face from its shell
+/// counted the same.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BrepOpenness {
+    /// A body of the record closes by its own loops: every edge it draws is
+    /// drawn by exactly one other face of the same body. The record fails the
+    /// record-wide test only for what it carries beside that body, which is
+    /// what a wall's record looks like and what the exporter already selects
+    /// from by the box.
+    BoundsAVolume,
+    /// A body whose faces pair up curve for curve, with two of its edges
+    /// running between the same pair of points - a circle written as two arcs,
+    /// which is every pipe in a plumbing model. The boundary closes; what does
+    /// not is the reading of it that keys an edge by its endpoints alone.
+    ClosesCurveForCurve,
+    /// A body whose every edge names two faces, both of them in it, whose
+    /// loops still leave an edge undrawn by any second face. The topology says
+    /// closed and the geometry says otherwise, so one of the two readings is
+    /// wrong: a hole nobody read, or a loop using an edge that is not on this
+    /// boundary.
+    ClosedOnItsEdgesOnly,
+    /// A body with nothing one-sided about it that names a face outside
+    /// itself: the shell has a hole exactly where that face should be. This
+    /// is the class where an unread face costs a solid.
+    ShellWithAHole,
+    /// Every body has an edge with nothing on the other side - a null side in
+    /// `GEdge.m_pFace` - which is what a free surface is. A record whose best
+    /// body is one of these holds no solid to export, and its not bounding a
+    /// volume is the file's answer rather than a shortfall of ours.
+    FreeSurface,
+    /// Bodies, but no edge names a face of any of them, so there is no
+    /// boundary to close.
+    NoEdgeNamesItsFaces,
+    /// No node of the record names a face, so it declares no body at all.
+    NoBodyDeclared,
+}
+
+impl BrepOpenness {
+    /// The reading in one line, for a report.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BoundsAVolume => "a body of the record bounds a volume by its own loops",
+            Self::ClosesCurveForCurve => {
+                "a body pairs curve for curve, but two of its edges share both endpoints"
+            }
+            Self::ClosedOnItsEdgesOnly => {
+                "a body closes on its edges, but its loops leave one unmatched"
+            }
+            Self::ShellWithAHole => "a body's shell has a hole where a face it names should be",
+            Self::FreeSurface => {
+                "every body is a free surface: an edge has nothing on the far side"
+            }
+            Self::NoEdgeNamesItsFaces => "no edge names a face of any body",
+            Self::NoBodyDeclared => "the record declares no body",
+        }
+    }
+}
+
 impl SymbolBrep {
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -199,31 +266,46 @@ impl SymbolBrep {
     /// share an edge traverse it in opposite directions.
     #[must_use]
     pub fn bounds_a_volume(&self) -> bool {
-        let key = |point: [f64; 3]| {
-            point.map(|value| {
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    (value / CLOSURE_TOLERANCE_FEET).round() as i64
-                }
-            })
-        };
-        let mut uses: HashMap<([i64; 3], [i64; 3]), usize> = HashMap::new();
-        let mut edges = 0_usize;
-        for face in &self.faces {
-            for face_loop in &face.loops {
-                for edge in face_loop {
-                    let (start, end) = (key(edge.start), key(edge.end));
-                    let ends = if start <= end {
-                        (start, end)
-                    } else {
-                        (end, start)
-                    };
-                    *uses.entry(ends).or_default() += 1;
-                    edges += 1;
-                }
-            }
+        faces_closure(self.faces.iter()) == FaceClosure::Closes
+    }
+
+    /// The best reading the bodies of this record support.
+    ///
+    /// [`SymbolBrep::bounds_a_volume`] puts its question to the record as a
+    /// whole, and a record is not one body: a wall declaring its solid plus a
+    /// free surface for each plane its compound structure separates on can
+    /// never answer yes, however completely it was read. What an exporter
+    /// takes from a record is one body - the one reproducing the box on the
+    /// same record - so the question worth putting to a record that does not
+    /// close is which of its bodies came closest. That is what this answers,
+    /// and [`BrepOpenness`] says what each answer is evidence of.
+    #[must_use]
+    pub fn openness(&self) -> BrepOpenness {
+        self.bodies
+            .iter()
+            .map(|body| self.body_openness(body))
+            .min()
+            .unwrap_or(BrepOpenness::NoBodyDeclared)
+    }
+
+    /// One body's reading. [`BrepOpenness`] is ordered best first, so
+    /// [`SymbolBrep::openness`] is a minimum over the record's bodies.
+    fn body_openness(&self, body: &BrepBody) -> BrepOpenness {
+        if body.edges == 0 {
+            return BrepOpenness::NoEdgeNamesItsFaces;
         }
-        edges > 0 && uses.values().all(|uses| *uses == 2)
+        match faces_closure(body.faces.iter().filter_map(|index| self.faces.get(*index))) {
+            FaceClosure::Closes => return BrepOpenness::BoundsAVolume,
+            FaceClosure::SharedEndpoints => return BrepOpenness::ClosesCurveForCurve,
+            FaceClosure::Empty | FaceClosure::Gap => {}
+        }
+        if body.is_closed() {
+            return BrepOpenness::ClosedOnItsEdgesOnly;
+        }
+        if body.one_sided_edges == 0 {
+            return BrepOpenness::ShellWithAHole;
+        }
+        BrepOpenness::FreeSurface
     }
 
     /// One declared body on its own.
@@ -261,6 +343,124 @@ impl SymbolBrep {
             ordering_control: self.ordering_control,
             holes: self.holes.clone(),
         })
+    }
+}
+
+/// How a set of faces pairs its edges up, which is the geometric reading of
+/// closure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FaceClosure {
+    /// No face drew an edge, so there is nothing to close.
+    Empty,
+    /// Every edge is drawn by exactly two faces, and no two edges run between
+    /// the same pair of points.
+    Closes,
+    /// Every edge is drawn by exactly two faces, and two of them run between
+    /// the same pair of points - which is what a circle written as two arcs
+    /// looks like, and which reading the boundary by endpoints alone cannot
+    /// tell from an edge drawn four times.
+    SharedEndpoints,
+    /// Some edge is not drawn by exactly two faces: a boundary with a gap in
+    /// it, or one face drawing over another.
+    Gap,
+}
+
+/// A point on the [`CLOSURE_TOLERANCE_FEET`] grid.
+type ClosureKey = [i64; 3];
+
+/// One edge as the two faces sharing it both see it: its endpoints, taken
+/// unordered, and the point it passes through halfway along.
+type CurveKey = (ClosureKey, ClosureKey, ClosureKey);
+
+/// Quantise a point onto the [`CLOSURE_TOLERANCE_FEET`] grid.
+fn closure_key(point: [f64; 3]) -> ClosureKey {
+    point.map(|value| {
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            (value / CLOSURE_TOLERANCE_FEET).round() as i64
+        }
+    })
+}
+
+/// The point an edge passes through halfway along, in the same quantised
+/// coordinates as its endpoints.
+///
+/// Two faces sharing an edge read it from the one `GEdge`, so they place this
+/// point identically; two *different* edges between the same pair of points
+/// place it apart. That is the whole of what it is for - endpoints alone
+/// cannot tell those two cases from each other, and a pipe's circular seam is
+/// written as the second one.
+///
+/// Orientation does not move it: reversing an edge swaps a line's endpoints,
+/// swaps an arc's two angles - leaving their mean where it was - and reverses
+/// a polyline, whose smallest interior point is the same set either way.
+fn edge_midpoint_key(edge: &BrepEdge) -> ClosureKey {
+    match &edge.curve {
+        BrepCurve::Line => closure_key(scale3(add3(edge.start, edge.end), 0.5)),
+        BrepCurve::Arc(arc) => {
+            let middle = f64::midpoint(arc.start_angle, arc.end_angle);
+            let y_axis = cross3(arc.z_axis, arc.x_axis);
+            closure_key(add3(
+                arc.center,
+                add3(
+                    scale3(arc.x_axis, arc.radius * middle.cos()),
+                    scale3(y_axis, arc.radius * middle.sin()),
+                ),
+            ))
+        }
+        // The endpoints are the first and last of these, so an interior point
+        // is what says which curve this is; the smallest is picked because it
+        // is the one choice a reversal cannot move.
+        BrepCurve::Polyline(points) => points
+            .get(1..points.len().saturating_sub(1))
+            .unwrap_or_default()
+            .iter()
+            .map(|point| closure_key(*point))
+            .min()
+            .unwrap_or_else(|| closure_key(scale3(add3(edge.start, edge.end), 0.5))),
+    }
+}
+
+/// How a set of faces closes: every edge one of them draws has to be drawn by
+/// exactly one other.
+///
+/// Points are quantised to [`CLOSURE_TOLERANCE_FEET`] and an edge's two
+/// endpoints are taken unordered, because the two faces sharing an edge
+/// traverse it in opposite directions. [`SymbolBrep::bounds_a_volume`] and the
+/// per-body reading in [`SymbolBrep::openness`] both go through here, so a
+/// record and one of its bodies are judged by the same test rather than by two
+/// that could drift.
+fn faces_closure<'a>(faces: impl Iterator<Item = &'a BrepFace>) -> FaceClosure {
+    let mut curves: HashMap<CurveKey, usize> = HashMap::new();
+    let mut ends: HashMap<(ClosureKey, ClosureKey), usize> = HashMap::new();
+    let mut edges = 0_usize;
+    for face in faces {
+        for face_loop in &face.loops {
+            for edge in face_loop {
+                let (start, end) = (closure_key(edge.start), closure_key(edge.end));
+                let pair = if start <= end {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
+                *ends.entry(pair).or_default() += 1;
+                *curves
+                    .entry((pair.0, pair.1, edge_midpoint_key(edge)))
+                    .or_default() += 1;
+                edges += 1;
+            }
+        }
+    }
+    if edges == 0 {
+        return FaceClosure::Empty;
+    }
+    if !curves.values().all(|uses| *uses == 2) {
+        return FaceClosure::Gap;
+    }
+    if ends.values().all(|uses| *uses == 2) {
+        FaceClosure::Closes
+    } else {
+        FaceClosure::SharedEndpoints
     }
 }
 
@@ -2770,6 +2970,120 @@ mod tests {
         // One square is a boundary with one side and no volume: the record is
         // not a closed solid and saying so is the whole point of the gate.
         assert!(!brep.bounds_a_volume());
+    }
+
+    /// A face whose one loop runs the given points and closes back to the
+    /// first, on a plane nothing here evaluates.
+    fn loop_face(points: &[[f64; 3]]) -> BrepFace {
+        BrepFace {
+            surface: BrepSurface::Plane {
+                origin: [0.0, 0.0, 0.0],
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+            },
+            loops: vec![
+                points
+                    .iter()
+                    .enumerate()
+                    .map(|(index, start)| BrepEdge {
+                        start: *start,
+                        end: points[(index + 1) % points.len()],
+                        curve: BrepCurve::Line,
+                    })
+                    .collect(),
+            ],
+        }
+    }
+
+    fn body(faces: &[usize], edges: usize, one_sided: usize, open: usize) -> BrepBody {
+        BrepBody {
+            node_id: 500,
+            faces: faces.to_vec(),
+            edges,
+            one_sided_edges: one_sided,
+            open_edges: open,
+        }
+    }
+
+    /// The reading `SymbolBrep::openness` gives is of the record's *best*
+    /// body, because that is the one an exporter would take. A wall's record -
+    /// a shell that closes, plus a free surface beside it - does not bound a
+    /// volume as a whole and is still not a shortfall of the reader's.
+    #[test]
+    fn openness_reads_the_best_body_a_record_declares() {
+        let square = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        // Two faces on the same four edges: every edge drawn exactly twice,
+        // which is the whole of what closure asks of the loops.
+        let closed = SymbolBrep {
+            faces: vec![loop_face(&square), loop_face(&square)],
+            face_ids: vec![1, 2],
+            bodies: vec![body(&[0, 1], 4, 0, 0)],
+            ..SymbolBrep::default()
+        };
+        assert!(closed.bounds_a_volume());
+        assert_eq!(closed.openness(), BrepOpenness::BoundsAVolume);
+
+        let with_a_free_surface = SymbolBrep {
+            faces: vec![loop_face(&square), loop_face(&square), loop_face(&square)],
+            face_ids: vec![1, 2, 3],
+            bodies: vec![body(&[0, 1], 4, 0, 0), body(&[2], 4, 4, 0)],
+            ..SymbolBrep::default()
+        };
+        // The record does not close - the free surface's edges are drawn once
+        // - and the body an exporter would take still does.
+        assert!(!with_a_free_surface.bounds_a_volume());
+        assert_eq!(with_a_free_surface.openness(), BrepOpenness::BoundsAVolume);
+    }
+
+    /// The four readings that are not a solid, each from the counters that
+    /// distinguish it. These are the classes the corpus breakdown is for: a
+    /// free surface is the file's own answer, a shell with a hole is ours.
+    #[test]
+    fn openness_separates_a_free_surface_from_a_shell_with_a_hole() {
+        let square = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let one_face = |bodies: Vec<BrepBody>| SymbolBrep {
+            faces: vec![loop_face(&square)],
+            face_ids: vec![1],
+            bodies,
+            ..SymbolBrep::default()
+        };
+
+        // Every edge with nothing on the far side: a free surface, and no
+        // amount of further reading turns it into a solid.
+        assert_eq!(
+            one_face(vec![body(&[0], 4, 4, 0)]).openness(),
+            BrepOpenness::FreeSurface
+        );
+        // Two-sided everywhere, but the face on the other side of each edge is
+        // not in this body: the shell has a hole where that face should be.
+        assert_eq!(
+            one_face(vec![body(&[0], 4, 0, 4)]).openness(),
+            BrepOpenness::ShellWithAHole
+        );
+        // Two-sided and every partner in the body - the topology says closed -
+        // while the loops draw each edge once. The two readings disagree.
+        assert_eq!(
+            one_face(vec![body(&[0], 4, 0, 0)]).openness(),
+            BrepOpenness::ClosedOnItsEdgesOnly
+        );
+        assert_eq!(
+            one_face(vec![body(&[0], 0, 0, 0)]).openness(),
+            BrepOpenness::NoEdgeNamesItsFaces
+        );
+        assert_eq!(
+            one_face(Vec::new()).openness(),
+            BrepOpenness::NoBodyDeclared
+        );
     }
 
     /// The control the reconstruction is allowed on: a face that declares a

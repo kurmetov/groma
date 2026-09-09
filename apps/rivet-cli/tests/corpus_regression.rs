@@ -254,6 +254,20 @@ fn measure(binary: &Path, label: &str, file: &Path, classes: &[String]) -> Vec<M
             "Edges that did not resolve",
             Better::Lower,
         ),
+        (
+            "brep.complete_bounding_a_volume",
+            "complete records bounding a volume",
+            Better::Higher,
+        ),
+        // The backlog the openness breakdown leaves: a complete record no body
+        // of which closes, by either reading. Lower is better, and it is
+        // checked in that direction so a change that closes more records by
+        // dropping faces out of them cannot pass.
+        (
+            "brep.complete_with_no_closed_body",
+            "of those, none of their bodies closes at all",
+            Better::Lower,
+        ),
     ] {
         if let Some(value) = field(&text, label) {
             push(key.to_owned(), value, better);
@@ -510,6 +524,8 @@ fn baseline_is_internally_consistent() {
             "gelement.face_records_exact",
             "brep.bodies_complete",
             "brep.faces_resolved",
+            "brep.complete_bounding_a_volume",
+            "brep.complete_with_no_closed_body",
         ] {
             assert!(
                 baseline.contains_key(&(label.to_owned(), key.to_owned())),
@@ -529,9 +545,13 @@ fn baseline_is_internally_consistent() {
     }
 
     // Directions must be the ones that make a regression fail. An excluded-face
-    // tally recorded as "higher is better" would invert the test it exists for.
+    // tally recorded as "higher is better" would invert the test it exists for,
+    // and so would the backlog of records no body of which closes.
     for ((label, key), (_, better)) in &baseline {
-        let expected = if key.ends_with("faces_excluded") || key.ends_with("edges_unresolved") {
+        let expected = if key.ends_with("faces_excluded")
+            || key.ends_with("edges_unresolved")
+            || key.ends_with("with_no_closed_body")
+        {
             Better::Lower
         } else {
             Better::Higher

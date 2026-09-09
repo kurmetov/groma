@@ -10,6 +10,8 @@
 #
 # label	metric	value	better
 BIG	brep.bodies_complete	9758	higher
+BIG	brep.complete_bounding_a_volume	3157	higher
+BIG	brep.complete_with_no_closed_body	5164	lower
 BIG	brep.edges_unresolved	4096	lower
 BIG	brep.faces_excluded	5054	lower
 BIG	brep.faces_resolved	108023	higher
@@ -64,6 +66,8 @@ BIG	gelement.face_records	10534	higher
 BIG	gelement.face_records_exact	10534	higher
 BIG	gelement.faces	114427	higher
 MEDIUM	brep.bodies_complete	7558	higher
+MEDIUM	brep.complete_bounding_a_volume	4820	higher
+MEDIUM	brep.complete_with_no_closed_body	2132	lower
 MEDIUM	brep.edges_unresolved	3202	lower
 MEDIUM	brep.faces_excluded	2313	lower
 MEDIUM	brep.faces_resolved	45712	higher
@@ -116,6 +120,8 @@ MEDIUM	gelement.face_records	7712	higher
 MEDIUM	gelement.face_records_exact	7712	higher
 MEDIUM	gelement.faces	48564	higher
 SMALL	brep.bodies_complete	13745	higher
+SMALL	brep.complete_bounding_a_volume	10002	higher
+SMALL	brep.complete_with_no_closed_body	1994	lower
 SMALL	brep.edges_unresolved	72	lower
 SMALL	brep.faces_excluded	619	lower
 SMALL	brep.faces_resolved	111562	higher
