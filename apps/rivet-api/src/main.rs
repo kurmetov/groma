@@ -1148,6 +1148,67 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    /// Every GLSL source in the viewer is a JavaScript template literal, so a
+    /// backtick inside one ends the string early and silently breaks the whole
+    /// page - no shader error, no console message, just every function in the
+    /// script undefined. It cost an afternoon once; it costs a test now.
+    #[test]
+    fn no_shader_source_in_the_viewer_contains_a_backtick() {
+        let mut offenders = Vec::new();
+        let mut rest = VIEWER_HTML;
+        while let Some(at) = rest
+            .find("_FRAGMENT = `")
+            .or_else(|| rest.find("_VERTEX = `"))
+        {
+            // The name is the identifier immediately before the assignment.
+            let head = &rest[..at];
+            let name: String = head
+                .chars()
+                .rev()
+                .take_while(|character| character.is_alphanumeric() || *character == '_')
+                .collect::<Vec<char>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let opened = rest[at..].find('`').expect("the backtick just matched") + at + 1;
+            let body = &rest[opened..];
+            let closed = body.find('`').unwrap_or(body.len());
+            let source = &body[..closed];
+            // A source that ends at a backtick which is not followed by `;` is
+            // one that ended early.
+            let tail = body[closed..].trim_start_matches('`');
+            if !tail.starts_with(';') {
+                offenders.push(format!("{name} (source ends at a stray backtick)"));
+            }
+            if source.contains('`') {
+                offenders.push(format!("{name} (backtick inside the source)"));
+            }
+            rest = &body[closed..];
+        }
+        assert!(
+            offenders.is_empty(),
+            "shader sources with a backtick in them: {}",
+            offenders.join(", ")
+        );
+    }
+
+    /// The page is one inline script; an odd number of backticks in it means a
+    /// template literal somewhere is unterminated.
+    #[test]
+    fn the_viewers_template_literals_are_balanced() {
+        let script = VIEWER_HTML
+            .split_once("<script")
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .map(|(_, rest)| rest.split("</script>").next().unwrap_or_default())
+            .expect("the viewer has one inline script");
+        let backticks = script.matches('`').count();
+        assert_eq!(
+            backticks % 2,
+            0,
+            "the viewer's script has {backticks} backticks, which cannot pair up"
+        );
+    }
+
     use super::*;
 
     #[test]

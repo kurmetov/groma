@@ -234,6 +234,18 @@ are the flags by name - `length-unit`, `base-quantities`, `no-types`,
 `no-ifc-common-property-sets`, `class-mapping` -
 and a parameter this server does not have is a 400 rather than a file that is
 quietly not what was asked for.
+## Rooms in the viewer
+
+A room bounds volume; it is not a thing you can touch. The viewer draws one as
+a faint translucent shell that never hides what stands inside it, and its body
+is not clickable at all - a room encloses everything in it, so clicking one
+would select the room instead of what is being pointed at.
+
+A room is selected by the ring at the centre of its extent. Rings are
+depth-tested in the solid view, so you can select a room where you can see one,
+and drawn through everything in X-ray, which is the mode for seeing what is
+behind something.
+
 ## Federating several files
 
 `export-scene` and `export-ifc` accept more than one source file and read them
