@@ -4,6 +4,8 @@
 # viewer page is `include_str!`d into the server at compile time, so nothing
 # but the two executables is needed at runtime.
 
+# The build stage needs a C toolchain as well as Rust: both binaries set
+# `mimalloc` as their allocator, and the `rust:` image carries one.
 FROM rust:1.98-bookworm AS build
 WORKDIR /src
 

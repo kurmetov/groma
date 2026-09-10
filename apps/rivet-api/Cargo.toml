@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 bim-convert = { path = "../../crates/bim-convert" }
 clap = { workspace = true }
+mimalloc = "0.1.52"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tiny_http = { workspace = true }

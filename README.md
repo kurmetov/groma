@@ -47,6 +47,41 @@ to the record walk: such a change can buy one class by selling another, and this
 is what catches that. Without `RIVET_CORPUS` the gate skips, so `cargo test`
 stays fast and CI stays meaningful.
 
+## Performance
+
+A conversion is measured the way decode accuracy is: against the reference
+corpus, before and after. These are one 32-core Linux host, warm page cache,
+`--release`:
+
+| Command | Source | Before | After |
+| --- | --- | ---: | ---: |
+| `export-scene` | 93 MB `.rvt` | 14.3 s | **3.2 s** |
+| `export-scene` | 453 MB `.rvt` | 40.6 s | **9.7 s** |
+| `export-scene` | 1.28 GB `.ifc` | 18.0 s | **7.7 s** |
+| `export-ifc` | 93 MB `.rvt`, 700 MB out | 80.9 s | **4.3 s** |
+| `export-json --full` | 453 MB `.rvt` | 41.3 s | **10.5 s** |
+
+The outputs are byte-for-byte what they were, which is the only claim worth
+making about an optimisation to a decoder: every element of every corpus file
+exports the same `export-json --full`, the same `.rvs`, and the same IFC apart
+from the file name and timestamp its header states. The corpus gate's 164
+measurements did not move.
+
+Two things carry most of it. **Independent work runs on every core** -
+inflating a partition's members, reading a record, reading a STEP statement,
+tessellating an element, deflating a chunk - through
+[`bim_core::work::map_in_order`](crates/bim-core/src/work.rs), which hands the
+results back in the order the input came in so a conversion produces the same
+bytes on one core and on thirty-two. Everything that decides what to keep still
+runs on one thread, in file order. **Allocation is the other half**: the record
+walk built three strings per string field whether or not a caller kept one, and
+the parse tree of a large IFC cost seconds to free, which is why both binaries
+set `mimalloc` as their allocator.
+
+Peak memory rose by about a third - 4.0 GB to 5.3 GB on the 453 MB model -
+because a partition is held in memory to inflate its members from, and members
+are read a batch at a time. `MEMBER_PREPARE_BATCH` in `rvt-import` is the knob.
+
 ## CLI
 
 ```bash

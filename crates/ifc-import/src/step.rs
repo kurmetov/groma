@@ -298,6 +298,18 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
             }
             reader.take_semicolon();
             in_data = true;
+            // A data section of nothing but `#id=...;` is the shape every IFC
+            // file this reads has, and its statements are independent of one
+            // another, so it is read on every core at once. Anything else -
+            // a section holding a keyword this loop would have acted on -
+            // returns `None` here and is read below exactly as before.
+            if let Some(runs) = instance_runs(bytes, reader.at) {
+                read_instance_runs(bytes, &runs, &mut parsed);
+                // `in_data` is left alone: the loop reads whatever follows the
+                // last statement - the section's `ENDSEC` - and closes the
+                // section itself, as it does for a section read sequentially.
+                reader.at = runs.last().map_or(reader.at, |run| run.end);
+            }
             continue;
         }
         if reader.take_keyword("END-ISO-10303-21") {
@@ -320,6 +332,104 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
         }
     }
     Ok(parsed)
+}
+
+/// Statements read as one run by one thread.
+///
+/// Enough runs that a thread which draws a run of large instances does not
+/// hold up the rest, and few enough that each is worth its own thread.
+const RUNS_PER_THREAD: usize = 4;
+/// Smallest data section split across threads. Below this the split costs more
+/// than the parse it divides.
+const SMALLEST_SPLIT_BYTES: usize = 1 << 20;
+
+/// Split a data section into runs of whole `#id=...;` statements.
+///
+/// `None` where the section holds anything but instances - a second `HEADER`,
+/// a nested `DATA`, a statement this reader does not know - because those
+/// change what the statements after them mean, and the sequential loop is
+/// where that is decided. The final `ENDSEC` ends the last run and is left for
+/// the caller to read.
+///
+/// Statement ends are found the way [`Reader::skip_statement`] finds them: a
+/// `;` that is not inside a `'...'` string, quotes doubled to escape.
+fn instance_runs(bytes: &[u8], from: usize) -> Option<Vec<std::ops::Range<usize>>> {
+    if bytes.len().saturating_sub(from) < SMALLEST_SPLIT_BYTES {
+        return None;
+    }
+    let runs = bim_core::work::threads(bytes.len() - from) * RUNS_PER_THREAD;
+    let target = (bytes.len() - from) / runs.max(1);
+    let mut split = Vec::with_capacity(runs + 1);
+    let mut start = from;
+    let mut reader = Reader {
+        bytes,
+        at: from,
+        length: bytes.len(),
+        names: Names::default(),
+    };
+    loop {
+        reader.skip_whitespace();
+        let at = reader.at;
+        if at >= bytes.len() {
+            break;
+        }
+        if bytes[at] != b'#' {
+            // `ENDSEC` closes the section; the caller reads it and whatever
+            // follows. Anything else is not an instance, and what it means for
+            // the statements after it is the sequential loop's decision.
+            if bytes[at..].len() >= 6 && bytes[at..at + 6].eq_ignore_ascii_case(b"ENDSEC") {
+                break;
+            }
+            return None;
+        }
+        if !reader.skip_statement() {
+            break;
+        }
+        if reader.at - start >= target {
+            split.push(start..reader.at);
+            start = reader.at;
+        }
+    }
+    if start < reader.at {
+        split.push(start..reader.at);
+    }
+    (!split.is_empty()).then_some(split)
+}
+
+/// Read each run of statements on its own thread and add the instances to
+/// `parsed` in the order the runs appear in the file.
+///
+/// Each thread interns type names into its own table, so a name stated in two
+/// runs is held twice rather than shared - a few dozen strings against the
+/// millions of instances that point at them.
+fn read_instance_runs(bytes: &[u8], runs: &[std::ops::Range<usize>], parsed: &mut Parsed) {
+    let read = bim_core::work::map_in_order(runs, |run| {
+        let mut reader = Reader {
+            bytes: &bytes[..run.end],
+            at: run.start,
+            length: run.end,
+            names: Names::default(),
+        };
+        let mut instances = Vec::new();
+        let mut skipped = 0_usize;
+        while reader.at < reader.length {
+            reader.skip_whitespace();
+            if reader.at >= reader.length {
+                break;
+            }
+            match reader.read_instance() {
+                Some(instance) => instances.push(instance),
+                None => skipped += 1,
+            }
+        }
+        (instances, skipped)
+    });
+    for (instances, skipped) in read {
+        parsed.skipped += skipped;
+        for (id, entity) in instances {
+            parsed.entities.insert(id, entity);
+        }
+    }
 }
 
 struct Reader<'bytes> {

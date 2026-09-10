@@ -46,6 +46,19 @@ use bim_mesh::MeshOptions;
 pub use chunk::{CHUNK_MAGIC, ChunkBuilder, encode_octahedral};
 pub use manifest::Span;
 
+/// Chunks deflated together before being written.
+///
+/// Bounds what is held uncompressed at once: a chunk of the default budget is
+/// a few megabytes, so this is tens of megabytes, and it is enough parallelism
+/// that compression stops being the cost of writing a scene.
+const CHUNK_FLUSH_BATCH: usize = 8;
+
+/// Elements tessellated in one batch.
+///
+/// Large enough to keep every core busy on a model of any size, small enough
+/// that the meshes held at once stay a fraction of the scene.
+const TESSELLATION_BATCH: usize = 1024;
+
 /// `RIVETSCN`, the eight bytes every scene begins with.
 pub const MAGIC: &[u8; 8] = b"RIVETSCN";
 /// `RIVETEND`, the eight bytes every scene ends with.
@@ -121,12 +134,18 @@ impl<W: Write> Counting<W> {
     /// Write one raw-deflate section and return where it went.
     fn section(&mut self, bytes: &[u8], compression: u32) -> io::Result<manifest::Span> {
         let stored = deflate(bytes, compression)?;
+        self.stored_section(&stored, bytes.len())
+    }
+
+    /// Write a section already compressed, for a caller that deflated it off
+    /// this thread, and return where it went.
+    fn stored_section(&mut self, stored: &[u8], length: usize) -> io::Result<manifest::Span> {
         let offset = self.at;
-        self.write_all(&stored)?;
+        self.write_all(stored)?;
         Ok(manifest::Span {
             offset,
             stored: stored.len() as u64,
-            length: bytes.len() as u64,
+            length: length as u64,
         })
     }
 }
@@ -179,37 +198,55 @@ pub fn write_scene<W: Write>(
     // exact to a fraction of a millimetre and lets a viewer cull whole chunks.
     let order = spatial_order(model);
     let mut chunk = ChunkBuilder::new();
+    // Chunks that are full but not yet written. They are deflated together, on
+    // every core, and then written in the order they closed - which is the
+    // order they were written in before.
+    let mut closed: Vec<ClosedChunk> = Vec::new();
     let mut element_bounds = vec![f32::NAN; model.elements.len() * 6];
-    for element_index in order {
-        let Some(geometry) = model.elements[element_index].geometry.as_ref() else {
-            continue;
-        };
-        let mesh = bim_mesh::tessellate(geometry, &options.mesh);
-        stats.skipped_faces += mesh.skipped_faces;
-        if mesh.is_empty() {
-            continue;
-        }
-        if let Some((min, max)) = mesh.bounds() {
-            for axis in 0..3 {
-                element_bounds[element_index * 6 + axis] = min[axis] as f32;
-                element_bounds[element_index * 6 + 3 + axis] = max[axis] as f32;
+    // Tessellated a batch at a time on every core, then pushed into chunks in
+    // the spatial order above. One element's triangles do not depend on
+    // another's, so this only moves where the work happens; the batch bounds
+    // how many meshes are held at once, and the order the chunks are built in
+    // is the order they were built in before.
+    for batch in order.chunks(TESSELLATION_BATCH) {
+        let meshes = bim_core::work::map_in_order(batch, |element_index| {
+            model.elements[*element_index]
+                .geometry
+                .as_ref()
+                .map(|geometry| bim_mesh::tessellate(geometry, &options.mesh))
+        });
+        for (element_index, mesh) in batch.iter().copied().zip(meshes) {
+            let Some(mesh) = mesh else {
+                continue;
+            };
+            stats.skipped_faces += mesh.skipped_faces;
+            if mesh.is_empty() {
+                continue;
             }
-        }
-        stats.elements_with_geometry += 1;
-        stats.vertices += mesh.vertex_count();
-        stats.triangles += mesh.triangle_count();
-        stats.edges += mesh.edge_indices.len() / 2;
-        chunk.push(u32::try_from(element_index).unwrap_or(u32::MAX), &mesh);
-        builder.mark_geometry(element_index);
-        if chunk.triangle_count() >= options.chunk_triangle_budget {
-            flush_chunk(&mut out, &mut builder, &mut chunk, options)?;
-            stats.chunks += 1;
+            if let Some((min, max)) = mesh.bounds() {
+                for axis in 0..3 {
+                    element_bounds[element_index * 6 + axis] = min[axis] as f32;
+                    element_bounds[element_index * 6 + 3 + axis] = max[axis] as f32;
+                }
+            }
+            stats.elements_with_geometry += 1;
+            stats.vertices += mesh.vertex_count();
+            stats.triangles += mesh.triangle_count();
+            stats.edges += mesh.edge_indices.len() / 2;
+            chunk.push(u32::try_from(element_index).unwrap_or(u32::MAX), &mesh);
+            builder.mark_geometry(element_index);
+            if chunk.triangle_count() >= options.chunk_triangle_budget {
+                closed.push(close_chunk(&mut chunk));
+                if closed.len() >= CHUNK_FLUSH_BATCH {
+                    flush_chunks(&mut out, &mut builder, &mut closed, options, &mut stats)?;
+                }
+            }
         }
     }
     if !chunk.is_empty() {
-        flush_chunk(&mut out, &mut builder, &mut chunk, options)?;
-        stats.chunks += 1;
+        closed.push(close_chunk(&mut chunk));
     }
+    flush_chunks(&mut out, &mut builder, &mut closed, options, &mut stats)?;
 
     let mut bounds_bytes = Vec::with_capacity(element_bounds.len() * 4);
     for value in &element_bounds {
@@ -218,10 +255,19 @@ pub fn write_scene<W: Write>(
     let bounds_span = out.section(&bounds_bytes, options.compression)?;
     builder.set_element_bounds(bounds_span);
 
-    for block in model.elements.chunks(options.property_block) {
+    // Each block states its own elements and is compressed on its own, so the
+    // blocks are built and deflated on every core and then written in order.
+    let blocks = model
+        .elements
+        .chunks(options.property_block)
+        .collect::<Vec<_>>();
+    let stored_blocks = bim_core::work::map_in_order(&blocks, |block| {
         let json = manifest::property_block(block);
-        let span = out.section(json.as_bytes(), options.compression)?;
-        builder.push_property_block(span);
+        deflate(json.as_bytes(), options.compression).map(|stored| (json.len(), stored))
+    });
+    for stored in stored_blocks {
+        let (length, stored) = stored?;
+        builder.push_property_block(out.stored_section(&stored, length)?);
     }
     builder.set_property_block_size(options.property_block);
 
@@ -238,16 +284,45 @@ pub fn write_scene<W: Write>(
     Ok(stats)
 }
 
-fn flush_chunk<W: Write>(
+/// A chunk that has taken its last element: its bytes, and the builder the
+/// manifest reads its extent and element list from.
+struct ClosedChunk {
+    chunk: ChunkBuilder,
+    bytes: Vec<u8>,
+}
+
+/// Take the chunk's bytes and start a new one.
+fn close_chunk(chunk: &mut ChunkBuilder) -> ClosedChunk {
+    let chunk = std::mem::replace(chunk, ChunkBuilder::new());
+    let bytes = chunk.finish();
+    ClosedChunk { chunk, bytes }
+}
+
+/// Deflate the closed chunks on every core and write them in the order they
+/// closed.
+///
+/// Deflating is most of what writing a scene costs - on a three-million-
+/// triangle model it was four fifths of the pack stage - and one chunk's
+/// compression says nothing about another's, so the only thing that has to
+/// stay in order is the writing.
+fn flush_chunks<W: Write>(
     out: &mut Counting<W>,
     builder: &mut manifest::Builder,
-    chunk: &mut ChunkBuilder,
+    closed: &mut Vec<ClosedChunk>,
     options: &PackOptions,
+    stats: &mut Stats,
 ) -> io::Result<()> {
-    let bytes = chunk.finish();
-    let span = out.section(&bytes, options.compression)?;
-    builder.push_chunk(span, chunk);
-    *chunk = ChunkBuilder::new();
+    if closed.is_empty() {
+        return Ok(());
+    }
+    let stored =
+        bim_core::work::map_in_order(closed, |closed| deflate(&closed.bytes, options.compression));
+    for (closed, stored) in closed.iter().zip(stored) {
+        let span = out.stored_section(&stored?, closed.bytes.len())?;
+        builder.push_chunk(span, &closed.chunk);
+        stats.chunks += 1;
+    }
+    closed.clear();
     Ok(())
 }
 

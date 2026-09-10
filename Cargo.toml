@@ -37,3 +37,13 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+# The corpus runs to hundreds of megabytes a file and the record walk is the
+# whole cost of a conversion, so the release build is tuned for it: one
+# codegen unit and cross-crate inlining let the walk in `rvt-model` be inlined
+# into the readers in `rvt-import` and `ifc-import`, which is where the hot
+# loops actually live. `panic` is left unwinding so `cargo test --release`
+# still catches assertions.
+[profile.release]
+lto = "fat"
+codegen-units = 1

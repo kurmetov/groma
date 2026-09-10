@@ -220,6 +220,89 @@ impl RvtContainer {
             options,
         )?)
     }
+
+    /// The stored bytes of one `Partitions/*` stream, checksum pages included.
+    ///
+    /// A caller that will read every member of a partition wants this once
+    /// rather than a fresh CFB stream per member: the compound file resolves a
+    /// stream's sector chain from its start on every buffer refill, so paying
+    /// for the chain once and inflating from memory is what makes the members
+    /// independent of each other - which is what lets them be inflated in
+    /// parallel. See [`decode_partition_member_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent or non-partition stream, one larger than
+    /// `limit`, or an I/O failure.
+    pub fn read_partition_bytes(&self, name: &str, limit: u64) -> Result<Vec<u8>> {
+        let metadata = self.partition_metadata(name)?;
+        if metadata.len > limit {
+            return Err(Error::StreamTooLarge {
+                name: metadata.path.clone(),
+                size: metadata.len,
+                limit,
+            });
+        }
+        let path = metadata.path.clone();
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len).unwrap_or(0));
+        self.copy_stream(&path, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Inventory a partition already held in memory, exactly as
+    /// [`RvtContainer::inspect_partition`] does from the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent or non-partition stream, or where the
+    /// scan finds more gzip candidates than the options allow.
+    pub fn inspect_partition_bytes(
+        &self,
+        name: &str,
+        stored: &[u8],
+        options: PartitionReadOptions,
+    ) -> Result<PartitionReport> {
+        let metadata = self.partition_metadata(name)?;
+        let path = metadata.path.clone();
+        let stored_bytes = metadata.len;
+        let mut reader = std::io::Cursor::new(stored);
+        Ok(partition::analyze_partition(
+            path,
+            &mut reader,
+            stored_bytes,
+            options,
+        )?)
+    }
+}
+
+/// Inflate one member of a partition already held in memory.
+///
+/// `logical_offset` is a member offset from a [`PartitionReport`], measured in
+/// the checksum-clean stream, exactly as
+/// [`RvtContainer::decode_partition_member`] takes it. `stored` must be the
+/// whole stored stream, checksum pages included, as
+/// [`RvtContainer::read_partition_bytes`] returns it.
+///
+/// This borrows nothing but the bytes, so members of one partition can be
+/// inflated on several threads at once.
+///
+/// # Errors
+///
+/// Returns an error where the offset is outside the stream, where the bytes
+/// there are not a valid gzip member, or where its payload exceeds `limit`.
+pub fn decode_partition_member_bytes(
+    stored: &[u8],
+    logical_offset: u64,
+    limit: u64,
+) -> Result<Vec<u8>> {
+    let stored_bytes = stored.len() as u64;
+    let mut reader = std::io::Cursor::new(stored);
+    Ok(partition::decode_member_bytes(
+        &mut reader,
+        stored_bytes,
+        logical_offset,
+        limit,
+    )?)
 }
 
 impl RvtContainer {

@@ -1,7 +1,7 @@
 use rvt_schema::Schema;
 
 use crate::member::RecordString;
-use crate::serial::{SerialObject, walk_record_collecting};
+use crate::serial::{SerialObject, walk_record_collecting_classes};
 
 /// Largest parameter count accepted from one stored set.
 pub const MAX_PARAMETERS_PER_SET: u32 = 4096;
@@ -142,7 +142,21 @@ impl ParameterSets {
         body: &[u8],
         classes: ParameterSetClassIndexes,
     ) -> Option<Self> {
-        let (_walk, objects) = walk_record_collecting(schema, class_index, body);
+        // Only the four set classes are materialized. `read_value_set` answers
+        // for those four and for nothing else, so the objects left out could
+        // not have contributed a parameter; on a record whose node stream is a
+        // solid, they are every face in it.
+        let (_walk, objects) = walk_record_collecting_classes(
+            schema,
+            class_index,
+            body,
+            &[
+                classes.double,
+                classes.integer,
+                classes.text,
+                classes.reference,
+            ],
+        );
         Self::from_objects(&objects, classes)
     }
 

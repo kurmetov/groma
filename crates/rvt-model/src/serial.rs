@@ -43,7 +43,7 @@
 //! exists to check. The walk reads the declaration as declared, which is the
 //! reading that needs no extra rule, and does not interpret the value.
 
-use rvt_schema::{FieldType, PropertyDefinition, Schema, TypeReference};
+use rvt_schema::{ClassDefinition, FieldType, PropertyDefinition, Schema, TypeReference};
 
 use crate::{geometry::GElementNodeReference, member::MAX_STRING_CHARS};
 
@@ -171,7 +171,12 @@ pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk
         node_headers: false,
         record_narrow_pending: true,
         trace: None,
+        trace_properties: None,
         kept_strings: None,
+        string_properties: None,
+        // Neither walk reads a value back; both measure how much of a body the
+        // declarations explain.
+        collect_values: false,
         string_distance: 0,
         node_class: 0,
         flag_samples: None,
@@ -206,7 +211,12 @@ pub fn walk_object_stream(schema: &Schema, class_index: u16, body: &[u8]) -> Ser
         node_headers: false,
         record_narrow_pending: true,
         trace: None,
+        trace_properties: None,
         kept_strings: None,
+        string_properties: None,
+        // Neither walk reads a value back; both measure how much of a body the
+        // declarations explain.
+        collect_values: false,
         string_distance: 0,
         node_class: 0,
         flag_samples: None,
@@ -394,7 +404,7 @@ pub struct SerialObject {
     pub alternate_integers: Vec<i64>,
 }
 
-/// Same as [`walk_record`], keeping each object the node stream held.
+/// Same as [`walk`](walk_record), keeping each object the node stream held.
 #[must_use]
 pub fn walk_record_collecting(
     schema: &Schema,
@@ -409,6 +419,32 @@ pub fn walk_record_collecting(
     (walk, objects)
 }
 
+/// Same as [`walk_record_collecting`], keeping only the objects whose class is
+/// one of `keep`.
+///
+/// The walk is the same walk over the same bytes and stops where it always
+/// stopped; what changes is which of the objects it meets are materialized.
+/// An object is materialized by copying the seven value lists its
+/// declarations filled, so a caller after the four parameter sets of a record
+/// whose node stream holds sixty thousand faces was paying for all of them.
+/// Values read outside a kept object are not retained either, since nothing
+/// can read them back.
+#[must_use]
+pub fn walk_record_collecting_classes<'a>(
+    schema: &'a Schema,
+    class_index: u16,
+    body: &'a [u8],
+    keep: &'a [u16],
+) -> (SerialRecordWalk, Vec<SerialObject>) {
+    let options = RecordWalkOptions {
+        collect: true,
+        ..RecordWalkOptions::default()
+    };
+    let (walk, _, objects, _, _) =
+        walk_record_inner_with(schema, class_index, body, options, None, Some(keep));
+    (walk, objects)
+}
+
 /// Same as [`walk_record`], keeping every `String` the declarations read, in
 /// the order they were read, with the declaration that read each one.
 #[must_use]
@@ -417,11 +453,29 @@ pub fn walk_record_strings(
     class_index: u16,
     body: &[u8],
 ) -> (SerialRecordWalk, Vec<SerialString>) {
+    walk_record_strings_of(schema, class_index, body, None)
+}
+
+/// Same as [`walk_record_strings`], keeping only the strings read by one of
+/// `properties`.
+///
+/// The walk is the same walk and reads the same bytes; what changes is how
+/// much of it is retained. A caller after one named property - which is what
+/// reading a record's name is - would otherwise pay three string allocations
+/// for every value in the body to throw all but one of them away.
+#[must_use]
+pub fn walk_record_strings_of<'a>(
+    schema: &'a Schema,
+    class_index: u16,
+    body: &'a [u8],
+    properties: Option<&'a [&'a str]>,
+) -> (SerialRecordWalk, Vec<SerialString>) {
     let options = RecordWalkOptions {
         keep_strings: true,
         ..RecordWalkOptions::default()
     };
-    let (walk, _, _, strings, _) = walk_record_inner(schema, class_index, body, options);
+    let (walk, _, _, strings, _) =
+        walk_record_inner_with(schema, class_index, body, options, properties, None);
     (walk, strings)
 }
 
@@ -504,8 +558,17 @@ pub fn record_name(schema: &Schema, class_index: u16, body: &[u8]) -> Option<Str
 /// caller measuring the reading can report which property answered.
 #[must_use]
 pub fn record_name_string(schema: &Schema, class_index: u16, body: &[u8]) -> Option<SerialString> {
-    let (_walk, strings) = walk_record_strings(schema, class_index, body);
     let parameter = descends_from(schema, class_index, PARAMETER_ELEMENT_CLASS);
+    // The class chain decides which property can answer before the walk runs,
+    // so the walk keeps that property and nothing else. The filter below is
+    // unchanged and still checks the class as well: `m_caption` is declared by
+    // three classes and only `ParamDef`'s is a name.
+    let wanted: &[&str] = if parameter {
+        &[PARAMETER_CAPTION_PROPERTY]
+    } else {
+        &[NAME_PROPERTY]
+    };
+    let (_walk, strings) = walk_record_strings_of(schema, class_index, body, Some(wanted));
     strings
         .into_iter()
         .filter(|string| {
@@ -587,7 +650,10 @@ pub fn record_declared_ids(
         node_headers: false,
         record_narrow_pending: true,
         trace: Some(Vec::new()),
+        trace_properties: Some(properties),
         kept_strings: None,
+        string_properties: None,
+        collect_values: false,
         string_distance: 0,
         node_class: 0,
         flag_samples: None,
@@ -764,6 +830,23 @@ fn walk_record_inner(
     Vec<SerialString>,
     Vec<FlagWidthSample>,
 ) {
+    walk_record_inner_with(schema, class_index, body, options, None, None)
+}
+
+fn walk_record_inner_with<'a>(
+    schema: &'a Schema,
+    class_index: u16,
+    body: &'a [u8],
+    options: RecordWalkOptions,
+    string_properties: Option<&'a [&'a str]>,
+    collect_classes: Option<&'a [u16]>,
+) -> (
+    SerialRecordWalk,
+    Vec<SerialTraceEntry>,
+    Vec<SerialObject>,
+    Vec<SerialString>,
+    Vec<FlagWidthSample>,
+) {
     let (trace, collect, keep_strings) = (options.trace, options.collect, options.keep_strings);
     let trailer_offset = body.len().saturating_sub(RECORD_LENGTH_TRAILER_BYTES);
     let length_trailer_matches = body
@@ -784,7 +867,12 @@ fn walk_record_inner(
         node_headers: false,
         record_narrow_pending: true,
         trace: trace.then(Vec::new),
+        trace_properties: None,
         kept_strings: keep_strings.then(Vec::new),
+        string_properties,
+        // The record's own declarations are not part of any object, so their
+        // values are kept only for a caller collecting every object.
+        collect_values: collect && collect_classes.is_none(),
         string_distance: 0,
         node_class: 0,
         flag_samples: options.flag_widths.then(Vec::new),
@@ -812,6 +900,9 @@ fn walk_record_inner(
             continue;
         }
         nodes += 1;
+        let kept =
+            collect && collect_classes.is_none_or(|keep| keep.contains(&reference.class_index));
+        reader.collect_values = kept;
         reader.node_class = reference.class_index;
         reader.string_distance = if next <= own_references { 1 } else { 2 };
         let began = reader.offset;
@@ -823,7 +914,7 @@ fn walk_record_inner(
         let first_small_integer = reader.small_integers.len();
         let first_alternate = reader.alternate_integers.len();
         stop = reader.read_class(reference.class_index, 1).err();
-        if collect {
+        if kept {
             objects.push(SerialObject {
                 object_id: reference.object_id,
                 class_index: reference.class_index,
@@ -858,6 +949,26 @@ fn walk_record_inner(
     )
 }
 
+/// A record's UTF-16 string, as the format writes it: little-endian pairs,
+/// zero-padded to the declared character count.
+///
+/// Built in one pass into one allocation. This is the same value
+/// `String::from_utf16_lossy` followed by `trim_end_matches('\0')` produced -
+/// an unpaired surrogate is still U+FFFD - without the two intermediate
+/// buffers that spelling allocated on every string in every record.
+fn decode_utf16_value(units: &[u8]) -> String {
+    let mut value: String = char::decode_utf16(
+        units
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+    )
+    .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+    .collect();
+    let kept = value.trim_end_matches('\0').len();
+    value.truncate(kept);
+    value
+}
+
 struct Reader<'a> {
     schema: &'a Schema,
     body: &'a [u8],
@@ -883,8 +994,26 @@ struct Reader<'a> {
     /// later one takes the declared width. See [`FIRST_RECORD_IDENTIFIER_BYTES`].
     record_narrow_pending: bool,
     trace: Option<Vec<SerialTraceEntry>>,
+    /// Properties the trace is narrowed to, when a caller wants only some.
+    ///
+    /// The trace entry of a property carries its class and its own name, both
+    /// owned, so tracing every property of every object allocated two strings
+    /// per field read. A caller that walks a record to read four named
+    /// identifiers out of it wants four entries, not the sixty thousand a
+    /// `GElement` produces. `None` keeps every property, which is what the
+    /// diagnostic walk still asks for.
+    trace_properties: Option<&'a [&'a str]>,
     /// Every `String` read, with its declaration, when a caller asked for them.
     kept_strings: Option<Vec<SerialString>>,
+    /// Properties the kept strings are narrowed to, on the same principle as
+    /// [`Reader::trace_properties`]. Reading a record's name wants the one
+    /// property that declares it, not the value of every string in the body.
+    string_properties: Option<&'a [&'a str]>,
+    /// Whether the per-type value lists are filled. A walk that reads only
+    /// the shape of a record - the identifier reads, the framing checks -
+    /// keeps none of them, and building a `String` per string field was the
+    /// largest single cost of doing so.
+    collect_values: bool,
     /// Distance of the object being read from the record's own declarations.
     /// See [`SerialString::distance`].
     string_distance: u8,
@@ -901,19 +1030,26 @@ impl Reader<'_> {
         if depth >= MAX_WALK_DEPTH {
             return Err(SerialStop::TooDeep);
         }
-        let mut chain = Vec::new();
+        // Into a fixed array rather than a fresh `Vec`: this runs once per
+        // object read and a record's node stream holds hundreds of thousands
+        // of them, so the allocation was paid more often than any other in
+        // the walk. The depth is already bounded by `MAX_WALK_DEPTH`, and a
+        // chain that would run past it is the same `TooDeep` it always was.
+        let mut chain: [Option<&ClassDefinition>; MAX_WALK_DEPTH] = [None; MAX_WALK_DEPTH];
+        let mut length = 0_usize;
         let mut current = Some(class_index);
         while let Some(index) = current {
             let Some(class) = self.schema.class_by_index(index) else {
                 return Err(SerialStop::UnknownClass { class_index: index });
             };
-            chain.push(class);
-            if chain.len() > MAX_WALK_DEPTH {
+            if length >= MAX_WALK_DEPTH {
                 return Err(SerialStop::TooDeep);
             }
+            chain[length] = Some(class);
+            length += 1;
             current = class.parent.index();
         }
-        for class in chain.into_iter().rev() {
+        for class in chain[..length].iter().rev().flatten() {
             for property in &class.properties {
                 self.read_property(&class.name, property, depth)?;
             }
@@ -970,14 +1106,21 @@ impl Reader<'_> {
         depth: usize,
     ) -> Result<(), SerialStop> {
         let entered = self.offset;
+        let traced = self.trace.is_some()
+            && self
+                .trace_properties
+                .is_none_or(|wanted| wanted.contains(&property.name.as_str()));
         let result = self.read_item_inner(class_name, property, depth);
-        if let Some(trace) = self.trace.as_mut() {
-            trace.push(SerialTraceEntry {
+        if traced {
+            let entry = SerialTraceEntry {
                 offset: entered,
                 class: class_name.to_owned(),
                 property: property.name.clone(),
                 consumed: self.offset.saturating_sub(entered),
-            });
+            };
+            if let Some(trace) = self.trace.as_mut() {
+                trace.push(entry);
+            }
         }
         result
     }
@@ -1062,23 +1205,33 @@ impl Reader<'_> {
                 let units = self
                     .body
                     .get(self.offset..self.offset.saturating_add(bytes))
-                    .ok_or_else(&truncated)?
-                    .chunks_exact(2)
-                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                    .collect::<Vec<_>>();
-                let value = String::from_utf16_lossy(&units)
-                    .trim_end_matches('\0')
-                    .to_owned();
-                if let Some(kept) = self.kept_strings.as_mut() {
-                    kept.push(SerialString {
-                        offset: self.offset,
-                        class: class_name.to_owned(),
-                        property: property.name.clone(),
-                        value: value.clone(),
-                        distance: self.string_distance,
-                    });
+                    .ok_or_else(&truncated)?;
+                let keep = self.kept_strings.is_some()
+                    && self
+                        .string_properties
+                        .is_none_or(|wanted| wanted.contains(&property.name.as_str()));
+                // Decoded once, into one allocation, and only where the value
+                // is kept. Every walk used to build three strings per field -
+                // the UTF-16 units, the lossy conversion, and the trimmed copy
+                // - whether or not anything ever read them.
+                if keep || self.collect_values {
+                    let value = decode_utf16_value(units);
+                    if keep {
+                        let string = SerialString {
+                            offset: self.offset,
+                            class: class_name.to_owned(),
+                            property: property.name.clone(),
+                            value: value.clone(),
+                            distance: self.string_distance,
+                        };
+                        if let Some(kept) = self.kept_strings.as_mut() {
+                            kept.push(string);
+                        }
+                    }
+                    if self.collect_values {
+                        self.strings.push(value);
+                    }
                 }
-                self.strings.push(value);
                 self.advance(bytes).ok_or_else(truncated)
             }
             FieldType::Integer32Alternate => {

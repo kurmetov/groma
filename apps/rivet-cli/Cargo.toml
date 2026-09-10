@@ -23,6 +23,7 @@ rvt-container = { path = "../../crates/rvt-container" }
 rvt-import = { path = "../../crates/rvt-import" }
 rvt-model = { path = "../../crates/rvt-model" }
 rvt-schema = { path = "../../crates/rvt-schema" }
+mimalloc = "0.1.52"
 
 [dev-dependencies]
 cfb.workspace = true

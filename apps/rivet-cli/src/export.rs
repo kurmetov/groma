@@ -24,6 +24,14 @@ use crate::{json::*, source::*};
 use rvt_import::recover_elements;
 use scene_pack::{PackOptions, write_scene};
 
+/// Bytes buffered ahead of the destination an export is written to.
+///
+/// The STEP and JSON-lines emitters both write a token or a line at a time,
+/// which is the right shape for a writer and the wrong thing to hand a file
+/// descriptor: unbuffered, a 700 MB IFC export spent its time in the write
+/// syscall rather than in formatting.
+const EXPORT_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+
 pub(crate) fn export_json(
     path: &Path,
     output: Option<&Path>,
@@ -33,8 +41,17 @@ pub(crate) fn export_json(
 ) -> Result<(), Box<dyn Error>> {
     let recovered = recover_elements(path, max_member_bytes)?;
     let writer: Box<dyn Write> = match output {
-        Some(output) => Box::new(BufWriter::new(File::create(output)?)),
-        None => Box::new(io::stdout().lock()),
+        Some(output) => Box::new(BufWriter::with_capacity(
+            EXPORT_WRITE_BUFFER_BYTES,
+            File::create(output)?,
+        )),
+        // Buffered as well: a locked stdout is line-buffered, and an export of
+        // one JSON object per element would otherwise be one write syscall per
+        // element.
+        None => Box::new(BufWriter::with_capacity(
+            EXPORT_WRITE_BUFFER_BYTES,
+            io::stdout().lock(),
+        )),
     };
     let metadata = ExportMetadata {
         schema: recovered.schema.as_ref(),
@@ -236,7 +253,7 @@ pub(crate) fn export_ifc(
         settings,
     };
     let file = metadata_ifc(&conversion.model, &options)?;
-    let mut writer = File::create(&output)?;
+    let mut writer = BufWriter::with_capacity(EXPORT_WRITE_BUFFER_BYTES, File::create(&output)?);
     file.write_to(&mut writer)?;
     writer.flush()?;
 

@@ -166,62 +166,297 @@ pub fn for_each_member(
     max_member_bytes: u64,
     mut visit: impl FnMut(&str, &rvt_container::PartitionMember, u32, RecordLayout, &MemberWalk, &[u8]),
 ) -> Result<(), Box<dyn Error>> {
+    for_each_member_batch(
+        container,
+        partition_paths,
+        max_member_bytes,
+        |path, batch| {
+            for member in batch {
+                visit(
+                    path,
+                    member.member,
+                    member.format_tag,
+                    member.layout,
+                    &member.walk,
+                    &member.payload,
+                );
+            }
+        },
+    )
+}
+
+/// Read every member of every named partition, mapping each on its own thread
+/// and folding the results in member order.
+///
+/// This is [`for_each_member`] for a pass whose per-member work depends only on
+/// that member. The mapping runs in parallel and the folding does not, so the
+/// result is the same whatever the machine: `map` sees one member and cannot
+/// see the pass so far, and `fold` sees the mapped values in the order the
+/// members are stored.
+///
+/// Resolving a member is still sequential, and has to be: a record spilling out
+/// of one member changes where the next member's walk starts, and completing
+/// one reads the members that follow it.
+///
+/// # Errors
+///
+/// Fails where a partition cannot be inventoried or a member cannot be
+/// inflated.
+pub fn map_members<T: Send>(
+    container: &RvtContainer,
+    partition_paths: &[String],
+    max_member_bytes: u64,
+    map: impl Fn(&ResolvedMember<'_>) -> T + Sync,
+    mut fold: impl FnMut(&str, T),
+) -> Result<(), Box<dyn Error>> {
+    map_members_with(
+        container,
+        partition_paths,
+        max_member_bytes,
+        map,
+        |path, _, value| {
+            fold(path, value);
+        },
+    )
+}
+
+/// [`map_members`], with the member itself handed to the fold beside what the
+/// mapping made of it.
+///
+/// A pass that reads a member's records into values and then decides what to
+/// keep of them needs both: the values, which were made on another thread, and
+/// the records they were made from.
+///
+/// # Errors
+///
+/// Fails where a partition cannot be inventoried or a member cannot be
+/// inflated.
+pub fn map_members_with<T: Send>(
+    container: &RvtContainer,
+    partition_paths: &[String],
+    max_member_bytes: u64,
+    map: impl Fn(&ResolvedMember<'_>) -> T + Sync,
+    mut fold: impl FnMut(&str, &ResolvedMember<'_>, T),
+) -> Result<(), Box<dyn Error>> {
+    for_each_member_batch(
+        container,
+        partition_paths,
+        max_member_bytes,
+        |path, batch| {
+            for (member, value) in batch.iter().zip(parallel_map(batch, &map)) {
+                fold(path, member, value);
+            }
+        },
+    )
+}
+
+/// One member of a partition, inflated and framed, ready to be read.
+pub struct ResolvedMember<'a> {
+    pub member: &'a rvt_container::PartitionMember,
+    pub format_tag: u32,
+    pub layout: RecordLayout,
+    pub walk: MemberWalk,
+    pub payload: Vec<u8>,
+}
+
+/// Read every member of every named partition, a batch at a time.
+///
+/// Batching is what lets the expensive halves of the read - inflating a member
+/// and walking its record array - happen on several threads while the order
+/// the caller sees stays the order the members are stored in. Resolving the
+/// batch is sequential for the reason [`map_members`] gives.
+fn for_each_member_batch(
+    container: &RvtContainer,
+    partition_paths: &[String],
+    max_member_bytes: u64,
+    mut visit_batch: impl FnMut(&str, &[ResolvedMember<'_>]),
+) -> Result<(), Box<dyn Error>> {
     for partition_path in partition_paths {
-        let report =
-            container.inspect_partition(partition_path, PartitionReadOptions::default())?;
+        // The whole stored stream, once, so that inflating a member borrows
+        // nothing but bytes. Everything below - the inventory, the lookahead
+        // and the parallel prepare - reads it instead of reopening the CFB
+        // stream, which resolves the sector chain from its start on every
+        // buffer refill. A partition too large to hold is read the old way
+        // rather than refused.
+        let stored = container
+            .read_partition_bytes(partition_path, PARTITION_IN_MEMORY_LIMIT)
+            .ok();
+        let report = match stored.as_deref() {
+            Some(bytes) => container.inspect_partition_bytes(
+                partition_path,
+                bytes,
+                PartitionReadOptions::default(),
+            )?,
+            None => container.inspect_partition(partition_path, PartitionReadOptions::default())?,
+        };
         let mut carry = 0_u64;
         // Members decoded ahead of the walk to complete a spilled record. Each
         // is decoded once: the lookahead leaves it here and the walk takes it
         // when it arrives.
         let mut ahead: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
-        for (at, member) in report.members.iter().enumerate() {
-            let Some(descriptor) = member.descriptor else {
-                ahead.remove(&at);
-                carry = 0;
-                continue;
+        let mut at = 0_usize;
+        while at < report.members.len() {
+            let end = (at + MEMBER_PREPARE_BATCH).min(report.members.len());
+            let mut prepared = match stored.as_deref() {
+                Some(bytes) => prepare_members(bytes, &report.members[at..end], max_member_bytes),
+                None => (at..end).map(|_| None).collect(),
             };
-            let Some(layout) = RecordLayout::from_format_tag(descriptor.format_tag) else {
-                ahead.remove(&at);
-                carry = 0;
-                continue;
-            };
-            let mut payload = match ahead.remove(&at) {
-                Some(payload) => payload,
-                None => container.decode_partition_member(
-                    partition_path,
-                    member.logical_offset,
-                    max_member_bytes,
-                )?,
-            };
-            let leading_carry = usize::try_from(carry).unwrap_or(usize::MAX);
-            let Ok(walk) = MemberWalk::parse(&payload, layout, leading_carry) else {
-                carry = 0;
-                continue;
-            };
-            if walk.trailing_deficit > 0 {
-                complete_spilled_record(
-                    container,
-                    partition_path,
-                    &report.members,
-                    at,
-                    walk.trailing_deficit,
-                    max_member_bytes,
-                    &mut payload,
-                    &mut ahead,
-                )?;
+            let mut batch: Vec<ResolvedMember<'_>> = Vec::with_capacity(end - at);
+            for (offset, member) in report.members[at..end].iter().enumerate() {
+                let index = at + offset;
+                let Some(descriptor) = member.descriptor else {
+                    ahead.remove(&index);
+                    carry = 0;
+                    continue;
+                };
+                let Some(layout) = RecordLayout::from_format_tag(descriptor.format_tag) else {
+                    ahead.remove(&index);
+                    carry = 0;
+                    continue;
+                };
+                let ready = prepared.get_mut(offset).and_then(Option::take);
+                let (mut payload, ready_walk) = match (ahead.remove(&index), ready) {
+                    // The lookahead already inflated this member to finish an
+                    // earlier record; its bytes and the prepared ones are the
+                    // same bytes, and taking the ones already in hand keeps the
+                    // promise that a member is inflated once for the walk.
+                    (Some(payload), _) => (payload, None),
+                    (None, Some(ready)) => (ready.payload, ready.walk),
+                    (None, None) => (
+                        container.decode_partition_member(
+                            partition_path,
+                            member.logical_offset,
+                            max_member_bytes,
+                        )?,
+                        None,
+                    ),
+                };
+                let leading_carry = usize::try_from(carry).unwrap_or(usize::MAX);
+                // The prepared walk was taken with no carry, which is what all
+                // but a few members have. Where a record did spill into this
+                // one the walk starts elsewhere and is retaken here.
+                let walk = match ready_walk {
+                    Some(walk) if leading_carry == 0 => Some(walk),
+                    _ => MemberWalk::parse(&payload, layout, leading_carry).ok(),
+                };
+                let Some(walk) = walk else {
+                    carry = 0;
+                    continue;
+                };
+                if walk.trailing_deficit > 0 {
+                    complete_spilled_record(
+                        container,
+                        partition_path,
+                        stored.as_deref(),
+                        &report.members,
+                        index,
+                        walk.trailing_deficit,
+                        max_member_bytes,
+                        &mut payload,
+                        &mut ahead,
+                    )?;
+                }
+                carry = walk.trailing_deficit;
+                batch.push(ResolvedMember {
+                    member,
+                    format_tag: descriptor.format_tag,
+                    layout,
+                    walk,
+                    payload,
+                });
             }
-            visit(
-                partition_path,
-                member,
-                descriptor.format_tag,
-                layout,
-                &walk,
-                &payload,
-            );
-            carry = walk.trailing_deficit;
+            visit_batch(partition_path, &batch);
+            at = end;
         }
     }
     Ok(())
+}
+
+/// Largest partition stream held in memory to inflate its members from.
+///
+/// Above this the members are inflated one at a time from the file, as they
+/// always were: a conversion of a file this project has never seen should get
+/// slower, not fail.
+const PARTITION_IN_MEMORY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// Members resolved, and mapped, in one batch.
+///
+/// The batch bounds what is held at once - the members themselves, and
+/// whatever a mapping pass makes of them, which for the record read is a
+/// decode per record with its geometry in it. Small enough that a batch of a
+/// geometry-heavy partition stays tens of megabytes, large enough that every
+/// thread has several members of any partition to work on.
+const MEMBER_PREPARE_BATCH: usize = 192;
+
+/// One member inflated ahead of the walk, with the walk it takes when no
+/// record spilled into it.
+struct PreparedMember {
+    payload: Vec<u8>,
+    /// The record array, walked with no leading carry. `None` where that walk
+    /// failed, which the caller reads as the failure it always was.
+    walk: Option<MemberWalk>,
+}
+
+/// Threads to spread a batch over: what the machine reports, and never more
+/// than there is work for.
+fn batch_threads(work: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(work.max(1))
+}
+
+/// Apply `map` to every item, on as many threads as the machine has, and hand
+/// the results back in the order the items came in.
+///
+/// A panic inside `map` is carried out to this thread rather than swallowed,
+/// so a failure reads the same way it would have read in a sequential loop.
+fn parallel_map<I: Sync, T: Send>(items: &[I], map: &(impl Fn(&I) -> T + Sync)) -> Vec<T> {
+    let per_thread = items.len().div_ceil(batch_threads(items.len()));
+    if per_thread == 0 {
+        return Vec::new();
+    }
+    std::thread::scope(|scope| {
+        let workers = items
+            .chunks(per_thread)
+            .map(|chunk| scope.spawn(move || chunk.iter().map(map).collect::<Vec<T>>()))
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
+/// Inflate a run of members and walk each one's record array, on as many
+/// threads as the machine has.
+///
+/// Members are independent: each is its own gzip member at its own offset, and
+/// its record array is read from its own payload. The one thing that is not
+/// independent is a record spilling from one member into the next, which
+/// changes where the receiving member's walk starts - so the walk here is
+/// taken with no carry, and [`for_each_member_batch`] retakes it for the few
+/// members that need one. Nothing is decided here: the results are handed back
+/// in member order and a failure is left as a failure for the caller to read.
+fn prepare_members(
+    stored: &[u8],
+    members: &[rvt_container::PartitionMember],
+    max_member_bytes: u64,
+) -> Vec<Option<PreparedMember>> {
+    parallel_map(members, &|member: &rvt_container::PartitionMember| {
+        let descriptor = member.descriptor?;
+        let layout = RecordLayout::from_format_tag(descriptor.format_tag)?;
+        let payload = rvt_container::decode_partition_member_bytes(
+            stored,
+            member.logical_offset,
+            max_member_bytes,
+        )
+        .ok()?;
+        let walk = MemberWalk::parse(&payload, layout, 0).ok();
+        Some(PreparedMember { payload, walk })
+    })
 }
 
 /// Append the bytes a record left owing to `payload`, taken from the members
@@ -239,6 +474,7 @@ pub fn for_each_member(
 fn complete_spilled_record(
     container: &RvtContainer,
     partition_path: &str,
+    stored: Option<&[u8]>,
     members: &[rvt_container::PartitionMember],
     at: usize,
     deficit: u64,
@@ -264,11 +500,18 @@ fn complete_spilled_record(
             return Ok(());
         };
         if let std::collections::btree_map::Entry::Vacant(slot) = ahead.entry(next) {
-            slot.insert(container.decode_partition_member(
-                partition_path,
-                member.logical_offset,
-                max_member_bytes,
-            )?);
+            slot.insert(match stored {
+                Some(stored) => rvt_container::decode_partition_member_bytes(
+                    stored,
+                    member.logical_offset,
+                    max_member_bytes,
+                )?,
+                None => container.decode_partition_member(
+                    partition_path,
+                    member.logical_offset,
+                    max_member_bytes,
+                )?,
+            });
         }
         let Some(decoded) = ahead.get(&next) else {
             return Ok(());
@@ -600,42 +843,92 @@ pub fn calibrate_names(
     let parameter_classes = parameter_class_indexes(schema);
     let mut parameter_ids = BTreeSet::new();
     let mut calibrations: BTreeMap<u16, NameCalibration> = BTreeMap::new();
-    for_each_member(
+    // One member's records say nothing about another's, so each member is read
+    // on its own thread and the readings are added in member order. Counting
+    // and set membership do not care about that order; the three samples a
+    // class keeps do, and folding in order is what keeps them the same three.
+    map_members(
         container,
         partition_paths,
         max_member_bytes,
-        |_, _, format_tag, layout, walk, payload| {
-            if format_tag != ELEMENT_CLASS_FORMAT_TAG {
-                return;
-            }
-            for record in &walk.records {
-                let Some(header) = RecordHeader::parse(payload, record, layout) else {
-                    continue;
-                };
-                let body = payload
-                    .get(record.body_offset()..record.end())
-                    .unwrap_or_default();
-                if parameter_classes.contains(&header.class_index) {
-                    if let Ok(id) = i32::try_from(header.id) {
-                        parameter_ids.insert(id);
-                    }
+        |member| read_member_calibration(member, &parameter_classes),
+        |_, read| {
+            parameter_ids.extend(read.parameter_ids);
+            for (class_index, found) in read.calibrations {
+                let entry = calibrations.entry(class_index).or_default();
+                entry.bodies += found.bodies;
+                for (offset, count) in found.offsets {
+                    *entry.offsets.entry(offset).or_default() += count;
                 }
-                let Some(fields) = ElementFields::parse(body, header.id) else {
-                    continue;
-                };
-                let tail_end = fields.id_offset + 4 + ELEMENT_TAIL_BYTES;
-                let entry = calibrations.entry(header.class_index).or_default();
-                entry.bodies += 1;
-                if let Some(found) = RecordString::scan_from(body, tail_end) {
-                    *entry.offsets.entry(found.offset - tail_end).or_default() += 1;
-                    if entry.samples.len() < 3 {
-                        entry.samples.push(found.value);
+                for sample in found.samples {
+                    if entry.samples.len() < NAME_SAMPLES_KEPT {
+                        entry.samples.push(sample);
                     }
                 }
             }
         },
     )?;
     Ok((calibrations, parameter_ids))
+}
+
+/// Samples of the string a class writes, kept per class so a report can show
+/// what the settled offset actually reads.
+const NAME_SAMPLES_KEPT: usize = 3;
+
+/// What one member contributes to the calibration.
+struct MemberCalibration {
+    calibrations: Vec<(u16, NameCalibration)>,
+    parameter_ids: Vec<i32>,
+}
+
+/// Read one member's element records: where each class puts its first readable
+/// string, and which records are a parameter's definition.
+///
+/// This reads one member and nothing else, which is what lets the pass run a
+/// member per thread. Everything it returns is added to the pass's totals by
+/// the fold in [`calibrate_names`].
+fn read_member_calibration(
+    member: &ResolvedMember<'_>,
+    parameter_classes: &BTreeSet<u16>,
+) -> MemberCalibration {
+    let mut calibrations: BTreeMap<u16, NameCalibration> = BTreeMap::new();
+    let mut parameter_ids = Vec::new();
+    if member.format_tag != ELEMENT_CLASS_FORMAT_TAG {
+        return MemberCalibration {
+            calibrations: Vec::new(),
+            parameter_ids,
+        };
+    }
+    let payload = &member.payload;
+    for record in &member.walk.records {
+        let Some(header) = RecordHeader::parse(payload, record, member.layout) else {
+            continue;
+        };
+        let body = payload
+            .get(record.body_offset()..record.end())
+            .unwrap_or_default();
+        if parameter_classes.contains(&header.class_index) {
+            if let Ok(id) = i32::try_from(header.id) {
+                parameter_ids.push(id);
+            }
+        }
+        let Some(fields) = ElementFields::parse(body, header.id) else {
+            continue;
+        };
+        let tail_end = fields.id_offset + 4 + ELEMENT_TAIL_BYTES;
+        let entry = calibrations.entry(header.class_index).or_default();
+        entry.bodies += 1;
+        if let Some(found) = RecordString::scan_from(body, tail_end) {
+            *entry.offsets.entry(found.offset - tail_end).or_default() += 1;
+            if entry.samples.len() < NAME_SAMPLES_KEPT {
+                entry.samples.push(found.value);
+            }
+        }
+    }
+    MemberCalibration {
+        calibrations: calibrations.into_iter().collect(),
+        parameter_ids,
+    }
 }
 
 /// Schema classes whose elements define parameters.
@@ -745,214 +1038,162 @@ pub fn recover_elements(
         &partition_paths,
         max_member_bytes,
     )?;
-    let accept_parameter = |id: i32| parameter_ids.contains(&id);
-    let accept_verified_parameter = |id: i32| {
-        if id < 0 {
-            catalog.is_some_and(|catalog| catalog.built_in_parameter(id).is_some())
-        } else {
-            parameter_ids.contains(&id)
-        }
+    // Everything the read of a record needs, gathered once. Reading a record
+    // is then a function of that record, which is what lets a member's records
+    // be read on every core at once and folded here in the order they are
+    // stored. See `RecordContext`.
+    let context = RecordContext {
+        schema: schema.as_ref(),
+        catalog,
+        calibrations: &calibrations,
+        parameter_ids: &parameter_ids,
+        header_class_index,
+        level_class_index,
+        plane_class_index,
+        pipe_curve_class_index,
+        family_instance_class_index,
+        curve_driver_class_index,
+        pipe_fitting_center_line_class_index,
+        gline_class_index,
+        ginstance_class_index,
+        inst_info_base_class_index,
+        gnode_class_index,
+        geometry_element_class_index,
+        parameter_set_classes,
+        compound_structure_classes,
+        brep_body_class_indices,
+        brep_classes,
     };
     let mut elements: BTreeMap<u32, ExportedElement> = BTreeMap::new();
 
     for (partition_index, partition_path) in partition_paths.iter().enumerate() {
-        for_each_member(
+        map_members_with(
             &container,
             std::slice::from_ref(partition_path),
             max_member_bytes,
-            |_, member, format_tag, layout, walk, payload| {
-                for record in &walk.records {
-                    let Some(header) = RecordHeader::parse(payload, record, layout) else {
+            |member| decode_member_records(&context, member),
+            |_, member, decoded| {
+                for (record, decoded) in member.walk.records.iter().zip(decoded) {
+                    let Some(decoded) = decoded else {
                         continue;
                     };
+                    let header = decoded.header;
                     let entry = elements.entry(header.id).or_default();
                     entry.record_count += 1;
-                    let body = record.body_in(payload);
 
-                    if Some(header.class_index) == geometry_element_class_index {
-                        let exact_bounds = GElementBounds::parse(body);
-                        let graph = gnode_class_index.and_then(|gnode_class_index| {
-                            GElementGraphFields::parse(body, |class_index| {
-                                schema.as_ref().is_some_and(|schema| {
-                                    schema_class_is_a(schema, class_index, gnode_class_index)
-                                })
-                            })
-                        });
-                        // The declared box first. `GRep.m_bBox` is read at
-                        // its own offset now, so it is the record's box as the
-                        // format states it; the duplicated-block scan below it
-                        // is a search for the same field, and a search can
-                        // land on a different pair of blocks entirely in a
-                        // record whose two boxes differ.
-                        let placement_bounds = graph
-                            .as_ref()
-                            .map(|graph| graph.bounds)
-                            .or(exact_bounds)
-                            .or_else(|| GElementBounds::parse_near_duplicate(body));
+                    if let Some(geometry) = decoded.geometry {
+                        let exact_bounds = geometry.exact_bounds;
+                        let graph_bounds = geometry.graph_bounds;
+                        let placement_bounds = geometry.placement_bounds;
                         if let Some(bounds) = exact_bounds {
                             entry.geometry_bounds = Some(bounds);
                         }
-                        let graph_bounds = graph.as_ref().map(|graph| graph.bounds);
-                        entry.geometry_graph = graph;
+                        entry.geometry_graph = geometry.graph;
                         if let Some(bounds) = placement_bounds {
                             entry.placement_bounds = Some(bounds);
-                            if let Some(ginstance_class_index) = ginstance_class_index {
-                                entry.scanned_ginstance_transform = GInstanceTransformFields::parse(
-                                    body,
-                                    ginstance_class_index,
-                                    &bounds,
-                                );
+                            if context.ginstance_class_index.is_some() {
+                                entry.scanned_ginstance_transform =
+                                    geometry.scanned_ginstance_transform;
                             }
                         }
-                        if let (Some(schema), Some(classes)) = (schema.as_ref(), &brep_classes) {
-                            let (_walk, objects) =
-                                rvt_model::walk_record_collecting(schema, header.class_index, body);
-                            if let Some(base) = inst_info_base_class_index {
-                                let declared = objects
-                                    .iter()
-                                    .filter(|object| {
-                                        schema_class_is_a(schema, object.class_index, base)
-                                    })
-                                    .filter_map(GInstanceTransformFields::from_instance_info)
-                                    .collect::<Vec<_>>();
-                                entry.declared_instance_placements += declared.len();
-                                if !declared.is_empty() {
-                                    entry.declared_placements.clone_from(&declared);
-                                }
-                                // One placement is the case every consumer
-                                // here is written for: the element is that
-                                // instance. A record declaring several is a
-                                // real thing - a nested family writes one per
-                                // sub-instance - and is counted rather than
-                                // resolved, because picking one of them would
-                                // be picking arbitrarily.
-                                if let [only] = declared[..] {
-                                    // Not `get_or_insert`: the box has to come
-                                    // from the record that supplied the
-                                    // transform, so both are set in the one
-                                    // step or neither is.
-                                    if entry.ginstance_transform.is_none() {
-                                        entry.ginstance_transform = Some(only);
-                                        entry.instance_placement_bounds = placement_bounds;
-                                    }
-                                }
+                        let declared = geometry.declared_placements;
+                        entry.declared_instance_placements += declared.len();
+                        if !declared.is_empty() {
+                            entry.declared_placements.clone_from(&declared);
+                        }
+                        // One placement is the case every consumer here is
+                        // written for: the element is that instance. A record
+                        // declaring several is a real thing - a nested family
+                        // writes one per sub-instance - and is counted rather
+                        // than resolved, because picking one of them would be
+                        // picking arbitrarily.
+                        if let [only] = declared[..] {
+                            // Not `get_or_insert`: the box has to come from
+                            // the record that supplied the transform, so both
+                            // are set in the one step or neither is.
+                            if entry.ginstance_transform.is_none() {
+                                entry.ginstance_transform = Some(only);
+                                entry.instance_placement_bounds = placement_bounds;
                             }
-                            let brep = rvt_model::assemble_symbol_brep(
-                                &objects,
-                                classes,
-                                &brep_body_class_indices,
-                            );
-                            if !brep.is_empty() {
-                                // Counted as well as kept: one id can carry
-                                // more than one body-bearing record.
-                                entry.brep_records += 1;
-                                // Paired with the bounds block of *this*
-                                // record. Reading it off the element instead
-                                // would cross one record's body with another's
-                                // box: on AR S1, 13 208 wall ids carry 25 486
-                                // body-bearing records between them.
-                                let placement_box = body_placement_box(exact_bounds, graph_bounds);
-                                let (brep, placed) =
-                                    place_declared_body(brep, placement_box.as_ref());
-                                // Second pass, and only where the first found
-                                // nothing: a record whose solid the file joins
-                                // to the geometry of what was cut out of it.
-                                // See `place_body_less_its_cut_faces`.
-                                let (brep, placed) = if placed {
-                                    (brep, placed)
-                                } else {
-                                    place_body_less_its_cut_faces(
-                                        &objects,
-                                        classes,
-                                        &brep_body_class_indices,
-                                        placement_box.as_ref(),
-                                    )
-                                    .map_or((brep, placed), |trimmed| (trimmed, true))
+                        }
+                        if let Some(read) = geometry.body {
+                            // Counted as well as kept: one id can carry more
+                            // than one body-bearing record.
+                            entry.brep_records += 1;
+                            let PlacedBody {
+                                brep,
+                                placed,
+                                placement_box,
+                            } = read;
+                            if keep_body(&brep, placed, entry) {
+                                let body = record.body_in(&member.payload);
+                                entry.brep_placement_box = placement_box;
+                                entry.brep_box_residuals = BodyBoxResiduals {
+                                    exact: exact_bounds.and_then(|bounds| {
+                                        body_bounds_residual_feet(&brep, &bounds)
+                                    }),
+                                    graph: graph_bounds.and_then(|bounds| {
+                                        body_bounds_residual_feet(&brep, &bounds)
+                                    }),
+                                    // Scanned only where there is no exact
+                                    // block to compare against, which is both
+                                    // the population that could gain by it and
+                                    // the only one worth the cost of a whole-
+                                    // body scan.
+                                    near_duplicate: exact_bounds
+                                        .is_none()
+                                        .then(|| GElementBounds::parse_near_duplicate(body))
+                                        .flatten()
+                                        .and_then(|bounds| {
+                                            body_bounds_residual_feet(&brep, &bounds)
+                                        }),
+                                    graph_from_exact: exact_bounds.zip(graph_bounds).map(
+                                        |(exact, graph)| {
+                                            exact
+                                                .min
+                                                .into_iter()
+                                                .chain(exact.max)
+                                                .zip(graph.min.into_iter().chain(graph.max))
+                                                .map(|(left, right)| (left - right).abs())
+                                                .fold(0.0_f64, f64::max)
+                                        },
+                                    ),
                                 };
-                                if keep_body(&brep, placed, entry) {
-                                    entry.brep_placement_box = placement_box;
-                                    entry.brep_box_residuals = BodyBoxResiduals {
-                                        exact: exact_bounds.and_then(|bounds| {
-                                            body_bounds_residual_feet(&brep, &bounds)
-                                        }),
-                                        graph: graph_bounds.and_then(|bounds| {
-                                            body_bounds_residual_feet(&brep, &bounds)
-                                        }),
-                                        // Scanned only where there is no exact
-                                        // block to compare against, which is
-                                        // both the population that could gain
-                                        // by it and the only one worth the
-                                        // cost of a whole-body scan.
-                                        near_duplicate: exact_bounds
-                                            .is_none()
-                                            .then(|| GElementBounds::parse_near_duplicate(body))
-                                            .flatten()
-                                            .and_then(|bounds| {
-                                                body_bounds_residual_feet(&brep, &bounds)
-                                            }),
-                                        graph_from_exact: exact_bounds.zip(graph_bounds).map(
-                                            |(exact, graph)| {
-                                                exact
-                                                    .min
-                                                    .into_iter()
-                                                    .chain(exact.max)
-                                                    .zip(graph.min.into_iter().chain(graph.max))
-                                                    .map(|(left, right)| (left - right).abs())
-                                                    .fold(0.0_f64, f64::max)
-                                            },
-                                        ),
-                                    };
-                                    entry.brep_is_placed = placed;
-                                    entry.brep = Some(brep);
-                                }
+                                entry.brep_is_placed = placed;
+                                entry.brep = Some(brep);
                             }
                         }
                     }
 
-                    if Some(header.class_index) == header_class_index {
-                        if let Some(fields) = ElementHeaderFields::parse(body) {
-                            if entry.category.is_none() && fields.category.is_some() {
-                                entry.category = fields.category;
-                                entry.category_source = Some("declared");
-                            }
-                            entry.header_family_id = entry.header_family_id.or(fields.family_id);
+                    if let Some(fields) = decoded.header_fields {
+                        if entry.category.is_none() && fields.category.is_some() {
+                            entry.category = fields.category;
+                            entry.category_source = Some("declared");
                         }
-                    } else if format_tag == ELEMENT_CLASS_FORMAT_TAG {
+                        entry.header_family_id = entry.header_family_id.or(fields.family_id);
+                    }
+                    if let Some(element) = decoded.element {
+                        let ElementDecode {
+                            declared_parameters,
+                            declared_name,
+                            declared_ids: declared,
+                            compound_structures,
+                            fields,
+                            elevation_feet,
+                            pipe_line_candidate,
+                            fitting_center_line_candidate,
+                            parameter_spec,
+                        } = *element;
                         entry.class_index = Some(header.class_index);
-                        entry.source = Some((partition_index, member.index, record.offset));
-                        // The declarations name the four parameter sets
-                        // outright, so they are read from the walk rather than
-                        // searched for, and without waiting on the heuristic
-                        // that locates the element's fixed tail.
+                        entry.source = Some((partition_index, member.member.index, record.offset));
                         if entry.parameters.is_empty() {
-                            let declared = (|| {
-                                let classes = parameter_set_classes?;
-                                ParameterSets::from_record(
-                                    schema.as_ref()?,
-                                    header.class_index,
-                                    body,
-                                    classes,
-                                )
-                            })();
-                            if let Some(found) = declared {
+                            if let Some(found) = declared_parameters {
                                 entry.parameters = found.parameters;
                             }
                         }
-                        // The declarations name the property a record's name
-                        // is the value of, so it is read rather than scanned
-                        // for. The scan stays as the fallback for a record
-                        // whose class declares no such property.
                         if entry.name.is_none() {
-                            entry.name = schema
-                                .as_ref()
-                                .and_then(|schema| {
-                                    rvt_model::record_name(schema, header.class_index, body)
-                                })
-                                .map(|name| (name, "declared"));
+                            entry.name = declared_name.map(|name| (name, "declared"));
                         }
-                        // The type an element is an instance of is a declared
-                        // property, so it is read rather than inferred from
-                        // geometry. See `TYPE_ELEMENT_ID_PROPERTIES`.
                         if entry.type_element_id.is_none()
                             || entry.family_element_id.is_none()
                             || entry.declared_category_id.is_none()
@@ -960,99 +1201,53 @@ pub fn recover_elements(
                             || entry.main_design_option_id.is_none()
                             || entry.host_id.is_none()
                         {
-                            if let Some(schema) = schema.as_ref() {
-                                let declared = rvt_model::record_declared_ids(
-                                    schema,
-                                    header.class_index,
-                                    body,
-                                    DECLARED_ID_PROPERTIES,
-                                );
-                                if entry.type_element_id.is_none() {
-                                    if let Some((property, id)) = TYPE_ELEMENT_ID_PROPERTIES
-                                        .iter()
-                                        .zip(&declared)
-                                        .find_map(|(property, id)| Some((*property, (*id)?)))
-                                    {
-                                        entry.type_element_id = Some(id);
-                                        entry.type_element_property = Some(property);
-                                    }
-                                }
-                                entry.family_element_id = entry
-                                    .family_element_id
-                                    .or_else(|| declared_id(&declared, FAMILY_ID_PROPERTY));
-                                entry.declared_category_id = entry
-                                    .declared_category_id
-                                    .or_else(|| declared_id(&declared, CATEGORY_ID_PROPERTY));
-                                entry.design_option_set_id =
-                                    entry.design_option_set_id.or_else(|| {
-                                        declared_id(&declared, DESIGN_OPTION_SET_ID_PROPERTY)
-                                    });
-                                entry.main_design_option_id =
-                                    entry.main_design_option_id.or_else(|| {
-                                        declared_id(&declared, MAIN_DESIGN_OPTION_PROPERTY)
-                                    });
-                                entry.host_id = entry
-                                    .host_id
-                                    .or_else(|| declared_id(&declared, HOST_ID_PROPERTY));
-                            }
-                        }
-                        // A compound host object's type owns its layer table,
-                        // and `HostObjAttr` is the class that declares it, so
-                        // the read is bound to that chain rather than to a
-                        // list of type classes.
-                        if entry.compound_structures.is_empty() {
-                            if let (Some(schema), Some(classes)) =
-                                (schema.as_ref(), compound_structure_classes)
-                            {
-                                if rvt_model::descends_from(
-                                    schema,
-                                    header.class_index,
-                                    rvt_model::HOST_OBJECT_ATTRIBUTES_CLASS_NAME,
-                                ) {
-                                    entry.compound_structures =
-                                        rvt_model::CompoundStructure::from_record(
-                                            schema,
-                                            header.class_index,
-                                            body,
-                                            classes,
-                                        );
-                                }
-                            }
-                        }
-                        if let Some(fields) = ElementFields::parse(body, header.id) {
-                            let tail_end = fields.id_offset + 4 + ELEMENT_TAIL_BYTES;
-                            if entry.name.is_none() {
-                                entry.name = read_name(
-                                    body,
-                                    tail_end,
-                                    calibrations
-                                        .get(&header.class_index)
-                                        .and_then(NameCalibration::settled_offset),
-                                );
-                            }
-                            // The scan stays as the fallback for a record the
-                            // walk cannot reach the sets in.
-                            if entry.parameters.is_empty() {
-                                let found = if let (Some(classes), Some(_)) =
-                                    (parameter_set_classes, catalog)
+                            if entry.type_element_id.is_none() {
+                                if let Some((property, id)) = TYPE_ELEMENT_ID_PROPERTIES
+                                    .iter()
+                                    .zip(&declared)
+                                    .find_map(|(property, id)| Some((*property, (*id)?)))
                                 {
-                                    ParameterSets::scan_schema_bound(
-                                        body,
-                                        tail_end,
-                                        fields.id_offset,
-                                        classes,
-                                        &accept_verified_parameter,
-                                    )
-                                } else {
-                                    ParameterSets::scan(body, &accept_parameter)
-                                };
-                                if let Some(found) = found {
+                                    entry.type_element_id = Some(id);
+                                    entry.type_element_property = Some(property);
+                                }
+                            }
+                            entry.family_element_id = entry
+                                .family_element_id
+                                .or_else(|| declared_id(&declared, FAMILY_ID_PROPERTY));
+                            entry.declared_category_id = entry
+                                .declared_category_id
+                                .or_else(|| declared_id(&declared, CATEGORY_ID_PROPERTY));
+                            entry.design_option_set_id = entry
+                                .design_option_set_id
+                                .or_else(|| declared_id(&declared, DESIGN_OPTION_SET_ID_PROPERTY));
+                            entry.main_design_option_id = entry
+                                .main_design_option_id
+                                .or_else(|| declared_id(&declared, MAIN_DESIGN_OPTION_PROPERTY));
+                            entry.host_id = entry
+                                .host_id
+                                .or_else(|| declared_id(&declared, HOST_ID_PROPERTY));
+                        }
+                        if entry.compound_structures.is_empty() {
+                            entry.compound_structures = compound_structures;
+                        }
+                        if let Some(read) = fields {
+                            let ElementFieldsDecode {
+                                fields,
+                                scanned_name,
+                                scanned_parameters,
+                                family_instance_placement_candidates,
+                            } = read;
+                            if entry.name.is_none() {
+                                entry.name = scanned_name;
+                            }
+                            if entry.parameters.is_empty() {
+                                if let Some(found) = scanned_parameters {
                                     entry.parameters = found.parameters;
                                 }
                             }
-                            if Some(header.class_index) == family_instance_class_index {
+                            if Some(header.class_index) == context.family_instance_class_index {
                                 entry.family_instance_placement_candidates =
-                                    FamilyInstancePlacementFields::candidates(body, tail_end);
+                                    family_instance_placement_candidates;
                             }
                             entry.moribund |= fields.moribund;
                             entry.locked |= fields.locked;
@@ -1066,28 +1261,23 @@ pub fn recover_elements(
                             entry.unplaced_owner_id =
                                 entry.unplaced_owner_id.or(fields.unplaced_owner_id);
                         }
-                        if Some(header.class_index) == level_class_index {
-                            if let Some(plane_index) = plane_class_index {
-                                if let Some(fields) = LevelFields::parse(body, plane_index) {
-                                    entry.elevation_feet = Some(fields.elevation_feet);
-                                }
-                            }
+                        if let Some(elevation_feet) = elevation_feet {
+                            entry.elevation_feet = Some(elevation_feet);
                         }
-                        if Some(header.class_index) == pipe_curve_class_index {
-                            if let Some(curve_driver_class_index) = curve_driver_class_index {
-                                entry.pipe_line_candidate =
-                                    PipeLineGeometryFields::parse(body, curve_driver_class_index);
-                            }
+                        if Some(header.class_index) == context.pipe_curve_class_index
+                            && context.curve_driver_class_index.is_some()
+                        {
+                            entry.pipe_line_candidate = pipe_line_candidate;
                         }
-                        if Some(header.class_index) == pipe_fitting_center_line_class_index {
-                            if let Some(gline_class_index) = gline_class_index {
-                                entry.fitting_center_line_candidate =
-                                    FittingCenterLineFields::parse(body, gline_class_index);
-                            }
+                        if Some(header.class_index) == context.pipe_fitting_center_line_class_index
+                            && context.gline_class_index.is_some()
+                        {
+                            entry.fitting_center_line_candidate = fitting_center_line_candidate;
                         }
-                        if i32::try_from(header.id).is_ok_and(|id| parameter_ids.contains(&id)) {
-                            entry.parameter_spec =
-                                ParameterSpec::scan(body).map(|spec| spec.type_id);
+                        if i32::try_from(header.id)
+                            .is_ok_and(|id| context.parameter_ids.contains(&id))
+                        {
+                            entry.parameter_spec = parameter_spec;
                         }
                     }
                 }
@@ -1113,6 +1303,371 @@ pub fn recover_elements(
         parameter_specs,
         elements,
     })
+}
+
+/// Everything the read of one record needs besides the record: the class
+/// indexes the schema resolved once, the parameter identifiers the first pass
+/// collected, and the release catalogue.
+///
+/// Gathered into one value so that reading a record is a function of that
+/// record, which is what lets the records of a batch be read on every core at
+/// once. Nothing here changes while the pass runs.
+struct RecordContext<'a> {
+    schema: Option<&'a Schema>,
+    catalog: Option<Catalog>,
+    calibrations: &'a BTreeMap<u16, NameCalibration>,
+    parameter_ids: &'a BTreeSet<i32>,
+    header_class_index: Option<u16>,
+    level_class_index: Option<u16>,
+    plane_class_index: Option<u16>,
+    pipe_curve_class_index: Option<u16>,
+    family_instance_class_index: Option<u16>,
+    curve_driver_class_index: Option<u16>,
+    pipe_fitting_center_line_class_index: Option<u16>,
+    gline_class_index: Option<u16>,
+    ginstance_class_index: Option<u16>,
+    inst_info_base_class_index: Option<u16>,
+    gnode_class_index: Option<u16>,
+    geometry_element_class_index: Option<u16>,
+    parameter_set_classes: Option<ParameterSetClassIndexes>,
+    compound_structure_classes: Option<rvt_model::CompoundStructureClassIndexes>,
+    brep_body_class_indices: Vec<u16>,
+    brep_classes: Option<rvt_model::BrepClassIndexes>,
+}
+
+impl RecordContext<'_> {
+    /// Whether a stored parameter identifier is one the file defines.
+    fn accept_parameter(&self, id: i32) -> bool {
+        self.parameter_ids.contains(&id)
+    }
+
+    /// The same question where a release catalogue can vouch for the built-in
+    /// identifiers, which are negative and are not defined by the file.
+    fn accept_verified_parameter(&self, id: i32) -> bool {
+        if id < 0 {
+            self.catalog
+                .is_some_and(|catalog| catalog.built_in_parameter(id).is_some())
+        } else {
+            self.parameter_ids.contains(&id)
+        }
+    }
+}
+
+/// One record read into the values the pass may keep from it.
+///
+/// This is the whole of what reading a record costs, and none of it depends on
+/// the pass so far - which is the point: the fold in [`recover_elements`] still
+/// decides what to keep, with the guards it always had, and no longer does the
+/// reading itself. A value the guards turn out not to want was read anyway,
+/// which is what a parallel pass trades for the wall time it returns.
+struct RecordDecode {
+    header: RecordHeader,
+    /// Present for a `GElement` record, which is the one that carries a solid.
+    geometry: Option<GeometryDecode>,
+    /// Present for an `ElementHeader` record.
+    header_fields: Option<ElementHeaderFields>,
+    /// Present for a record in a member whose descriptor says it carries the
+    /// element's own class.
+    element: Option<Box<ElementDecode>>,
+}
+
+/// What a `GElement` record's body states about where it is and what it holds.
+struct GeometryDecode {
+    exact_bounds: Option<GElementBounds>,
+    graph: Option<GElementGraphFields>,
+    graph_bounds: Option<GElementBounds>,
+    placement_bounds: Option<GElementBounds>,
+    scanned_ginstance_transform: Option<GInstanceTransformFields>,
+    /// The placements the record's own `InstInfoBase` objects declare.
+    declared_placements: Vec<GInstanceTransformFields>,
+    /// The solid the record assembles, already placed against its own box.
+    body: Option<PlacedBody>,
+}
+
+/// A solid read out of one record, and whether its own box placed it.
+struct PlacedBody {
+    brep: rvt_model::SymbolBrep,
+    placed: bool,
+    placement_box: Option<GElementBounds>,
+}
+
+/// What an element-class record's body states about the element.
+struct ElementDecode {
+    declared_parameters: Option<ParameterSets>,
+    declared_name: Option<String>,
+    declared_ids: Vec<Option<i32>>,
+    compound_structures: Vec<rvt_model::CompoundStructure>,
+    fields: Option<ElementFieldsDecode>,
+    elevation_feet: Option<f64>,
+    pipe_line_candidate: Option<PipeLineGeometryFields>,
+    fitting_center_line_candidate: Option<FittingCenterLineFields>,
+    parameter_spec: Option<String>,
+}
+
+/// What the fixed `Element` tail locates, and the readings that start from it.
+struct ElementFieldsDecode {
+    fields: ElementFields,
+    scanned_name: Option<(String, &'static str)>,
+    scanned_parameters: Option<ParameterSets>,
+    family_instance_placement_candidates: Vec<FamilyInstancePlacementFields>,
+}
+
+/// Read every record of one member.
+///
+/// The result is in record order and holds one entry per record the header
+/// parse accepted, so the fold can walk the member's records and its decodes
+/// together.
+fn decode_member_records(
+    context: &RecordContext<'_>,
+    member: &ResolvedMember<'_>,
+) -> Vec<Option<RecordDecode>> {
+    member
+        .walk
+        .records
+        .iter()
+        .map(|record| {
+            let header = RecordHeader::parse(&member.payload, record, member.layout)?;
+            let body = record.body_in(&member.payload);
+            Some(RecordDecode {
+                header,
+                geometry: (Some(header.class_index) == context.geometry_element_class_index)
+                    .then(|| decode_geometry(context, header, body)),
+                header_fields: (Some(header.class_index) == context.header_class_index)
+                    .then(|| ElementHeaderFields::parse(body))
+                    .flatten(),
+                element: (Some(header.class_index) != context.header_class_index
+                    && member.format_tag == ELEMENT_CLASS_FORMAT_TAG)
+                    .then(|| Box::new(decode_element(context, header, body))),
+            })
+        })
+        .collect()
+}
+
+/// Read a `GElement` record's body: its boxes, the node graph under it, the
+/// placements it declares and the solid it assembles.
+fn decode_geometry(
+    context: &RecordContext<'_>,
+    header: RecordHeader,
+    body: &[u8],
+) -> GeometryDecode {
+    let exact_bounds = GElementBounds::parse(body);
+    let graph = context.gnode_class_index.and_then(|gnode_class_index| {
+        GElementGraphFields::parse(body, |class_index| {
+            context
+                .schema
+                .is_some_and(|schema| schema_class_is_a(schema, class_index, gnode_class_index))
+        })
+    });
+    // The declared box first. `GRep.m_bBox` is read at its own offset now, so
+    // it is the record's box as the format states it; the duplicated-block
+    // scan below it is a search for the same field, and a search can land on a
+    // different pair of blocks entirely in a record whose two boxes differ.
+    let placement_bounds = graph
+        .as_ref()
+        .map(|graph| graph.bounds)
+        .or(exact_bounds)
+        .or_else(|| GElementBounds::parse_near_duplicate(body));
+    let graph_bounds = graph.as_ref().map(|graph| graph.bounds);
+    let scanned_ginstance_transform = placement_bounds.and_then(|bounds| {
+        context
+            .ginstance_class_index
+            .and_then(|ginstance_class_index| {
+                GInstanceTransformFields::parse(body, ginstance_class_index, &bounds)
+            })
+    });
+    let mut declared_placements = Vec::new();
+    let mut body_read = None;
+    if let (Some(schema), Some(classes)) = (context.schema, context.brep_classes.as_ref()) {
+        let (_walk, objects) = rvt_model::walk_record_collecting(schema, header.class_index, body);
+        if let Some(base) = context.inst_info_base_class_index {
+            declared_placements = objects
+                .iter()
+                .filter(|object| schema_class_is_a(schema, object.class_index, base))
+                .filter_map(GInstanceTransformFields::from_instance_info)
+                .collect::<Vec<_>>();
+        }
+        let brep =
+            rvt_model::assemble_symbol_brep(&objects, classes, &context.brep_body_class_indices);
+        if !brep.is_empty() {
+            // Paired with the bounds block of *this* record. Reading it off
+            // the element instead would cross one record's body with another's
+            // box: on AR S1, 13 208 wall ids carry 25 486 body-bearing records
+            // between them.
+            let placement_box = body_placement_box(exact_bounds, graph_bounds);
+            let (brep, placed) = place_declared_body(brep, placement_box.as_ref());
+            // Second pass, and only where the first found nothing: a record
+            // whose solid the file joins to the geometry of what was cut out
+            // of it. See `place_body_less_its_cut_faces`.
+            let (brep, placed) = if placed {
+                (brep, placed)
+            } else {
+                place_body_less_its_cut_faces(
+                    &objects,
+                    classes,
+                    &context.brep_body_class_indices,
+                    placement_box.as_ref(),
+                )
+                .map_or((brep, placed), |trimmed| (trimmed, true))
+            };
+            body_read = Some(PlacedBody {
+                brep,
+                placed,
+                placement_box,
+            });
+        }
+    }
+    GeometryDecode {
+        exact_bounds,
+        graph,
+        graph_bounds,
+        placement_bounds,
+        scanned_ginstance_transform,
+        declared_placements,
+        body: body_read,
+    }
+}
+
+/// Read the parts of an element record that its fixed `Element` tail locates:
+/// the fallback name, the fallback parameter scan, and the placement
+/// candidates a family instance carries.
+///
+/// Both fallbacks are read only where the declarations did not answer, which
+/// is the one case the fold in [`recover_elements`] can reach them in.
+fn decode_element_fields(
+    context: &RecordContext<'_>,
+    header: RecordHeader,
+    body: &[u8],
+    fields: ElementFields,
+    declared_parameters: Option<&ParameterSets>,
+    declared_name: Option<&String>,
+) -> ElementFieldsDecode {
+    let tail_end = fields.id_offset + 4 + ELEMENT_TAIL_BYTES;
+    ElementFieldsDecode {
+        fields,
+        // Read only where the declarations did not answer, which is the
+        // one case the fold can reach it in.
+        scanned_name: declared_name
+            .is_none()
+            .then(|| {
+                read_name(
+                    body,
+                    tail_end,
+                    context
+                        .calibrations
+                        .get(&header.class_index)
+                        .and_then(NameCalibration::settled_offset),
+                )
+            })
+            .flatten(),
+        // The scan stays as the fallback for a record the walk cannot
+        // reach the sets in - which is a record whose declared read
+        // yielded no parameter, not merely one that yielded no set.
+        scanned_parameters: declared_parameters
+            .is_none_or(|found| found.parameters.is_empty())
+            .then(|| {
+                if let (Some(classes), Some(_)) = (context.parameter_set_classes, context.catalog) {
+                    ParameterSets::scan_schema_bound(
+                        body,
+                        tail_end,
+                        fields.id_offset,
+                        classes,
+                        &|id| context.accept_verified_parameter(id),
+                    )
+                } else {
+                    ParameterSets::scan(body, &|id| context.accept_parameter(id))
+                }
+            })
+            .flatten(),
+        family_instance_placement_candidates: if Some(header.class_index)
+            == context.family_instance_class_index
+        {
+            FamilyInstancePlacementFields::candidates(body, tail_end)
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// Read an element-class record's body: the parameters, name and identifiers
+/// its declarations state, and the readings its fixed tail locates.
+fn decode_element(context: &RecordContext<'_>, header: RecordHeader, body: &[u8]) -> ElementDecode {
+    // The declarations name the four parameter sets outright, so they are read
+    // from the walk rather than searched for, and without waiting on the
+    // heuristic that locates the element's fixed tail.
+    let declared_parameters = (|| {
+        let classes = context.parameter_set_classes?;
+        ParameterSets::from_record(context.schema?, header.class_index, body, classes)
+    })();
+    // The declarations name the property a record's name is the value of, so
+    // it is read rather than scanned for. The scan stays as the fallback for a
+    // record whose class declares no such property.
+    let declared_name = context
+        .schema
+        .and_then(|schema| rvt_model::record_name(schema, header.class_index, body));
+    // The type an element is an instance of is a declared property, so it is
+    // read rather than inferred from geometry. See `TYPE_ELEMENT_ID_PROPERTIES`.
+    let declared_ids = context.schema.map_or_else(Vec::new, |schema| {
+        rvt_model::record_declared_ids(schema, header.class_index, body, DECLARED_ID_PROPERTIES)
+    });
+    // A compound host object's type owns its layer table, and `HostObjAttr` is
+    // the class that declares it, so the read is bound to that chain rather
+    // than to a list of type classes.
+    let compound_structures = match (context.schema, context.compound_structure_classes) {
+        (Some(schema), Some(classes))
+            if rvt_model::descends_from(
+                schema,
+                header.class_index,
+                rvt_model::HOST_OBJECT_ATTRIBUTES_CLASS_NAME,
+            ) =>
+        {
+            rvt_model::CompoundStructure::from_record(schema, header.class_index, body, classes)
+        }
+        _ => Vec::new(),
+    };
+    let fields = ElementFields::parse(body, header.id).map(|fields| {
+        decode_element_fields(
+            context,
+            header,
+            body,
+            fields,
+            declared_parameters.as_ref(),
+            declared_name.as_ref(),
+        )
+    });
+    ElementDecode {
+        declared_parameters,
+        declared_name,
+        declared_ids,
+        compound_structures,
+        fields,
+        elevation_feet: (Some(header.class_index) == context.level_class_index)
+            .then(|| {
+                context
+                    .plane_class_index
+                    .and_then(|plane_index| LevelFields::parse(body, plane_index))
+                    .map(|fields| fields.elevation_feet)
+            })
+            .flatten(),
+        pipe_line_candidate: (Some(header.class_index) == context.pipe_curve_class_index)
+            .then(|| {
+                context
+                    .curve_driver_class_index
+                    .and_then(|index| PipeLineGeometryFields::parse(body, index))
+            })
+            .flatten(),
+        fitting_center_line_candidate: (Some(header.class_index)
+            == context.pipe_fitting_center_line_class_index)
+            .then(|| {
+                context
+                    .gline_class_index
+                    .and_then(|index| FittingCenterLineFields::parse(body, index))
+            })
+            .flatten(),
+        parameter_spec: i32::try_from(header.id)
+            .is_ok_and(|id| context.parameter_ids.contains(&id))
+            .then(|| ParameterSpec::scan(body).map(|spec| spec.type_id))
+            .flatten(),
+    }
 }
 
 /// Give a loadable family's elements the category their family declares.

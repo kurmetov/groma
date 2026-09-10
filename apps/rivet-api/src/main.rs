@@ -7,6 +7,12 @@
 //! serving the artefact keeps every answer traceable to the export it came
 //! from. Point `--data` at a directory of `<model>.jsonl` files.
 
+/// The same allocator the converter uses. The server holds a parsed model
+/// of millions of small values, and freeing one was measured at three and a
+/// half seconds of a twelve-second conversion under the system allocator.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod scenes;
 mod store;
 mod upload;

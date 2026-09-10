@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod work;
+
 use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Debug, Default, PartialEq)]

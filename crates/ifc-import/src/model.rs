@@ -95,21 +95,40 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
     let index = Index::build(parsed);
     let (levels, level_of_storey) = levels(parsed, &index, units);
 
-    let mut elements = Vec::new();
     // Which entities became elements, so a relation between two of them can be
     // stated in the model's own identifiers and one naming anything else - an
     // opening, a storey, a group - can be dropped.
     let mut kept: HashMap<u64, BimElementId> = HashMap::new();
-    for (id, entity) in products(parsed, &index) {
+    let products = products(parsed, &index);
+    // The placement chain is resolved here, in file order, because resolving
+    // one placement memoises every placement above it and the count of the
+    // ones it could not read is a property of the pass rather than of a
+    // product. Everything after this reads a product and nothing else, which
+    // is what lets the products be read on every core at once.
+    let placed = products
+        .into_iter()
+        .map(|(id, entity)| {
+            if NOT_DRAWN.contains(&entity.type_name.as_str()) {
+                return (id, entity, None);
+            }
+            let world = entity
+                .attribute(5)
+                .and_then(Value::as_reference)
+                .and_then(|placement| placements.world(placement));
+            (id, entity, world)
+        })
+        .collect::<Vec<_>>();
+    read.unread_placements = placements.unread;
+
+    // One product's geometry, properties and identity say nothing about
+    // another's, so they are built on every core and the tallies each one
+    // raises are added below in file order.
+    let built = bim_core::work::map_in_order(&placed, |(id, entity, world)| {
         if NOT_DRAWN.contains(&entity.type_name.as_str()) {
-            read.openings += 1;
-            continue;
+            return None;
         }
-        read.products += 1;
-        let world = entity
-            .attribute(5)
-            .and_then(Value::as_reference)
-            .and_then(|placement| placements.world(placement));
+        let world = *world;
+        let mut read = Read::default();
         let geometry = geometry(
             parsed,
             entity,
@@ -118,50 +137,50 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
             *options,
             &mut read,
         );
-        if geometry.is_some() {
-            read.with_geometry += 1;
-        } else {
-            read.without_geometry += 1;
-        }
+        let id = *id;
         let type_id = index.type_of.get(&id).copied();
         let element_id = identity(parsed, id, entity);
-        kept.insert(id, element_id.clone());
-        elements.push(BimElement {
-            id: element_id,
-            // One file per reader; `bim_core::federate` names the document.
-            document: None,
-            element_type: element_type(&entity.type_name),
-            class_name: Some(entity.type_name.as_str().to_owned()),
-            name: text(entity.attribute(2)),
-            // A space is named by its number and described by its name, which
-            // is what `LongName` carries for every spatial element.
-            long_name: entity
-                .type_name
-                .starts_with("IFCSPACE")
-                .then(|| text(entity.attribute(7)))
-                .flatten(),
-            category: None,
-            level_id: index
-                .storey_of(id)
-                .and_then(|storey| level_of_storey.get(&storey).cloned()),
-            type_id: type_id
-                .and_then(|type_id| Some((type_id, parsed.get(type_id)?)))
-                .map(|(type_id, entity)| identity(parsed, type_id, entity)),
-            // A type object is an `IfcRoot`, so its name is where every other
-            // root keeps one.
-            type_name: type_id
-                .and_then(|type_id| parsed.get(type_id))
-                .and_then(|entity| text(entity.attribute(2))),
-            placement: world.map(placement),
-            geometry,
-            properties: properties(parsed, &index, id, units),
-            type_properties: type_id
-                .map(|type_id| properties(parsed, &index, type_id, units))
-                .unwrap_or_default(),
-            material_layers: material_layers(parsed, &index, id, type_id, units),
-        });
-    }
-    read.unread_placements = placements.unread;
+        Some((
+            id,
+            read,
+            BimElement {
+                id: element_id,
+                // One file per reader; `bim_core::federate` names the document.
+                document: None,
+                element_type: element_type(&entity.type_name),
+                class_name: Some(entity.type_name.as_str().to_owned()),
+                name: text(entity.attribute(2)),
+                // A space is named by its number and described by its name, which
+                // is what `LongName` carries for every spatial element.
+                long_name: entity
+                    .type_name
+                    .starts_with("IFCSPACE")
+                    .then(|| text(entity.attribute(7)))
+                    .flatten(),
+                category: None,
+                level_id: index
+                    .storey_of(id)
+                    .and_then(|storey| level_of_storey.get(&storey).cloned()),
+                type_id: type_id
+                    .and_then(|type_id| Some((type_id, parsed.get(type_id)?)))
+                    .map(|(type_id, entity)| identity(parsed, type_id, entity)),
+                // A type object is an `IfcRoot`, so its name is where every other
+                // root keeps one.
+                type_name: type_id
+                    .and_then(|type_id| parsed.get(type_id))
+                    .and_then(|entity| text(entity.attribute(2))),
+                placement: world.map(placement),
+                geometry,
+                properties: properties(parsed, &index, id, units),
+                type_properties: type_id
+                    .map(|type_id| properties(parsed, &index, type_id, units))
+                    .unwrap_or_default(),
+                material_layers: material_layers(parsed, &index, id, type_id, units),
+            },
+        ))
+    });
+
+    let elements = collect_products(built, &mut read, &mut kept);
 
     Import {
         model: BimModel {
@@ -389,6 +408,36 @@ fn source(parsed: &Parsed) -> Option<BimSource> {
         application,
         release: parsed.schema.clone(),
     })
+}
+
+/// Add up what each product was read as, in file order.
+///
+/// The products were read on several threads and the tallies each raised are
+/// its own, so they are added here rather than into one counter shared across
+/// threads: the totals are then the totals a single-threaded read produced.
+fn collect_products(
+    built: Vec<Option<(u64, Read, BimElement)>>,
+    read: &mut Read,
+    kept: &mut HashMap<u64, BimElementId>,
+) -> Vec<BimElement> {
+    let mut elements = Vec::with_capacity(built.len());
+    for built in built {
+        let Some((id, item, element)) = built else {
+            read.openings += 1;
+            continue;
+        };
+        read.products += 1;
+        if element.geometry.is_some() {
+            read.with_geometry += 1;
+        } else {
+            read.without_geometry += 1;
+        }
+        read.unread_items += item.unread_items;
+        read.approximated_items += item.approximated_items;
+        kept.insert(id, element.id.clone());
+        elements.push(element);
+    }
+    elements
 }
 
 /// Every product a file states, in file order.
