@@ -1,16 +1,13 @@
 [package]
-name = "ifc-export"
-description = "Minimal IFC4 STEP writer for canonical BIM models"
+name = "bim-convert"
+description = "Source-format identification and the conversion pipeline shared by every reader"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-bim-convert = { path = "../bim-convert" }
 bim-core = { path = "../bim-core" }
-serde.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

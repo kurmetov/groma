@@ -65,6 +65,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 
 [[package]]
+name = "bim-convert"
+version = "0.1.0"
+dependencies = [
+ "bim-core",
+]
+
+[[package]]
 name = "bim-core"
 version = "0.1.0"
 
@@ -249,7 +256,10 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 name = "ifc-export"
 version = "0.1.0"
 dependencies = [
+ "bim-convert",
  "bim-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -367,6 +377,7 @@ version = "0.1.0"
 name = "rivet-api"
 version = "0.1.0"
 dependencies = [
+ "bim-convert",
  "clap",
  "serde",
  "serde_json",
@@ -377,6 +388,7 @@ dependencies = [
 name = "rivet-cli"
 version = "0.1.0"
 dependencies = [
+ "bim-convert",
  "bim-core",
  "bim-mesh",
  "cfb",
@@ -386,6 +398,7 @@ dependencies = [
  "ifc-import",
  "revit-catalog",
  "rvt-container",
+ "rvt-import",
  "rvt-model",
  "rvt-schema",
  "scene-pack",
@@ -423,6 +436,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvt-import"
+version = "0.1.0"
+dependencies = [
+ "bim-convert",
+ "bim-core",
+ "revit-catalog",
+ "rvt-container",
+ "rvt-model",
+ "rvt-schema",
+]
+
+[[package]]
 name = "rvt-model"
 version = "0.1.0"
 dependencies = [
@@ -437,10 +462,10 @@ version = "0.1.0"
 name = "scene-pack"
 version = "0.1.0"
 dependencies = [
+ "bim-convert",
  "bim-core",
  "bim-mesh",
  "flate2",
- "ifc-export",
  "serde_json",
 ]
 

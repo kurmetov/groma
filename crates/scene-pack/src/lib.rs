@@ -325,6 +325,7 @@ mod tests {
     fn boxy(id: &str, origin: [f64; 3]) -> BimElement {
         BimElement {
             id: BimElementId(id.to_owned()),
+            document: None,
             element_type: BimElementType::Wall,
             class_name: Some("SWall".to_owned()),
             name: Some(format!("Wall {id}")),
@@ -332,6 +333,7 @@ mod tests {
             category: None,
             level_id: None,
             type_id: None,
+            type_name: None,
             placement: None,
             geometry: Some(BimGeometry::BoundingBox(BimBoundingBox {
                 min: at(origin),

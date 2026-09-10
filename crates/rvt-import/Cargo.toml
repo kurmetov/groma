@@ -1,0 +1,18 @@
+[package]
+name = "rvt-import"
+description = "Semantic reconstruction of a Revit model into the canonical BIM model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bim-convert = { path = "../bim-convert" }
+bim-core = { path = "../bim-core" }
+revit-catalog = { path = "../revit-catalog" }
+rvt-container = { path = "../rvt-container" }
+rvt-model = { path = "../rvt-model" }
+rvt-schema = { path = "../rvt-schema" }
+
+[lints]
+workspace = true

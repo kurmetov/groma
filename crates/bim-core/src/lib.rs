@@ -5,7 +5,16 @@ use std::sync::{Arc, OnceLock};
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BimModel {
     /// Application/release that supplied the data, retained for provenance.
+    ///
+    /// The shorthand for a model read from one file. A federated model leaves
+    /// this `None` and states each file in [`BimModel::documents`] instead,
+    /// because there is no single application that supplied it.
     pub source: Option<BimSource>,
+    /// The source files this model was assembled from, one entry per file.
+    ///
+    /// Empty for a model a reader produced directly; [`federate`] fills it,
+    /// with one entry even for a single source.
+    pub documents: Vec<BimDocument>,
     pub elements: Vec<BimElement>,
     pub levels: Vec<BimLevel>,
     pub relations: Vec<BimRelation>,
@@ -32,6 +41,10 @@ pub struct BimElement {
     pub category: Option<BimCategory>,
     pub level_id: Option<BimElementId>,
     pub type_id: Option<BimElementId>,
+    /// What that type is called. Kept beside the identifier rather than
+    /// derived from it: an IFC type is identified by a GUID and an RVT one by
+    /// a record number, so neither identifier is anything to show a reader.
+    pub type_name: Option<String>,
     pub placement: Option<BimPlacement>,
     pub geometry: Option<BimGeometry>,
     pub properties: Vec<BimProperty>,
@@ -44,6 +57,10 @@ pub struct BimElement {
     /// layered build-up. A wall, floor, roof or ceiling has one; a component
     /// does not.
     pub material_layers: Option<BimMaterialLayerSet>,
+    /// The source file this element came from, in a federated model. `None`
+    /// where the model was read from a single file and the question does not
+    /// arise.
+    pub document: Option<BimDocumentId>,
 }
 
 /// A layered build-up, in order from one face to the other. The order is the
@@ -445,9 +462,441 @@ pub struct BimLevel {
     pub elevation: Option<BimNumber>,
 }
 
+/// One source file that contributed to a model.
+///
+/// A model read from a single file has one of these; a federated model - an
+/// IFC set, or a model and its links - has one per file, and every element
+/// names the one it came from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BimDocument {
+    pub id: BimDocumentId,
+    /// The file's own name, as it was handed over.
+    pub name: String,
+    /// The source format's short tag, such as `rvt` or `ifc`.
+    pub kind: String,
+    pub source: Option<BimSource>,
+    /// Elements this document contributed.
+    pub elements: usize,
+}
+
+/// A document's short name inside a federated model.
+///
+/// Kept separate from [`BimElementId`] because it namespaces one: two files
+/// may both call an element `1234`, and only the pair identifies it.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BimDocumentId(pub String);
+
+impl BimElementId {
+    /// This identifier qualified by the document it came from.
+    ///
+    /// The separator is `/`, which neither an RVT record number nor an IFC
+    /// `GlobalId` contains, so the qualified form can always be split back.
+    #[must_use]
+    pub fn qualified(&self, document: &BimDocumentId) -> Self {
+        Self(format!("{}/{}", document.0, self.0))
+    }
+}
+
+/// What [`federate`] assembled, and what a reader of the result should be
+/// told about it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BimFederationReport {
+    pub documents: usize,
+    pub elements: usize,
+    /// Element identifiers that occurred in more than one document. These are
+    /// the collisions qualification prevented; zero means qualification
+    /// changed nothing but the spelling of every identifier.
+    pub collisions: usize,
+    /// Pairs of documents whose stated geometry does not overlap at all.
+    ///
+    /// This is the only coordinate check made, and it is a report rather than
+    /// a correction. Files exported from one coordinated project share a
+    /// survey point and their extents overlap; files that do not are almost
+    /// certainly stated about different origins, and nothing here knows the
+    /// transform that would reconcile them. Nothing is moved on the strength
+    /// of this - it says where to look.
+    pub disjoint: Vec<(BimDocumentId, BimDocumentId)>,
+}
+
+/// Assemble several source models into one.
+///
+/// With a single source nothing is renamed: its identifiers reach the output
+/// exactly as its reader stated them, so a one-file conversion's element ids,
+/// and every `GlobalId` derived from them, stay what they have always been.
+///
+/// With several, every identifier is qualified by its document - element ids,
+/// the level and type each element names, relation endpoints, and the
+/// references stored in property values - because two files that each number
+/// an element `1234` would otherwise collapse into one element. The
+/// qualification is applied whether or not a collision actually occurred, so
+/// that an identifier's meaning does not depend on what else happened to be
+/// federated with it.
+///
+/// Coordinates are **not** reconciled. Each document's geometry arrives in
+/// whatever world system its own file stated; see
+/// [`BimFederationReport::disjoint`].
+#[must_use]
+pub fn federate(sources: Vec<(BimDocument, BimModel)>) -> (BimModel, BimFederationReport) {
+    let mut report = BimFederationReport {
+        documents: sources.len(),
+        ..BimFederationReport::default()
+    };
+    let qualify = sources.len() > 1;
+
+    // Which documents claimed each identifier, so that a collision can be
+    // counted rather than assumed.
+    let mut claimed: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut extents: Vec<(BimDocumentId, Option<BimBoundingBox>)> = Vec::new();
+    let mut out = BimModel::default();
+
+    for (mut document, mut model) in sources {
+        document.elements = model.elements.len();
+        extents.push((document.id.clone(), model.extent()));
+        for element in &model.elements {
+            *claimed.entry(element.id.0.clone()).or_default() += 1;
+        }
+        if qualify {
+            model.qualify(&document.id);
+        }
+        for element in &mut model.elements {
+            element.document = Some(document.id.clone());
+        }
+        // A single source keeps its own provenance in the shorthand field as
+        // well, so every consumer that reads only that still works.
+        if !qualify {
+            out.source = model.source.clone();
+        }
+        out.elements.append(&mut model.elements);
+        out.levels.append(&mut model.levels);
+        out.relations.append(&mut model.relations);
+        out.documents.push(document);
+    }
+
+    report.elements = out.elements.len();
+    report.collisions = claimed.values().filter(|count| **count > 1).count();
+    for (left_index, (left, left_extent)) in extents.iter().enumerate() {
+        for (right, right_extent) in &extents[left_index + 1..] {
+            if let (Some(left_extent), Some(right_extent)) = (left_extent, right_extent) {
+                if !left_extent.overlaps(right_extent) {
+                    report.disjoint.push((left.clone(), right.clone()));
+                }
+            }
+        }
+    }
+    (out, report)
+}
+
+impl BimBoundingBox {
+    /// Whether two boxes share any volume, touching counted as sharing.
+    #[must_use]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        (0..3).all(|axis| {
+            self.min.coordinates[axis] <= other.max.coordinates[axis]
+                && other.min.coordinates[axis] <= self.max.coordinates[axis]
+        })
+    }
+
+    /// The smallest box holding both.
+    #[must_use]
+    pub fn union(&self, other: &Self) -> Self {
+        let mut min = self.min.clone();
+        let mut max = self.max.clone();
+        for axis in 0..3 {
+            min.coordinates[axis] = min.coordinates[axis].min(other.min.coordinates[axis]);
+            max.coordinates[axis] = max.coordinates[axis].max(other.max.coordinates[axis]);
+        }
+        Self { min, max }
+    }
+}
+
+impl BimModel {
+    /// The hull of every point the model's geometry states, or `None` where
+    /// no element carries geometry.
+    ///
+    /// This is a hull of stated vertices, not an exact extent: an arc bulges
+    /// past its own endpoints, and a swept disk past its directrix by its
+    /// radius. It is enough to tell whether two documents are stated about
+    /// the same origin, which is what it is for.
+    #[must_use]
+    pub fn extent(&self) -> Option<BimBoundingBox> {
+        let mut extent: Option<BimBoundingBox> = None;
+        let mut include = |point: &BimPoint3| {
+            let box_of = BimBoundingBox {
+                min: point.clone(),
+                max: point.clone(),
+            };
+            extent = Some(match extent.take() {
+                Some(current) => current.union(&box_of),
+                None => box_of,
+            });
+        };
+        for element in &self.elements {
+            match &element.geometry {
+                None => {}
+                Some(BimGeometry::AxisLine(line)) => {
+                    include(&line.start);
+                    include(&line.end);
+                }
+                Some(BimGeometry::SweptDisk(disk)) => {
+                    include(&disk.directrix.start);
+                    include(&disk.directrix.end);
+                }
+                Some(BimGeometry::BoundingBox(bounds)) => {
+                    include(&bounds.min);
+                    include(&bounds.max);
+                }
+                Some(BimGeometry::Brep(brep)) => brep_points(brep, &mut include),
+                Some(BimGeometry::Assembly(breps)) => {
+                    for brep in breps {
+                        brep_points(brep, &mut include);
+                    }
+                }
+            }
+        }
+        extent
+    }
+
+    /// Rewrite every identifier this model states to name `document` as well.
+    ///
+    /// Every field of type [`BimElementId`] is covered: an identifier missed
+    /// here would become a reference into another document's elements, which
+    /// is a silently wrong model rather than a broken one.
+    fn qualify(&mut self, document: &BimDocumentId) {
+        for element in &mut self.elements {
+            element.id = element.id.qualified(document);
+            if let Some(level) = &element.level_id {
+                element.level_id = Some(level.qualified(document));
+            }
+            if let Some(kind) = &element.type_id {
+                element.type_id = Some(kind.qualified(document));
+            }
+            if let Some(layers) = &mut element.material_layers {
+                if let Some(source) = &layers.source_type_id {
+                    layers.source_type_id = Some(source.qualified(document));
+                }
+            }
+            for property in element
+                .properties
+                .iter_mut()
+                .chain(element.type_properties.iter_mut())
+            {
+                if let BimPropertyValue::Reference(id) = &property.value {
+                    property.value = BimPropertyValue::Reference(id.qualified(document));
+                }
+            }
+        }
+        for level in &mut self.levels {
+            level.id = level.id.qualified(document);
+        }
+        for relation in &mut self.relations {
+            relation.source = relation.source.qualified(document);
+            relation.target = relation.target.qualified(document);
+        }
+    }
+}
+
+/// Every point a boundary representation states, endpoints included.
+fn brep_points(brep: &BimBrep, include: &mut impl FnMut(&BimPoint3)) {
+    for face in &brep.faces {
+        for boundary in &face.loops {
+            for edge in boundary {
+                include(&edge.start);
+                include(&edge.end);
+                if let BimBrepCurve::Polyline(points) = &edge.curve {
+                    for point in points {
+                        include(point);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn point(coordinates: [f64; 3]) -> BimPoint3 {
+        BimPoint3 {
+            coordinates,
+            unit: BimUnit::metres(),
+        }
+    }
+
+    /// One element with an identifier, a level, a type and a reference, so
+    /// that every kind of identifier a model states is present.
+    fn element(id: &str, at: [f64; 3]) -> BimElement {
+        BimElement {
+            id: BimElementId(id.to_owned()),
+            document: None,
+            element_type: BimElementType::Wall,
+            class_name: None,
+            name: None,
+            long_name: None,
+            category: None,
+            level_id: Some(BimElementId("level".to_owned())),
+            type_id: Some(BimElementId("type".to_owned())),
+            type_name: None,
+            placement: None,
+            geometry: Some(BimGeometry::BoundingBox(BimBoundingBox {
+                min: point(at),
+                max: point([at[0] + 1.0, at[1] + 1.0, at[2] + 1.0]),
+            })),
+            properties: vec![BimProperty {
+                id: None,
+                name: "Host".to_owned(),
+                specification: None,
+                value: BimPropertyValue::Reference(BimElementId("host".to_owned())),
+            }],
+            type_properties: Vec::new(),
+            material_layers: Some(BimMaterialLayerSet {
+                source_type_id: Some(BimElementId("type".to_owned())),
+                name: None,
+                layers: Vec::new(),
+            }),
+        }
+    }
+
+    fn model(id: &str, at: [f64; 3]) -> BimModel {
+        BimModel {
+            source: Some(BimSource {
+                application: "Test".to_owned(),
+                release: None,
+            }),
+            documents: Vec::new(),
+            elements: vec![element(id, at)],
+            levels: vec![BimLevel {
+                id: BimElementId("level".to_owned()),
+                name: None,
+                elevation: None,
+            }],
+            relations: vec![BimRelation {
+                kind: "contains".to_owned(),
+                source: BimElementId("level".to_owned()),
+                target: BimElementId(id.to_owned()),
+            }],
+        }
+    }
+
+    fn document(id: &str) -> BimDocument {
+        BimDocument {
+            id: BimDocumentId(id.to_owned()),
+            name: format!("{id}.ifc"),
+            kind: "ifc".to_owned(),
+            source: None,
+            elements: 0,
+        }
+    }
+
+    #[test]
+    fn one_source_keeps_every_identifier_its_reader_stated() {
+        let (federated, report) = federate(vec![(document("a"), model("1234", [0.0; 3]))]);
+
+        // A conversion of a single file must not have its ids renamed: an IFC
+        // GlobalId is derived from them, and they are what a caller has
+        // already stored.
+        assert_eq!(federated.elements[0].id, BimElementId("1234".to_owned()));
+        assert_eq!(federated.levels[0].id, BimElementId("level".to_owned()));
+        assert_eq!(
+            federated.relations[0].target,
+            BimElementId("1234".to_owned())
+        );
+        assert_eq!(federated.documents.len(), 1);
+        assert_eq!(federated.documents[0].elements, 1);
+        assert_eq!(
+            federated.elements[0].document,
+            Some(BimDocumentId("a".to_owned()))
+        );
+        // The shorthand still answers for a single-source model.
+        assert!(federated.source.is_some());
+        assert_eq!(report.collisions, 0);
+        assert!(report.disjoint.is_empty());
+    }
+
+    #[test]
+    fn several_sources_qualify_every_kind_of_identifier() {
+        let (federated, report) = federate(vec![
+            (document("a"), model("1234", [0.0; 3])),
+            (document("b"), model("5678", [0.5, 0.0, 0.0])),
+        ]);
+
+        assert_eq!(federated.elements.len(), 2);
+        let first = &federated.elements[0];
+        assert_eq!(first.id, BimElementId("a/1234".to_owned()));
+        assert_eq!(first.level_id, Some(BimElementId("a/level".to_owned())));
+        assert_eq!(first.type_id, Some(BimElementId("a/type".to_owned())));
+        assert_eq!(
+            first.material_layers.as_ref().unwrap().source_type_id,
+            Some(BimElementId("a/type".to_owned()))
+        );
+        assert_eq!(
+            first.properties[0].value,
+            BimPropertyValue::Reference(BimElementId("a/host".to_owned()))
+        );
+        assert_eq!(first.document, Some(BimDocumentId("a".to_owned())));
+
+        // The two files each state a level called `level`; qualification is
+        // what keeps them two levels.
+        assert_eq!(federated.levels.len(), 2);
+        assert_eq!(federated.levels[0].id, BimElementId("a/level".to_owned()));
+        assert_eq!(federated.levels[1].id, BimElementId("b/level".to_owned()));
+        assert_eq!(
+            federated.relations[1].target,
+            BimElementId("b/5678".to_owned())
+        );
+        // No element id occurred twice, even though the levels did.
+        assert_eq!(report.documents, 2);
+        assert_eq!(report.elements, 2);
+        assert!(report.disjoint.is_empty());
+        // There is no one application behind a federated model.
+        assert!(federated.source.is_none());
+    }
+
+    #[test]
+    fn an_identifier_two_documents_both_claim_is_counted() {
+        let (federated, report) = federate(vec![
+            (document("a"), model("1234", [0.0; 3])),
+            (document("b"), model("1234", [0.5, 0.0, 0.0])),
+        ]);
+
+        assert_eq!(report.collisions, 1);
+        // And they stayed two elements, which is the point of counting it.
+        assert_eq!(federated.elements.len(), 2);
+        assert_ne!(federated.elements[0].id, federated.elements[1].id);
+    }
+
+    #[test]
+    fn documents_stated_about_different_origins_are_reported_not_moved() {
+        let far = model("5678", [10_000.0, 0.0, 0.0]);
+        let (federated, report) = federate(vec![
+            (document("a"), model("1234", [0.0; 3])),
+            (document("b"), far),
+        ]);
+
+        assert_eq!(
+            report.disjoint,
+            vec![(BimDocumentId("a".to_owned()), BimDocumentId("b".to_owned()))]
+        );
+        // Reported, and nothing was moved on the strength of it.
+        let Some(BimGeometry::BoundingBox(bounds)) = &federated.elements[1].geometry else {
+            panic!("the far document lost its geometry");
+        };
+        assert!((bounds.min.coordinates[0] - 10_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn an_extent_is_none_where_nothing_carries_geometry() {
+        let mut empty = model("1234", [0.0; 3]);
+        empty.elements[0].geometry = None;
+        assert!(empty.extent().is_none());
+        // And a document without geometry is never called disjoint from one
+        // that has it, because there is nothing to compare.
+        let (_, report) = federate(vec![
+            (document("a"), empty),
+            (document("b"), model("5678", [10_000.0, 0.0, 0.0])),
+        ]);
+        assert!(report.disjoint.is_empty());
+    }
 
     #[test]
     fn an_unknown_unit_is_distinct_from_a_unitless_quantity() {

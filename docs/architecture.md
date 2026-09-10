@@ -4,14 +4,36 @@ Rivet is deliberately split at format boundaries so that uncertain
 reverse-engineering work cannot leak into the canonical BIM model.
 
 ```text
-.rvt bytes
-  -> rvt-container  (CFB, streams, compression/framing)
-  -> rvt-schema     (generic type and field declarations)
-  -> rvt-model      (serialized objects, including unknown bytes)
-     + revit-catalog (release-specific public names and Forge units)
-  -> bim-core       (format-independent BIM entities)
-  -> ifc-export     (metadata IFC4 graph, GlobalId and ISO 10303-21)
+                  readers                                writers
+
+.rvt bytes -> rvt-container  (CFB, streams, framing)
+           -> rvt-schema     (generic type/field declarations)
+           -> rvt-model      (serialized objects, unknown bytes kept)
+           -> rvt-import     (semantic reconstruction)          \
+              + revit-catalog (public names and Forge units)     \
+                                                                  >- bim-core -> ifc-export  (IFC4, ISO 10303-21)
+.ifc text  -> ifc-import     (ISO 10303-21 -> semantic model)    /              -> scene-pack (viewer scene, via bim-mesh)
+                                                                /               -> JSON
+             bim-convert     (which format this is; what an element is)
 ```
+
+Every reader ends at `bim-core` and every writer starts there. `bim-convert`
+sits beside both: it answers what a file is, from its own leading bytes, and
+what an element is, from the vocabulary its source named it with. Those two
+questions used to be answered once per caller - a `looks_like_step` in the CLI
+and a private `Format` in the server, a class/category table reached through
+the IFC writer - which is what made a second source format a change to every
+export rather than a new reader.
+
+Adding a format is therefore: a reader crate that produces a `BimModel`, an
+arm in `Format::sniff`, and an arm in the CLI's `read_source`. Nothing in a
+writer, and nothing in the server.
+
+Several readers can feed one conversion. `bim_core::federate` assembles their
+models into one, qualifying every identifier by the document it came from so
+that two files numbering an element `1234` stay two elements. It does not
+reconcile coordinates - it reports documents that state no overlapping
+geometry and moves nothing.
 
 ## Current milestone
 

@@ -2,11 +2,20 @@
 
 use std::io::{self, Write};
 
-mod mapping;
+mod class_mapping;
+mod ifc4_entities;
 mod metadata;
+mod settings;
 
-pub use mapping::element_type_for_source;
-pub use metadata::{MetadataError, MetadataOptions, ifc_entity_name, metadata_ifc};
+pub use class_mapping::{ClassMapping, ClassMappingError, Mapped};
+// Both tables live in `bim-convert`, which the viewer scene and the RVT
+// reader also ask. Re-exported so that this crate's published surface - the
+// one mapping `export-ifc` applies - is unchanged by where it is kept.
+pub use bim_convert::{element_type_for_source, ifc_entity_name};
+pub use metadata::{MetadataError, MetadataOptions, metadata_ifc};
+pub use settings::{
+    ExportSettings, LengthUnit, ProjectSettings, PropertySetSettings, SettingsError, ViewDefinition,
+};
 
 const IFC64: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
 
@@ -88,6 +97,10 @@ pub enum StepValue {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StepHeader {
+    /// The `FILE_DESCRIPTION` strings, in the order they are written. IFC puts
+    /// the model view definition first; a writer may state more beside it, as
+    /// Revit does with the exchange requirement and coordinate reference.
+    pub description: Vec<String>,
     pub file_name: String,
     pub timestamp: String,
     pub authors: Vec<String>,
@@ -149,10 +162,9 @@ impl StepFile {
         }
         writeln!(writer, "ISO-10303-21;")?;
         writeln!(writer, "HEADER;")?;
-        writeln!(
-            writer,
-            "FILE_DESCRIPTION(('ViewDefinition [ReferenceView_V1.2]'),'2;1');"
-        )?;
+        write!(writer, "FILE_DESCRIPTION(")?;
+        write_string_list(&mut writer, &self.header.description)?;
+        writeln!(writer, ",'2;1');")?;
         write!(writer, "FILE_NAME(")?;
         write_step_string(&mut writer, &self.header.file_name)?;
         write!(writer, ",")?;
@@ -377,6 +389,7 @@ mod tests {
     #[test]
     fn emits_header_entities_references_and_unicode() {
         let header = StepHeader {
+            description: vec!["ViewDefinition [DesignTransferView_V1.0]".to_owned()],
             file_name: "model.ifc".to_owned(),
             timestamp: "2026-09-04T12:00:00+06:00".to_owned(),
             authors: vec!["Rivet".to_owned()],
@@ -407,6 +420,9 @@ mod tests {
         file.write_to(&mut bytes).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("ISO-10303-21;\nHEADER;"));
+        assert!(
+            text.contains("FILE_DESCRIPTION(('ViewDefinition [DesignTransferView_V1.0]'),'2;1');")
+        );
         assert!(text.contains("#1=IFCCARTESIANPOINT((0.000000000000000e0"));
         assert!(text.contains("#2=IFCAXIS2PLACEMENT3D(#1,$,'\\X2\\"));
         assert!(text.ends_with("END-ISO-10303-21;\n"));
@@ -421,6 +437,7 @@ mod tests {
     #[test]
     fn rejects_an_empty_header_organization() {
         let file = StepFile::new(StepHeader {
+            description: Vec::new(),
             file_name: "model.ifc".to_owned(),
             timestamp: "2026-09-04T12:00:00Z".to_owned(),
             authors: vec!["Rivet".to_owned()],

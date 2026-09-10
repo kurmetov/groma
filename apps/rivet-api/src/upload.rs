@@ -6,6 +6,8 @@
 //! either. As a child it is bounded, killable, and its stages arrive on a pipe
 //! - which is exactly what the progress display needs.
 
+pub use bim_convert::Format;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -15,12 +17,6 @@ use std::process::{Child, Command, Stdio};
 /// streamed to disk a megabyte at a time and costs no memory to hold, so this
 /// guards the disk; what can be *converted* is [`max_ifc_bytes`].
 pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// How much memory the STEP reader needs, as a multiple of the source text.
-///
-/// Measured on SMALL's own 643 MB IFC export: 2.20 GB peak, a 3.4x ratio,
-/// steady from 65 MB up to a synthetic 2.4 GiB. Four is that with headroom.
-const IFC_MEMORY_RATIO: u64 = 4;
 
 /// The share of the memory budget one conversion may plan to occupy.
 ///
@@ -88,7 +84,7 @@ fn meminfo_field(field: &str) -> Option<u64> {
 pub fn max_ifc_bytes() -> u64 {
     memory_budget()
         .map_or(MIN_MAX_IFC_BYTES, |budget| {
-            budget / (IFC_MEMORY_RATIO * CONVERSION_SHARE)
+            budget / (Format::Ifc.memory_ratio().unwrap_or(1) * CONVERSION_SHARE)
         })
         .clamp(MIN_MAX_IFC_BYTES, MAX_AUTOMATIC_IFC_BYTES)
 }
@@ -101,10 +97,12 @@ pub fn max_ifc_bytes() -> u64 {
 /// costs everyone the machine - and a host that swaps is not one anybody can
 /// see a progress bar on.
 pub fn room_to_convert(bytes: u64, format: Format) -> Result<(), String> {
-    if format != Format::Ifc {
+    // Only a whole-file reader's cost scales with the source, and only such a
+    // format declares a ratio. An RVT is bounded a member at a time instead.
+    let Some(ratio) = format.memory_ratio() else {
         return Ok(());
-    }
-    let Some(needed) = bytes.checked_mul(IFC_MEMORY_RATIO) else {
+    };
+    let Some(needed) = bytes.checked_mul(ratio) else {
         return Err("this file is too large to convert".to_owned());
     };
     let Some(free) = meminfo_field("MemAvailable:") else {
@@ -113,9 +111,10 @@ pub fn room_to_convert(bytes: u64, format: Format) -> Result<(), String> {
     if needed > free {
         let megabytes = |value: u64| value / (1024 * 1024);
         return Err(format!(
-            "converting this {} MB IFC needs about {} MB of memory and only {} MB is free; \
+            "converting this {} MB {} needs about {} MB of memory and only {} MB is free; \
              close something or try again",
             megabytes(bytes),
+            format.label(),
             megabytes(needed),
             megabytes(free)
         ));
@@ -128,12 +127,7 @@ pub fn room_to_convert(bytes: u64, format: Format) -> Result<(), String> {
 /// underscore, so no upload can name a path.
 fn sanitise(name: &str) -> String {
     let stem = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let stem = stem
-        .strip_suffix(".rvt")
-        .or_else(|| stem.strip_suffix(".RVT"))
-        .or_else(|| stem.strip_suffix(".ifc"))
-        .or_else(|| stem.strip_suffix(".IFC"))
-        .unwrap_or(stem);
+    let stem = Format::strip_extension(stem);
     let cleaned: String = stem
         .chars()
         .map(|character| {
@@ -153,46 +147,11 @@ fn sanitise(name: &str) -> String {
     }
 }
 
-/// The format an upload is in, decided by what the bytes say rather than by
-/// what the name claims.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format {
-    Rvt,
-    Ifc,
-}
-
-impl Format {
-    /// Read the format from the file's leading bytes.
-    ///
-    /// An RVT is a compound file, which always begins with the OLE signature.
-    /// An IFC is STEP text, which begins with `ISO-10303-21`, possibly behind
-    /// whitespace or a byte-order mark.
-    #[must_use]
-    pub fn sniff(head: &[u8]) -> Option<Self> {
-        const OLE: [u8; 8] = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
-        if head.starts_with(&OLE) {
-            return Some(Self::Rvt);
-        }
-        let text = head.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(head);
-        let text = String::from_utf8_lossy(&text[..text.len().min(64)]);
-        text.trim_start()
-            .starts_with("ISO-10303-21")
-            .then_some(Self::Ifc)
-    }
-
-    #[must_use]
-    pub fn extension(self) -> &'static str {
-        match self {
-            Self::Rvt => "rvt",
-            Self::Ifc => "ifc",
-        }
-    }
-}
-
 fn conversion_limit(format: Format, configured: u64) -> u64 {
-    match format {
-        Format::Ifc => configured.min(max_ifc_bytes()),
-        Format::Rvt => configured,
+    if format.memory_ratio().is_some() {
+        configured.min(max_ifc_bytes())
+    } else {
+        configured
     }
 }
 
@@ -222,7 +181,7 @@ impl Uploads {
     /// # Errors
     ///
     /// Fails where the body cannot be read or stored, where it is too large,
-    /// or where its leading bytes are neither an RVT nor an IFC.
+    /// or where its leading bytes name no format this server can read.
     pub fn receive(
         &self,
         name: &str,
@@ -233,7 +192,7 @@ impl Uploads {
 
         // The format is read from the first bytes, so the extension a client
         // claims never decides how the file is treated.
-        let mut head = [0_u8; 64];
+        let mut head = [0_u8; bim_convert::SNIFF_BYTES];
         let mut filled = 0;
         while filled < head.len() {
             match body.read(&mut head[filled..]) {
@@ -242,8 +201,20 @@ impl Uploads {
                 Err(error) => return Err(error.to_string()),
             }
         }
-        let Some(format) = Format::sniff(&head[..filled]) else {
-            return Err("this is neither a Revit file nor an IFC file".to_owned());
+        let format = match Format::sniff(&head[..filled]) {
+            Some(format) if format.is_readable() => format,
+            Some(format) => {
+                return Err(format!(
+                    "this is a{} {}, which this server cannot convert yet",
+                    if format.label().starts_with(['A', 'E', 'I', 'O', 'U']) {
+                        "n"
+                    } else {
+                        ""
+                    },
+                    format.label()
+                ));
+            }
+            None => return Err("this is not a model file this server reads".to_owned()),
         };
 
         let stem = sanitise(name);
@@ -302,11 +273,85 @@ impl Uploads {
         // process it hands it to - so the ceiling the upload was measured
         // against is passed on. An RVT is left alone: there the flag bounds one
         // decoded member rather than the source, and is not ours to raise.
-        if format == Format::Ifc {
+        if format.memory_ratio().is_some() {
             command
                 .arg("--max-member-bytes")
                 .arg(max_ifc_bytes().to_string());
         }
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+
+    /// Where an exported IFC is written, and where [`Uploads::exported`]
+    /// serves it from.
+    #[must_use]
+    pub fn exports(&self) -> PathBuf {
+        self.scenes.join("exports")
+    }
+
+    /// One export produced by this server, by name and extension. The extension is one this server
+    /// writes, never something a request supplies, so no name can reach a file
+    /// the exporter did not make.
+    #[must_use]
+    pub fn exported_as(&self, name: &str, extension: &str) -> Option<PathBuf> {
+        if !["ifc", "jsonl"].contains(&extension) {
+            return None;
+        }
+        let path = self
+            .exports()
+            .join(format!("{}.{extension}", sanitise(name)));
+        path.is_file().then_some(path)
+    }
+
+    /// Write the recovered records as JSON lines, the other thing a Revit
+    /// model converts to today.
+    ///
+    /// # Errors
+    ///
+    /// Fails where the exporter cannot be started.
+    pub fn export_json(&self, source: &Path, name: &str, full: bool) -> std::io::Result<Child> {
+        let directory = self.exports();
+        std::fs::create_dir_all(&directory)?;
+        let output = directory.join(format!("{name}.jsonl"));
+        let mut command = Command::new(&self.rivet);
+        command
+            .arg("export-json")
+            .arg(source)
+            .arg("--output")
+            .arg(&output);
+        if full {
+            command.arg("--full");
+        }
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+
+    /// Start an IFC export of an uploaded model, with the setup asked for.
+    ///
+    /// # Errors
+    ///
+    /// Fails where the exports directory cannot be made or the exporter cannot
+    /// be started.
+    pub fn export_ifc(
+        &self,
+        source: &Path,
+        name: &str,
+        request: &IfcRequest,
+    ) -> std::io::Result<Child> {
+        let directory = self.exports();
+        std::fs::create_dir_all(&directory)?;
+        let output = directory.join(format!("{name}.ifc"));
+        let mut command = Command::new(&self.rivet);
+        command
+            .arg("export-ifc")
+            .arg(source)
+            .arg("--output")
+            .arg(&output);
+        request.apply(&mut command);
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -331,9 +376,22 @@ pub struct Job {
     pub state: JobState,
     /// The scene, once it exists.
     pub scene: Option<String>,
+    /// The IFC file, once it exists. A job produces one or the other: an
+    /// upload becomes a scene to draw, an export becomes a file to download.
+    pub ifc: Option<String>,
+    /// The JSON-lines export, once it exists.
+    pub json: Option<String>,
     pub error: Option<String>,
     /// The converter's own summary lines, for the panel to show.
     pub notes: Vec<String>,
+    /// The name the model was uploaded under, its format and its size, so a
+    /// conversion can still be described after it has finished and the page
+    /// that started it has gone.
+    pub source: Option<String>,
+    pub format: Option<String>,
+    pub bytes: u64,
+    /// Seconds since the Unix epoch, for ordering a history a reader scrolls.
+    pub started: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,7 +410,15 @@ impl Job {
             seconds: 0.0,
             state: JobState::Running,
             scene: None,
+            ifc: None,
+            json: None,
             error: None,
+            source: None,
+            format: None,
+            bytes: 0,
+            started: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
             notes: Vec::new(),
         }
     }
@@ -371,8 +437,14 @@ impl Job {
             "running": self.running,
             "seconds": self.seconds,
             "scene": self.scene,
+            "ifc": self.ifc,
+            "json": self.json,
             "error": self.error,
             "notes": self.notes,
+            "source": self.source,
+            "format": self.format,
+            "bytes": self.bytes,
+            "started": self.started,
         })
     }
 }
@@ -383,8 +455,107 @@ impl Default for Job {
     }
 }
 
+/// The IFC export setup a request asks for.
+///
+/// The names are the exporter's own flags, so what a caller may ask for over
+/// HTTP and what `rivet export-ifc` accepts stay one list rather than two that
+/// drift. A parameter this does not know is refused: a setting silently
+/// dropped is a file that is not what was asked for.
+// One field per exporter flag, on purpose: this is the list of what a caller
+// may ask for, and keeping it flat is what makes it readable beside
+// `rivet export-ifc --help`.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IfcRequest {
+    pub length_unit: Option<String>,
+    pub no_revit_property_sets: bool,
+    pub no_revit_type_property_sets: bool,
+    pub no_ifc_common_property_sets: bool,
+    pub base_quantities: bool,
+    pub no_types: bool,
+    /// A class mapping table already on this server, named by path.
+    pub class_mapping: Option<PathBuf>,
+}
+
+impl IfcRequest {
+    /// Read the setup out of a request's query parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message to answer with where a parameter is not one of
+    /// these, or its value is not one this exporter has.
+    pub fn from_params(
+        params: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let mut request = Self::default();
+        let flag = |value: &str| match value {
+            "" | "1" | "true" | "yes" => Ok(true),
+            "0" | "false" | "no" => Ok(false),
+            other => Err(format!("{other} is not true or false")),
+        };
+        for (key, value) in params {
+            match key.as_str() {
+                // The model this export is for, handled by the caller.
+                "name" => {}
+                "length-unit" => match value.as_str() {
+                    "metre" | "millimetre" => request.length_unit = Some(value.clone()),
+                    other => {
+                        return Err(format!("length-unit is metre or millimetre, not {other}"));
+                    }
+                },
+                "no-revit-property-sets" => request.no_revit_property_sets = flag(value)?,
+                "no-revit-type-property-sets" => {
+                    request.no_revit_type_property_sets = flag(value)?;
+                }
+                "no-ifc-common-property-sets" => {
+                    request.no_ifc_common_property_sets = flag(value)?;
+                }
+                "base-quantities" => request.base_quantities = flag(value)?,
+                "no-types" => request.no_types = flag(value)?,
+                "class-mapping" => request.class_mapping = Some(PathBuf::from(value)),
+                other => return Err(format!("{other} is not an export setting")),
+            }
+        }
+        Ok(request)
+    }
+
+    fn apply(&self, command: &mut Command) {
+        if let Some(unit) = &self.length_unit {
+            command.arg("--length-unit").arg(unit);
+        }
+        for (asked, flag) in [
+            (self.no_revit_property_sets, "--no-revit-property-sets"),
+            (
+                self.no_revit_type_property_sets,
+                "--no-revit-type-property-sets",
+            ),
+            (
+                self.no_ifc_common_property_sets,
+                "--no-ifc-common-property-sets",
+            ),
+            (self.base_quantities, "--base-quantities"),
+            (self.no_types, "--no-types"),
+        ] {
+            if asked {
+                command.arg(flag);
+            }
+        }
+        if let Some(path) = &self.class_mapping {
+            command.arg("--class-mapping").arg(path);
+        }
+    }
+}
+
+/// What a conversion is producing, so a finished job names the right thing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Product {
+    Scene,
+    Ifc,
+    Json,
+}
+
 /// Read the converter's stages into `job` until it exits.
-pub fn follow(mut child: Child, scene_name: &str, job: &std::sync::Mutex<Job>) {
+pub fn follow(mut child: Child, name: &str, product: Product, job: &std::sync::Mutex<Job>) {
     let update = |change: &dyn Fn(&mut Job)| {
         if let Ok(mut held) = job.lock() {
             change(&mut held);
@@ -431,7 +602,11 @@ pub fn follow(mut child: Child, scene_name: &str, job: &std::sync::Mutex<Job>) {
         held.running = None;
         if succeeded {
             held.state = JobState::Done;
-            held.scene = Some(scene_name.to_owned());
+            match product {
+                Product::Scene => held.scene = Some(name.to_owned()),
+                Product::Ifc => held.ifc = Some(name.to_owned()),
+                Product::Json => held.json = Some(name.to_owned()),
+            }
         } else {
             held.state = JobState::Failed;
             held.error = Some(reason.clone());
@@ -474,10 +649,52 @@ fn failure_reason(status: Option<std::process::ExitStatus>, stderr_text: &str) -
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        Format, MAX_AUTOMATIC_IFC_BYTES, MIN_MAX_IFC_BYTES, conversion_limit, max_ifc_bytes,
-        memory_budget, room_to_convert, sanitise,
+        Format, IfcRequest, MAX_AUTOMATIC_IFC_BYTES, MIN_MAX_IFC_BYTES, conversion_limit,
+        max_ifc_bytes, memory_budget, room_to_convert, sanitise,
     };
+
+    fn params(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn reads_an_export_setup_out_of_the_query() {
+        let request = IfcRequest::from_params(&params(&[
+            ("name", "tower"),
+            ("length-unit", "millimetre"),
+            ("no-types", "true"),
+            // A flag with no value is the flag being set, which is how a bare
+            // `?no-ifc-common-property-sets` arrives.
+            ("no-ifc-common-property-sets", ""),
+        ]))
+        .expect("a readable setup");
+        assert_eq!(request.length_unit.as_deref(), Some("millimetre"));
+        assert!(request.no_types);
+        assert!(request.no_ifc_common_property_sets);
+        assert!(!request.no_revit_property_sets);
+    }
+
+    /// A setting the exporter does not have, or a value it cannot honour, is
+    /// refused. The alternative is a file that is quietly not what was asked
+    /// for, which nobody can tell by looking at it.
+    #[test]
+    fn refuses_a_setting_this_exporter_does_not_have() {
+        let error = IfcRequest::from_params(&params(&[("length-unit", "cubits")]))
+            .expect_err("an unknown unit");
+        assert!(error.contains("cubits"), "{error}");
+        let error = IfcRequest::from_params(&params(&[("tessellate", "1")]))
+            .expect_err("an unknown setting");
+        assert!(error.contains("tessellate"), "{error}");
+        let error = IfcRequest::from_params(&params(&[("no-types", "perhaps")]))
+            .expect_err("an unreadable flag");
+        assert!(error.contains("perhaps"), "{error}");
+    }
 
     #[test]
     fn derives_a_name_that_cannot_leave_the_directory() {

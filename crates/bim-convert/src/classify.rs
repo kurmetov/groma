@@ -1,3 +1,11 @@
+//! What an element is, read from the vocabulary its source names it with,
+//! and what each answer is called in IFC.
+//!
+//! Both tables live here rather than in a writer because three crates ask
+//! the same questions - the RVT reader while it builds a model, the IFC
+//! writer while it emits one, and the viewer scene while it labels one - and
+//! a second copy of either table would drift from the first.
+
 use bim_core::{BimElement, BimElementType};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,7 +212,15 @@ pub fn element_type_for_source(
         .map_or(BimElementType::Unknown, |mapping| mapping.element_type)
 }
 
-pub(crate) fn resolved_element_type(element: &BimElement) -> BimElementType {
+/// The element's own type where it has one, and what its source vocabulary
+/// says otherwise.
+///
+/// A reader that classified the element already has the answer; one that
+/// left it `Unknown` has not, and the fallback reads the class and category
+/// the source stated. Both writers and the viewer scene ask this rather than
+/// each keeping the fallback, which is how three copies of it came about.
+#[must_use]
+pub fn resolved_element_type(element: &BimElement) -> BimElementType {
     if element.element_type == BimElementType::Unknown {
         element_type_for_source(
             element.class_name.as_deref(),
@@ -215,6 +231,50 @@ pub(crate) fn resolved_element_type(element: &BimElement) -> BimElementType {
         )
     } else {
         element.element_type
+    }
+}
+
+/// The IFC entity a model element of this type is written as.
+///
+/// This is the one mapping `export-ifc` applies, published so that anything
+/// else - a viewer, a report - can say what an element would become without
+/// running the export and without keeping a second copy of the rules that
+/// could drift from this one.
+#[must_use]
+pub fn ifc_entity_name(element_type: BimElementType) -> &'static str {
+    match element_type {
+        BimElementType::PipeSegment => "IFCPIPESEGMENT",
+        BimElementType::PipeFitting => "IFCPIPEFITTING",
+        BimElementType::SanitaryTerminal => "IFCSANITARYTERMINAL",
+        BimElementType::AirTerminal => "IFCAIRTERMINAL",
+        BimElementType::FireSuppressionTerminal => "IFCFIRESUPPRESSIONTERMINAL",
+        BimElementType::Alarm => "IFCALARM",
+        BimElementType::CableCarrierFitting => "IFCCABLECARRIERFITTING",
+        BimElementType::DuctSegment => "IFCDUCTSEGMENT",
+        BimElementType::CableCarrierSegment => "IFCCABLECARRIERSEGMENT",
+        // The two distribution supertypes are instantiable but, unlike the
+        // typed leaves, declare no `PredefinedType` - which the schema table
+        // says for them as it does for the rest.
+        BimElementType::DistributionElement => "IFCDISTRIBUTIONELEMENT",
+        BimElementType::DistributionFlowElement => "IFCDISTRIBUTIONFLOWELEMENT",
+        BimElementType::Wall => "IFCWALL",
+        BimElementType::Slab => "IFCSLAB",
+        BimElementType::Roof => "IFCROOF",
+        BimElementType::Stair => "IFCSTAIR",
+        BimElementType::StairFlight => "IFCSTAIRFLIGHT",
+        BimElementType::CurtainWall => "IFCCURTAINWALL",
+        BimElementType::Railing => "IFCRAILING",
+        BimElementType::Column => "IFCCOLUMN",
+        BimElementType::Member => "IFCMEMBER",
+        BimElementType::Plate => "IFCPLATE",
+        BimElementType::Window => "IFCWINDOW",
+        BimElementType::Door => "IFCDOOR",
+        BimElementType::Unknown => "IFCBUILDINGELEMENTPROXY",
+        // A space never reaches `push_element`: `push_elements` sends a
+        // spatial type to `push_space`, whose attributes are a spatial
+        // element's rather than an element's. The match must still be total,
+        // and naming the entity is better than a panic.
+        BimElementType::Space => "IFCSPACE",
     }
 }
 

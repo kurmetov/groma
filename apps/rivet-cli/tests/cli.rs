@@ -42,6 +42,43 @@ fn ifc_fixture() -> NamedTempFile {
     file
 }
 
+/// The same IFC as [`ifc_fixture`], written under a name of your choosing and
+/// with its wall moved along X, so that two of them can be federated and
+/// their extents made to overlap or not.
+fn ifc_fixture_in(directory: &std::path::Path, name: &str, x: f64) -> std::path::PathBuf {
+    let path = directory.join(name);
+    let body = format!(
+        "ISO-10303-21;\n\
+         HEADER;\n\
+         FILE_SCHEMA(('IFC4'));\n\
+         ENDSEC;\n\
+         DATA;\n\
+         #1=IFCCARTESIANPOINT(({x}.,0.,0.));\n\
+         #2=IFCDIRECTION((0.,0.,1.));\n\
+         #3=IFCDIRECTION((1.,0.,0.));\n\
+         #4=IFCAXIS2PLACEMENT3D(#1,#2,#3);\n\
+         #5=IFCLOCALPLACEMENT($,#4);\n\
+         #6=IFCCARTESIANPOINT((0.,0.));\n\
+         #7=IFCDIRECTION((1.,0.));\n\
+         #8=IFCAXIS2PLACEMENT2D(#6,#7);\n\
+         #9=IFCRECTANGLEPROFILEDEF(.AREA.,$,#8,2.,1.);\n\
+         #10=IFCDIRECTION((0.,0.,1.));\n\
+         #11=IFCEXTRUDEDAREASOLID(#9,#4,#10,3.);\n\
+         #12=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#11));\n\
+         #13=IFCPRODUCTDEFINITIONSHAPE($,$,(#12));\n\
+         #14=IFCWALL('wall-guid',$,'Fixture wall',$,$,#5,#13,$,$);\n\
+         #15=IFCBUILDINGSTOREY('level-guid',$,'Ground floor',$,$,#5,$,$,$,0.);\n\
+         #16=IFCRELCONTAINEDINSPATIALSTRUCTURE('rel-guid',$,$,$,(#14),#15);\n\
+         #17=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);\n\
+         #18=IFCUNITASSIGNMENT((#17));\n\
+         #19=IFCPROJECT('project-guid',$,'Fixture project',$,$,$,$,(),#18);\n\
+         ENDSEC;\n\
+         END-ISO-10303-21;\n"
+    );
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
 fn fixture_with_schema(schema: &[u8]) -> NamedTempFile {
     fixture_with_schema_and_partition(schema, b"partition")
 }
@@ -958,8 +995,105 @@ fn export_ifc_writes_an_ifc4_spatial_model() {
     assert!(written.ends_with("END-ISO-10303-21;\n"));
 }
 
+/// The setup a run used can be written out and read back, and a flag beats
+/// what the file says - which is what makes a saved setup reusable with one
+/// thing changed.
 #[test]
-fn export_ifc_refuses_to_overwrite_the_source_rvt() {
+fn export_ifc_saves_and_reuses_an_export_setup() {
+    let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
+    let target = NamedTempFile::new().unwrap();
+    let setup = NamedTempFile::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-ifc",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            target.path().to_str().unwrap(),
+            "--length-unit",
+            "millimetre",
+            "--no-types",
+            "--write-settings",
+            setup.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Length unit: millimetre")
+    );
+
+    let written = std::fs::read_to_string(setup.path()).unwrap();
+    assert!(
+        written.contains("\"length-unit\": \"millimetre\""),
+        "{written}"
+    );
+    assert!(written.contains("\"types\": false"), "{written}");
+
+    // Read back, the same setup produces the same file - and the flag beside
+    // it overrides the one setting it names.
+    let again = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-ifc",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            target.path().to_str().unwrap(),
+            "--settings",
+            setup.path().to_str().unwrap(),
+            "--length-unit",
+            "metre",
+        ])
+        .output()
+        .unwrap();
+    assert!(again.status.success());
+    assert!(
+        String::from_utf8(again.stdout)
+            .unwrap()
+            .contains("Length unit: metre")
+    );
+    let ifc = std::fs::read_to_string(target.path()).unwrap();
+    assert!(
+        ifc.contains("=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)"),
+        "the flag should win"
+    );
+}
+
+/// A settings file naming a mapping table that cannot be applied fails before
+/// the model is read, and says which line is wrong.
+#[test]
+fn export_ifc_refuses_a_mapping_table_it_cannot_apply() {
+    let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
+    let target = NamedTempFile::new().unwrap();
+    let mut mapping = NamedTempFile::new().unwrap();
+    writeln!(mapping, "OST_Walls\t\tIfcWall\t").unwrap();
+    writeln!(mapping, "OST_Ceilings\t\tIfcCeiling\t").unwrap();
+    mapping.flush().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-ifc",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            target.path().to_str().unwrap(),
+            "--class-mapping",
+            mapping.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("line 2"), "{stderr}");
+    assert!(stderr.contains("IfcCeiling"), "{stderr}");
+}
+
+#[test]
+fn export_ifc_refuses_to_overwrite_the_source_file() {
     let fixture = fixture();
     let before = std::fs::read(fixture.path()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
@@ -976,7 +1110,7 @@ fn export_ifc_refuses_to_overwrite_the_source_rvt() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("IFC output must not overwrite the source RVT file")
+            .contains("output must not overwrite the source file")
     );
     assert_eq!(std::fs::read(fixture.path()).unwrap(), before);
 }
@@ -1175,7 +1309,7 @@ fn export_scene_refuses_an_ifc_above_the_safe_parsing_limit_before_reading_it() 
 }
 
 #[test]
-fn export_scene_refuses_to_overwrite_the_source_rvt() {
+fn export_scene_refuses_to_overwrite_the_source_file() {
     let fixture = fixture();
     let before = std::fs::read(fixture.path()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
@@ -1192,7 +1326,7 @@ fn export_scene_refuses_to_overwrite_the_source_rvt() {
     assert!(
         String::from_utf8(output.stderr)
             .unwrap()
-            .contains("scene output must not overwrite the source model file")
+            .contains("output must not overwrite the source file")
     );
     assert_eq!(std::fs::read(fixture.path()).unwrap(), before);
 }
@@ -1234,4 +1368,140 @@ fn inflate(bytes: &[u8]) -> Vec<u8> {
     let mut decoder = flate2::write::DeflateDecoder::new(Vec::new());
     decoder.write_all(bytes).unwrap();
     decoder.finish().unwrap()
+}
+
+/// Two files that each number their elements from scratch. Both name a wall
+/// `wall-guid` and a storey `level-guid`, which is exactly the collision a
+/// federated model has to survive.
+#[test]
+fn export_ifc_federates_several_sources_and_keeps_their_identifiers_apart() {
+    let directory = tempfile::tempdir().unwrap();
+    let architecture = ifc_fixture_in(directory.path(), "architecture.ifc", 0.0);
+    let structure = ifc_fixture_in(directory.path(), "structure.ifc", 1.0);
+    let target = directory.path().join("federated.ifc");
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-ifc",
+            architecture.to_str().unwrap(),
+            structure.to_str().unwrap(),
+            "--output",
+            target.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Federated documents: 2"), "{stdout}");
+    assert!(
+        stdout.contains("architecture: 1 elements from architecture.ifc"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("structure: 1 elements from structure.ifc"),
+        "{stdout}"
+    );
+    // The wall and the storey each occurred twice, and qualification is what
+    // kept them four things rather than two.
+    assert!(
+        stdout.contains("kept apart by qualification: 1"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Building storeys: 2"), "{stdout}");
+    assert!(stdout.contains("Elements: 2"), "{stdout}");
+    // The two walls overlap, so nothing is said about their origins.
+    assert!(!stdout.contains("different origins"), "{stdout}");
+
+    let written = std::fs::read_to_string(&target).unwrap();
+    assert!(written.starts_with("ISO-10303-21;\nHEADER;"));
+    assert_eq!(written.matches("IFCWALL(").count(), 2, "{written}");
+    assert_eq!(written.matches("IFCBUILDINGSTOREY(").count(), 2);
+}
+
+#[test]
+fn export_scene_reports_documents_that_are_stated_about_different_origins() {
+    let directory = tempfile::tempdir().unwrap();
+    let here = ifc_fixture_in(directory.path(), "here.ifc", 0.0);
+    let far = ifc_fixture_in(directory.path(), "far.ifc", 100_000.0);
+    let target = directory.path().join("federated.rvs");
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-scene",
+            here.to_str().unwrap(),
+            far.to_str().unwrap(),
+            "--output",
+            target.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Reported, and the conversion still finished: nothing here knows the
+    // transform that would reconcile two origins, so nothing is moved.
+    assert!(stdout.contains("different origins"), "{stdout}");
+    assert!(stdout.contains("nothing was moved"), "{stdout}");
+    assert!(
+        stdout.contains("Elements: 2 (2 carry geometry)"),
+        "{stdout}"
+    );
+
+    // The scene names both files and says which one each element came from,
+    // so a viewer can show one and hide the other.
+    let written = std::fs::read(&target).unwrap();
+    let trailer = written.len() - 24;
+    let offset = u64::from_le_bytes(written[trailer..trailer + 8].try_into().unwrap());
+    let stored = u32::from_le_bytes(written[trailer + 8..trailer + 12].try_into().unwrap());
+    let offset = usize::try_from(offset).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&inflate(&written[offset..offset + stored as usize])).unwrap();
+    let documents = manifest["documents"].as_array().unwrap();
+    assert_eq!(documents.len(), 2, "{manifest}");
+    let named: Vec<&str> = documents
+        .iter()
+        .map(|document| document["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        named.contains(&"here.ifc") && named.contains(&"far.ifc"),
+        "{named:?}"
+    );
+    assert_eq!(documents[0]["elements"], 1);
+    // Every element indexes a distinct document, and both are still read as
+    // IFC so their source class survives.
+    let per_element = manifest["elements"]["documents"].as_array().unwrap();
+    assert_eq!(per_element.len(), 2);
+    assert_ne!(per_element[0], per_element[1]);
+    assert_eq!(manifest["ifcClasses"][0]["name"], "IFCWALL");
+    // A federated set of IFCs is still an IFC set, not a mixed one.
+    assert_eq!(manifest["source"]["kind"], "ifc");
+}
+
+#[test]
+fn an_export_of_several_sources_will_not_guess_an_output_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = ifc_fixture_in(directory.path(), "first.ifc", 0.0);
+    let second = ifc_fixture_in(directory.path(), "second.ifc", 1.0);
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-scene",
+            first.to_str().unwrap(),
+            second.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("2 source files have no one name to derive it from")
+    );
 }

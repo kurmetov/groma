@@ -4,14 +4,21 @@ use std::{
     fmt,
 };
 
+use bim_convert::{ifc_entity_name, resolved_element_type};
 use bim_core::{
     BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
-    BimBrepSurface, BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel,
-    BimLineSegment, BimMaterialLayer, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty,
-    BimPropertyValue,
+    BimBrepSurface, BimElement, BimElementId, BimExternalId, BimGeometry, BimLevel, BimLineSegment,
+    BimMaterialLayer, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
 };
 
-use crate::{EntityRef, IfcGuid, StepFile, StepHeader, StepValue, mapping::resolved_element_type};
+use crate::{
+    ClassMapping, EntityRef, ExportSettings, IfcGuid, LengthUnit, Mapped, StepFile, StepHeader,
+    StepValue,
+    ifc4_entities::{
+        Attribute, IFC4_BASE_QUANTITY_SETS, IFC4_COMMON_PROPERTY_SETS, IFC4_ELEMENT_TYPES,
+        IFC4_ELEMENTS, IFC4_SPATIAL_ELEMENT_TYPES, Ifc4Entity,
+    },
+};
 
 /// How near the axis of revolution a profile's point must be to call it *on*
 /// the axis, in metres - the difference between a sphere and a torus, and
@@ -41,6 +48,8 @@ pub struct MetadataOptions {
     pub project_name: String,
     pub site_name: String,
     pub building_name: String,
+    /// What this export is allowed to decide. See [`ExportSettings`].
+    pub settings: ExportSettings,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,12 +102,13 @@ pub fn metadata_ifc(
     options: &MetadataOptions,
 ) -> Result<StepFile, MetadataError> {
     validate_model(model)?;
+    let lengths = Lengths::new(options.settings.length_unit);
     let mut file = StepFile::new(step_header(options));
     let ownership = push_ownership(&mut file, options.creation_time);
-    let context = push_context(&mut file);
-    let units = push_units(&mut file);
+    let context = push_context(&mut file, lengths);
+    let units = push_units(&mut file, options.settings.length_unit);
     let project = push_project(&mut file, options, ownership, context, units);
-    let origin_axis = push_axis(&mut file, 0.0);
+    let origin_axis = push_axis(&mut file, lengths, 0.0);
     let site_placement = file.push(
         "IFCLOCALPLACEMENT",
         vec![StepValue::Omitted, StepValue::Reference(origin_axis)],
@@ -135,6 +145,7 @@ pub fn metadata_ifc(
         options,
         ownership,
         building_placement,
+        lengths,
     );
     if !storeys.is_empty() {
         push_aggregate(
@@ -154,8 +165,11 @@ pub fn metadata_ifc(
     push_elements(
         &mut file,
         &model.elements,
-        options,
-        ownership,
+        WriteContext {
+            options,
+            owner: ownership,
+            lengths,
+        },
         building,
         building_placement,
         &storeys,
@@ -199,6 +213,10 @@ fn validate_model(model: &BimModel) -> Result<(), MetadataError> {
 
 fn step_header(options: &MetadataOptions) -> StepHeader {
     StepHeader {
+        description: vec![format!(
+            "ViewDefinition [{}]",
+            options.settings.view_definition.view_definition()
+        )],
         file_name: options.file_name.clone(),
         timestamp: options.timestamp.clone(),
         authors: vec!["Rivet".to_owned()],
@@ -256,29 +274,28 @@ fn push_ownership(file: &mut StepFile, creation_time: i64) -> EntityRef {
     )
 }
 
-fn push_context(file: &mut StepFile) -> EntityRef {
-    let axis = push_axis(file, 0.0);
+fn push_context(file: &mut StepFile, lengths: Lengths) -> EntityRef {
+    let axis = push_axis(file, lengths, 0.0);
     file.push(
         "IFCGEOMETRICREPRESENTATIONCONTEXT",
         vec![
             omitted(),
             string("Model"),
             StepValue::Integer(3),
-            StepValue::Real(1.0e-5),
+            // A hundredth of a millimetre, stated in the file's own unit: the
+            // precision is a length like any other, and Revit's export of the
+            // same models states the same distance.
+            lengths.value(1.0e-5),
             reference(axis),
             omitted(),
         ],
     )
 }
 
-fn push_axis(file: &mut StepFile, elevation: f64) -> EntityRef {
+fn push_axis(file: &mut StepFile, lengths: Lengths, elevation: f64) -> EntityRef {
     let point = file.push(
         "IFCCARTESIANPOINT",
-        vec![StepValue::List(vec![
-            StepValue::Real(0.0),
-            StepValue::Real(0.0),
-            StepValue::Real(elevation),
-        ])],
+        vec![lengths.coordinates([0.0, 0.0, elevation])],
     );
     file.push(
         "IFCAXIS2PLACEMENT3D",
@@ -286,10 +303,10 @@ fn push_axis(file: &mut StepFile, elevation: f64) -> EntityRef {
     )
 }
 
-fn push_units(file: &mut StepFile) -> EntityRef {
+fn push_units(file: &mut StepFile, length_unit: LengthUnit) -> EntityRef {
     let mut units = Vec::new();
     for (unit_type, prefix, name) in [
-        ("LENGTHUNIT", None, "METRE"),
+        ("LENGTHUNIT", length_unit.si_prefix(), "METRE"),
         ("AREAUNIT", None, "SQUARE_METRE"),
         ("VOLUMEUNIT", None, "CUBIC_METRE"),
         ("PLANEANGLEUNIT", None, "RADIAN"),
@@ -320,16 +337,17 @@ fn push_project(
     context: EntityRef,
     units: EntityRef,
 ) -> EntityRef {
+    let project = &options.settings.project;
     file.push(
         "IFCPROJECT",
         vec![
             global_id(options, "project"),
             reference(owner),
-            string(&options.project_name),
+            string(project.name.as_deref().unwrap_or(&options.project_name)),
             omitted(),
             omitted(),
-            omitted(),
-            omitted(),
+            optional_string(project.long_name.as_deref()),
+            optional_string(project.phase.as_deref()),
             StepValue::List(vec![reference(context)]),
             reference(units),
         ],
@@ -347,7 +365,14 @@ fn push_site(
         vec![
             global_id(options, "site"),
             reference(owner),
-            string(&options.site_name),
+            string(
+                options
+                    .settings
+                    .project
+                    .site_name
+                    .as_deref()
+                    .unwrap_or(&options.site_name),
+            ),
             omitted(),
             omitted(),
             reference(placement),
@@ -369,12 +394,43 @@ fn push_building(
     owner: EntityRef,
     placement: EntityRef,
 ) -> EntityRef {
+    let project = &options.settings.project;
+    // Revit puts the project's postal address on the building, and so does
+    // this - `IfcBuilding.BuildingAddress` is the last of its twelve
+    // attributes. Nothing is written where nothing was given.
+    let address = project.has_address().then(|| {
+        let lines = project.address_lines.iter().map(|line| string(line));
+        file.push(
+            "IFCPOSTALADDRESS",
+            vec![
+                omitted(),
+                omitted(),
+                omitted(),
+                omitted(),
+                if project.address_lines.is_empty() {
+                    omitted()
+                } else {
+                    StepValue::List(lines.collect())
+                },
+                omitted(),
+                optional_string(project.town.as_deref()),
+                optional_string(project.region.as_deref()),
+                optional_string(project.postal_code.as_deref()),
+                optional_string(project.country.as_deref()),
+            ],
+        )
+    });
     file.push(
         "IFCBUILDING",
         vec![
             global_id(options, "building"),
             reference(owner),
-            string(&options.building_name),
+            string(
+                project
+                    .building_name
+                    .as_deref()
+                    .unwrap_or(&options.building_name),
+            ),
             omitted(),
             omitted(),
             reference(placement),
@@ -383,7 +439,7 @@ fn push_building(
             enumeration("ELEMENT"),
             omitted(),
             omitted(),
-            omitted(),
+            address.map_or_else(omitted, reference),
         ],
     )
 }
@@ -394,6 +450,7 @@ fn push_storeys(
     options: &MetadataOptions,
     owner: EntityRef,
     building_placement: EntityRef,
+    lengths: Lengths,
 ) -> (
     BTreeMap<BimElementId, EntityRef>,
     BTreeMap<BimElementId, EntityRef>,
@@ -406,7 +463,7 @@ fn push_storeys(
             .as_ref()
             .expect("levels were validated")
             .value;
-        let axis = push_axis(file, elevation);
+        let axis = push_axis(file, lengths, elevation);
         let placement = file.push(
             "IFCLOCALPLACEMENT",
             vec![reference(building_placement), reference(axis)],
@@ -423,7 +480,7 @@ fn push_storeys(
                 omitted(),
                 omitted(),
                 enumeration("ELEMENT"),
-                StepValue::Real(elevation),
+                lengths.value(elevation),
             ],
         );
         storeys.insert(level.id.clone(), storey);
@@ -436,8 +493,7 @@ fn push_storeys(
 fn push_elements(
     file: &mut StepFile,
     elements: &[BimElement],
-    options: &MetadataOptions,
-    owner: EntityRef,
+    context: WriteContext<'_>,
     building: EntityRef,
     building_placement: EntityRef,
     storeys: &BTreeMap<BimElementId, EntityRef>,
@@ -447,78 +503,120 @@ fn push_elements(
     origin_axis: EntityRef,
 ) {
     let mut materials = MaterialLibrary::default();
+    let mut types = TypeLibrary::default();
+    let mut common_sets = CommonPropertySets::default();
     let mut containment: BTreeMap<String, (EntityRef, Vec<EntityRef>)> = BTreeMap::new();
     // A space is part of the spatial structure, so its storey decomposes it
     // rather than containing it. Kept apart from the first pass so the two
     // relationships never carry the same product.
     let mut decomposition: BTreeMap<String, (EntityRef, Vec<EntityRef>)> = BTreeMap::new();
     for element in elements {
+        // What the element is written as is settled before anything is
+        // written: a category the mapping table keeps out of the file leaves
+        // nothing behind it - no product, no placement, no property set and no
+        // type - and deciding afterwards would leave the placement stranded.
+        let Some(written_as) = resolve_entity(element, context.options.settings.class_mapping())
+        else {
+            continue;
+        };
         let (container, container_identity) = element
             .level_id
             .as_ref()
             .and_then(|id| Some((storeys.get(id).copied()?, format!("storey:{}", id.0))))
             .unwrap_or_else(|| (building, "building".to_owned()));
+        let frame = GeometryFrame {
+            lengths: context.lengths,
+            storey_elevation: element
+                .level_id
+                .as_ref()
+                .and_then(|id| storey_elevations.get(id).copied())
+                .unwrap_or(0.0),
+            placement: element
+                .placement
+                .as_ref()
+                .and_then(validated_metric_placement),
+        };
         let parent_placement = element
             .level_id
             .as_ref()
             .and_then(|id| storey_placements.get(id).copied())
             .unwrap_or(building_placement);
-        let placement_elevation = element
-            .level_id
-            .as_ref()
-            .and_then(|id| storey_elevations.get(id).copied())
-            .unwrap_or(0.0);
-        let metric_placement = element
-            .placement
-            .as_ref()
-            .and_then(validated_metric_placement);
-        let placement = push_element_placement(
-            file,
-            parent_placement,
-            origin_axis,
-            placement_elevation,
-            metric_placement,
-        );
+        let placement = push_element_placement(file, parent_placement, origin_axis, frame);
         let geometry_context = ElementGeometryContext {
             representation_context,
-            storey_elevation: placement_elevation,
-            placement: metric_placement,
+            frame,
         };
-        let spatial = resolved_element_type(element).is_spatial();
+        let spatial = written_as.name == "IFCSPACE";
         let entity = if spatial {
-            push_space(file, element, options, owner, placement, geometry_context)
+            push_space(file, element, context, placement, geometry_context)
         } else {
-            push_element(file, element, options, owner, placement, geometry_context)
+            push_element(
+                file,
+                element,
+                &written_as,
+                context,
+                placement,
+                geometry_context,
+            )
         };
-        let relationship = if spatial {
+        if spatial {
             &mut decomposition
         } else {
             &mut containment
-        };
-        relationship
-            .entry(container_identity)
-            .or_insert_with(|| (container, Vec::new()))
-            .1
-            .push(entity);
-        push_property_set(file, element, entity, options, owner);
+        }
+        .entry(container_identity)
+        .or_insert_with(|| (container, Vec::new()))
+        .1
+        .push(entity);
+        // The type comes first: where it holds the type's parameters, the
+        // element does not repeat them.
+        let type_carries_properties = context.options.settings.types
+            && types.associate(file, element, entity, written_as.name, context);
+        push_property_set(file, element, entity, context, type_carries_properties);
+        if context.options.settings.property_sets.ifc_common {
+            common_sets.associate(file, element, entity, written_as.name, context);
+        }
+        if context.options.settings.property_sets.base_quantities {
+            push_quantities(file, element, entity, written_as.name, context);
+        }
         if !spatial {
-            materials.associate(file, element, entity);
+            materials.associate(file, element, entity, context.lengths);
         }
     }
-    materials.push_associations(file, options, owner);
+    common_sets.push_relations(file, context);
+    types.push_relations(file, context);
+    materials.push_associations(file, context.options, context.owner);
     for (identity, (container, elements)) in containment {
-        push_containment(file, options, owner, &identity, container, elements);
+        push_containment(
+            file,
+            context.options,
+            context.owner,
+            &identity,
+            container,
+            elements,
+        );
     }
     for (identity, (container, spaces)) in decomposition {
         push_aggregate(
             file,
-            options,
-            owner,
+            context.options,
+            context.owner,
             &format!("spaces:{identity}"),
             container,
             spaces,
         );
     }
+}
+
+/// What every writer here needs beside the thing it is writing: this export's
+/// settings and identity, the owner history every entity points at, and the
+/// unit its lengths go out in. They travel together everywhere, so they are
+/// one value rather than three arguments repeated down the file.
+#[derive(Clone, Copy)]
+struct WriteContext<'a> {
+    options: &'a MetadataOptions,
+    owner: EntityRef,
+    lengths: Lengths,
 }
 
 /// Write one `IfcSpace`. It is a spatial structure element, not an element:
@@ -533,8 +631,7 @@ fn push_elements(
 fn push_space(
     file: &mut StepFile,
     element: &BimElement,
-    options: &MetadataOptions,
-    owner: EntityRef,
+    context: WriteContext<'_>,
     placement: EntityRef,
     geometry_context: ElementGeometryContext,
 ) -> EntityRef {
@@ -543,15 +640,14 @@ fn push_space(
             file,
             geometry,
             geometry_context.representation_context,
-            geometry_context.storey_elevation,
-            geometry_context.placement,
+            geometry_context.frame,
         )
     });
     file.push(
         "IFCSPACE",
         vec![
-            global_id(options, &format!("element:{}", element.id.0)),
-            reference(owner),
+            global_id(context.options, &format!("element:{}", element.id.0)),
+            reference(context.owner),
             string(element.name.as_deref().unwrap_or(&element.id.0)),
             omitted(),
             optional_string(element.class_name.as_deref()),
@@ -572,11 +668,49 @@ struct MetricPlacement {
     axis: [f64; 3],
 }
 
+/// The unit every length in the file is written in, and the factor from the
+/// metres the model carries. The model is metric throughout and stays that
+/// way; this is applied where a length becomes a number in the file, so that
+/// every comparison and tolerance above it is still in metres.
+#[derive(Clone, Copy)]
+struct Lengths {
+    per_metre: f64,
+}
+
+impl Lengths {
+    const fn new(unit: LengthUnit) -> Self {
+        Self {
+            per_metre: unit.per_metre(),
+        }
+    }
+
+    /// One length, in the file's unit.
+    fn value(self, metres: f64) -> StepValue {
+        StepValue::Real(metres * self.per_metre)
+    }
+
+    /// A point's coordinates, in the file's unit.
+    fn coordinates<const N: usize>(self, metres: [f64; N]) -> StepValue {
+        StepValue::List(metres.into_iter().map(|value| self.value(value)).collect())
+    }
+}
+
+/// Where a body's coordinates are read from, and what they are written in.
+/// The two placement fields travel together everywhere geometry is written, so
+/// they are one value; the unit rides with them because it is needed at the
+/// same points and nowhere else.
+#[derive(Clone, Copy)]
+struct GeometryFrame {
+    lengths: Lengths,
+    /// The storey elevation the body's coordinates are made relative to.
+    storey_elevation: f64,
+    placement: Option<MetricPlacement>,
+}
+
 #[derive(Clone, Copy)]
 struct ElementGeometryContext {
     representation_context: EntityRef,
-    storey_elevation: f64,
-    placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 }
 
 fn validated_metric_placement(placement: &BimPlacement) -> Option<MetricPlacement> {
@@ -610,13 +744,12 @@ fn push_element_placement(
     file: &mut StepFile,
     parent_placement: EntityRef,
     origin_axis: EntityRef,
-    storey_elevation: f64,
-    placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> EntityRef {
-    let relative = placement.map_or(origin_axis, |placement| {
+    let relative = frame.placement.map_or(origin_axis, |placement| {
         let mut origin = placement.origin;
-        origin[2] -= storey_elevation;
-        let point = push_cartesian_point(file, origin);
+        origin[2] -= frame.storey_elevation;
+        let point = push_cartesian_point(file, frame.lengths, origin);
         let axis = push_direction(file, placement.axis);
         let reference_direction = push_direction(file, placement.reference_direction);
         file.push(
@@ -637,8 +770,8 @@ fn push_element_placement(
 fn push_element(
     file: &mut StepFile,
     element: &BimElement,
-    options: &MetadataOptions,
-    owner: EntityRef,
+    written_as: &ResolvedEntity<'_>,
+    context: WriteContext<'_>,
     placement: EntityRef,
     geometry_context: ElementGeometryContext,
 ) -> EntityRef {
@@ -648,19 +781,18 @@ fn push_element(
             .as_ref()
             .map(|category| category.name.as_str())
     });
-    let entity = product_entity(resolved_element_type(element));
+    let entity = written_as.name;
     let representation = element.geometry.as_ref().and_then(|geometry| {
         push_geometry(
             file,
             geometry,
             geometry_context.representation_context,
-            geometry_context.storey_elevation,
-            geometry_context.placement,
+            geometry_context.frame,
         )
     });
     let mut attributes = vec![
-        global_id(options, &format!("element:{}", element.id.0)),
-        reference(owner),
+        global_id(context.options, &format!("element:{}", element.id.0)),
+        reference(context.owner),
         string(element.name.as_deref().unwrap_or(&element.id.0)),
         omitted(),
         optional_string(object_type),
@@ -668,103 +800,248 @@ fn push_element(
         representation.map_or_else(omitted, reference),
         string(&element.id.0),
     ];
-    // A few entities declare their own attributes between `IfcElement`'s eight
-    // and `PredefinedType`; those are left unset rather than invented, but they
-    // must still be written or `PredefinedType` lands in the wrong slot.
-    for _ in 0..entity.attributes_before_predefined_type {
-        attributes.push(omitted());
+    // STEP writes every attribute an entity declares, set or not, and what
+    // each entity declares past `Tag` comes from the schema itself - see
+    // `ifc4_entities`. A window's `OverallHeight` is not read from the source
+    // and goes in unset; its `PredefinedType` goes in as the enumeration
+    // member that says so.
+    attributes.extend(declared_attributes(IFC4_ELEMENTS, entity));
+    if let Some(predefined_type) = written_as.predefined_type {
+        set_predefined_type(IFC4_ELEMENTS, entity, &mut attributes, predefined_type);
     }
-    if entity.has_predefined_type {
-        attributes.push(enumeration("NOTDEFINED"));
-    }
-    // STEP writes every attribute an entity declares, set or not, so the ones
-    // after `PredefinedType` are written unset rather than left off.
-    for _ in 0..entity.attributes_after_predefined_type {
-        attributes.push(omitted());
-    }
-    file.push(entity.name, attributes)
+    file.push(entity, attributes)
 }
 
-/// The IFC4 product entity for a normalized type. The distribution supertypes
-/// are instantiable but, unlike the typed leaves, declare no `PredefinedType`.
-struct ProductEntity {
-    name: &'static str,
-    has_predefined_type: bool,
-    /// Attributes the entity declares between `IfcElement.Tag` and its
-    /// `PredefinedType`. `IfcStairFlight` has four - `NumberOfRisers`,
-    /// `NumberOfTreads`, `RiserHeight` and `TreadLength` - and `IfcWindow` and
-    /// `IfcDoor` two apiece, `OverallHeight` and `OverallWidth`.
-    attributes_before_predefined_type: usize,
-    /// Attributes the entity declares after its `PredefinedType`: a window's
-    /// `PartitioningType` and `UserDefinedPartitioningType`, a door's
-    /// `OperationType` and `UserDefinedOperationType`.
-    attributes_after_predefined_type: usize,
+/// What an element is written as. The class mapping table decides where it
+/// names the element's category; otherwise it is what [`ifc_entity_name`]
+/// says, with the kind left for the entity's own `NOTDEFINED`.
+struct ResolvedEntity<'a> {
+    name: &'a str,
+    predefined_type: Option<&'a str>,
 }
 
-/// The IFC entity a model element of this type is written as.
-///
-/// This is the one mapping `export-ifc` applies, published so that anything
-/// else - a viewer, a report - can say what an element would become without
-/// running the export and without keeping a second copy of the rules that
-/// could drift from this one.
-#[must_use]
-pub fn ifc_entity_name(element_type: BimElementType) -> &'static str {
-    product_entity(element_type).name
+/// The entity an element is written as, or `None` where the mapping table says
+/// the category is not exported.
+fn resolve_entity<'a>(
+    element: &BimElement,
+    mapping: Option<&'a ClassMapping>,
+) -> Option<ResolvedEntity<'a>> {
+    let mapped = mapping.and_then(|mapping| {
+        let category = element.category.as_ref()?;
+        mapping.lookup(
+            Some(category.name.as_str()),
+            category.id.as_ref().map(|id| id.value.as_str()),
+        )
+    });
+    match mapped {
+        Some(Mapped::NotExported) => None,
+        Some(Mapped::Entity {
+            name,
+            predefined_type,
+        }) => Some(ResolvedEntity {
+            name: name.as_str(),
+            predefined_type: predefined_type.as_deref(),
+        }),
+        None => Some(ResolvedEntity {
+            name: ifc_entity_name(resolved_element_type(element)),
+            predefined_type: None,
+        }),
+    }
 }
 
-fn product_entity(element_type: BimElementType) -> ProductEntity {
-    let mut attributes_before_predefined_type = 0;
-    let mut attributes_after_predefined_type = 0;
-    let (name, has_predefined_type) = match element_type {
-        BimElementType::PipeSegment => ("IFCPIPESEGMENT", true),
-        BimElementType::PipeFitting => ("IFCPIPEFITTING", true),
-        BimElementType::SanitaryTerminal => ("IFCSANITARYTERMINAL", true),
-        BimElementType::AirTerminal => ("IFCAIRTERMINAL", true),
-        BimElementType::FireSuppressionTerminal => ("IFCFIRESUPPRESSIONTERMINAL", true),
-        BimElementType::Alarm => ("IFCALARM", true),
-        BimElementType::CableCarrierFitting => ("IFCCABLECARRIERFITTING", true),
-        BimElementType::DuctSegment => ("IFCDUCTSEGMENT", true),
-        BimElementType::CableCarrierSegment => ("IFCCABLECARRIERSEGMENT", true),
-        BimElementType::DistributionElement => ("IFCDISTRIBUTIONELEMENT", false),
-        BimElementType::DistributionFlowElement => ("IFCDISTRIBUTIONFLOWELEMENT", false),
-        BimElementType::Wall => ("IFCWALL", true),
-        BimElementType::Slab => ("IFCSLAB", true),
-        BimElementType::Roof => ("IFCROOF", true),
-        BimElementType::Stair => ("IFCSTAIR", true),
-        BimElementType::StairFlight => {
-            attributes_before_predefined_type = 4;
-            ("IFCSTAIRFLIGHT", true)
-        }
-        BimElementType::CurtainWall => ("IFCCURTAINWALL", true),
-        BimElementType::Railing => ("IFCRAILING", true),
-        BimElementType::Column => ("IFCCOLUMN", true),
-        BimElementType::Member => ("IFCMEMBER", true),
-        BimElementType::Plate => ("IFCPLATE", true),
-        // A window and a door carry their overall size before the predefined
-        // type and a partitioning or operation type after it. None of the four
-        // is read from the source, so all four are written unset.
-        BimElementType::Window => {
-            attributes_before_predefined_type = 2;
-            attributes_after_predefined_type = 2;
-            ("IFCWINDOW", true)
-        }
-        BimElementType::Door => {
-            attributes_before_predefined_type = 2;
-            attributes_after_predefined_type = 2;
-            ("IFCDOOR", true)
-        }
-        BimElementType::Unknown => ("IFCBUILDINGELEMENTPROXY", true),
-        // A space never reaches here: `push_elements` sends a spatial type to
-        // `push_space`, whose attributes are a spatial element's rather than
-        // an element's. The match must still be total, and naming the entity
-        // is better than a panic.
-        BimElementType::Space => ("IFCSPACE", false),
+/// Put a mapped `PredefinedType` in the slot the schema gives it. The value
+/// was checked against the entity's own enumeration when the table was read,
+/// so a member that is not the entity's cannot reach here.
+fn set_predefined_type(
+    table: &'static [Ifc4Entity],
+    entity: &str,
+    attributes: &mut [StepValue],
+    value: &str,
+) {
+    let Some(declared) = table
+        .iter()
+        .find(|candidate| candidate.name == entity)
+        .and_then(|candidate| candidate.predefined_type)
+    else {
+        return;
     };
-    ProductEntity {
-        name,
-        has_predefined_type,
-        attributes_before_predefined_type,
-        attributes_after_predefined_type,
+    // The declared attributes follow the base ones this writer put in first.
+    let base = attributes.len()
+        - table
+            .iter()
+            .find(|candidate| candidate.name == entity)
+            .map_or(0, |candidate| candidate.attributes.len());
+    if let Some(slot) = attributes.get_mut(base + declared.index) {
+        *slot = enumeration(value);
+    }
+}
+
+/// The attributes an entity declares past the base ones, written the way the
+/// schema asks: an enumeration that can say "not stated" says it, and anything
+/// else this exporter does not read from the source is left unset.
+///
+/// An entity the table does not hold declares nothing here, which is the
+/// conservative answer: `push` would then write the base attributes alone and
+/// a reader would see a truncated entity, so every entity this exporter names
+/// is checked to be in the table by `every_entity_this_exporter_writes_is_in_the_schema_table`.
+fn declared_attributes(table: &'static [Ifc4Entity], name: &str) -> Vec<StepValue> {
+    table
+        .iter()
+        .find(|entity| entity.name == name)
+        .map(|entity| {
+            entity
+                .attributes
+                .iter()
+                .map(|attribute| match attribute {
+                    Attribute::Notdefined => enumeration("NOTDEFINED"),
+                    Attribute::Optional | Attribute::Required => omitted(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The type entity that stands behind a product, where the schema has one.
+///
+/// IFC4 names a type after its element - `IfcWall` and `IfcWallType`,
+/// `IfcPipeSegment` and `IfcPipeSegmentType` - and that rule holds for every
+/// one of the 130 instantiable elements: the 104 that have a type are named
+/// this way without exception, and for the other 26 the name simply is not in
+/// the schema. So the rule is applied and the answer checked against the
+/// table, which is what keeps `IfcDistributionFlowElementType` - declared
+/// ABSTRACT, and refused by `ifcopenshell.validate` on 26 elements of SMALL -
+/// out of the file, along with the standard-case entities that have no type.
+///
+/// The attribute layout comes from the same table, and agrees with Revit's own
+/// export of AR S1 entity for entity: ten attributes on an `IfcWallType`,
+/// eleven on an `IfcSpaceType` with its `LongName`, thirteen on an
+/// `IfcDoorType` and an `IfcWindowType`.
+fn type_entity_for(entity: &str) -> Option<(&'static str, &'static [Ifc4Entity])> {
+    // A space's type is a spatial element type, not an element type, and lives
+    // in its own table.
+    let table: &'static [Ifc4Entity] = if entity == "IFCSPACE" {
+        IFC4_SPATIAL_ELEMENT_TYPES
+    } else {
+        IFC4_ELEMENT_TYPES
+    };
+    let name = format!("{entity}TYPE");
+    table
+        .iter()
+        .find(|candidate| candidate.name == name)
+        .map(|candidate| (candidate.name, table))
+}
+
+/// The types written so far, and the products defined by each.
+///
+/// A type belongs to many elements - 13 193 walls of AR S1 share 111 wall
+/// types - so it is written once, keyed by the record it was read from, and
+/// one `IfcRelDefinesByType` at the end relates every product of it. That is
+/// also where the type's own parameters go: they hold for every element of the
+/// type, and writing them on each of thousands of products repeats them
+/// thousands of times.
+struct TypeEntry {
+    entity: EntityRef,
+    products: Vec<EntityRef>,
+    /// Whether the type was written holding its own parameters.
+    carries_properties: bool,
+}
+
+#[derive(Default)]
+struct TypeLibrary {
+    /// `(type record, entity)` to the type and the products defined by it. The
+    /// entity is part of the key because one record may reach the export as
+    /// two different products only if the decode disagrees with itself; a
+    /// shared key would then put a wall and a slab under one wall type.
+    types: BTreeMap<(String, &'static str), TypeEntry>,
+}
+
+impl TypeLibrary {
+    /// Record that `product` is of `element`'s type, writing the type the
+    /// first time it is seen. Returns whether the type carries the element's
+    /// type parameters, so the element does not repeat them.
+    fn associate(
+        &mut self,
+        file: &mut StepFile,
+        element: &BimElement,
+        product: EntityRef,
+        product_entity: &str,
+        context: WriteContext<'_>,
+    ) -> bool {
+        let Some(type_id) = element.type_id.as_ref() else {
+            return false;
+        };
+        let Some((entity, table)) = type_entity_for(product_entity) else {
+            return false;
+        };
+        let key = (type_id.0.clone(), entity);
+        let entry = match self.types.entry(key) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let identity = format!("type:{}:{}", type_id.0, entity);
+                let properties = context
+                    .options
+                    .settings
+                    .property_sets
+                    .revit_type_parameters
+                    .then(|| {
+                        push_property_set_entity(
+                            file,
+                            &element.type_properties,
+                            context,
+                            "Rivet Type Properties",
+                            &format!("type-properties:{}", type_id.0),
+                        )
+                    })
+                    .flatten();
+                let mut attributes = vec![
+                    global_id(context.options, &identity),
+                    reference(context.owner),
+                    optional_string(element.type_name.as_deref()),
+                    omitted(),
+                    omitted(),
+                    properties.map_or_else(omitted, |pset| StepValue::List(vec![reference(pset)])),
+                    omitted(),
+                    string(&type_id.0),
+                    omitted(),
+                ];
+                attributes.extend(declared_attributes(table, entity));
+                let written = file.push(entity, attributes);
+                entry.insert(TypeEntry {
+                    entity: written,
+                    products: Vec::new(),
+                    carries_properties: properties.is_some(),
+                })
+            }
+        };
+        entry.products.push(product);
+        // Type parameters are read from the type record, so every element of
+        // one carries the same ones and the set on the type states them all.
+        // An element whose parameters are *not* on the type says so, and
+        // writes its own set as it did before types were exported.
+        entry.carries_properties || element.type_properties.is_empty()
+    }
+
+    /// One `IfcRelDefinesByType` per type.
+    fn push_relations(self, file: &mut StepFile, context: WriteContext<'_>) {
+        for ((type_id, entity), entry) in self.types {
+            if entry.products.is_empty() {
+                continue;
+            }
+            file.push(
+                "IFCRELDEFINESBYTYPE",
+                vec![
+                    global_id(
+                        context.options,
+                        &format!("type-relation:{type_id}:{entity}"),
+                    ),
+                    reference(context.owner),
+                    omitted(),
+                    omitted(),
+                    StepValue::List(entry.products.into_iter().map(reference).collect()),
+                    reference(entry.entity),
+                ],
+            );
+        }
     }
 }
 
@@ -772,18 +1049,11 @@ fn push_geometry(
     file: &mut StepFile,
     geometry: &BimGeometry,
     representation_context: EntityRef,
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
     match geometry {
         BimGeometry::AxisLine(line) => {
-            let (_, axis) = push_axis_line(
-                file,
-                line,
-                representation_context,
-                placement_elevation,
-                metric_placement,
-            )?;
+            let (_, axis) = push_axis_line(file, line, representation_context, frame)?;
             Some(file.push(
                 "IFCPRODUCTDEFINITIONSHAPE",
                 vec![omitted(), omitted(), StepValue::List(vec![reference(axis)])],
@@ -796,18 +1066,13 @@ fn push_geometry(
             {
                 return None;
             }
-            let (directrix, axis) = push_axis_line(
-                file,
-                &swept_disk.directrix,
-                representation_context,
-                placement_elevation,
-                metric_placement,
-            )?;
+            let (directrix, axis) =
+                push_axis_line(file, &swept_disk.directrix, representation_context, frame)?;
             let solid = file.push(
                 "IFCSWEPTDISKSOLID",
                 vec![
                     reference(directrix),
-                    StepValue::Real(swept_disk.radius.value),
+                    frame.lengths.value(swept_disk.radius.value),
                     omitted(),
                     omitted(),
                     omitted(),
@@ -831,21 +1096,11 @@ fn push_geometry(
                 ],
             ))
         }
-        BimGeometry::BoundingBox(bounds) => push_bounding_box(file, bounds, representation_context),
-        BimGeometry::Brep(brep) => push_brep(
-            file,
-            brep,
-            representation_context,
-            placement_elevation,
-            metric_placement,
-        ),
-        BimGeometry::Assembly(parts) => push_assembly(
-            file,
-            parts,
-            representation_context,
-            placement_elevation,
-            metric_placement,
-        ),
+        BimGeometry::BoundingBox(bounds) => {
+            push_bounding_box(file, bounds, representation_context, frame)
+        }
+        BimGeometry::Brep(brep) => push_brep(file, brep, representation_context, frame),
+        BimGeometry::Assembly(parts) => push_assembly(file, parts, representation_context, frame),
     }
 }
 
@@ -856,8 +1111,7 @@ fn push_geometry(
 fn push_brep_item(
     file: &mut StepFile,
     brep: &BimBrep,
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<(EntityRef, &'static str)> {
     if brep.faces.is_empty() {
         return None;
@@ -869,7 +1123,7 @@ fn push_brep_item(
     // the source does declare is not closed, however the face was lost.
     let mut wrote_every_face = true;
     for face in &brep.faces {
-        match push_advanced_face(file, face, placement_elevation, metric_placement) {
+        match push_advanced_face(file, face, frame) {
             Some(written) => faces.push(written),
             None => wrote_every_face = false,
         }
@@ -902,11 +1156,9 @@ fn push_brep(
     file: &mut StepFile,
     brep: &BimBrep,
     representation_context: EntityRef,
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
-    let (item, representation_type) =
-        push_brep_item(file, brep, placement_elevation, metric_placement)?;
+    let (item, representation_type) = push_brep_item(file, brep, frame)?;
     let body = push_body_representation(
         file,
         representation_context,
@@ -932,12 +1184,11 @@ fn push_assembly(
     file: &mut StepFile,
     parts: &[BimBrep],
     representation_context: EntityRef,
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
     let mut items = Vec::with_capacity(parts.len());
     for part in parts {
-        match push_brep_item(file, part, placement_elevation, metric_placement) {
+        match push_brep_item(file, part, frame) {
             Some((item, "AdvancedBrep")) => items.push(item),
             _ => return None,
         }
@@ -980,16 +1231,15 @@ fn push_body_representation(
 fn push_advanced_face(
     file: &mut StepFile,
     face: &BimBrepFace,
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
-    let surface = push_brep_surface(file, face, placement_elevation, metric_placement)?;
+    let surface = push_brep_surface(file, face, frame)?;
     if face.loops.is_empty() {
         return None;
     }
     let mut bounds = Vec::with_capacity(face.loops.len());
     for (index, loop_edges) in face.loops.iter().enumerate() {
-        let edge_loop = push_edge_loop(file, loop_edges, placement_elevation, metric_placement)?;
+        let edge_loop = push_edge_loop(file, loop_edges, frame)?;
         let entity = if index == 0 {
             "IFCFACEOUTERBOUND"
         } else {
@@ -1013,8 +1263,7 @@ fn push_advanced_face(
 fn push_brep_surface(
     file: &mut StepFile,
     face: &BimBrepFace,
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
     match &face.surface {
         BimBrepSurface::Plane {
@@ -1023,14 +1272,7 @@ fn push_brep_surface(
             y_axis,
         } => {
             let normal = cross(*x_axis, *y_axis);
-            let axis = push_local_axis(
-                file,
-                origin,
-                normal,
-                *x_axis,
-                placement_elevation,
-                metric_placement,
-            )?;
+            let axis = push_local_axis(file, origin, normal, *x_axis, frame)?;
             Some(file.push("IFCPLANE", vec![reference(axis)]))
         }
         BimBrepSurface::Cylinder {
@@ -1046,26 +1288,15 @@ fn push_brep_surface(
             {
                 return None;
             }
-            let axis = push_local_axis(
-                file,
-                center,
-                *z_axis,
-                *x_axis,
-                placement_elevation,
-                metric_placement,
-            )?;
+            let axis = push_local_axis(file, center, *z_axis, *x_axis, frame)?;
             Some(file.push(
                 "IFCCYLINDRICALSURFACE",
-                vec![reference(axis), StepValue::Real(radius.value)],
+                vec![reference(axis), frame.lengths.value(radius.value)],
             ))
         }
-        surface @ BimBrepSurface::Revolution { .. } => push_revolved_surface(
-            file,
-            surface,
-            &face.loops,
-            placement_elevation,
-            metric_placement,
-        ),
+        surface @ BimBrepSurface::Revolution { .. } => {
+            push_revolved_surface(file, surface, &face.loops, frame)
+        }
         // IFC4 has no ruled-surface entity. Some ruled surfaces coincide with
         // one it does have - a profile translated along a direction is an
         // `IfcSurfaceOfLinearExtrusion`, and a circle ruled to a point is a
@@ -1115,8 +1346,7 @@ fn push_revolved_surface(
     file: &mut StepFile,
     surface: &BimBrepSurface,
     loops: &[Vec<BimBrepEdge>],
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
     let BimBrepSurface::Revolution {
         center,
@@ -1128,7 +1358,7 @@ fn push_revolved_surface(
     else {
         return None;
     };
-    let frame = RevolvedFrame {
+    let revolution = RevolvedFrame {
         center,
         x_axis: *x_axis,
         y_axis: *y_axis,
@@ -1137,19 +1367,14 @@ fn push_revolved_surface(
     match profile {
         BimBrepProfile::Line { origin, direction } => push_revolved_line_surface(
             file,
-            &frame,
+            &revolution,
             (origin.coordinates, *direction),
             loops,
-            placement_elevation,
-            metric_placement,
+            frame,
         ),
-        BimBrepProfile::Arc { center, radius, .. } => push_revolved_arc_surface(
-            file,
-            &frame,
-            (center.coordinates, radius),
-            placement_elevation,
-            metric_placement,
-        ),
+        BimBrepProfile::Arc { center, radius, .. } => {
+            push_revolved_arc_surface(file, &revolution, (center.coordinates, radius), frame)
+        }
     }
 }
 
@@ -1157,11 +1382,10 @@ fn push_revolved_surface(
 /// the cylinder or the flat annulus that slant would degenerate into.
 fn push_revolved_line_surface(
     file: &mut StepFile,
-    frame: &RevolvedFrame,
+    revolution: &RevolvedFrame,
     (point, direction): ([f64; 3], [f64; 3]),
     loops: &[Vec<BimBrepEdge>],
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
     // Which way out of the axis the profile's own plane lies. The point names
     // it, unless the point is *on* the axis - a cone declared from its own
@@ -1191,36 +1415,22 @@ fn push_revolved_line_surface(
     if !radius.is_finite() {
         return None;
     }
-    let radial = frame.direction(radial_local);
+    let radial = revolution.direction(radial_local);
     // How fast the radius grows as the profile climbs.
     let outward = direction[0] * radial_local[0] + direction[1] * radial_local[1];
     let rise = direction[2];
-    let position = frame.point([0.0, 0.0, point[2]]);
+    let position = revolution.point([0.0, 0.0, point[2]]);
     if rise.abs() <= REVOLVED_AXIS_TOLERANCE_METRES {
         // The line is perpendicular to the axis: an annulus, which is flat.
-        let axis = push_local_axis(
-            file,
-            &position,
-            frame.z_axis,
-            radial,
-            placement_elevation,
-            metric_placement,
-        )?;
+        let axis = push_local_axis(file, &position, revolution.z_axis, radial, frame)?;
         return Some(file.push("IFCPLANE", vec![reference(axis)]));
     }
     if outward.abs() <= REVOLVED_AXIS_TOLERANCE_METRES {
         // Parallel to the axis: a cylinder of that radius.
-        let axis = push_local_axis(
-            file,
-            &position,
-            frame.z_axis,
-            radial,
-            placement_elevation,
-            metric_placement,
-        )?;
+        let axis = push_local_axis(file, &position, revolution.z_axis, radial, frame)?;
         return Some(file.push(
             "IFCCYLINDRICALSURFACE",
-            vec![reference(axis), StepValue::Real(radius)],
+            vec![reference(axis), frame.lengths.value(radius)],
         ));
     }
     // IFC4 has no conical surface - `IfcConicalSurface` is ISO 10303-42's, and
@@ -1230,7 +1440,7 @@ fn push_revolved_line_surface(
     // is the face's own boundary measured along that axis: every point of it
     // lies on the surface, so the span they cover is the span the face needs.
     let slope = outward / rise;
-    let (low, high) = axial_span(frame, loops)?;
+    let (low, high) = axial_span(revolution, loops)?;
     // Off the ends, so the boundary is trimmed out of the surface's interior
     // rather than off its edge.
     let margin = ((high - low) * CONE_MARGIN_FRACTION).max(REVOLVED_AXIS_TOLERANCE_METRES);
@@ -1250,8 +1460,9 @@ fn push_revolved_line_surface(
     }
     let profile_radius = |height: f64| radius + (height - point[2]) * slope;
     let curve = {
-        let points =
-            ends.map(|height| push_cartesian_point_2d(file, [profile_radius(height), height]));
+        let points = ends.map(|height| {
+            push_cartesian_point_2d(file, frame.lengths, [profile_radius(height), height])
+        });
         file.push(
             "IFCPOLYLINE",
             vec![StepValue::List(points.into_iter().map(reference).collect())],
@@ -1269,19 +1480,12 @@ fn push_revolved_line_surface(
     // for the other.
     let position = push_local_axis(
         file,
-        frame.center,
-        cross(radial, frame.z_axis),
+        revolution.center,
+        cross(radial, revolution.z_axis),
         radial,
-        placement_elevation,
-        metric_placement,
+        frame,
     )?;
-    let axis = push_axis_placement_1d(
-        file,
-        frame.center,
-        frame.z_axis,
-        placement_elevation,
-        metric_placement,
-    )?;
+    let axis = push_axis_placement_1d(file, revolution.center, revolution.z_axis, frame)?;
     Some(file.push(
         "IFCSURFACEOFREVOLUTION",
         vec![reference(profile), reference(position), reference(axis)],
@@ -1291,12 +1495,15 @@ fn push_revolved_line_surface(
 /// How far a revolved face's boundary reaches along the frame's axis, measured
 /// from the frame's own origin. `None` when the face has no boundary to
 /// measure or a point of it is not in metres.
-fn axial_span(frame: &RevolvedFrame, loops: &[Vec<BimBrepEdge>]) -> Option<(f64, f64)> {
-    let center = metric_coordinates(frame.center)?;
+fn axial_span(revolution: &RevolvedFrame, loops: &[Vec<BimBrepEdge>]) -> Option<(f64, f64)> {
+    let center = metric_coordinates(revolution.center)?;
     let mut span: Option<(f64, f64)> = None;
     for edge in loops.iter().flatten() {
         for point in [&edge.start, &edge.end] {
-            let height = dot(subtract(metric_coordinates(point)?, center), frame.z_axis);
+            let height = dot(
+                subtract(metric_coordinates(point)?, center),
+                revolution.z_axis,
+            );
             if !height.is_finite() {
                 return None;
             }
@@ -1313,10 +1520,9 @@ fn axial_span(frame: &RevolvedFrame, loops: &[Vec<BimBrepEdge>]) -> Option<(f64,
 /// centred on the axis itself.
 fn push_revolved_arc_surface(
     file: &mut StepFile,
-    frame: &RevolvedFrame,
+    revolution: &RevolvedFrame,
     (point, radius): ([f64; 3], &BimNumber),
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
     if radius.unit.as_ref()?.id != "autodesk.unit.unit:meters-1.0.0"
         || !radius.value.is_finite()
@@ -1328,23 +1534,16 @@ fn push_revolved_arc_surface(
     if !major.is_finite() {
         return None;
     }
-    let position = frame.point([0.0, 0.0, point[2]]);
+    let position = revolution.point([0.0, 0.0, point[2]]);
     if major <= REVOLVED_AXIS_TOLERANCE_METRES {
         // The arc is centred on the axis: a sphere.
-        let axis = push_local_axis(
-            file,
-            &position,
-            frame.z_axis,
-            frame.x_axis,
-            placement_elevation,
-            metric_placement,
-        )?;
+        let axis = push_local_axis(file, &position, revolution.z_axis, revolution.x_axis, frame)?;
         return Some(file.push(
             "IFCSPHERICALSURFACE",
-            vec![reference(axis), StepValue::Real(radius.value)],
+            vec![reference(axis), frame.lengths.value(radius.value)],
         ));
     }
-    let radial = frame.direction([point[0] / major, point[1] / major, 0.0]);
+    let radial = revolution.direction([point[0] / major, point[1] / major, 0.0]);
     if radius.value >= major * (1.0 - TORUS_RADIUS_MARGIN) {
         // The profile circle reaches the axis or crosses it, and
         // `IfcToroidalSurface` requires a minor radius strictly under the
@@ -1352,26 +1551,18 @@ fn push_revolved_arc_surface(
         // in it, is written the way the cone is: the profile revolved.
         return push_revolved_arc_as_revolution(
             file,
-            frame,
+            revolution,
             (radial, [major, point[2]], radius.value),
-            placement_elevation,
-            metric_placement,
+            frame,
         );
     }
-    let axis = push_local_axis(
-        file,
-        &position,
-        frame.z_axis,
-        radial,
-        placement_elevation,
-        metric_placement,
-    )?;
+    let axis = push_local_axis(file, &position, revolution.z_axis, radial, frame)?;
     Some(file.push(
         "IFCTOROIDALSURFACE",
         vec![
             reference(axis),
-            StepValue::Real(major),
-            StepValue::Real(radius.value),
+            frame.lengths.value(major),
+            frame.lengths.value(radius.value),
         ],
     ))
 }
@@ -1383,12 +1574,11 @@ fn push_revolved_arc_surface(
 /// points it sweeps.
 fn push_revolved_arc_as_revolution(
     file: &mut StepFile,
-    frame: &RevolvedFrame,
+    revolution: &RevolvedFrame,
     (radial, center, radius): ([f64; 3], [f64; 2], f64),
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
-    let profile_center = push_cartesian_point_2d(file, center);
+    let profile_center = push_cartesian_point_2d(file, frame.lengths, center);
     let profile_direction = push_direction_2d(file, [1.0, 0.0]);
     let profile_position = file.push(
         "IFCAXIS2PLACEMENT2D",
@@ -1396,7 +1586,7 @@ fn push_revolved_arc_as_revolution(
     );
     let circle = file.push(
         "IFCCIRCLE",
-        vec![reference(profile_position), StepValue::Real(radius)],
+        vec![reference(profile_position), frame.lengths.value(radius)],
     );
     // A full turn, in the radians this file declares its angles in.
     let trimmed = file.push(
@@ -1415,19 +1605,12 @@ fn push_revolved_arc_as_revolution(
     );
     let position = push_local_axis(
         file,
-        frame.center,
-        cross(radial, frame.z_axis),
+        revolution.center,
+        cross(radial, revolution.z_axis),
         radial,
-        placement_elevation,
-        metric_placement,
+        frame,
     )?;
-    let axis = push_axis_placement_1d(
-        file,
-        frame.center,
-        frame.z_axis,
-        placement_elevation,
-        metric_placement,
-    )?;
+    let axis = push_axis_placement_1d(file, revolution.center, revolution.z_axis, frame)?;
     Some(file.push(
         "IFCSURFACEOFREVOLUTION",
         vec![reference(profile), reference(position), reference(axis)],
@@ -1446,19 +1629,18 @@ fn push_revolved_arc_as_revolution(
 fn push_edge_loop(
     file: &mut StepFile,
     edges: &[BimBrepEdge],
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
     if edges.is_empty() {
         return None;
     }
     let mut vertices = Vec::with_capacity(edges.len());
     for edge in edges {
-        let corner = local_coordinates(&edge.start, placement_elevation, metric_placement)?;
+        let corner = local_coordinates(&edge.start, frame)?;
         if corner.into_iter().any(|value| !value.is_finite()) {
             return None;
         }
-        let point = push_cartesian_point(file, corner);
+        let point = push_cartesian_point(file, frame.lengths, corner);
         vertices.push(file.push("IFCVERTEXPOINT", vec![reference(point)]));
     }
     let mut oriented = Vec::with_capacity(edges.len());
@@ -1470,8 +1652,7 @@ fn push_edge_loop(
             edge,
             start_vertex,
             end_vertex,
-            placement_elevation,
-            metric_placement,
+            frame,
         )?);
     }
     Some(file.push(
@@ -1487,11 +1668,10 @@ fn push_oriented_edge(
     edge: &BimBrepEdge,
     start_vertex: EntityRef,
     end_vertex: EntityRef,
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
-    let start = local_coordinates(&edge.start, placement_elevation, metric_placement)?;
-    let end = local_coordinates(&edge.end, placement_elevation, metric_placement)?;
+    let start = local_coordinates(&edge.start, frame)?;
+    let end = local_coordinates(&edge.end, frame)?;
     if start.into_iter().chain(end).any(|value| !value.is_finite()) {
         return None;
     }
@@ -1506,12 +1686,14 @@ fn push_oriented_edge(
             let direction_ref = push_direction(file, direction);
             let vector = file.push(
                 "IFCVECTOR",
-                vec![reference(direction_ref), StepValue::Real(1.0)],
+                // `IfcVector.Magnitude` is a length, so one unit of the file's
+                // own length unit - not one metre in a millimetre file.
+                vec![reference(direction_ref), frame.lengths.value(1.0)],
             );
             // `IfcLine.Pnt` describes the underlying infinite line, not a
             // topological vertex, so it needs its own value, not the shared
             // `IfcVertexPoint`'s.
-            let line_point = push_cartesian_point(file, start);
+            let line_point = push_cartesian_point(file, frame.lengths, start);
             file.push("IFCLINE", vec![reference(line_point), reference(vector)])
         }
         BimBrepCurve::Arc(arc) => {
@@ -1521,17 +1703,10 @@ fn push_oriented_edge(
             {
                 return None;
             }
-            let axis = push_local_axis(
-                file,
-                &arc.center,
-                arc.z_axis,
-                arc.x_axis,
-                placement_elevation,
-                metric_placement,
-            )?;
+            let axis = push_local_axis(file, &arc.center, arc.z_axis, arc.x_axis, frame)?;
             file.push(
                 "IFCCIRCLE",
-                vec![reference(axis), StepValue::Real(arc.radius.value)],
+                vec![reference(axis), frame.lengths.value(arc.radius.value)],
             )
         }
         BimBrepCurve::Polyline(points) => {
@@ -1540,11 +1715,15 @@ fn push_oriented_edge(
             }
             let mut point_refs = Vec::with_capacity(points.len());
             for point in points {
-                let coordinates = local_coordinates(point, placement_elevation, metric_placement)?;
+                let coordinates = local_coordinates(point, frame)?;
                 if coordinates.into_iter().any(|value| !value.is_finite()) {
                     return None;
                 }
-                point_refs.push(reference(push_cartesian_point(file, coordinates)));
+                point_refs.push(reference(push_cartesian_point(
+                    file,
+                    frame.lengths,
+                    coordinates,
+                )));
             }
             file.push("IFCPOLYLINE", vec![StepValue::List(point_refs)])
         }
@@ -1577,12 +1756,11 @@ fn push_local_axis(
     origin: &BimPoint3,
     axis_world: [f64; 3],
     ref_direction_world: [f64; 3],
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
-    let point = local_coordinates(origin, placement_elevation, metric_placement)?;
-    let axis = local_direction(axis_world, metric_placement);
-    let ref_direction = local_direction(ref_direction_world, metric_placement);
+    let point = local_coordinates(origin, frame)?;
+    let axis = local_direction(axis_world, frame.placement);
+    let ref_direction = local_direction(ref_direction_world, frame.placement);
     if point
         .into_iter()
         .chain(axis)
@@ -1591,7 +1769,7 @@ fn push_local_axis(
     {
         return None;
     }
-    let point_ref = push_cartesian_point(file, point);
+    let point_ref = push_cartesian_point(file, frame.lengths, point);
     let axis_ref = push_direction(file, axis);
     let ref_direction_ref = push_direction(file, ref_direction);
     Some(file.push(
@@ -1623,6 +1801,7 @@ fn push_bounding_box(
     file: &mut StepFile,
     bounds: &BimBoundingBox,
     representation_context: EntityRef,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
     let min = metric_coordinates(&bounds.min)?;
     let max = metric_coordinates(&bounds.max)?;
@@ -1633,14 +1812,14 @@ fn push_bounding_box(
     {
         return None;
     }
-    let corner = push_cartesian_point(file, min);
+    let corner = push_cartesian_point(file, frame.lengths, min);
     let item = file.push(
         "IFCBOUNDINGBOX",
         vec![
             reference(corner),
-            StepValue::Real(dimensions[0]),
-            StepValue::Real(dimensions[1]),
-            StepValue::Real(dimensions[2]),
+            frame.lengths.value(dimensions[0]),
+            frame.lengths.value(dimensions[1]),
+            frame.lengths.value(dimensions[2]),
         ],
     );
     let representation = file.push(
@@ -1666,11 +1845,10 @@ fn push_axis_line(
     file: &mut StepFile,
     line: &BimLineSegment,
     representation_context: EntityRef,
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<(EntityRef, EntityRef)> {
-    let start = local_coordinates(&line.start, placement_elevation, metric_placement)?;
-    let end = local_coordinates(&line.end, placement_elevation, metric_placement)?;
+    let start = local_coordinates(&line.start, frame)?;
+    let end = local_coordinates(&line.end, frame)?;
     let length_squared = start
         .into_iter()
         .zip(end)
@@ -1681,8 +1859,8 @@ fn push_axis_line(
     {
         return None;
     }
-    let start = push_cartesian_point(file, start);
-    let end = push_cartesian_point(file, end);
+    let start = push_cartesian_point(file, frame.lengths, start);
+    let end = push_cartesian_point(file, frame.lengths, end);
     let line = file.push(
         "IFCPOLYLINE",
         vec![StepValue::List(vec![reference(start), reference(end)])],
@@ -1705,13 +1883,9 @@ fn metric_coordinates(point: &BimPoint3) -> Option<[f64; 3]> {
     .then_some(point.coordinates)
 }
 
-fn local_coordinates(
-    point: &BimPoint3,
-    storey_elevation: f64,
-    placement: Option<MetricPlacement>,
-) -> Option<[f64; 3]> {
+fn local_coordinates(point: &BimPoint3, frame: GeometryFrame) -> Option<[f64; 3]> {
     let mut world = metric_coordinates(point)?;
-    if let Some(placement) = placement {
+    if let Some(placement) = frame.placement {
         let delta = subtract(world, placement.origin);
         let local_y = cross(placement.axis, placement.reference_direction);
         return Some([
@@ -1720,10 +1894,10 @@ fn local_coordinates(
             dot(delta, placement.axis),
         ]);
     }
-    if !storey_elevation.is_finite() {
+    if !frame.storey_elevation.is_finite() {
         return None;
     }
-    world[2] -= storey_elevation;
+    world[2] -= frame.storey_elevation;
     Some(world)
 }
 
@@ -1745,13 +1919,12 @@ fn cross(left: [f64; 3], right: [f64; 3]) -> [f64; 3] {
 
 /// A point of a profile's own two-dimensional plane, which is not the
 /// element's coordinate system and takes none of its placement.
-fn push_cartesian_point_2d(file: &mut StepFile, coordinates: [f64; 2]) -> EntityRef {
-    file.push(
-        "IFCCARTESIANPOINT",
-        vec![StepValue::List(
-            coordinates.into_iter().map(StepValue::Real).collect(),
-        )],
-    )
+fn push_cartesian_point_2d(
+    file: &mut StepFile,
+    lengths: Lengths,
+    coordinates: [f64; 2],
+) -> EntityRef {
+    file.push("IFCCARTESIANPOINT", vec![lengths.coordinates(coordinates)])
 }
 
 /// An axis with a position but no reference direction: what a surface of
@@ -1760,11 +1933,10 @@ fn push_axis_placement_1d(
     file: &mut StepFile,
     origin: &BimPoint3,
     axis_world: [f64; 3],
-    placement_elevation: f64,
-    metric_placement: Option<MetricPlacement>,
+    frame: GeometryFrame,
 ) -> Option<EntityRef> {
-    let point = local_coordinates(origin, placement_elevation, metric_placement)?;
-    let axis = local_direction(axis_world, metric_placement);
+    let point = local_coordinates(origin, frame)?;
+    let axis = local_direction(axis_world, frame.placement);
     if point
         .into_iter()
         .chain(axis)
@@ -1772,7 +1944,7 @@ fn push_axis_placement_1d(
     {
         return None;
     }
-    let point_ref = push_cartesian_point(file, point);
+    let point_ref = push_cartesian_point(file, frame.lengths, point);
     let axis_ref = push_direction(file, axis);
     Some(file.push(
         "IFCAXIS1PLACEMENT",
@@ -1780,13 +1952,8 @@ fn push_axis_placement_1d(
     ))
 }
 
-fn push_cartesian_point(file: &mut StepFile, coordinates: [f64; 3]) -> EntityRef {
-    file.push(
-        "IFCCARTESIANPOINT",
-        vec![StepValue::List(
-            coordinates.into_iter().map(StepValue::Real).collect(),
-        )],
-    )
+fn push_cartesian_point(file: &mut StepFile, lengths: Lengths, coordinates: [f64; 3]) -> EntityRef {
+    file.push("IFCCARTESIANPOINT", vec![lengths.coordinates(coordinates)])
 }
 
 /// A direction of a profile's own two-dimensional plane.
@@ -1806,6 +1973,266 @@ fn push_direction(file: &mut StepFile, direction: [f64; 3]) -> EntityRef {
             direction.into_iter().map(StepValue::Real).collect(),
         )],
     )
+}
+
+/// What has been measured from an element's own exported body.
+///
+/// Not read from the source: Revit computes its quantities when it exports and
+/// stores none of them, and joining every numeric parameter this decode
+/// recovers against every quantity in Revit's own export of AR S1 - as it
+/// stands, in feet turned to millimetres and the other way - found no carrier
+/// for a single one. So they are measured here, from the solid this file
+/// carries, and they describe that solid and nothing else.
+///
+/// Measured against Revit's own `Qto_..BaseQuantities` on the 8 047 closed,
+/// planar-faced solids of AR S1 that both files hold: **7 482 reproduce
+/// Revit's `NetVolume` to within a thousandth**, and 565 do not, of which 558
+/// are walls whose body we export larger than Revit exports its own - a
+/// difference in the body, not in the measurement, and the same difference a
+/// reader would see by looking at the two solids.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MeasuredQuantities {
+    /// The volume the closed shell encloses, in cubic metres.
+    net_volume: f64,
+    /// The area of every face of it, in square metres.
+    net_surface_area: f64,
+}
+
+/// Measure a body, where it is one this can measure exactly.
+///
+/// Only a closed shell of planar faces bounded by straight edges: a curved
+/// face would have to be tessellated, and a tessellation is an approximation
+/// whose error nothing here bounds. Anything else is left unmeasured rather
+/// than estimated.
+fn measure(geometry: &BimGeometry) -> Option<MeasuredQuantities> {
+    let BimGeometry::Brep(brep) = geometry else {
+        return None;
+    };
+    if !brep.complete || brep.faces.is_empty() {
+        return None;
+    }
+    // Six times the signed volume and twice the area, so the division happens
+    // once at the end.
+    let mut six_volume = 0.0_f64;
+    let mut two_area = 0.0_f64;
+    for face in &brep.faces {
+        if !matches!(face.surface, BimBrepSurface::Plane { .. }) {
+            return None;
+        }
+        for loop_edges in &face.loops {
+            let mut corners = Vec::with_capacity(loop_edges.len());
+            for edge in loop_edges {
+                if !matches!(edge.curve, BimBrepCurve::Line) {
+                    return None;
+                }
+                corners.push(metric_coordinates(&edge.start)?);
+            }
+            // The divergence theorem over the face, fan-triangulated from its
+            // first corner. A hole is wound against the loop it is in, so its
+            // triangles take themselves back out of both sums.
+            let Some((origin, rest)) = corners.split_first() else {
+                continue;
+            };
+            for pair in rest.windows(2) {
+                let first = subtract(pair[0], *origin);
+                let second = subtract(pair[1], *origin);
+                let normal = cross(first, second);
+                six_volume += dot(*origin, normal);
+                two_area += dot(normal, normal).sqrt();
+            }
+        }
+    }
+    let net_volume = six_volume.abs() / 6.0;
+    let net_surface_area = two_area / 2.0;
+    (net_volume.is_finite() && net_surface_area.is_finite() && net_volume > 0.0).then_some(
+        MeasuredQuantities {
+            net_volume,
+            net_surface_area,
+        },
+    )
+}
+
+/// The base quantity set for an entity, and the quantities it holds - the
+/// buildingSMART templates' own answer, because the names differ from entity
+/// to entity: a wall's volume is in `Qto_WallBaseQuantities` and a proxy's in
+/// `Qto_BuildingElementProxyQuantities`, which is not even called *Base*.
+fn base_quantity_set(entity: &str) -> Option<(&'static str, &'static [&'static str])> {
+    IFC4_BASE_QUANTITY_SETS
+        .iter()
+        .find(|(name, _, _)| *name == entity)
+        .map(|(_, set, quantities)| (*set, *quantities))
+}
+
+/// Write what has been measured from `element`'s body, as the quantity set the
+/// entity's own template defines. Nothing is written where the body cannot be
+/// measured exactly, or where the set has no name for what was measured.
+fn push_quantities(
+    file: &mut StepFile,
+    element: &BimElement,
+    product: EntityRef,
+    product_entity: &str,
+    context: WriteContext<'_>,
+) {
+    let Some(measured) = element.geometry.as_ref().and_then(measure) else {
+        return;
+    };
+    let Some((set_name, allowed)) = base_quantity_set(product_entity) else {
+        return;
+    };
+    let mut quantities = Vec::new();
+    if allowed.contains(&"NetVolume") {
+        quantities.push(reference(file.push(
+            "IFCQUANTITYVOLUME",
+            vec![
+                string("NetVolume"),
+                omitted(),
+                omitted(),
+                StepValue::Real(measured.net_volume),
+                omitted(),
+            ],
+        )));
+    }
+    if allowed.contains(&"NetSurfaceArea") {
+        quantities.push(reference(file.push(
+            "IFCQUANTITYAREA",
+            vec![
+                string("NetSurfaceArea"),
+                omitted(),
+                omitted(),
+                StepValue::Real(measured.net_surface_area),
+                omitted(),
+            ],
+        )));
+    }
+    if quantities.is_empty() {
+        return;
+    }
+    let set = file.push(
+        "IFCELEMENTQUANTITY",
+        vec![
+            global_id(context.options, &format!("quantities:{}", element.id.0)),
+            reference(context.owner),
+            string(set_name),
+            omitted(),
+            omitted(),
+            StepValue::List(quantities),
+        ],
+    );
+    file.push(
+        "IFCRELDEFINESBYPROPERTIES",
+        vec![
+            global_id(
+                context.options,
+                &format!("quantities-relation:{}", element.id.0),
+            ),
+            reference(context.owner),
+            omitted(),
+            omitted(),
+            StepValue::List(vec![reference(product)]),
+            reference(set),
+        ],
+    );
+}
+
+/// IFC's own property set for an element written as this entity, where the
+/// property set templates define one that holds `Reference`.
+///
+/// The names are the templates' own - see `ifc4_entities` - rather than a rule
+/// applied to the entity name: a building element's set is
+/// `Pset_<Entity>Common` but a distribution element's is
+/// `Pset_<Entity>TypeCommon`, which the template declares applicable to the
+/// occurrence as well as to the type. An entity with no such set gets none.
+fn common_property_set(entity: &str) -> Option<&'static str> {
+    IFC4_COMMON_PROPERTY_SETS
+        .iter()
+        .find(|(name, _)| *name == entity)
+        .map(|(_, pset)| *pset)
+}
+
+/// The IFC common property sets written so far, and the products carrying each.
+///
+/// The only property in them is `Reference`, which holds the element's type
+/// name - so every element of one type carries the identical set, and it is
+/// written once and related to all of them at the end. A reader sees on each
+/// element exactly what Revit's own export puts there; what it does not see is
+/// the same six properties repeated 7 617 times.
+#[derive(Default)]
+struct CommonPropertySets {
+    /// `(set name, reference)` to the set and the products carrying it.
+    sets: BTreeMap<(&'static str, String), (EntityRef, Vec<EntityRef>)>,
+}
+
+impl CommonPropertySets {
+    /// Record that `product` carries the common set for its type, writing the
+    /// set the first time that name and reference are seen.
+    fn associate(
+        &mut self,
+        file: &mut StepFile,
+        element: &BimElement,
+        product: EntityRef,
+        product_entity: &str,
+        context: WriteContext<'_>,
+    ) {
+        let Some(name) = common_property_set(product_entity) else {
+            return;
+        };
+        // Revit's `Reference` is the element's type name, which is the one
+        // thing in these sets this decode establishes. An element whose type
+        // name was not recovered carries no set rather than an empty one.
+        let Some(type_reference) = element.type_name.as_deref() else {
+            return;
+        };
+        let entry = self
+            .sets
+            .entry((name, type_reference.to_owned()))
+            .or_insert_with(|| {
+                let identity = format!("common:{name}:{type_reference}");
+                let property = file.push(
+                    "IFCPROPERTYSINGLEVALUE",
+                    vec![
+                        string("Reference"),
+                        omitted(),
+                        StepValue::Typed {
+                            name: "IFCIDENTIFIER".to_owned(),
+                            value: Box::new(string(type_reference)),
+                        },
+                        omitted(),
+                    ],
+                );
+                let set = file.push(
+                    "IFCPROPERTYSET",
+                    vec![
+                        global_id(context.options, &identity),
+                        reference(context.owner),
+                        string(name),
+                        omitted(),
+                        StepValue::List(vec![reference(property)]),
+                    ],
+                );
+                (set, Vec::new())
+            });
+        entry.1.push(product);
+    }
+
+    /// One `IfcRelDefinesByProperties` per distinct set.
+    fn push_relations(self, file: &mut StepFile, context: WriteContext<'_>) {
+        for ((name, value), (set, products)) in self.sets {
+            if products.is_empty() {
+                continue;
+            }
+            file.push(
+                "IFCRELDEFINESBYPROPERTIES",
+                vec![
+                    global_id(context.options, &format!("common-relation:{name}:{value}")),
+                    reference(context.owner),
+                    omitted(),
+                    omitted(),
+                    StepValue::List(products.into_iter().map(reference).collect()),
+                    reference(set),
+                ],
+            );
+        }
+    }
 }
 
 /// The material layer sets written so far, and the products that carry them.
@@ -1829,7 +2256,13 @@ struct MaterialLibrary {
 impl MaterialLibrary {
     /// Record that `product` is made of `element`'s layers, writing the layer
     /// set the first time it is seen.
-    fn associate(&mut self, file: &mut StepFile, element: &BimElement, product: EntityRef) {
+    fn associate(
+        &mut self,
+        file: &mut StepFile,
+        element: &BimElement,
+        product: EntityRef,
+        lengths: Lengths,
+    ) {
         let Some(set) = &element.material_layers else {
             return;
         };
@@ -1850,7 +2283,9 @@ impl MaterialLibrary {
                 let layers = set
                     .layers
                     .iter()
-                    .filter_map(|layer| push_material_layer(file, &mut self.materials, layer))
+                    .filter_map(|layer| {
+                        push_material_layer(file, &mut self.materials, layer, lengths)
+                    })
                     .map(reference)
                     .collect::<Vec<_>>();
                 if layers.is_empty() {
@@ -1905,6 +2340,7 @@ fn push_material_layer(
     file: &mut StepFile,
     materials: &mut BTreeMap<String, EntityRef>,
     layer: &BimMaterialLayer,
+    lengths: Lengths,
 ) -> Option<EntityRef> {
     if layer.thickness.unit.as_ref()?.id != "autodesk.unit.unit:meters-1.0.0"
         || !layer.thickness.value.is_finite()
@@ -1927,7 +2363,7 @@ fn push_material_layer(
         "IFCMATERIALLAYER",
         vec![
             material.map_or_else(omitted, reference),
-            StepValue::Real(layer.thickness.value),
+            lengths.value(layer.thickness.value),
             omitted(),
             omitted(),
             omitted(),
@@ -1941,77 +2377,94 @@ fn push_property_set(
     file: &mut StepFile,
     element: &BimElement,
     product: EntityRef,
-    options: &MetadataOptions,
-    owner: EntityRef,
+    context: WriteContext<'_>,
+    type_carries_properties: bool,
 ) {
-    push_named_property_set(
-        file,
-        &element.properties,
-        product,
-        options,
-        owner,
-        "Rivet Properties",
-        &format!("properties:{}", element.id.0),
-        &format!("properties-relation:{}", element.id.0),
-    );
-    // The type's values go in a set of their own. Both sets hang off the same
-    // product - the element's type is not itself exported as an
-    // `IfcTypeProduct` - so the set name is what keeps "set on this element"
-    // and "set on its type" apart for a reader.
-    push_named_property_set(
-        file,
-        &element.type_properties,
-        product,
-        options,
-        owner,
-        "Rivet Type Properties",
-        &format!("type-properties:{}", element.id.0),
-        &format!("type-properties-relation:{}", element.id.0),
-    );
+    if context.options.settings.property_sets.revit_parameters {
+        push_named_property_set(
+            file,
+            &element.properties,
+            product,
+            context,
+            "Rivet Properties",
+            &format!("properties:{}", element.id.0),
+            &format!("properties-relation:{}", element.id.0),
+        );
+    }
+    // The type's values go in a set of their own, and where the type itself is
+    // exported they hang off *it* rather than off each of its elements - that
+    // is what `type_carries_properties` says. Where it is not, both sets hang
+    // off the same product and the set name is what keeps "set on this
+    // element" and "set on its type" apart for a reader.
+    if context.options.settings.property_sets.revit_type_parameters && !type_carries_properties {
+        push_named_property_set(
+            file,
+            &element.type_properties,
+            product,
+            context,
+            "Rivet Type Properties",
+            &format!("type-properties:{}", element.id.0),
+            &format!("type-properties-relation:{}", element.id.0),
+        );
+    }
 }
 
-#[allow(clippy::too_many_arguments)] // Two identifiers and a name, all distinct.
 fn push_named_property_set(
     file: &mut StepFile,
     source: &[BimProperty],
     product: EntityRef,
-    options: &MetadataOptions,
-    owner: EntityRef,
+    context: WriteContext<'_>,
     name: &str,
     key: &str,
     relation_key: &str,
 ) {
-    let names = unique_property_names(source);
-    let properties = source
-        .iter()
-        .zip(&names)
-        .filter_map(|(property, name)| push_property(file, property, name))
-        .map(reference)
-        .collect::<Vec<_>>();
-    if properties.is_empty() {
+    let Some(pset) = push_property_set_entity(file, source, context, name, key) else {
         return;
-    }
-    let pset = file.push(
-        "IFCPROPERTYSET",
-        vec![
-            global_id(options, key),
-            reference(owner),
-            string(name),
-            omitted(),
-            StepValue::List(properties),
-        ],
-    );
+    };
     file.push(
         "IFCRELDEFINESBYPROPERTIES",
         vec![
-            global_id(options, relation_key),
-            reference(owner),
+            global_id(context.options, relation_key),
+            reference(context.owner),
             omitted(),
             omitted(),
             StepValue::List(vec![reference(product)]),
             reference(pset),
         ],
     );
+}
+
+/// One `IfcPropertySet`, without the relationship that carries it: a type
+/// holds its own in `HasPropertySets`, where an element needs an
+/// `IfcRelDefinesByProperties`. `None` where nothing in the source survived
+/// into a property, which is not the same as an empty set.
+fn push_property_set_entity(
+    file: &mut StepFile,
+    source: &[BimProperty],
+    context: WriteContext<'_>,
+    name: &str,
+    key: &str,
+) -> Option<EntityRef> {
+    let names = unique_property_names(source);
+    let properties = source
+        .iter()
+        .zip(&names)
+        .filter_map(|(property, name)| push_property(file, property, name, context.lengths))
+        .map(reference)
+        .collect::<Vec<_>>();
+    if properties.is_empty() {
+        return None;
+    }
+    Some(file.push(
+        "IFCPROPERTYSET",
+        vec![
+            global_id(context.options, key),
+            reference(context.owner),
+            string(name),
+            omitted(),
+            StepValue::List(properties),
+        ],
+    ))
 }
 
 /// `IfcPropertySet.UniquePropertyNames` requires the names within one set to
@@ -2054,8 +2507,13 @@ fn unique_property_names(source: &[BimProperty]) -> Vec<String> {
         .collect()
 }
 
-fn push_property(file: &mut StepFile, property: &BimProperty, name: &str) -> Option<EntityRef> {
-    let nominal = nominal_value(property)?;
+fn push_property(
+    file: &mut StepFile,
+    property: &BimProperty,
+    name: &str,
+    lengths: Lengths,
+) -> Option<EntityRef> {
+    let nominal = nominal_value(property, lengths)?;
     Some(file.push(
         "IFCPROPERTYSINGLEVALUE",
         vec![
@@ -2067,7 +2525,7 @@ fn push_property(file: &mut StepFile, property: &BimProperty, name: &str) -> Opt
     ))
 }
 
-fn nominal_value(property: &BimProperty) -> Option<StepValue> {
+fn nominal_value(property: &BimProperty, lengths: Lengths) -> Option<StepValue> {
     let typed = |name: &str, value: StepValue| StepValue::Typed {
         name: name.to_owned(),
         value: Box::new(value),
@@ -2075,14 +2533,20 @@ fn nominal_value(property: &BimProperty) -> Option<StepValue> {
     match &property.value {
         BimPropertyValue::Bool(value) => Some(typed("IFCBOOLEAN", StepValue::Boolean(*value))),
         BimPropertyValue::Integer(value) => Some(typed("IFCINTEGER", StepValue::Integer(*value))),
-        BimPropertyValue::Number(number) => number_value(number, property.specification.as_deref()),
+        BimPropertyValue::Number(number) => {
+            number_value(number, property.specification.as_deref(), lengths)
+        }
         BimPropertyValue::Text(value) => Some(typed("IFCLABEL", string(value))),
         BimPropertyValue::Reference(value) => Some(typed("IFCIDENTIFIER", string(&value.0))),
         BimPropertyValue::Bytes(_) | BimPropertyValue::Unknown(_) => None,
     }
 }
 
-fn number_value(number: &BimNumber, specification: Option<&str>) -> Option<StepValue> {
+fn number_value(
+    number: &BimNumber,
+    specification: Option<&str>,
+    lengths: Lengths,
+) -> Option<StepValue> {
     if !number.value.is_finite() {
         return None;
     }
@@ -2105,7 +2569,16 @@ fn number_value(number: &BimNumber, specification: Option<&str>) -> Option<StepV
         _ => None,
     };
     if let Some(measure) = measure {
-        return Some(typed(measure, StepValue::Real(number.value)));
+        // A property's length is stated in the file's own length unit, like
+        // every other length in it. An area and a volume are not: the unit
+        // assignment keeps them in square and cubic metres whatever the
+        // length unit is, which is what Revit's own export does too.
+        let value = if measure == "IFCLENGTHMEASURE" {
+            lengths.value(number.value)
+        } else {
+            StepValue::Real(number.value)
+        };
+        return Some(typed(measure, value));
     }
     let suffix = unit.map_or_else(
         || specification.unwrap_or("unit unknown"),
@@ -2196,6 +2669,8 @@ fn enumeration(value: &str) -> StepValue {
 
 #[cfg(test)]
 mod tests {
+    use bim_core::BimElementType;
+
     use bim_core::{
         BimCategory, BimLineSegment, BimMaterial, BimMaterialLayerSet, BimPlacement, BimSweptDisk,
         BimUnit,
@@ -2212,6 +2687,16 @@ mod tests {
             project_name: "Test Project".to_owned(),
             site_name: "Site".to_owned(),
             building_name: "Building".to_owned(),
+            settings: ExportSettings::default(),
+        }
+    }
+
+    /// A body read straight in the model's own coordinates, in metres.
+    fn test_frame() -> GeometryFrame {
+        GeometryFrame {
+            lengths: Lengths::new(LengthUnit::Metre),
+            storey_elevation: 0.0,
+            placement: None,
         }
     }
 
@@ -2219,6 +2704,7 @@ mod tests {
         let level_id = BimElementId("100".to_owned());
         BimModel {
             source: None,
+            documents: Vec::new(),
             levels: vec![BimLevel {
                 id: level_id.clone(),
                 name: Some("Этаж 1".to_owned()),
@@ -2229,6 +2715,7 @@ mod tests {
             }],
             elements: vec![BimElement {
                 id: BimElementId("200".to_owned()),
+                document: None,
                 element_type: BimElementType::Unknown,
                 class_name: Some("Wall".to_owned()),
                 name: Some("Wall 1".to_owned()),
@@ -2239,6 +2726,7 @@ mod tests {
                 }),
                 level_id: Some(level_id),
                 type_id: None,
+                type_name: None,
                 placement: None,
                 geometry: None,
                 properties: vec![BimProperty {
@@ -2260,6 +2748,7 @@ mod tests {
     fn element(id: &str, class_name: &str, category_name: &str) -> BimElement {
         BimElement {
             id: BimElementId(id.to_owned()),
+            document: None,
             element_type: BimElementType::Unknown,
             class_name: Some(class_name.to_owned()),
             name: Some(format!("Element {id}")),
@@ -2270,6 +2759,7 @@ mod tests {
             }),
             level_id: Some(BimElementId("100".to_owned())),
             type_id: None,
+            type_name: None,
             placement: None,
             geometry: None,
             properties: Vec::new(),
@@ -2419,6 +2909,53 @@ mod tests {
         assert!(text.contains("'\\X2\\042D04420430043600200031\\X0\\'"));
     }
 
+    /// The length unit changes the numbers and states itself; it changes
+    /// nothing else. The storey elevation, the property's length measure and
+    /// the geometry all move together, while the area beside them does not -
+    /// the unit assignment keeps areas and volumes metric whatever the length
+    /// unit is, which is what Revit's own export of the corpus does.
+    #[test]
+    fn a_millimetre_export_states_its_unit_and_scales_every_length_by_it() {
+        let mut model = model();
+        model.elements[0].properties.push(BimProperty {
+            id: None,
+            name: "Area".to_owned(),
+            specification: None,
+            value: BimPropertyValue::Number(BimNumber {
+                value: 12.0,
+                unit: Some(BimUnit::new(
+                    "autodesk.unit.unit:squareMeters-1.0.1",
+                    "square metres",
+                )),
+            }),
+        });
+        let mut options = options();
+        options.settings.length_unit = LengthUnit::Millimetre;
+
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("=IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.)"));
+        // Still square metres, beside a millimetre length.
+        assert!(text.contains("=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.)"));
+        assert!(
+            text.contains("IFCLENGTHMEASURE(2.500000000000000e3)"),
+            "the property's 2.5 m should be written as 2500 mm"
+        );
+        assert!(
+            text.contains("IFCAREAMEASURE(1.200000000000000e1)"),
+            "the property's 12 m2 should stay 12 m2"
+        );
+        // The storey's own elevation, 3.048 m, and the model's precision.
+        assert!(
+            text.contains("=IFCBUILDINGSTOREY(") && text.contains(",3.048000000000000e3)"),
+            "the storey elevation should be written in millimetres"
+        );
+        assert!(text.contains("1.000000000000000e-2,"), "precision in mm");
+    }
+
     #[test]
     fn a_room_is_written_as_a_space_the_storey_decomposes() {
         let mut model = model();
@@ -2510,6 +3047,524 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text.matches("=IFCPROPERTYSET(").count(), 1);
         assert!(!text.contains("'Rivet Type Properties'"));
+    }
+
+    /// Two elements of one Revit type: one type object, one relationship
+    /// carrying both, and the type's parameters stated once - on the type.
+    #[test]
+    fn writes_one_type_per_revit_type_and_relates_every_element_to_it() {
+        let mut model = model();
+        let mut first = model.elements[0].clone();
+        first.element_type = BimElementType::Wall;
+        first.type_id = Some(BimElementId("900".to_owned()));
+        first.type_name = Some("Basic Wall: 200mm".to_owned());
+        first.type_properties = vec![BimProperty {
+            id: None,
+            name: "Manufacturer".to_owned(),
+            specification: None,
+            value: BimPropertyValue::Text("SANEXT".to_owned()),
+        }];
+        let mut second = first.clone();
+        second.id = BimElementId("201".to_owned());
+        model.elements = vec![first, second];
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(text.matches("=IFCWALLTYPE(").count(), 1);
+        assert_eq!(text.matches("=IFCRELDEFINESBYTYPE(").count(), 1);
+        let relation = text
+            .lines()
+            .find(|line| line.contains("=IFCRELDEFINESBYTYPE("))
+            .expect("the type relationship");
+        assert_eq!(relation.matches('#').count(), 5, "{relation}");
+
+        // The type is named and tagged by the record it was read from, and it
+        // holds the type's parameters in `HasPropertySets`.
+        let written = text
+            .lines()
+            .find(|line| line.contains("=IFCWALLTYPE("))
+            .expect("the wall type");
+        assert!(written.contains("'Basic Wall: 200mm'"), "{written}");
+        assert!(written.contains(",'900',"), "{written}");
+        assert!(text.contains("'Rivet Type Properties'"));
+        assert_eq!(text.matches("'Rivet Type Properties'").count(), 1);
+        // Stated on the type, so no element repeats it: the property
+        // relationships left are the two elements' own parameters and the one
+        // IFC common set both of them share.
+        assert_eq!(text.matches("=IFCRELDEFINESBYPROPERTIES(").count(), 3);
+    }
+
+    /// The attribute layout, measured against the IFC Revit itself exported
+    /// from AR S1: nine `IfcElementType` attributes and then the entity's own.
+    /// A wall type ends at `PredefinedType` for ten, a space type adds
+    /// `LongName` for eleven, and a door type adds three for thirteen.
+    #[test]
+    fn a_type_carries_the_attributes_revit_writes_for_it() {
+        let attributes = |line: &str| {
+            let arguments = line
+                .split_once('(')
+                .and_then(|(_, rest)| rest.rsplit_once(')'))
+                .expect("an entity line")
+                .0;
+            let mut depth = 0;
+            let mut quoted = false;
+            let mut count = 1;
+            for character in arguments.chars() {
+                match character {
+                    '\'' => quoted = !quoted,
+                    '(' if !quoted => depth += 1,
+                    ')' if !quoted => depth -= 1,
+                    ',' if !quoted && depth == 0 => count += 1,
+                    _ => {}
+                }
+            }
+            count
+        };
+        for (element_type, entity, expected) in [
+            (BimElementType::Wall, "=IFCWALLTYPE(", 10),
+            (BimElementType::Door, "=IFCDOORTYPE(", 13),
+            (BimElementType::Window, "=IFCWINDOWTYPE(", 13),
+            (BimElementType::Space, "=IFCSPACETYPE(", 11),
+            (BimElementType::Unknown, "=IFCBUILDINGELEMENTPROXYTYPE(", 10),
+        ] {
+            let mut model = model();
+            let mut element = model.elements[0].clone();
+            element.element_type = element_type;
+            element.category = None;
+            element.type_id = Some(BimElementId("900".to_owned()));
+            model.elements = vec![element];
+            let file = metadata_ifc(&model, &options()).unwrap();
+            let mut bytes = Vec::new();
+            file.write_to(&mut bytes).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            let line = text
+                .lines()
+                .find(|line| line.contains(entity))
+                .unwrap_or_else(|| panic!("missing {entity}"));
+            assert_eq!(attributes(line), expected, "{line}");
+        }
+    }
+
+    /// A box of known size: 1 x 2 x 3 metres at the origin, so six cubic
+    /// metres of volume and twenty-two square metres of surface.
+    fn box_brep(complete: bool) -> BimBrep {
+        let point = |x: f64, y: f64, z: f64| BimPoint3 {
+            coordinates: [x, y, z],
+            unit: BimUnit::metres(),
+        };
+        let quad = |corners: [[f64; 3]; 4]| {
+            let edge = |from: [f64; 3], to: [f64; 3]| BimBrepEdge {
+                start: point(from[0], from[1], from[2]),
+                end: point(to[0], to[1], to[2]),
+                curve: BimBrepCurve::Line,
+            };
+            BimBrepFace {
+                surface: BimBrepSurface::Plane {
+                    origin: point(corners[0][0], corners[0][1], corners[0][2]),
+                    x_axis: [1.0, 0.0, 0.0],
+                    y_axis: [0.0, 1.0, 0.0],
+                },
+                loops: vec![vec![
+                    edge(corners[0], corners[1]),
+                    edge(corners[1], corners[2]),
+                    edge(corners[2], corners[3]),
+                    edge(corners[3], corners[0]),
+                ]],
+            }
+        };
+        let (x, y, z) = (1.0, 2.0, 3.0);
+        BimBrep {
+            complete,
+            faces: vec![
+                quad([[0.0, 0.0, 0.0], [x, 0.0, 0.0], [x, y, 0.0], [0.0, y, 0.0]]),
+                quad([[0.0, 0.0, z], [0.0, y, z], [x, y, z], [x, 0.0, z]]),
+                quad([[0.0, 0.0, 0.0], [0.0, y, 0.0], [0.0, y, z], [0.0, 0.0, z]]),
+                quad([[x, 0.0, 0.0], [x, 0.0, z], [x, y, z], [x, y, 0.0]]),
+                quad([[0.0, 0.0, 0.0], [0.0, 0.0, z], [x, 0.0, z], [x, 0.0, 0.0]]),
+                quad([[0.0, y, 0.0], [x, y, 0.0], [x, y, z], [0.0, y, z]]),
+            ],
+        }
+    }
+
+    /// The quantities are measured from the body this file carries, in the
+    /// units the file states for them - cubic and square metres, whatever the
+    /// length unit is. Off unless asked for, as Revit's own switch is.
+    #[test]
+    fn measures_base_quantities_from_the_exported_solid() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Wall;
+        model.elements[0].geometry = Some(BimGeometry::Brep(box_brep(true)));
+        let mut options = options();
+        options.settings.property_sets.base_quantities = true;
+        // The unit does not touch them: an area is square metres in a
+        // millimetre file too, which is what the unit assignment says.
+        options.settings.length_unit = LengthUnit::Millimetre;
+
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("=IFCELEMENTQUANTITY("));
+        assert!(text.contains("'Qto_WallBaseQuantities'"));
+        assert!(
+            text.contains("=IFCQUANTITYVOLUME('NetVolume',$,$,6.000000000000000e0,$)"),
+            "one by two by three metres is six cubic metres"
+        );
+        // A wall's quantity set has no name for a total surface area, so none
+        // is written; a proxy's does.
+        assert!(!text.contains("NetSurfaceArea"));
+
+        model.elements[0].element_type = BimElementType::Unknown;
+        model.elements[0].category = None;
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("'Qto_BuildingElementProxyQuantities'"));
+        assert!(
+            text.contains("=IFCQUANTITYAREA('NetSurfaceArea',$,$,2.200000000000000e1,$)"),
+            "twenty-two square metres of surface"
+        );
+    }
+
+    /// A shell that is not closed, or one with a face this cannot measure
+    /// exactly, is left unmeasured rather than estimated.
+    #[test]
+    fn refuses_to_measure_a_body_it_cannot_measure_exactly() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Wall;
+        let mut measuring = options();
+        measuring.settings.property_sets.base_quantities = true;
+
+        for geometry in [
+            BimGeometry::Brep(box_brep(false)),
+            BimGeometry::Brep(quarter_disc_brep(true)),
+        ] {
+            model.elements[0].geometry = Some(geometry);
+            let file = metadata_ifc(&model, &measuring).unwrap();
+            let mut bytes = Vec::new();
+            file.write_to(&mut bytes).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(!text.contains("=IFCELEMENTQUANTITY("));
+        }
+
+        // And with the switch off, nothing is measured at all.
+        model.elements[0].geometry = Some(BimGeometry::Brep(box_brep(true)));
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("=IFCELEMENTQUANTITY("));
+    }
+
+    /// What the setup says about the project reaches the file: the three
+    /// spatial roots take the names it gives them, the project carries its
+    /// long name and phase, and the building carries the postal address -
+    /// which is where Revit's own export puts it too.
+    #[test]
+    fn the_project_settings_name_the_spatial_tree_and_address_the_building() {
+        let mut with_project = options();
+        with_project.settings.project = crate::ProjectSettings {
+            name: Some("SRG-DP-RP".to_owned()),
+            long_name: Some("Residential complex, phase 2".to_owned()),
+            phase: Some("Detail design".to_owned()),
+            site_name: Some("Plot 219B".to_owned()),
+            building_name: Some("Section 1".to_owned()),
+            address_lines: vec!["Raiymbek 219B".to_owned()],
+            town: Some("Almaty".to_owned()),
+            region: None,
+            postal_code: Some("050000".to_owned()),
+            country: Some("KZ".to_owned()),
+        };
+
+        let file = metadata_ifc(&model(), &with_project).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        let project = text
+            .lines()
+            .find(|line| line.contains("=IFCPROJECT("))
+            .expect("the project");
+        assert!(project.contains("'SRG-DP-RP'"), "{project}");
+        assert!(
+            project.contains("'Residential complex, phase 2'"),
+            "{project}"
+        );
+        assert!(project.contains("'Detail design'"), "{project}");
+        assert!(text.contains("=IFCSITE('") && text.contains("'Plot 219B'"));
+        let building = text
+            .lines()
+            .find(|line| line.contains("=IFCBUILDING("))
+            .expect("the building");
+        assert!(building.contains("'Section 1'"), "{building}");
+        let address = text
+            .lines()
+            .find(|line| line.contains("=IFCPOSTALADDRESS("))
+            .expect("the address");
+        assert!(address.contains("('Raiymbek 219B')"), "{address}");
+        assert!(
+            address.contains("'Almaty'") && address.contains("'050000'"),
+            "{address}"
+        );
+
+        // With nothing given, the file is what it was before the setting
+        // existed: the source's own stem, and no address at all.
+        let file = metadata_ifc(&model(), &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("'Test Project'"));
+        assert!(!text.contains("=IFCPOSTALADDRESS("));
+    }
+
+    /// A mapping table decides what a category becomes, ahead of the built-in
+    /// mapping, and can keep one out of the file altogether - which is what
+    /// Revit's own `Not Exported` does.
+    #[test]
+    fn a_class_mapping_table_decides_what_a_category_becomes() {
+        let mut model = model();
+        let mut beam = model.elements[0].clone();
+        beam.id = BimElementId("201".to_owned());
+        beam.type_id = Some(BimElementId("900".to_owned()));
+        beam.category = Some(BimCategory {
+            id: Some(BimExternalId {
+                system: "revit.builtincategory".to_owned(),
+                value: "-2001320".to_owned(),
+            }),
+            name: "OST_StructuralFraming".to_owned(),
+        });
+        let mut hidden = beam.clone();
+        hidden.id = BimElementId("202".to_owned());
+        hidden.category = Some(BimCategory {
+            id: None,
+            name: "OST_GenericModel".to_owned(),
+        });
+        model.elements = vec![beam, hidden];
+
+        let mut options = options();
+        options.settings.set_class_mapping(
+            ClassMapping::from_table(
+                "OST_StructuralFraming\t\tIfcBeam\tJOIST\nOST_GenericModel\t\tNot Exported\t",
+            )
+            .expect("a readable table"),
+        );
+
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        // The mapped category is written as what the table says, with the kind
+        // the table gives it in the slot the schema declares for it.
+        let beam = text
+            .lines()
+            .find(|line| line.contains("=IFCBEAM("))
+            .expect("the mapped beam");
+        assert!(beam.ends_with(".JOIST.);"), "{beam}");
+        // Its type follows the entity it was written as.
+        assert!(text.contains("=IFCBEAMTYPE("));
+        // Without the table both would have been proxies; with it, one is a
+        // beam and the other is not in the file at all.
+        assert!(!text.contains("=IFCBUILDINGELEMENTPROXY("));
+        assert_eq!(
+            text.matches("=IFCRELCONTAINEDINSPATIALSTRUCTURE(").count(),
+            1
+        );
+        let containment = text
+            .lines()
+            .find(|line| line.contains("=IFCRELCONTAINEDINSPATIALSTRUCTURE("))
+            .expect("the containment");
+        // One product in it - the beam - beside its own reference, the owner
+        // and the storey that contains it.
+        assert_eq!(containment.matches('#').count(), 4, "{containment}");
+    }
+
+    /// Every entity this exporter can name is in the schema table, so no
+    /// element is ever written with its own attributes silently left off.
+    /// `IfcSpace` is the exception the writer already knows about: it is a
+    /// spatial element rather than an element, and `push_space` writes its
+    /// attributes itself.
+    #[test]
+    fn every_entity_this_exporter_writes_is_in_the_schema_table() {
+        for element_type in [
+            BimElementType::PipeSegment,
+            BimElementType::PipeFitting,
+            BimElementType::SanitaryTerminal,
+            BimElementType::AirTerminal,
+            BimElementType::FireSuppressionTerminal,
+            BimElementType::Alarm,
+            BimElementType::CableCarrierFitting,
+            BimElementType::DuctSegment,
+            BimElementType::CableCarrierSegment,
+            BimElementType::DistributionElement,
+            BimElementType::DistributionFlowElement,
+            BimElementType::Wall,
+            BimElementType::Slab,
+            BimElementType::Roof,
+            BimElementType::Stair,
+            BimElementType::StairFlight,
+            BimElementType::CurtainWall,
+            BimElementType::Railing,
+            BimElementType::Column,
+            BimElementType::Member,
+            BimElementType::Plate,
+            BimElementType::Window,
+            BimElementType::Door,
+            BimElementType::Unknown,
+        ] {
+            let name = ifc_entity_name(element_type);
+            assert!(
+                IFC4_ELEMENTS.iter().any(|entity| entity.name == name),
+                "{name} is not in the IFC4 element table"
+            );
+            if let Some((type_name, table)) = type_entity_for(name) {
+                assert!(
+                    table.iter().any(|entity| entity.name == type_name),
+                    "{type_name} is not in its schema table"
+                );
+            }
+        }
+        assert_eq!(ifc_entity_name(BimElementType::Space), "IFCSPACE");
+        let (space_type, table) = type_entity_for("IFCSPACE").expect("a space has a type entity");
+        assert!(table.iter().any(|entity| entity.name == space_type));
+    }
+
+    /// IFC's own set, written once per type and related to every element of
+    /// it. `Reference` is the element's type name, which is what Revit's own
+    /// export of AR S1 puts there for 11 545 of its 11 895 products.
+    #[test]
+    fn writes_the_ifc_common_set_once_per_type_with_the_reference_revit_writes() {
+        let mut model = model();
+        let mut first = model.elements[0].clone();
+        first.element_type = BimElementType::Wall;
+        first.type_id = Some(BimElementId("900".to_owned()));
+        first.type_name = Some("Finish: concrete t=10".to_owned());
+        let mut second = first.clone();
+        second.id = BimElementId("201".to_owned());
+        // A third element of another type, and a fourth with no type name at
+        // all, which carries no set rather than an empty one.
+        let mut third = first.clone();
+        third.id = BimElementId("202".to_owned());
+        third.element_type = BimElementType::Slab;
+        third.type_name = Some("Floor: floating t=90".to_owned());
+        let mut fourth = first.clone();
+        fourth.id = BimElementId("203".to_owned());
+        fourth.type_name = None;
+        model.elements = vec![first, second, third, fourth];
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(text.matches("'Pset_WallCommon'").count(), 1);
+        assert_eq!(text.matches("'Pset_SlabCommon'").count(), 1);
+        let wall_set = text
+            .lines()
+            .find(|line| line.contains("'Pset_WallCommon'"))
+            .expect("the wall's common set");
+        // One property in it, and it is the reference.
+        assert_eq!(wall_set.matches('#').count(), 3, "{wall_set}");
+        assert!(text.contains("'Reference',$,IFCIDENTIFIER('Finish: concrete t=10')"));
+
+        // The set is related once, to both walls of that type.
+        let relation = text
+            .lines()
+            .filter(|line| line.contains("=IFCRELDEFINESBYPROPERTIES("))
+            .find(|line| {
+                line.contains(&format!(
+                    "#{}",
+                    wall_set
+                        .split('=')
+                        .next()
+                        .unwrap_or_default()
+                        .trim_start_matches('#')
+                ))
+            })
+            .map(str::to_owned);
+        assert!(relation.is_some(), "the common set should be related");
+
+        // Turning it off leaves nothing of it behind.
+        let mut options = options();
+        options.settings.property_sets.ifc_common = false;
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("Pset_WallCommon"));
+    }
+
+    /// `IfcDistributionFlowElementType` is ABSTRACT in IFC4, so an element
+    /// typed as that supertype gets no type object at all and keeps its type's
+    /// parameters on itself. `ifcopenshell.validate` refused 26 of them on
+    /// SMALL before this; the schema says the same thing.
+    #[test]
+    fn refuses_to_write_a_type_the_schema_declares_abstract() {
+        let mut model = model();
+        let mut element = model.elements[0].clone();
+        element.element_type = BimElementType::DistributionFlowElement;
+        element.category = None;
+        element.type_id = Some(BimElementId("900".to_owned()));
+        element.type_properties = vec![BimProperty {
+            id: None,
+            name: "Manufacturer".to_owned(),
+            specification: None,
+            value: BimPropertyValue::Text("SANEXT".to_owned()),
+        }];
+        model.elements = vec![element];
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("=IFCDISTRIBUTIONFLOWELEMENT("));
+        assert!(!text.contains("=IFCDISTRIBUTIONFLOWELEMENTTYPE("));
+        assert!(!text.contains("=IFCRELDEFINESBYTYPE("));
+        // Nothing holds the type's parameters now, so the element does.
+        assert!(text.contains("'Rivet Type Properties'"));
+
+        // The concrete sibling is written.
+        model.elements[0].element_type = BimElementType::DistributionElement;
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("=IFCDISTRIBUTIONELEMENTTYPE("));
+    }
+
+    /// With types off, nothing is written that a reader would have to know
+    /// about, and the type's parameters go back onto the element itself.
+    #[test]
+    fn types_can_be_left_out_and_the_parameters_return_to_the_element() {
+        let mut model = model();
+        let mut element = model.elements[0].clone();
+        element.element_type = BimElementType::Wall;
+        element.type_id = Some(BimElementId("900".to_owned()));
+        element.type_properties = vec![BimProperty {
+            id: None,
+            name: "Manufacturer".to_owned(),
+            specification: None,
+            value: BimPropertyValue::Text("SANEXT".to_owned()),
+        }];
+        model.elements = vec![element];
+        let mut options = options();
+        options.settings.types = false;
+
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(!text.contains("=IFCWALLTYPE("));
+        assert!(!text.contains("=IFCRELDEFINESBYTYPE("));
+        assert!(text.contains("'Rivet Type Properties'"));
+        assert_eq!(text.matches("=IFCRELDEFINESBYPROPERTIES(").count(), 2);
     }
 
     #[test]
@@ -2940,7 +3995,7 @@ mod tests {
                 curve: BimBrepCurve::Line,
             }]],
         };
-        push_brep_surface(&mut file, &face, 0.0, None).expect("the surface was written");
+        push_brep_surface(&mut file, &face, test_frame()).expect("the surface was written");
         let mut bytes = Vec::new();
         file.write_to(&mut bytes).unwrap();
         String::from_utf8(bytes).unwrap()

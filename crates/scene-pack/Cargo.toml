@@ -7,9 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bim-convert = { path = "../bim-convert" }
 bim-core = { path = "../bim-core" }
 bim-mesh = { path = "../bim-mesh" }
-ifc-export = { path = "../ifc-export" }
 flate2.workspace = true
 serde_json.workspace = true
 

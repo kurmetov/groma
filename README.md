@@ -1,8 +1,13 @@
 # Rivet
 
-Rivet is an early-stage, Linux-native, read-only ingestion engine for Autodesk
-Revit `.rvt` files. It does not require Revit, Windows, Wine, Autodesk Platform
-Services, or ODA BimRv.
+Rivet is an early-stage, Linux-native, read-only ingestion engine for building
+models. It reads Autodesk Revit `.rvt` files and IFC (ISO 10303-21), converts
+between them, and needs neither Revit, Windows, Wine, Autodesk Platform
+Services, nor ODA BimRv.
+
+The source format is read from a file's own leading bytes, so `export-scene`
+and `export-ifc` take either an `.rvt` or an `.ifc` without being told which.
+Both also take several files at once and read them as one federated model.
 
 The current milestone opens the CFB/OLE container, inventories and extracts raw
 streams, recognizes the known truncated-gzip framing, reads the Revit release
@@ -68,6 +73,8 @@ cargo run -p rivet-cli -- export-json model.rvt --full --output model.jsonl
 cargo run -p rivet-cli -- export-ifc model.rvt --output model.ifc
 python -m ifcopenshell.validate model.ifc --rules
 cargo run -p rivet-cli -- export-scene model.rvt --output model.rvs
+cargo run -p rivet-cli -- export-scene ar.ifc st.ifc mep.ifc --output site.rvs
+cargo run -p rivet-cli -- export-ifc ar.ifc st.ifc mep.ifc --output site.ifc
 ```
 
 `schema` reports the generic class hierarchy and property counts without
@@ -105,7 +112,7 @@ a superset: the element lines carry the same fields with or without it.
 `names` reports where each class keeps its
 string and how consistently, so a name read at a calibrated offset can be told
 apart from one found by scanning.
-`export-ifc` writes an IFC4 Reference View file with
+`export-ifc` writes an IFC4 Design Transfer View file with
 `IfcProject -> IfcSite -> IfcBuilding -> IfcBuildingStorey`, metric units,
 deterministic 22-character GlobalIds, and typed elements. The current
 conservative mapping covers pipe segments/fittings and sanitary/air/fire-
@@ -134,6 +141,135 @@ classes referenced by the element and exactly one matching run is present;
 legacy unbound results from unsupported releases stay out of IFC. Pass
 `--model-namespace <UUID>` to keep IDs stable if the source file moves,
 otherwise the canonical RVT path determines the namespace.
+
+The export is configurable the way Revit's own IFC setup is, and the setup can
+be saved and reused:
+
+```bash
+cargo run -p rivet-cli -- export-ifc model.rvt \
+    --length-unit millimetre \
+    --class-mapping export-classes.txt \
+    --write-settings setup.json
+cargo run -p rivet-cli -- export-ifc other.rvt --settings setup.json
+```
+
+`--length-unit` writes every length in metres (the default) or millimetres,
+which is what Revit's own export of the corpus writes; areas and volumes stay
+metric in both, as they do there. `--no-types` leaves out the `IfcTypeProduct`
+behind each element - by default each Revit type becomes one, related to its
+elements by `IfcRelDefinesByType`, and the type's parameters are stated on it
+once instead of on every element of it. `--no-ifc-common-property-sets` leaves
+out IFC's own `Pset_..Common`, which carries `Reference`, the element's type
+name: joined to the IFC Revit itself exported from AR S1 on the Revit element
+id, that is what Revit puts there for 11 545 of the 11 895 products carrying
+one. Nothing else from those sets is written - no parameter this decode
+recovers agrees with `IsExternal`, `LoadBearing` or `ExtendToStructure` on any
+element where they vary. `--no-revit-property-sets` and
+`--no-revit-type-property-sets` leave out the Revit parameters themselves.
+
+`--base-quantities` writes IFC's own `Qto_..BaseQuantities` - Revit's *Export
+base quantities*, off by default as it is there. The numbers are measured from
+the solid this file carries rather than read from the source, because Revit
+computes its own at export time and stores none of them: joining every numeric
+parameter the decode recovers against every quantity in Revit's export of AR S1
+found no carrier for a single one. Only a closed shell of planar faces is
+measured, since a curved face would have to be tessellated and a tessellation
+is an approximation nothing here bounds. Measured against Revit's own file on
+the 8 047 such solids both hold, 7 482 reproduce its `NetVolume` to within a
+thousandth; the 565 that do not are 558 walls whose body we export larger than
+Revit exports its own, which is a difference in the body rather than in the
+measurement.
+
+`--class-mapping` reads a class mapping table in the tab-separated form Revit's
+*IFC Options* dialog reads and writes - a category, an empty subcategory
+column, the IFC class to write it as, and the predefined type - and it decides
+ahead of the built-in mapping. `Not Exported` keeps a category out of the file
+entirely. It is the *export* table, not the import one: Revit ships two files
+that look alike, and `importIFCClassMapping.txt` - IFC class, predefined type,
+then the Revit category - is the other direction, for reading an IFC in.
+Passing that one here says so rather than failing row by row. Two further
+things differ from Revit's own export table: the category is named by its
+`BuiltInCategory` (`OST_Walls`, or the number `-2000011`), because that is what
+a decoded model carries and no display name in any language is recoverable from
+the file; and a row naming a subcategory is refused rather than applied to the
+whole category. The class and predefined type are checked against the IFC4
+schema itself - see `crates/ifc-export/src/ifc4_entities.rs`, generated by
+`scripts/generate_ifc4_entities.py` - so a table naming a class that does not
+exist, or a kind an entity does not declare, fails before the model is read.
+
+`--settings` reads all of the above from a JSON file and `--write-settings`
+saves the setup a run used; a flag beside `--settings` overrides what the file
+says. A key the exporter does not have is an error rather than something
+quietly ignored. The file also carries what Revit's *Project Address* tab
+holds, which has no flag of its own:
+
+```json
+{
+  "length-unit": "millimetre",
+  "class-mapping-file": "export-classes.txt",
+  "project": {
+    "name": "SRG-DP-RP",
+    "long-name": "Residential complex, phase 2",
+    "phase": "Detail design",
+    "site-name": "Plot 219B",
+    "building-name": "Section 1",
+    "address-lines": ["Raiymbek 219B"],
+    "town": "Almaty",
+    "postal-code": "050000",
+    "country": "KZ"
+  }
+}
+```
+
+Nothing there is invented: a name left out keeps what the exporter wrote
+before - the source file's own stem for the project, `Site` and `Building`
+below it - and an address left out is no `IfcPostalAddress` at all, because
+none of the three is recoverable from a decoded model today.
+
+The same settings are available over HTTP. `POST /export-ifc?name=<model>` with
+the model as the body starts an export and answers with a job to poll at
+`/jobs/{job}`; the file is then at `/exports/{name}.ifc`. The query parameters
+are the flags by name - `length-unit`, `base-quantities`, `no-types`,
+`no-revit-property-sets`, `no-revit-type-property-sets`,
+`no-ifc-common-property-sets`, `class-mapping` -
+and a parameter this server does not have is a 400 rather than a file that is
+quietly not what was asked for.
+## Federating several files
+
+`export-scene` and `export-ifc` accept more than one source file and read them
+as one model:
+
+```bash
+cargo run -p rivet-cli -- export-ifc ar.ifc st.ifc mep.ifc --output site.ifc
+```
+
+Every identifier is qualified by the file it came from - `ar/1G4h...` rather
+than `1G4h...` - covering element ids, the level and type each element names,
+relation endpoints and the references stored in property values. Without that,
+two files that each number an element `1234`, or each call a storey
+`level-guid`, would collapse into one. The qualification is applied whenever
+there is more than one file, whether or not a collision actually occurred, so
+an identifier's meaning never depends on what else was federated with it.
+
+A **single** file is never renamed. Its identifiers, and every IFC `GlobalId`
+derived from them, reach the output exactly as its reader stated them.
+
+The scene records one entry per file in `documents`, and each element indexes
+the one it came from, so a viewer can show one discipline and hide another.
+
+**Coordinates are not reconciled.** Each file's geometry arrives in whatever
+world system that file stated. Files exported from one coordinated project
+share a survey point and need nothing done; files that do not are reported -
+
+```text
+warning: ar and st state no overlapping geometry, so they are probably about
+different origins; nothing was moved
+```
+
+- and left alone, because nothing here knows the transform that would
+reconcile them. Reading `IfcMapConversion` and true north is the work that
+would change that.
+
 `export-scene` writes the binary scene a viewer loads: the same recovered
 elements and levels `export-ifc` maps, the triangles their geometry tessellates
 to, and their properties. Geometry is tessellated once, in Rust, to a chord
@@ -147,20 +283,74 @@ section is raw deflate, which a browser decompresses natively through
 `DecompressionStream("deflate-raw")`; the manifest is located by a 24-byte
 trailer, so a reader needs two range requests before the first triangle. A face
 the tessellator cannot read is counted and reported, never replaced by a box.
+The viewer provides perspective and orthographic plan/front/right views, an
+X-ray mode with a translucent ghosted shell and depth-tested edges on the dark canvas,
+persistent point-to-point metric measurements (including multiple rulers), and
+a relationship graph for the selected element. The graph combines the
+relations the source file states with the element's recovered level, type,
+category, Revit class, and IFC export class, and each related element is a
+node you can open to re-root the graph there. From an IFC those relations are
+read outright: which wall hosts a door or window (composed from the stated
+`IfcRelVoidsElement` and `IfcRelFillsElement` pair, since a file never names
+the two directly), which spaces an element physically bounds, and what an
+assembly aggregates. Nothing is inferred from geometry, and an edge whose
+either end is not an element - an opening, a storey, a group - is dropped
+rather than invented. An RVT states no relations yet, so there the graph shows
+what the element is. Press `2`/`3` to switch between plan and 3D, `X` to
+toggle X-ray, `M` to enter or leave measurement mode, and `F` to frame the
+selection or model.
+
+The same page is also the model library. Without a `?scene=` parameter it
+lists every scene the server holds as a card - a preview, the model's name,
+whether it came from an RVT or an IFC, the application that wrote it, and its
+element, triangle and level counts - with a drop zone that converts a dropped
+or chosen `.rvt` or `.ifc` and opens it when it is done. What a card shows is
+read from that scene's own manifest by range, so listing a 450 MB scene costs
+the same two short requests as listing a small one, and the server never
+inflates a scene to describe it. A preview is rendered by the viewer itself
+the first time a model is opened and cached through `PUT /previews/{scene}`,
+so it is a picture of the real geometry rather than an approximation of it.
+
+Being one page is what makes it embeddable: another application mounts a
+single URL in an `iframe` and gets the library, the upload and the 3D view,
+with `?scene=NAME` linking straight to one model. Every route the page calls
+is resolved against the directory the page was served from, so the whole
+viewer also works behind a path prefix - proxied at `/rivet/viewer` inside
+another application - and it degrades rather than breaks where an embedder
+denies it history or storage access.
 Unknown stream bytes are always available through `dump-stream` and the
 `rvt-container` API.
 
 ## Workspace
 
+Readers, one group per source format:
+
 - `rvt-container`: physical CFB streams and known compression/framing
 - `rvt-schema`: generic schema definitions
 - `rvt-model`: loss-preserving serialized-object IR
-- `bim-core`: format-independent BIM types
+- `rvt-import`: semantic reconstruction of an RVT into `bim-core`
 - `revit-catalog`: versioned Revit identifiers and Forge unit conversion
+- `ifc-import`: reading ISO 10303-21 into `bim-core`
+
+Shared, and depended on by both sides:
+
+- `bim-core`: format-independent BIM types
+- `bim-convert`: what format a file is, and what an element is
+
+Writers:
+
 - `ifc-export`: IFC4 model builder, GlobalId and STEP writer
 - `bim-mesh`: tessellation of canonical BIM geometry into triangle meshes
 - `scene-pack`: the binary viewer scene format
+
+Applications:
+
 - `rivet-cli`: command-line interface
+- `rivet-api`: HTTP server and the viewer it serves
+
+Every reader ends at `bim-core` and every writer starts there, so a new source
+format is a reader crate plus an arm in `Format::sniff` - not a change to any
+export.
 
 See [`docs/architecture.md`](docs/architecture.md) and
 [`docs/format-notes.md`](docs/format-notes.md) for current boundaries and

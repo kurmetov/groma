@@ -13,7 +13,7 @@ use bim_core::{
 };
 use serde_json::{Value, json};
 
-use ifc_export::{element_type_for_source, ifc_entity_name};
+use bim_convert::{ifc_entity_name, resolved_element_type};
 
 use crate::chunk::ChunkBuilder;
 use crate::{SourceInfo, Stats, VERSION};
@@ -174,7 +174,18 @@ impl<'model> Builder<'model> {
         let mut levels = Vec::with_capacity(count);
         let mut types = Vec::with_capacity(count);
         let mut geometry = Vec::with_capacity(count);
+        let mut documents = Vec::with_capacity(count);
         let mut by_id: HashMap<&str, usize> = HashMap::with_capacity(count);
+        // Where a document each element names, so that a federated scene can
+        // be filtered by source file and each element's source class read
+        // against the format that actually stated it.
+        let document_index: HashMap<&str, (usize, &str)> = self
+            .model
+            .documents
+            .iter()
+            .enumerate()
+            .map(|(at, document)| (document.id.0.as_str(), (at, document.kind.as_str())))
+            .collect();
 
         for (index, element) in self.model.elements.iter().enumerate() {
             by_id.insert(element.id.0.as_str(), index);
@@ -199,14 +210,29 @@ impl<'model> Builder<'model> {
             // reinforcing bars, footings, ...) into a building-element proxy.
             // An RVT has no source IFC class, so there the export mapping is
             // still the useful answer: the entity `export-ifc` would write.
-            let ifc_class = if self.source.kind.eq_ignore_ascii_case("ifc") {
+            let document = element
+                .document
+                .as_ref()
+                .and_then(|id| document_index.get(id.0.as_str()).copied());
+            documents.push(
+                document
+                    .and_then(|(at, _)| i32::try_from(at).ok())
+                    .unwrap_or(-1),
+            );
+            // The format that stated *this* element, which in a federated set
+            // of mixed sources is not the set's own kind.
+            let from_ifc = document.map_or_else(
+                || self.source.kind.eq_ignore_ascii_case("ifc"),
+                |(_, kind)| kind.eq_ignore_ascii_case("ifc"),
+            );
+            let ifc_class = if from_ifc {
                 element
                     .class_name
                     .as_deref()
                     .filter(|name| name.starts_with("IFC"))
-                    .unwrap_or_else(|| ifc_entity_name(resolved_type(element)))
+                    .unwrap_or_else(|| ifc_entity_name(resolved_element_type(element)))
             } else {
-                ifc_entity_name(resolved_type(element))
+                ifc_entity_name(resolved_element_type(element))
             };
             ifc_classes.push(self.ifc_classes.insert(Some(ifc_class)));
             levels.push(
@@ -217,10 +243,33 @@ impl<'model> Builder<'model> {
                     .and_then(|at| i32::try_from(*at).ok())
                     .unwrap_or(-1),
             );
-            let type_id = self.intern(element.type_id.as_ref().map(|id| id.0.as_str()));
-            types.push(type_id);
+            // A type is shown by name where it has one and only falls back to
+            // its identifier, which is a GUID or a record number.
+            types.push(
+                self.intern(
+                    element
+                        .type_name
+                        .as_deref()
+                        .or_else(|| element.type_id.as_ref().map(|id| id.0.as_str())),
+                ),
+            );
             geometry.push(u8::from(self.has_geometry[index]));
         }
+        let documents_json: Vec<Value> = self
+            .model
+            .documents
+            .iter()
+            .map(|document| {
+                json!({
+                    "id": document.id.0,
+                    "name": document.name,
+                    "kind": document.kind,
+                    "application": document.source.as_ref().map(|source| &source.application),
+                    "release": document.source.as_ref().and_then(|source| source.release.as_ref()),
+                    "elements": document.elements,
+                })
+            })
+            .collect();
 
         let relations: Vec<Value> = self
             .model
@@ -263,6 +312,10 @@ impl<'model> Builder<'model> {
             "kinds": self.kinds.to_json(),
             "ifcClasses": self.ifc_classes.to_json(),
             "levels": levels_json,
+            // One entry per source file. A scene read from a single file has
+            // one; a federated scene has one per file, and every element's
+            // `documents` entry indexes into this list.
+            "documents": documents_json,
             "elements": {
                 "ids": ids,
                 "names": names,
@@ -274,6 +327,7 @@ impl<'model> Builder<'model> {
                 "levels": levels,
                 "types": types,
                 "geometry": geometry,
+                "documents": documents,
             },
             "elementBounds": self.element_bounds.to_json(),
             "chunks": self.chunks,
@@ -376,23 +430,6 @@ fn layer_set_json(layers: &BimMaterialLayerSet) -> Value {
 /// The name a semantic type is published under. These are `bim-core`'s own
 /// names, not IFC entity names: the mapping to IFC is the exporter's business
 /// and is not repeated here.
-/// The element's type, falling back to the class/category reading where the
-/// decode did not establish one. This is what `ifc-export` resolves before it
-/// writes an entity, applied here for the same reason.
-fn resolved_type(element: &BimElement) -> BimElementType {
-    if element.element_type == BimElementType::Unknown {
-        element_type_for_source(
-            element.class_name.as_deref(),
-            element
-                .category
-                .as_ref()
-                .map(|category| category.name.as_str()),
-        )
-    } else {
-        element.element_type
-    }
-}
-
 fn kind_name(kind: BimElementType) -> &'static str {
     match kind {
         BimElementType::Unknown => "Unknown",

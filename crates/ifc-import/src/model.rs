@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use bim_core::{
     BimCategory, BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel,
     BimMaterial, BimMaterialLayer, BimMaterialLayerSet, BimModel, BimNumber, BimPlacement,
-    BimProperty, BimPropertyValue, BimSource, BimUnit,
+    BimProperty, BimPropertyValue, BimRelation, BimSource, BimUnit,
 };
 
 use crate::curve::Sampler;
@@ -96,6 +96,10 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
     let (levels, level_of_storey) = levels(parsed, &index, units);
 
     let mut elements = Vec::new();
+    // Which entities became elements, so a relation between two of them can be
+    // stated in the model's own identifiers and one naming anything else - an
+    // opening, a storey, a group - can be dropped.
+    let mut kept: HashMap<u64, BimElementId> = HashMap::new();
     for (id, entity) in products(parsed, &index) {
         if NOT_DRAWN.contains(&entity.type_name.as_str()) {
             read.openings += 1;
@@ -120,8 +124,12 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
             read.without_geometry += 1;
         }
         let type_id = index.type_of.get(&id).copied();
+        let element_id = identity(parsed, id, entity);
+        kept.insert(id, element_id.clone());
         elements.push(BimElement {
-            id: identity(parsed, id, entity),
+            id: element_id,
+            // One file per reader; `bim_core::federate` names the document.
+            document: None,
             element_type: element_type(&entity.type_name),
             class_name: Some(entity.type_name.as_str().to_owned()),
             name: text(entity.attribute(2)),
@@ -139,6 +147,11 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
             type_id: type_id
                 .and_then(|type_id| Some((type_id, parsed.get(type_id)?)))
                 .map(|(type_id, entity)| identity(parsed, type_id, entity)),
+            // A type object is an `IfcRoot`, so its name is where every other
+            // root keeps one.
+            type_name: type_id
+                .and_then(|type_id| parsed.get(type_id))
+                .and_then(|entity| text(entity.attribute(2))),
             placement: world.map(placement),
             geometry,
             properties: properties(parsed, &index, id, units),
@@ -153,9 +166,10 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
     Import {
         model: BimModel {
             source: source(parsed),
+            documents: Vec::new(),
             elements,
             levels,
-            relations: Vec::new(),
+            relations: relations(&index, &kept),
         },
         read,
     }
@@ -174,6 +188,20 @@ struct Index {
     properties: HashMap<u64, Vec<u64>>,
     type_of: HashMap<u64, u64>,
     material_of: HashMap<u64, u64>,
+    /// The element an opening was cut out of, by that opening. An opening is
+    /// a void rather than a product, so it never becomes an element itself;
+    /// it is the join that carries a door or a window back to its host.
+    voids: HashMap<u64, u64>,
+    /// What fills an opening, by that opening.
+    fills: HashMap<u64, Vec<u64>>,
+    /// `(building element, space)` for every boundary the file marked
+    /// `.PHYSICAL.`. A virtual boundary is an imaginary plane and usually
+    /// names no element at all, so it is left out rather than resolved.
+    boundaries: Vec<(u64, u64)>,
+    /// `(whole, part)` for aggregations between products. The spatial ones -
+    /// a storey holding its spaces - are already levels, and are filtered out
+    /// when the relations are emitted rather than here.
+    aggregates: Vec<(u64, u64)>,
 }
 
 impl Index {
@@ -189,6 +217,10 @@ impl Index {
             properties: HashMap::new(),
             type_of: HashMap::new(),
             material_of: HashMap::new(),
+            voids: HashMap::new(),
+            fills: HashMap::new(),
+            boundaries: Vec::new(),
+            aggregates: Vec::new(),
         };
         for (_, relation) in parsed.of_type("IFCRELCONTAINEDINSPATIALSTRUCTURE") {
             let Some(structure) = relation.attribute(5).and_then(Value::as_reference) else {
@@ -207,6 +239,7 @@ impl Index {
             };
             for part in references(relation.attribute(5)) {
                 index.container.entry(part).or_insert(whole);
+                index.aggregates.push((whole, part));
             }
         }
         for (_, relation) in parsed.of_type("IFCRELDEFINESBYPROPERTIES") {
@@ -224,6 +257,39 @@ impl Index {
             for object in references(relation.attribute(4)) {
                 index.type_of.insert(object, kind);
             }
+        }
+        // A door or a window is not attached to its wall directly: the wall
+        // is voided by an opening, and the opening is filled by the product.
+        // Both halves are stated, so the host is a join rather than a guess.
+        for (_, relation) in parsed.of_type("IFCRELVOIDSELEMENT") {
+            let (Some(host), Some(opening)) = (
+                relation.attribute(4).and_then(Value::as_reference),
+                relation.attribute(5).and_then(Value::as_reference),
+            ) else {
+                continue;
+            };
+            index.voids.insert(opening, host);
+        }
+        for (_, relation) in parsed.of_type("IFCRELFILLSELEMENT") {
+            let (Some(opening), Some(filler)) = (
+                relation.attribute(4).and_then(Value::as_reference),
+                relation.attribute(5).and_then(Value::as_reference),
+            ) else {
+                continue;
+            };
+            index.fills.entry(opening).or_default().push(filler);
+        }
+        for (_, relation) in parsed.of_type("IFCRELSPACEBOUNDARY") {
+            if relation.attribute(7).and_then(Value::as_enumeration) != Some("PHYSICAL") {
+                continue;
+            }
+            let (Some(space), Some(element)) = (
+                relation.attribute(4).and_then(Value::as_reference),
+                relation.attribute(5).and_then(Value::as_reference),
+            ) else {
+                continue;
+            };
+            index.boundaries.push((element, space));
         }
         for (_, relation) in parsed.of_type("IFCRELASSOCIATESMATERIAL") {
             let Some(material) = relation.attribute(5).and_then(Value::as_reference) else {
@@ -267,6 +333,52 @@ fn text(value: Option<&Value>) -> Option<String> {
 
 /// An entity's identity: the globally unique id every rooted entity carries,
 /// falling back to its instance number where a file leaves one out.
+/// The relations between two elements that the file states outright.
+///
+/// Each one is read from a relationship entity and nothing else: no adjacency
+/// is inferred from geometry, and an edge whose either end did not become an
+/// element - an opening, a storey, a group - is dropped rather than invented.
+/// Duplicates are collapsed, because a file may state the same boundary from
+/// more than one relationship instance.
+fn relations(index: &Index, kept: &HashMap<u64, BimElementId>) -> Vec<BimRelation> {
+    let mut seen = HashSet::new();
+    let mut relations = Vec::new();
+    let mut emit = |kind: &str, source: u64, target: u64| {
+        let (Some(source), Some(target)) = (kept.get(&source), kept.get(&target)) else {
+            return;
+        };
+        if source == target {
+            return;
+        }
+        if !seen.insert((kind.to_owned(), source.clone(), target.clone())) {
+            return;
+        }
+        relations.push(BimRelation {
+            kind: kind.to_owned(),
+            source: source.clone(),
+            target: target.clone(),
+        });
+    };
+
+    // Walk the openings in a stable order so two conversions of one file
+    // produce the same list.
+    let mut openings: Vec<&u64> = index.voids.keys().collect();
+    openings.sort_unstable();
+    for opening in openings {
+        let host = index.voids[opening];
+        for filler in index.fills.get(opening).into_iter().flatten() {
+            emit("hosts", host, *filler);
+        }
+    }
+    for (element, space) in &index.boundaries {
+        emit("bounds", *element, *space);
+    }
+    for (whole, part) in &index.aggregates {
+        emit("aggregates", *whole, *part);
+    }
+    relations
+}
+
 fn identity(parsed: &Parsed, id: u64, entity: &Entity) -> BimElementId {
     let _ = parsed;
     BimElementId(text(entity.attribute(0)).unwrap_or_else(|| format!("#{id}")))
@@ -710,4 +822,110 @@ fn material_layers(
 #[must_use]
 pub fn category(_entity: &Entity) -> Option<BimCategory> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Options, convert};
+    use crate::step::parse;
+
+    /// A wall voided by two openings: one filled by a window, one left empty.
+    /// The wall also bounds a space physically and another virtually, and an
+    /// assembly aggregates one of its members. Every relation the conversion
+    /// should find is stated here, and every near miss is stated with it.
+    const RELATED: &str = "ISO-10303-21;\n\
+        HEADER;\n\
+        FILE_SCHEMA(('IFC4'));\n\
+        ENDSEC;\n\
+        DATA;\n\
+        #1=IFCCARTESIANPOINT((0.,0.,0.));\n\
+        #2=IFCAXIS2PLACEMENT3D(#1,$,$);\n\
+        #3=IFCLOCALPLACEMENT($,#2);\n\
+        #4=IFCCARTESIANPOINT((0.,0.));\n\
+        #5=IFCAXIS2PLACEMENT2D(#4,$);\n\
+        #6=IFCRECTANGLEPROFILEDEF(.AREA.,$,#5,2.,1.);\n\
+        #7=IFCDIRECTION((0.,0.,1.));\n\
+        #8=IFCEXTRUDEDAREASOLID(#6,#2,#7,3.);\n\
+        #9=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#8));\n\
+        #10=IFCPRODUCTDEFINITIONSHAPE($,$,(#9));\n\
+        #11=IFCWALL('wall',$,'Host wall',$,$,#3,#10,$,$);\n\
+        #12=IFCWINDOW('window',$,'Filling window',$,$,#3,#10,$,$,$,$,$);\n\
+        #13=IFCSPACE('space',$,'101',$,$,#3,#10,'Office',$,$);\n\
+        #14=IFCSPACE('other',$,'102',$,$,#3,#10,'Corridor',$,$);\n\
+        #15=IFCOPENINGELEMENT('filled',$,$,$,$,#3,#10,$,$);\n\
+        #16=IFCOPENINGELEMENT('empty',$,$,$,$,#3,#10,$,$);\n\
+        #17=IFCRELVOIDSELEMENT('v1',$,$,$,#11,#15);\n\
+        #18=IFCRELVOIDSELEMENT('v2',$,$,$,#11,#16);\n\
+        #19=IFCRELFILLSELEMENT('f1',$,$,$,#15,#12);\n\
+        #20=IFCRELSPACEBOUNDARY('b1',$,$,$,#13,#11,$,.PHYSICAL.,.INTERNAL.);\n\
+        #21=IFCRELSPACEBOUNDARY('b2',$,$,$,#13,#11,$,.PHYSICAL.,.INTERNAL.);\n\
+        #22=IFCRELSPACEBOUNDARY('b3',$,$,$,#14,$,$,.VIRTUAL.,.INTERNAL.);\n\
+        #23=IFCELEMENTASSEMBLY('assembly',$,'Frame',$,$,#3,#10,$,$,$);\n\
+        #24=IFCRELAGGREGATES('a1',$,$,$,#23,(#12));\n\
+        ENDSEC;\n\
+        END-ISO-10303-21;\n";
+
+    fn relations_of(text: &str) -> Vec<(String, String, String)> {
+        let parsed = parse(text.as_bytes()).unwrap();
+        let mut found: Vec<(String, String, String)> = convert(&parsed, &Options::default())
+            .model
+            .relations
+            .into_iter()
+            .map(|relation| (relation.kind, relation.source.0, relation.target.0))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn stated_relations_are_read_and_composed() {
+        assert_eq!(
+            relations_of(RELATED),
+            vec![
+                // The wall never names the window: the pair of relations
+                // through the opening is what carries one to the other.
+                (
+                    "aggregates".to_owned(),
+                    "assembly".to_owned(),
+                    "window".to_owned()
+                ),
+                ("bounds".to_owned(), "wall".to_owned(), "space".to_owned()),
+                ("hosts".to_owned(), "wall".to_owned(), "window".to_owned()),
+            ]
+        );
+    }
+
+    /// The openings themselves are voids, not products, so no edge may end on
+    /// one - and the same boundary stated twice is still one edge.
+    #[test]
+    fn unresolvable_and_repeated_ends_are_dropped() {
+        let found = relations_of(RELATED);
+        assert!(
+            !found
+                .iter()
+                .any(|(_, from, to)| from == "filled" || to == "filled" || to == "empty"),
+            "an opening reached the model: {found:?}"
+        );
+        assert_eq!(
+            found.iter().filter(|(kind, _, _)| kind == "bounds").count(),
+            1,
+            "the repeated boundary was not collapsed: {found:?}"
+        );
+    }
+
+    /// A virtual boundary is an imaginary plane and names no element here; a
+    /// void nobody fills leaves the wall with no second host edge.
+    #[test]
+    fn virtual_boundaries_and_unfilled_voids_state_nothing() {
+        let found = relations_of(RELATED);
+        assert!(
+            !found.iter().any(|(_, _, to)| to == "other"),
+            "a virtual boundary became an edge: {found:?}"
+        );
+        assert_eq!(
+            found.iter().filter(|(kind, _, _)| kind == "hosts").count(),
+            1,
+            "an unfilled void produced a host edge: {found:?}"
+        );
+    }
 }
