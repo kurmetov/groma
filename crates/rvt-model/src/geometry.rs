@@ -195,6 +195,46 @@ impl GInstanceTransformFields {
         })
     }
 
+    /// One placement seen through another: the frame `inner` puts a body in,
+    /// carried by `outer`.
+    ///
+    /// A member of an assembly is not always a symbol. It can be an instance
+    /// of its own - an element that places a symbol - and then its body is
+    /// reached in two hops: the inner transform takes the symbol's local
+    /// coordinates to the frame the member's own box is stated in, and the
+    /// outer transform takes that frame to the assembly's. Composing them is
+    /// the same arithmetic [`GElementBounds::transformed`] does to a box,
+    /// applied twice, so the body and the box the hull check accepted travel
+    /// by the same route.
+    ///
+    /// The composition of two right-handed rigid frames is one, so nothing
+    /// here can turn a verified pair of links into a scaled or mirrored one.
+    #[must_use]
+    pub fn composed(outer: &Self, inner: &Self) -> Self {
+        let mut basis = [[0.0_f64; 3]; 3];
+        for (local_axis, axis) in basis.iter_mut().enumerate() {
+            for (world_axis, value) in axis.iter_mut().enumerate() {
+                *value = (0..3)
+                    .map(|middle| inner.basis[local_axis][middle] * outer.basis[middle][world_axis])
+                    .sum();
+            }
+        }
+        let mut origin = outer.origin.coordinates_feet;
+        for (middle, coordinate) in inner.origin.coordinates_feet.into_iter().enumerate() {
+            for (world_axis, value) in origin.iter_mut().enumerate() {
+                *value += outer.basis[middle][world_axis] * coordinate;
+            }
+        }
+        Self {
+            offset: inner.offset,
+            basis,
+            origin: RvtPoint3 {
+                coordinates_feet: origin,
+            },
+            symbol_element_id: inner.symbol_element_id,
+        }
+    }
+
     /// Recover one right-handed rigid `Trf` after a schema-resolved
     /// `GInstance` marker and require its origin to lie in the independently
     /// serialized element bounds.
@@ -992,6 +1032,56 @@ mod tests {
             ])
         {
             assert!((actual - expected).abs() < f64::EPSILON);
+        }
+    }
+
+    /// Two placements compose the way the box does: a point of the inner
+    /// frame reaches the outer frame by the inner transform and then the
+    /// outer one, and the composed transform has to put it in the same place.
+    #[test]
+    fn composes_two_placements_the_way_a_point_travels_through_them() {
+        // A quarter turn about Z, then a half turn about Z with an offset -
+        // chosen so neither transform is its own inverse and the order shows.
+        let inner = GInstanceTransformFields {
+            offset: 0,
+            basis: [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            origin: RvtPoint3 {
+                coordinates_feet: [1.0, 2.0, 3.0],
+            },
+            symbol_element_id: Some(7),
+        };
+        let outer = GInstanceTransformFields {
+            offset: 0,
+            basis: [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+            origin: RvtPoint3 {
+                coordinates_feet: [10.0, 20.0, 30.0],
+            },
+            symbol_element_id: Some(9),
+        };
+        let apply = |transform: &GInstanceTransformFields, point: [f64; 3]| {
+            let mut world = transform.origin.coordinates_feet;
+            for (local_axis, coordinate) in point.into_iter().enumerate() {
+                for (world_axis, value) in world.iter_mut().enumerate() {
+                    *value += transform.basis[local_axis][world_axis] * coordinate;
+                }
+            }
+            world
+        };
+        let composed = GInstanceTransformFields::composed(&outer, &inner);
+        // The symbol the composed transform places is the inner one's: the
+        // body being carried is the inner symbol's body.
+        assert_eq!(composed.symbol_element_id, Some(7));
+        for point in [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, -3.0, 5.0],
+        ] {
+            let twice = apply(&outer, apply(&inner, point));
+            let once = apply(&composed, point);
+            for (left, right) in twice.into_iter().zip(once) {
+                assert!((left - right).abs() < 1e-12, "{left} != {right}");
+            }
         }
     }
 

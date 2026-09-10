@@ -1374,6 +1374,18 @@ mod tests {
         parse(text.as_bytes()).expect("a STEP file")
     }
 
+    /// A number the file states arrives unscaled, so these comparisons are
+    /// about an exact value; they are still written to a tolerance, because a
+    /// test that pins a float with `==` breaks the moment a metre conversion
+    /// is introduced between the two sides.
+    #[track_caller]
+    fn same(found: f64, stated: f64) {
+        assert!(
+            (found - stated).abs() < 1e-12,
+            "expected {stated}, found {found}"
+        );
+    }
+
     fn builder(parsed: &crate::step::Parsed) -> Builder<'_> {
         Builder::new(Sampler {
             parsed,
@@ -1467,7 +1479,7 @@ mod tests {
         let BimBrepSurface::Cylinder { radius, .. } = cylinder else {
             panic!("cylinder");
         };
-        assert_eq!(radius.value, 2.0);
+        same(radius.value, 2.0);
 
         for (id, major, minor) in [(6, 0.0, 3.0), (7, 5.0, 1.0)] {
             let surface = builder
@@ -1479,8 +1491,8 @@ mod tests {
             let BimBrepProfile::Arc { center, radius, .. } = profile else {
                 panic!("arc profile");
             };
-            assert_eq!(center.coordinates[0], major);
-            assert_eq!(radius.value, minor);
+            same(center.coordinates[0], major);
+            same(radius.value, minor);
         }
     }
 
@@ -1508,7 +1520,9 @@ mod tests {
         let BimBrepProfile::Line { origin, direction } = profile else {
             panic!("line profile");
         };
-        assert_eq!(origin.coordinates, [2.0, 0.0, 3.0]);
+        for (found, stated) in origin.coordinates.iter().zip([2.0, 0.0, 3.0]) {
+            same(*found, stated);
+        }
         assert!((direction[0] - 1.0 / 5.0_f64.sqrt()).abs() < 1e-12);
         assert!((direction[2] - 2.0 / 5.0_f64.sqrt()).abs() < 1e-12);
     }

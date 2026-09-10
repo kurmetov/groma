@@ -13,14 +13,14 @@ mod upload;
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use clap::Parser;
 use scenes::{SceneError, Scenes};
 use store::{Model, Query};
-use tiny_http::{Header, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server};
 use upload::{DEFAULT_MAX_UPLOAD_BYTES, Job, Uploads};
 
 /// The viewer page, embedded so the binary needs nothing beside it.
@@ -309,6 +309,26 @@ impl ConversionSlot {
         self.jobs.lock().ok()?.get(id).cloned()
     }
 
+    /// Every conversion still remembered, newest first. Job identifiers lead
+    /// with the clock, so the map's own order is chronological.
+    fn listing(&self) -> Vec<serde_json::Value> {
+        let Ok(jobs) = self.jobs.lock() else {
+            return Vec::new();
+        };
+        jobs.iter()
+            .rev()
+            .map(|(id, job)| {
+                let mut entry = job
+                    .lock()
+                    .map_or_else(|held| held.into_inner().to_json(), |held| held.to_json());
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("job".to_owned(), serde_json::Value::String(id.clone()));
+                }
+                entry
+            })
+            .collect()
+    }
+
     /// Remember a job, and forget the oldest once there are many: this is a
     /// viewer, not a queue, and a session's worth is all anyone asks about.
     fn remember(&self, id: String, job: &Arc<Mutex<Job>>) {
@@ -361,6 +381,12 @@ fn serve_upload(
     }
     let id = job_id();
     let job = Arc::new(Mutex::new(Job::new()));
+    if let Ok(mut held) = job.lock() {
+        held.source = Some(name.to_owned());
+        held.format = Some(format.extension().to_owned());
+        held.bytes = source_bytes;
+        held.scene = Some(stem.clone());
+    }
     slot.remember(id.clone(), &job);
     let response = json_response(
         202,
@@ -375,11 +401,181 @@ fn serve_upload(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match uploads.convert(&source, &stem, format) {
-            Ok(child) => upload::follow(child, &stem, &job),
+            Ok(child) => upload::follow(child, &stem, upload::Product::Scene, &job),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
                     held.state = upload::JobState::Failed;
                     held.error = Some(format!("the converter could not be started: {failure}"));
+                }
+            }
+        }
+    });
+    request.respond(response)
+}
+
+/// Receive a Revit model and start exporting it as IFC, with the settings the
+/// query asks for. The reply names a job, as an upload's does; the file is at
+/// `/exports/{name}.ifc` once the job is done.
+fn serve_export_ifc(
+    slot: Option<&ConversionSlot>,
+    params: &BTreeMap<String, String>,
+    mut request: Request,
+) -> std::io::Result<()> {
+    let Some(slot) = slot else {
+        return request.respond(error(
+            503,
+            "this server cannot export: no rivet binary was found beside it, \
+             and none was given with --rivet",
+        ));
+    };
+    if request.method() != &tiny_http::Method::Post {
+        return request.respond(error(405, "an export is a POST"));
+    }
+    let settings = match upload::IfcRequest::from_params(params) {
+        Ok(settings) => settings,
+        Err(message) => return request.respond(error(400, &message)),
+    };
+    let name = params.get("name").map_or("model", String::as_str);
+
+    let received = slot.uploads.receive(name, request.as_reader());
+    let (source, format, stem) = match received {
+        Ok(received) => received,
+        Err(message) => return request.respond(error(400, &message)),
+    };
+    // An IFC in, an IFC out is a round trip through two readings of the same
+    // model, and nobody has asked for one. Say so rather than doing it.
+    if format != upload::Format::Rvt {
+        let _ = std::fs::remove_file(&source);
+        return request.respond(error(400, "an IFC export is made from a Revit model"));
+    }
+
+    let id = job_id();
+    let job = Arc::new(Mutex::new(Job::new()));
+    let source_bytes = std::fs::metadata(&source).map_or(0, |file| file.len());
+    if let Ok(mut held) = job.lock() {
+        held.source = Some(name.to_owned());
+        held.format = Some(format.extension().to_owned());
+        held.bytes = source_bytes;
+    }
+    slot.remember(id.clone(), &job);
+    let response = json_response(
+        202,
+        &serde_json::json!({ "job": id, "ifc": format!("{stem}.ifc") }),
+    );
+
+    let uploads = slot.uploads.clone();
+    let running = Arc::clone(&slot.running);
+    std::thread::spawn(move || {
+        // One at a time, for the same reason an upload is: a decode holds
+        // gigabytes and two at once is what takes a machine down.
+        let _guard = running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match uploads.export_ifc(&source, &stem, &settings) {
+            Ok(child) => upload::follow(child, &stem, upload::Product::Ifc, &job),
+            Err(failure) => {
+                if let Ok(mut held) = job.lock() {
+                    held.state = upload::JobState::Failed;
+                    held.error = Some(format!("the exporter could not be started: {failure}"));
+                }
+            }
+        }
+    });
+    request.respond(response)
+}
+
+/// Serve an exported IFC. It is a file to save rather than a page to read, so
+/// it is offered as a download under the name it was exported as.
+fn serve_export(
+    slot: Option<&ConversionSlot>,
+    name: &str,
+    request: Request,
+) -> std::io::Result<()> {
+    // The extension in the request picks which export is meant, and only the
+    // two this server writes are answered.
+    let (stem, extension, mime) = match () {
+        () if name.to_ascii_lowercase().ends_with(".jsonl") => (
+            name.trim_end_matches(".jsonl"),
+            "jsonl",
+            "application/x-ndjson",
+        ),
+        () => (name.trim_end_matches(".ifc"), "ifc", "application/x-step"),
+    };
+    let Some(path) = slot.and_then(|slot| slot.uploads.exported_as(stem, extension)) else {
+        return request.respond(error(404, "no export by that name"));
+    };
+    match std::fs::File::open(&path) {
+        Ok(file) => request.respond(
+            Response::from_file(file)
+                .with_header(content_type(mime))
+                .with_header(header(
+                    "Content-Disposition",
+                    &format!("attachment; filename=\"{stem}.{extension}\""),
+                )),
+        ),
+        Err(_) => request.respond(error(500, "the export could not be read")),
+    }
+}
+
+/// Convert an uploaded Revit model into JSON lines.
+///
+/// It mirrors the IFC export: the model arrives as the request body, the
+/// answer names a job, and the file is fetched from `/exports` when that job
+/// says it is done.
+fn serve_export_json(
+    slot: Option<&ConversionSlot>,
+    params: &BTreeMap<String, String>,
+    mut request: Request,
+) -> std::io::Result<()> {
+    let Some(slot) = slot else {
+        return request.respond(error(
+            503,
+            "this server cannot export: no rivet binary was found beside it, \
+             and none was given with --rivet",
+        ));
+    };
+    if request.method() != &Method::Post {
+        return request.respond(error(405, "an export is a POST"));
+    }
+    let full = params.get("full").is_some_and(|value| value != "false");
+    let name = params.get("name").map_or("model", String::as_str);
+
+    let received = slot.uploads.receive(name, request.as_reader());
+    let (source, format, stem) = match received {
+        Ok(received) => received,
+        Err(message) => return request.respond(error(400, &message)),
+    };
+    if format != upload::Format::Rvt {
+        let _ = std::fs::remove_file(&source);
+        return request.respond(error(400, "a JSON export is made from a Revit model"));
+    }
+
+    let id = job_id();
+    let job = Arc::new(Mutex::new(Job::new()));
+    let source_bytes = std::fs::metadata(&source).map_or(0, |file| file.len());
+    if let Ok(mut held) = job.lock() {
+        held.source = Some(name.to_owned());
+        held.format = Some(format.extension().to_owned());
+        held.bytes = source_bytes;
+    }
+    slot.remember(id.clone(), &job);
+    let response = json_response(
+        202,
+        &serde_json::json!({ "job": id, "json": format!("{stem}.jsonl") }),
+    );
+
+    let uploads = slot.uploads.clone();
+    let running = Arc::clone(&slot.running);
+    std::thread::spawn(move || {
+        let _guard = running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match uploads.export_json(&source, &stem, full) {
+            Ok(child) => upload::follow(child, &stem, upload::Product::Json, &job),
+            Err(failure) => {
+                if let Ok(mut held) = job.lock() {
+                    held.state = upload::JobState::Failed;
+                    held.error = Some(format!("the exporter could not be started: {failure}"));
                 }
             }
         }
@@ -440,6 +636,89 @@ fn serve_scene(scenes: Option<&Scenes>, name: &str, request: Request) -> std::io
     }
 }
 
+/// Delete one scene, and the file it was converted from where the caller asks
+/// for it with `?source=rvt` or `?source=ifc`.
+///
+/// The parameter names a format, never a path, so this cannot be pointed at a
+/// file outside the uploads directory. Which of the two a scene actually came
+/// from is the reader's to say: both can exist under one name, and only the
+/// manifest records which one was converted.
+fn serve_delete(
+    scenes: Option<&Scenes>,
+    name: &str,
+    params: &BTreeMap<String, String>,
+    request: Request,
+) -> std::io::Result<()> {
+    let Some(scenes) = scenes else {
+        return request.respond(error(404, "this server was started without --scenes"));
+    };
+    let source = params.get("source").map(String::as_str);
+    match scenes.remove(name, source) {
+        Ok(removed) => request.respond(json_response(
+            200,
+            &serde_json::json!({
+                "deleted": name,
+                "scene": removed.scene,
+                "preview": removed.preview,
+                "source": removed.source,
+                "bytes": removed.bytes,
+            }),
+        )),
+        Err(SceneError::NotFound) => request.respond(error(404, "unknown scene")),
+        Err(failure) => {
+            eprintln!("delete {name}: {failure:?}");
+            request.respond(error(500, "the scene could not be deleted"))
+        }
+    }
+}
+
+/// The largest preview a viewer may store: these are small JPEGs of a framed
+/// model, and a cap keeps the route from becoming a way to fill the disk.
+const MAX_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
+
+/// A scene's cached preview image: `GET` to read one, `PUT` to store the one a
+/// viewer just rendered.
+fn serve_preview(scenes: Option<&Scenes>, name: &str, mut request: Request) -> std::io::Result<()> {
+    let Some(scenes) = scenes else {
+        return request.respond(error(404, "this server was started without --scenes"));
+    };
+    if request.method() == &Method::Put {
+        let mut image = Vec::new();
+        // Read one byte past the cap, so a body that is exactly at it is still
+        // told apart from one that runs over. The reader borrows the request,
+        // so it is scoped to end before the request is answered.
+        let read = {
+            let reader: &mut dyn Read = request.as_reader();
+            Read::take(reader, MAX_PREVIEW_BYTES as u64 + 1).read_to_end(&mut image)
+        };
+        if read.is_err() {
+            return request.respond(error(400, "the preview could not be read"));
+        }
+        if image.len() > MAX_PREVIEW_BYTES {
+            return request.respond(error(413, "preview too large"));
+        }
+        return match scenes.store_preview(name, &image) {
+            Ok(()) => request.respond(json_response(200, &serde_json::json!({ "stored": name }))),
+            Err(SceneError::NotFound) => request.respond(error(404, "unknown scene")),
+            Err(failure) => {
+                eprintln!("preview {name}: {failure:?}");
+                request.respond(error(500, "the preview could not be stored"))
+            }
+        };
+    }
+    match scenes.preview(name) {
+        Some(image) => request.respond(
+            Response::from_data(image)
+                .with_header(content_type("image/png"))
+                // A preview changes only when a viewer redraws it, and the
+                // page asks for it by name; revalidating keeps a replaced one
+                // from sticking.
+                .with_header(header("Cache-Control", "no-cache")),
+        ),
+        None => request.respond(error(404, "no preview yet")),
+    }
+}
+
 #[allow(clippy::too_many_lines)] // One match over the routes this server serves.
 fn handle(
     store: &Store,
@@ -453,7 +732,7 @@ fn handle(
     // The viewer and its scenes are answered before the JSON routes: a scene
     // is bytes served by range, not a document, and the page is HTML.
     match route.as_slice() {
-        ["viewer"] => {
+        [] | ["viewer"] => {
             let content_type =
                 Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
                     .expect("static header");
@@ -467,11 +746,40 @@ fn handle(
             );
         }
         ["scenes"] => {
-            let names = scenes.map(Scenes::available).unwrap_or_default();
-            return request.respond(json_response(200, &serde_json::json!({ "scenes": names })));
+            let listed = scenes.map(Scenes::listing).unwrap_or_default();
+            return request.respond(json_response(
+                200,
+                &serde_json::json!({
+                    // `scenes` stays a plain list of names, which is what a
+                    // caller wanting only the names already reads; `entries`
+                    // carries what a library page shows beside each one.
+                    "scenes": listed.iter().map(|entry| entry.name.clone()).collect::<Vec<_>>(),
+                    "entries": listed.iter().map(|entry| serde_json::json!({
+                        "name": entry.name,
+                        "bytes": entry.bytes,
+                        "modified": entry.modified,
+                        "hasPreview": entry.has_preview,
+                        // What deleting this model could also remove.
+                        "sources": entry.sources.iter().map(|(extension, bytes)| {
+                            serde_json::json!({ "extension": extension, "bytes": bytes })
+                        }).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                }),
+            ));
+        }
+        ["scenes", name] if request.method() == &Method::Delete => {
+            return serve_delete(scenes, name, &params, request);
         }
         ["scenes", name] => return serve_scene(scenes, name, request),
+        ["previews", name] => return serve_preview(scenes, name, request),
         ["upload"] => return serve_upload(uploads, &params, request),
+        ["export-ifc"] => return serve_export_ifc(uploads, &params, request),
+        ["export-json"] => return serve_export_json(uploads, &params, request),
+        ["exports", name] => return serve_export(uploads, name, request),
+        ["jobs"] => {
+            let listed = uploads.map(ConversionSlot::listing).unwrap_or_default();
+            return request.respond(json_response(200, &serde_json::json!({ "jobs": listed })));
+        }
         ["jobs", id] => {
             let answer = uploads.and_then(|slot| slot.job(id)).map(|job| {
                 job.lock()
@@ -507,7 +815,7 @@ fn handle(
     }
 
     let response = match route.as_slice() {
-        [] | ["health"] => json_response(
+        ["api" | "health"] => json_response(
             200,
             &serde_json::json!({
                 "status": "ok",
@@ -521,10 +829,18 @@ fn handle(
                     "/models/{model}/rooms",
                     "/models/{model}/levels",
                     "/models/{model}/documents",
-                    "/viewer",
+                    "/ (the viewer and its model library)",
+                    "/api (this list)",
                     "/scenes",
                     "/scenes/{scene}",
+                    "/previews/{scene}",
+                    "DELETE /scenes/{scene}?source=rvt|ifc",
                     "/upload?name=",
+                    "POST /export-ifc?name=&length-unit=&no-types=&no-revit-property-sets=\
+                     &no-revit-type-property-sets=&no-ifc-common-property-sets=&class-mapping=",
+                    "POST /export-json?name=&full=",
+                    "/exports/{name}.ifc|.jsonl",
+                    "/jobs",
                     "/jobs/{job}",
                 ],
                 "scenes": scenes.map(Scenes::available).unwrap_or_default(),

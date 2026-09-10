@@ -10,6 +10,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
+/// The formats an upload can have arrived in. A request naming a source to
+/// delete picks one of these; it never names a path, so no request can reach a
+/// file outside the uploads directory.
+pub const SOURCE_EXTENSIONS: [&str; 2] = ["rvt", "ifc"];
+
 /// Scenes available on disk. Nothing is cached: a range read is a seek and a
 /// short read, which the page cache already makes cheap.
 pub struct Scenes {
@@ -40,20 +45,149 @@ impl Scenes {
     /// Scene names on disk, without the extension.
     #[must_use]
     pub fn available(&self) -> Vec<String> {
-        let mut names = Vec::new();
+        self.listing().into_iter().map(|entry| entry.name).collect()
+    }
+
+    /// Every scene with what can be known about it without decompressing it:
+    /// its size and when it was written. What the scene *is* - the model it
+    /// came from, its counts, whether it was an RVT or an IFC - lives in the
+    /// manifest, which a reader takes by range for itself rather than having
+    /// this inflate every scene on every listing.
+    #[must_use]
+    pub fn listing(&self) -> Vec<Listed> {
+        let mut listed = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.directory) else {
-            return names;
+            return listed;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|extension| extension == "rvs") {
-                if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    names.push(stem.to_owned());
+            if path.extension().is_none_or(|extension| extension != "rvs") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let metadata = entry.metadata().ok();
+            listed.push(Listed {
+                name: name.to_owned(),
+                bytes: metadata.as_ref().map_or(0, std::fs::Metadata::len),
+                // Seconds since the epoch, which is what a page formats in the
+                // reader's own locale. A clock that predates it is reported as
+                // unknown rather than as a negative time.
+                modified: metadata
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|since| since.as_secs()),
+                has_preview: self.preview_path(name).is_some_and(|at| at.is_file()),
+                sources: self.sources(name),
+            });
+        }
+        listed.sort_by(|left, right| left.name.cmp(&right.name));
+        listed
+    }
+
+    /// The uploaded files a scene's name could have been converted from, with
+    /// their sizes. Two can exist at once - the same model uploaded as an RVT
+    /// and as an IFC share a stem - so which one this scene actually came from
+    /// is settled by the manifest, which the reader already holds, not here.
+    #[must_use]
+    pub fn sources(&self, name: &str) -> Vec<(String, u64)> {
+        if !is_safe_name(name) {
+            return Vec::new();
+        }
+        let uploads = self.directory.join("uploads");
+        SOURCE_EXTENSIONS
+            .iter()
+            .filter_map(|extension| {
+                let at = uploads.join(format!("{name}.{extension}"));
+                let bytes = std::fs::metadata(&at)
+                    .ok()
+                    .filter(std::fs::Metadata::is_file)?
+                    .len();
+                Some(((*extension).to_owned(), bytes))
+            })
+            .collect()
+    }
+
+    /// Delete a scene, its cached preview, and optionally the file it was
+    /// converted from.
+    ///
+    /// `source` is an extension from [`SOURCE_EXTENSIONS`], never a path:
+    /// anything else leaves the uploads directory untouched. What was removed
+    /// is reported back, so a caller can say what it freed rather than assume.
+    ///
+    /// # Errors
+    ///
+    /// [`SceneError::NotFound`] where the name names no scene, and
+    /// [`SceneError::Io`] where the scene itself cannot be removed. A preview
+    /// or source that will not delete is reported as not removed rather than
+    /// failing the request: the scene is already gone by then.
+    pub fn remove(&self, name: &str, source: Option<&str>) -> Result<Removed, SceneError> {
+        let scene = self.path(name).ok_or(SceneError::NotFound)?;
+        let mut removed = Removed::default();
+        removed.bytes += std::fs::metadata(&scene).map_or(0, |at| at.len());
+        std::fs::remove_file(&scene).map_err(SceneError::Io)?;
+        removed.scene = true;
+
+        if let Some(preview) = self.preview_path(name) {
+            if let Ok(at) = std::fs::metadata(&preview) {
+                if std::fs::remove_file(&preview).is_ok() {
+                    removed.bytes += at.len();
+                    removed.preview = true;
                 }
             }
         }
-        names.sort();
-        names
+        // An extension this does not know names nothing, so an unexpected
+        // value deletes the scene and stops rather than guessing at a file.
+        if let Some(extension) = source.filter(|wanted| SOURCE_EXTENSIONS.contains(wanted)) {
+            if is_safe_name(name) {
+                let at = self
+                    .directory
+                    .join("uploads")
+                    .join(format!("{name}.{extension}"));
+                if let Ok(metadata) = std::fs::metadata(&at) {
+                    if metadata.is_file() && std::fs::remove_file(&at).is_ok() {
+                        removed.bytes += metadata.len();
+                        removed.source = Some(extension.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Where a scene's cached preview image lives. Previews sit in their own
+    /// directory so the listing, which looks for `.rvs`, never sees them.
+    #[must_use]
+    pub fn preview_path(&self, name: &str) -> Option<PathBuf> {
+        // PNG, because a preview is drawn on a transparent ground so it can sit
+        // on either theme's card; JPEG would flatten that to black.
+        is_safe_name(name).then(|| self.directory.join("previews").join(format!("{name}.png")))
+    }
+
+    /// One cached preview's bytes, or `None` where none has been made.
+    #[must_use]
+    pub fn preview(&self, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.preview_path(name)?).ok()
+    }
+
+    /// Cache a preview a viewer rendered. The scene must exist: a preview is
+    /// a picture of something this serves, not a way to write arbitrary files
+    /// into the directory.
+    ///
+    /// # Errors
+    ///
+    /// [`SceneError::NotFound`] where the name names no scene, and
+    /// [`SceneError::Io`] where the image cannot be written.
+    pub fn store_preview(&self, name: &str, image: &[u8]) -> Result<(), SceneError> {
+        if self.path(name).is_none() {
+            return Err(SceneError::NotFound);
+        }
+        let at = self.preview_path(name).ok_or(SceneError::NotFound)?;
+        if let Some(parent) = at.parent() {
+            std::fs::create_dir_all(parent).map_err(SceneError::Io)?;
+        }
+        std::fs::write(at, image).map_err(SceneError::Io)
     }
 
     /// The file one name resolves to, or `None` if the name does not name a
@@ -92,6 +226,30 @@ impl Scenes {
         file.read_exact(&mut bytes).map_err(SceneError::Io)?;
         Ok((bytes, range, total))
     }
+}
+
+/// One scene as a listing shows it.
+pub struct Listed {
+    pub name: String,
+    pub bytes: u64,
+    /// Seconds since the Unix epoch, where the filesystem states one.
+    pub modified: Option<u64>,
+    pub has_preview: bool,
+    /// `(extension, bytes)` for every upload sharing this scene's name.
+    pub sources: Vec<(String, u64)>,
+}
+
+/// What one delete actually removed. Reported rather than assumed, because a
+/// scene converted by the CLI has no upload behind it and a preview exists
+/// only once someone has opened the model.
+#[derive(Debug, Default)]
+pub struct Removed {
+    pub scene: bool,
+    pub preview: bool,
+    /// The extension of the source removed, where one was asked for and found.
+    pub source: Option<String>,
+    /// Bytes freed across all of them.
+    pub bytes: u64,
 }
 
 /// Why a scene could not be served.
@@ -176,7 +334,51 @@ pub fn parse_range(header: &str) -> Option<(Option<u64>, Option<u64>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Range, is_safe_name, parse_range, resolve};
+    use super::{Range, Scenes, is_safe_name, parse_range, resolve};
+
+    /// A delete must reach the scene, its preview and the one upload it names
+    /// - and nothing else, however the request spells the name or the format.
+    #[test]
+    fn deletes_a_scene_with_its_preview_and_named_source_only() {
+        let root = std::env::temp_dir().join(format!("rivet-scenes-{}", std::process::id()));
+        let uploads = root.join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        std::fs::create_dir_all(root.join("previews")).unwrap();
+        std::fs::write(root.join("model.rvs"), b"scene-bytes").unwrap();
+        std::fs::write(root.join("previews/model.png"), b"png!").unwrap();
+        std::fs::write(uploads.join("model.rvt"), b"revit-source").unwrap();
+        std::fs::write(uploads.join("model.ifc"), b"ifc-source").unwrap();
+        std::fs::write(root.join("keep.rvs"), b"other").unwrap();
+        let scenes = Scenes::new(root.clone());
+
+        // Both uploads are offered, since a name alone cannot say which one
+        // this scene came from.
+        assert_eq!(
+            scenes.sources("model"),
+            vec![("rvt".to_owned(), 12), ("ifc".to_owned(), 10)]
+        );
+
+        let removed = scenes.remove("model", Some("ifc")).unwrap();
+        assert!(removed.scene && removed.preview);
+        assert_eq!(removed.source.as_deref(), Some("ifc"));
+        assert_eq!(removed.bytes, 11 + 4 + 10);
+        assert!(!root.join("model.rvs").exists());
+        assert!(!root.join("previews/model.png").exists());
+        assert!(!uploads.join("model.ifc").exists());
+        // The format that was not named is the user's other upload.
+        assert!(uploads.join("model.rvt").exists());
+        assert!(root.join("keep.rvs").exists());
+
+        // A name that is gone, a name that tries to leave the directory, and
+        // a format that is not one this serves.
+        assert!(scenes.remove("model", None).is_err());
+        assert!(scenes.remove("../keep", None).is_err());
+        std::fs::write(root.join("other.rvs"), b"x").unwrap();
+        let removed = scenes.remove("other", Some("../../model")).unwrap();
+        assert_eq!(removed.source, None, "an unknown format named a file");
+        assert!(uploads.join("model.rvt").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn reads_the_range_forms_a_viewer_sends() {
