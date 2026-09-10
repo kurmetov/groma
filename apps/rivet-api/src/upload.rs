@@ -122,6 +122,33 @@ pub fn room_to_convert(bytes: u64, format: Format) -> Result<(), String> {
     Ok(())
 }
 
+/// The name a scene made from a federation takes, sanitised like any other.
+#[must_use]
+pub fn scene_name(set: &str) -> String {
+    sanitise(set)
+}
+
+/// Whether there is memory free now to convert a whole federation.
+///
+/// The sources are read one after another but their models are held together,
+/// so what has to fit is the sum. Only a whole-file reader's cost scales with
+/// its source, so only those contribute.
+///
+/// # Errors
+///
+/// The message explaining which conversion will not fit.
+pub fn room_to_convert_all(sources: &[(u64, Format)]) -> Result<(), String> {
+    let mut planned = 0_u64;
+    for (bytes, format) in sources {
+        if format.memory_ratio().is_some() {
+            planned = planned.saturating_add(*bytes);
+        }
+    }
+    // Charged against the format that actually scales; a set of RVTs plans
+    // nothing here and is bounded a member at a time, exactly as one is.
+    room_to_convert(planned, Format::Ifc)
+}
+
 /// What a model may be called once it is on disk. A name is derived from what
 /// the client sent rather than trusted: everything outside this set becomes an
 /// underscore, so no upload can name a path.
@@ -178,16 +205,23 @@ impl Uploads {
     /// Save a request body to the uploads directory, refusing anything that is
     /// not a model and anything over the size cap.
     ///
+    /// `set` stages the file beside the others of a federation instead of
+    /// converting it on its own; see [`Uploads::staged`].
+    ///
     /// # Errors
     ///
     /// Fails where the body cannot be read or stored, where it is too large,
     /// or where its leading bytes name no format this server can read.
     pub fn receive(
         &self,
+        set: Option<&str>,
         name: &str,
         body: &mut dyn Read,
     ) -> Result<(PathBuf, Format, String), String> {
-        let directory = self.scenes.join("uploads");
+        let directory = match set {
+            Some(set) => self.set_directory(set),
+            None => self.scenes.join("uploads"),
+        };
         std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
 
         // The format is read from the first bytes, so the extension a client
@@ -247,6 +281,39 @@ impl Uploads {
         Ok((path, format, stem))
     }
 
+    /// Where the files of one federation are held until it is converted.
+    ///
+    /// A directory per set, so that two clients federating at once cannot see
+    /// each other's files, and so that the set can be emptied by removing one
+    /// directory. The name is sanitised like any other, because it comes from
+    /// a request.
+    fn set_directory(&self, set: &str) -> PathBuf {
+        self.scenes.join("uploads").join("sets").join(sanitise(set))
+    }
+
+    /// The files held for one federation, in a deterministic order.
+    ///
+    /// Sorted by name rather than left in directory order: the order decides
+    /// which document is which in the output, and a conversion repeated on the
+    /// same files has to produce the same identifiers.
+    #[must_use]
+    pub fn staged(&self, set: &str) -> Vec<PathBuf> {
+        let mut held: Vec<PathBuf> = std::fs::read_dir(self.set_directory(set))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        held.sort();
+        held
+    }
+
+    /// Forget the files of one federation, once it has been converted.
+    pub fn discard_set(&self, set: &str) {
+        let _ = std::fs::remove_dir_all(self.set_directory(set));
+    }
+
     /// Start the conversion. The child's stdout carries one JSON object per
     /// stage, which [`stream_progress`] forwards to the caller as it arrives.
     ///
@@ -255,25 +322,27 @@ impl Uploads {
     /// Fails where the converter cannot be started.
     pub fn convert(
         &self,
-        source: &Path,
+        sources: &[PathBuf],
         scene_name: &str,
-        format: Format,
+        formats: &[Format],
     ) -> std::io::Result<Child> {
         let scene = self.scenes.join(format!("{scene_name}.rvs"));
         let mut command = Command::new(&self.rivet);
-        command
-            .arg("export-scene")
-            .arg(source)
-            .arg("--output")
-            .arg(&scene)
-            .arg("--progress");
+        command.arg("export-scene");
+        // Several sources are read as one federated model. The converter
+        // qualifies every identifier by the file it came from, so the scene
+        // that comes back can be filtered by document.
+        for source in sources {
+            command.arg(source);
+        }
+        command.arg("--output").arg(&scene).arg("--progress");
         // The converter guards its own reading with the same flag, and its
         // default is the constant this server used to stop at. Without saying
         // so, an IFC this server has just accepted would be refused by the
         // process it hands it to - so the ceiling the upload was measured
         // against is passed on. An RVT is left alone: there the flag bounds one
         // decoded member rather than the source, and is not ours to raise.
-        if format.memory_ratio().is_some() {
+        if formats.iter().any(|format| format.memory_ratio().is_some()) {
             command
                 .arg("--max-member-bytes")
                 .arg(max_ifc_bytes().to_string());
@@ -338,7 +407,7 @@ impl Uploads {
     /// be started.
     pub fn export_ifc(
         &self,
-        source: &Path,
+        sources: &[PathBuf],
         name: &str,
         request: &IfcRequest,
     ) -> std::io::Result<Child> {
@@ -346,11 +415,13 @@ impl Uploads {
         std::fs::create_dir_all(&directory)?;
         let output = directory.join(format!("{name}.ifc"));
         let mut command = Command::new(&self.rivet);
-        command
-            .arg("export-ifc")
-            .arg(source)
-            .arg("--output")
-            .arg(&output);
+        command.arg("export-ifc");
+        // Several sources are read as one federated model, exactly as a scene
+        // conversion reads them.
+        for source in sources {
+            command.arg(source);
+        }
+        command.arg("--output").arg(&output);
         request.apply(&mut command);
         command
             .stdout(Stdio::piped())
@@ -575,7 +646,17 @@ pub fn follow(mut child: Child, name: &str, product: Product, job: &std::sync::M
                     } else {
                         let seconds = value["seconds"].as_f64().unwrap_or_default();
                         update(&|held: &mut Job| {
-                            held.finished.push((stage.clone(), seconds));
+                            // A federation reports each stage once per source
+                            // file. Summed into one row, because a progress
+                            // display showing "Decode" three times says less
+                            // than one showing what reading the sources cost.
+                            if let Some(entry) =
+                                held.finished.iter_mut().find(|(held, _)| *held == stage)
+                            {
+                                entry.1 += seconds;
+                            } else {
+                                held.finished.push((stage.clone(), seconds));
+                            }
                             held.running = None;
                             held.seconds = total;
                         });
@@ -652,8 +733,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        Format, IfcRequest, MAX_AUTOMATIC_IFC_BYTES, MIN_MAX_IFC_BYTES, conversion_limit,
-        max_ifc_bytes, memory_budget, room_to_convert, sanitise,
+        Format, IfcRequest, MAX_AUTOMATIC_IFC_BYTES, MIN_MAX_IFC_BYTES, Uploads, conversion_limit,
+        max_ifc_bytes, memory_budget, room_to_convert, room_to_convert_all, sanitise, scene_name,
     };
 
     fn params(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -661,6 +742,69 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    /// A set's files decide which document is which in the output, so the
+    /// order has to be the same every time the same files are converted.
+    #[test]
+    fn a_set_is_read_back_in_a_deterministic_order_and_can_be_forgotten() {
+        let directory = std::env::temp_dir().join(format!("rivet-set-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let uploads = Uploads {
+            scenes: directory.clone(),
+            rivet: std::path::PathBuf::from("rivet"),
+            max_bytes: 1 << 20,
+        };
+
+        assert!(uploads.staged("tower").is_empty(), "nothing staged yet");
+        let held = directory.join("uploads").join("sets").join("tower");
+        std::fs::create_dir_all(&held).expect("a staging directory");
+        // Written out of order on purpose.
+        for name in ["st.ifc", "ar.ifc", "mep.ifc"] {
+            std::fs::write(held.join(name), b"ISO-10303-21;").expect("a staged file");
+        }
+        let staged = uploads.staged("tower");
+        let names: Vec<String> = staged
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["ar.ifc", "mep.ifc", "st.ifc"]);
+
+        uploads.discard_set("tower");
+        assert!(uploads.staged("tower").is_empty(), "the set was forgotten");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A set name reaches the filesystem, so it is sanitised like any other
+    /// name a request supplies.
+    #[test]
+    fn a_set_name_cannot_leave_the_staging_directory() {
+        assert_eq!(scene_name("../../etc/passwd"), "passwd");
+        assert_eq!(scene_name("tower/ar"), "ar");
+        assert_eq!(scene_name(""), "model");
+    }
+
+    /// A federation's models are held together, so what has to fit is the
+    /// sum - and only the formats whose cost scales with their source count.
+    #[test]
+    fn a_federation_is_charged_as_the_sum_of_its_whole_file_readers() {
+        let ceiling = 8 * MIN_MAX_IFC_BYTES;
+        // Well inside anything, whether counted once or three times.
+        let small = [(1 << 20, Format::Ifc); 3];
+        assert!(room_to_convert_all(&small).is_ok());
+        // An RVT is bounded a member at a time, so a set of them plans
+        // nothing here however large they are.
+        let huge_rvt = [(ceiling, Format::Rvt); 4];
+        assert!(room_to_convert_all(&huge_rvt).is_ok());
+        // And the sum is what is charged, not the largest: three sources that
+        // each fit can still fail together, if the host is small enough to say
+        // so. Only assert the arithmetic, since free memory is not ours.
+        let summed = [(1 << 30, Format::Ifc), (1 << 30, Format::Ifc)];
+        let one = [(2 << 30, Format::Ifc)];
+        assert_eq!(
+            room_to_convert_all(&summed).is_ok(),
+            room_to_convert_all(&one).is_ok()
+        );
     }
 
     #[test]

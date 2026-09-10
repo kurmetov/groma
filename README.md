@@ -255,7 +255,22 @@ A **single** file is never renamed. Its identifiers, and every IFC `GlobalId`
 derived from them, reach the output exactly as its reader stated them.
 
 The scene records one entry per file in `documents`, and each element indexes
-the one it came from, so a viewer can show one discipline and hide another.
+the one it came from, so the viewer shows a **Files** panel for a federated
+model and hides one discipline at a time.
+
+The server takes a federation as one upload per file under a shared set name,
+the last marked complete:
+
+```bash
+curl -X POST --data-binary @ar.ifc  'localhost:8800/upload?name=ar.ifc&set=tower'
+curl -X POST --data-binary @st.ifc  'localhost:8800/upload?name=st.ifc&set=tower'
+curl -X POST --data-binary @mep.ifc 'localhost:8800/upload?name=mep.ifc&set=tower&complete'
+```
+
+Each of the first two replies with how many files are held; the last starts one
+job that reads them all and answers with it. `POST /export-ifc` takes the same
+three parameters. Dropping several files on the viewer's model panel does this
+for you.
 
 **Coordinates are not reconciled.** Each file's geometry arrives in whatever
 world system that file stated. Files exported from one coordinated project

@@ -347,6 +347,105 @@ impl ConversionSlot {
 /// Receive a model and start converting it. The reply names a job the page
 /// then asks about, rather than holding the connection open for the minute a
 /// large model takes.
+/// What one upload request produced.
+enum Upload {
+    /// Held with the others of a federation that is still being uploaded.
+    /// Nothing is converted until a request says the set is complete.
+    Staged { set: String, files: usize },
+    /// Everything a conversion needs, whether it came from one file or a set.
+    Ready(Box<Received>),
+}
+
+/// The sources of one conversion, received and checked.
+struct Received {
+    /// Every source to read, in a deterministic order.
+    sources: Vec<PathBuf>,
+    formats: Vec<upload::Format>,
+    /// What the output is named.
+    stem: String,
+    /// The set to forget once the conversion has finished, if any.
+    set: Option<String>,
+    /// The sources' total size, for the job listing.
+    bytes: u64,
+}
+
+/// Receive one upload, staging it with a federation's other files or handing
+/// back everything a conversion needs.
+///
+/// `set` names a federation: the file is held rather than converted, and the
+/// scene takes the set's name rather than the file's. `complete` says this is
+/// the last file, at which point every file held for the set is converted
+/// together. Without `set` this is a single-file conversion, exactly as
+/// before.
+fn receive_upload(
+    uploads: &upload::Uploads,
+    params: &BTreeMap<String, String>,
+    name: &str,
+    body: &mut dyn std::io::Read,
+) -> Result<Upload, String> {
+    let set = params.get("set").filter(|set| !set.is_empty());
+    let complete = params.contains_key("complete");
+    let (source, format, stem) = uploads.receive(set.map(String::as_str), name, body)?;
+
+    let Some(set) = set else {
+        let bytes = std::fs::metadata(&source).map_or(0, |file| file.len());
+        return Ok(Upload::Ready(Box::new(Received {
+            sources: vec![source],
+            formats: vec![format],
+            stem,
+            set: None,
+            bytes,
+        })));
+    };
+    let staged = uploads.staged(set);
+    if !complete {
+        return Ok(Upload::Staged {
+            set: set.clone(),
+            files: staged.len(),
+        });
+    }
+    // The formats are read again from the staged files rather than remembered
+    // across requests: the set is on disk, and a server that trusted a
+    // client's earlier claim would be trusting the claim.
+    let mut formats = Vec::with_capacity(staged.len());
+    let mut bytes = 0_u64;
+    for path in &staged {
+        let mut head = [0_u8; bim_convert::SNIFF_BYTES];
+        let read = std::fs::File::open(path)
+            .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
+            .map_err(|error| error.to_string())?;
+        let Some(format) = upload::Format::sniff(&head[..read]) else {
+            return Err(format!(
+                "{} is no longer a file this server reads",
+                path.display()
+            ));
+        };
+        formats.push(format);
+        bytes = bytes.saturating_add(std::fs::metadata(path).map_or(0, |file| file.len()));
+    }
+    Ok(Upload::Ready(Box::new(Received {
+        sources: staged,
+        formats,
+        stem: upload::scene_name(set),
+        set: Some(set.clone()),
+        bytes,
+    })))
+}
+
+/// The format to show in the job listing: the one every source shares, or
+/// that they do not share one.
+fn format_label(formats: &[upload::Format]) -> String {
+    let mut kinds: Vec<&str> = formats.iter().map(|format| format.extension()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    match kinds.as_slice() {
+        [only] => (*only).to_owned(),
+        _ => "mixed".to_owned(),
+    }
+}
+
+/// Receive a model - or a federation of them - and start converting it to a
+/// scene.
 fn serve_upload(
     slot: Option<&ConversionSlot>,
     params: &BTreeMap<String, String>,
@@ -364,33 +463,69 @@ fn serve_upload(
     }
     let name = params.get("name").map_or("model", String::as_str);
 
-    let received = slot.uploads.receive(name, request.as_reader());
-    let (source, format, stem) = match received {
-        Ok(received) => received,
+    let received = match receive_upload(&slot.uploads, params, name, request.as_reader()) {
+        Ok(Upload::Staged { set, files }) => {
+            // Held, not converted. The client sends the last file with
+            // `complete` and the whole set is read as one model then.
+            return request.respond(json_response(
+                200,
+                &serde_json::json!({ "set": set, "files": files }),
+            ));
+        }
+        Ok(Upload::Ready(received)) => *received,
         Err(message) => return request.respond(error(400, &message)),
     };
 
     // The size ceiling is a plan drawn from this machine's capacity; this is
     // the check against the moment. A conversion that cannot fit in the memory
     // free right now is refused with a reason, because the alternative is the
-    // host swapping until someone reboots it.
-    let source_bytes = std::fs::metadata(&source).map_or(0, |file| file.len());
-    if let Err(message) = upload::room_to_convert(source_bytes, format) {
-        let _ = std::fs::remove_file(&source);
+    // host swapping until someone reboots it. A federation is charged as the
+    // sum, because its models are held together.
+    let sized: Vec<(u64, upload::Format)> = received
+        .sources
+        .iter()
+        .zip(&received.formats)
+        .map(|(path, format)| {
+            (
+                std::fs::metadata(path).map_or(0, |file| file.len()),
+                *format,
+            )
+        })
+        .collect();
+    if let Err(message) = upload::room_to_convert_all(&sized) {
+        for source in &received.sources {
+            let _ = std::fs::remove_file(source);
+        }
+        if let Some(set) = &received.set {
+            slot.uploads.discard_set(set);
+        }
         return request.respond(error(507, &message));
     }
     let id = job_id();
     let job = Arc::new(Mutex::new(Job::new()));
+    let Received {
+        sources,
+        formats,
+        stem,
+        set,
+        bytes,
+    } = received;
+    let label = format_label(&formats);
     if let Ok(mut held) = job.lock() {
-        held.source = Some(name.to_owned());
-        held.format = Some(format.extension().to_owned());
-        held.bytes = source_bytes;
+        held.source = Some(set.clone().unwrap_or_else(|| name.to_owned()));
+        held.format = Some(label.clone());
+        held.bytes = bytes;
         held.scene = Some(stem.clone());
     }
     slot.remember(id.clone(), &job);
     let response = json_response(
         202,
-        &serde_json::json!({ "job": id, "scene": stem, "format": format.extension() }),
+        &serde_json::json!({
+            "job": id,
+            "scene": stem,
+            "format": label,
+            "documents": sources.len(),
+        }),
     );
 
     let uploads = slot.uploads.clone();
@@ -400,7 +535,7 @@ fn serve_upload(
         let _guard = running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match uploads.convert(&source, &stem, format) {
+        match uploads.convert(&sources, &stem, &formats) {
             Ok(child) => upload::follow(child, &stem, upload::Product::Scene, &job),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
@@ -408,6 +543,10 @@ fn serve_upload(
                     held.error = Some(format!("the converter could not be started: {failure}"));
                 }
             }
+        }
+        if let Some(set) = set {
+            // The staged files have been read; the scene is what is kept.
+            uploads.discard_set(&set);
         }
     });
     request.respond(response)
@@ -437,25 +576,33 @@ fn serve_export_ifc(
     };
     let name = params.get("name").map_or("model", String::as_str);
 
-    let received = slot.uploads.receive(name, request.as_reader());
-    let (source, format, stem) = match received {
-        Ok(received) => received,
+    // An IFC source is no longer refused here: `export-ifc` reads a model and
+    // no longer cares which format stated it, and reading a federation of IFCs
+    // out as one file is the whole point of accepting several.
+    let received = match receive_upload(&slot.uploads, params, name, request.as_reader()) {
+        Ok(Upload::Staged { set, files }) => {
+            return request.respond(json_response(
+                200,
+                &serde_json::json!({ "set": set, "files": files }),
+            ));
+        }
+        Ok(Upload::Ready(received)) => *received,
         Err(message) => return request.respond(error(400, &message)),
     };
-    // An IFC in, an IFC out is a round trip through two readings of the same
-    // model, and nobody has asked for one. Say so rather than doing it.
-    if format != upload::Format::Rvt {
-        let _ = std::fs::remove_file(&source);
-        return request.respond(error(400, "an IFC export is made from a Revit model"));
-    }
 
     let id = job_id();
     let job = Arc::new(Mutex::new(Job::new()));
-    let source_bytes = std::fs::metadata(&source).map_or(0, |file| file.len());
+    let Received {
+        sources,
+        formats,
+        stem,
+        set,
+        bytes,
+    } = received;
     if let Ok(mut held) = job.lock() {
-        held.source = Some(name.to_owned());
-        held.format = Some(format.extension().to_owned());
-        held.bytes = source_bytes;
+        held.source = Some(set.clone().unwrap_or_else(|| name.to_owned()));
+        held.format = Some(format_label(&formats));
+        held.bytes = bytes;
     }
     slot.remember(id.clone(), &job);
     let response = json_response(
@@ -471,7 +618,7 @@ fn serve_export_ifc(
         let _guard = running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match uploads.export_ifc(&source, &stem, &settings) {
+        match uploads.export_ifc(&sources, &stem, &settings) {
             Ok(child) => upload::follow(child, &stem, upload::Product::Ifc, &job),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
@@ -479,6 +626,9 @@ fn serve_export_ifc(
                     held.error = Some(format!("the exporter could not be started: {failure}"));
                 }
             }
+        }
+        if let Some(set) = set {
+            uploads.discard_set(&set);
         }
     });
     request.respond(response)
@@ -540,7 +690,7 @@ fn serve_export_json(
     let full = params.get("full").is_some_and(|value| value != "false");
     let name = params.get("name").map_or("model", String::as_str);
 
-    let received = slot.uploads.receive(name, request.as_reader());
+    let received = slot.uploads.receive(None, name, request.as_reader());
     let (source, format, stem) = match received {
         Ok(received) => received,
         Err(message) => return request.respond(error(400, &message)),
@@ -835,9 +985,12 @@ fn handle(
                     "/scenes/{scene}",
                     "/previews/{scene}",
                     "DELETE /scenes/{scene}?source=rvt|ifc",
-                    "/upload?name=",
-                    "POST /export-ifc?name=&length-unit=&no-types=&no-revit-property-sets=\
-                     &no-revit-type-property-sets=&no-ifc-common-property-sets=&class-mapping=",
+                    "POST /upload?name= (one file), or ?name=&set=&complete= to \
+                     federate several: repeat with the same set, mark the last one \
+                     complete, and every file held is read as one model",
+                    "POST /export-ifc?name=&set=&complete=&length-unit=&no-types=\
+                     &no-revit-property-sets=&no-revit-type-property-sets=\
+                     &no-ifc-common-property-sets=&class-mapping=",
                     "POST /export-json?name=&full=",
                     "/exports/{name}.ifc|.jsonl",
                     "/jobs",

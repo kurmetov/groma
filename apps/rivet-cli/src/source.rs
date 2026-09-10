@@ -107,11 +107,24 @@ impl Stage {
         ));
     }
 
+    /// The prose summary, one line per stage.
+    ///
+    /// Stages of the same name are summed rather than listed: a federation
+    /// decodes once per source file, and three `Decode` lines answer nobody's
+    /// question. What a reader wants is what reading the sources cost.
     pub(crate) fn total(&self) {
         if self.progress {
             return;
         }
+        let mut summed: Vec<(&'static str, f64)> = Vec::new();
         for (name, seconds) in &self.elapsed {
+            if let Some(entry) = summed.iter_mut().find(|(held, _)| *held == *name) {
+                entry.1 += seconds;
+            } else {
+                summed.push((name, *seconds));
+            }
+        }
+        for (name, seconds) in summed {
             println!("{}: {seconds:.2}s", stage_label(name));
         }
         println!("Total: {:.2}s", self.started.elapsed().as_secs_f64());
@@ -537,6 +550,9 @@ pub(crate) fn read_sources(
     })
 }
 
+/// Disjoint document pairs named in full before the rest become a count.
+const DISJOINT_PAIRS_SHOWN: usize = 5;
+
 /// A short, stable name for one source file inside a federated model.
 ///
 /// The file's own stem, because that is what a person reading a federated
@@ -682,7 +698,10 @@ impl Conversion {
                 self.federation.collisions
             );
         }
-        for (left, right) in &self.federation.disjoint {
+        // Every pair is checked, so a set where nothing shares a frame yields
+        // one warning per pair - 45 of them for ten documents. A handful says
+        // the same thing; the rest is a count.
+        for (left, right) in self.federation.disjoint.iter().take(DISJOINT_PAIRS_SHOWN) {
             // Reported and not corrected: nothing here knows the transform
             // that would reconcile two origins. See `BimFederationReport`.
             println!(
@@ -690,6 +709,15 @@ impl Conversion {
                  different origins; nothing was moved",
                 left.0, right.0
             );
+        }
+        if let Some(more) = self
+            .federation
+            .disjoint
+            .len()
+            .checked_sub(DISJOINT_PAIRS_SHOWN)
+            .filter(|more| *more > 0)
+        {
+            println!("warning: and {more} further pairs that share no geometry");
         }
     }
 }
