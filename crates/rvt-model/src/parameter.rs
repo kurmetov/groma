@@ -1,4 +1,4 @@
-use rvt_schema::Schema;
+use rvt_schema::{FieldType, Schema};
 
 use crate::member::RecordString;
 use crate::serial::{SerialObject, walk_record_collecting_classes};
@@ -80,6 +80,164 @@ impl Parameter {
     pub const fn is_built_in(&self) -> bool {
         self.id < 0
     }
+}
+
+/// The classes behind the parameters a loadable family stores on its records.
+///
+/// `FamilyParams.m_params` is a counted collection of `NamedParam`, and a
+/// `NamedParam` is 30 bytes: a name, an expression reference, a `Float64`, two
+/// `ElementId`s and an `Integer32`, then two flags. The values a walk collects
+/// for one `FamilyParams` object are therefore N strings, N numbers, 3N
+/// integers and 2N small integers, and that shape is the read's own check -
+/// on AR S1's `FamilySymbol` records 5 059 of 5 062 objects pair exactly, and
+/// the three that do not are dropped rather than guessed at.
+///
+/// This is where a loadable family keeps what the four `ParamValueSet` objects
+/// keep for a system family. Before this was read, AR S1 yielded about 1 200
+/// values from every `FamilySymbol` in the file - seven distinct built-in
+/// codes - while the same records hold 118 087 `NamedParam` entries and its
+/// `FamilyInstance` records hold a further 126 605.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FamilyParameterClassIndexes {
+    pub params: u16,
+    pub named: u16,
+}
+
+/// What a `NamedParam` declares, in order. The read pairs values by position,
+/// so a schema that declares anything else is not decoded at all.
+const NAMED_PARAMETER_PROPERTIES: &[(&str, FieldType)] = &[
+    ("m_str", FieldType::String),
+    ("m_oExpression", FieldType::Object),
+    ("m_value", FieldType::Float64),
+    ("m_elemId", FieldType::Object),
+    ("m_paramId", FieldType::Object),
+    ("m_int", FieldType::Integer32),
+    ("m_instance", FieldType::Bool),
+    ("m_reporting", FieldType::Bool),
+];
+
+impl FamilyParameterClassIndexes {
+    /// Resolve the two classes and verify they declare what this module reads.
+    ///
+    /// `None` when either class is missing, when `FamilyParams.m_params` is not
+    /// a collection naming `NamedParam` as its element class, or when
+    /// `NamedParam` declares anything other than [`NAMED_PARAMETER_PROPERTIES`]
+    /// in that order. A schema that changed the layout is thereby not decoded
+    /// at all, rather than decoded wrongly.
+    #[must_use]
+    pub fn detect(schema: &Schema) -> Option<Self> {
+        let params = schema.class_by_name("FamilyParams")?;
+        let named = schema.class_by_name("NamedParam")?;
+        if named.parent != rvt_schema::TypeReference::None
+            || named.properties.len() != NAMED_PARAMETER_PROPERTIES.len()
+            || !named
+                .properties
+                .iter()
+                .zip(NAMED_PARAMETER_PROPERTIES)
+                .all(|(declared, (name, field_type))| {
+                    declared.name == *name && declared.field_type == *field_type
+                })
+        {
+            return None;
+        }
+        let collection = params.properties.first()?;
+        if collection.name != "m_params"
+            || collection.item_mode != 5
+            || collection.loading_mode != 0
+            || collection.static_type.as_ref()?.index()? != named.index
+        {
+            return None;
+        }
+        Some(Self {
+            params: params.index,
+            named: named.index,
+        })
+    }
+}
+
+/// The parameters one walked `FamilyParams` object holds.
+///
+/// A `NamedParam` carries three value slots - a `Float64`, an `ElementId` and
+/// an `Integer32` - and exactly one of them is ever filled: over AR S1's
+/// 118 087 entries, 42 633 carry the double, 15 131 the reference, 10 888 the
+/// integer and **not one carries two**. So the filled slot names the value's
+/// kind, and no display unit or spec has to be consulted to choose it. An
+/// entry with no slot filled states a zero whose kind nothing establishes, and
+/// is left out rather than written as one kind or the other.
+///
+/// `m_str` is empty on every entry the corpus holds - a family parameter is
+/// named by the element `m_paramId` points at, which is where
+/// `parameter_names` reads it - and `m_instance` reads zero on every entry of
+/// every `FamilyInstance` record, so neither is interpreted here.
+#[must_use]
+pub fn read_family_parameters(
+    object: &SerialObject,
+    classes: FamilyParameterClassIndexes,
+) -> Vec<Parameter> {
+    if object.class_index != classes.params {
+        return Vec::new();
+    }
+    let count = object.numbers.len();
+    if count == 0
+        || object.strings.len() != count
+        || object.integers.len() != count.saturating_mul(3)
+        || object.small_integers.len() != count.saturating_mul(2)
+    {
+        return Vec::new();
+    }
+    let mut parameters = Vec::new();
+    for at in 0..count {
+        let element_id = object.integers[at * 3];
+        let parameter_id = object.integers[at * 3 + 1];
+        let integer = object.integers[at * 3 + 2];
+        let double = object.numbers[at];
+        let value = match (double != 0.0, integer != 0, element_id > 0) {
+            (true, false, false) => ParameterValue::Double(double),
+            (false, true, false) => ParameterValue::Integer(integer),
+            (false, false, true) => ParameterValue::Reference(element_id),
+            // No slot filled, or more than one: nothing establishes which kind
+            // the value is, so none is written.
+            _ => continue,
+        };
+        parameters.push(Parameter {
+            id: parameter_id,
+            value,
+        });
+    }
+    parameters
+}
+
+/// Read both kinds of stored parameter out of one record in one walk: the four
+/// typed `ParamValueSet` objects a system family uses, and the `FamilyParams`
+/// collection a loadable family uses. See [`ParameterSets::from_record`] and
+/// [`read_family_parameters`].
+///
+/// One walk rather than two because a record's node stream is walked in full
+/// either way, and on the corpus that stream is mostly boundary geometry: the
+/// second pass would cost as much as the first and find the same objects.
+#[must_use]
+pub fn read_record_parameters(
+    schema: &Schema,
+    class_index: u16,
+    body: &[u8],
+    sets: ParameterSetClassIndexes,
+    family: Option<FamilyParameterClassIndexes>,
+) -> (Option<ParameterSets>, Vec<Parameter>) {
+    let mut keep = vec![sets.double, sets.integer, sets.text, sets.reference];
+    if let Some(family) = family {
+        keep.push(family.params);
+    }
+    let (_walk, objects) = walk_record_collecting_classes(schema, class_index, body, &keep);
+    let family_parameters = family.map_or_else(Vec::new, |family| {
+        objects
+            .iter()
+            .flat_map(|object| read_family_parameters(object, family))
+            .collect()
+    });
+    (
+        ParameterSets::from_objects(&objects, sets),
+        family_parameters,
+    )
 }
 
 /// The four typed parameter sets an element stores, in schema order.
@@ -507,6 +665,79 @@ mod tests {
             small_integers: Vec::new(),
             alternate_integers: Vec::new(),
         }
+    }
+
+    /// The classes a `FamilyParams` read needs, as a schema would report them.
+    fn family_classes() -> FamilyParameterClassIndexes {
+        FamilyParameterClassIndexes {
+            params: 765,
+            named: 766,
+        }
+    }
+
+    /// One `FamilyParams` object holding `entries` `NamedParam`s, laid out the
+    /// way a walk collects them: the values of all the entries concatenated,
+    /// each vector in declaration order.
+    fn family_object(entries: &[(f64, i32, i32, i32)]) -> SerialObject {
+        let mut object = set_object(family_classes().params, 100);
+        for (value, element_id, parameter_id, integer) in entries {
+            object.strings.push(String::new());
+            object.numbers.push(*value);
+            object.integers.extend([*element_id, *parameter_id, *integer]);
+            object.small_integers.extend([0, 0]);
+        }
+        object
+    }
+
+    /// Exactly one of a `NamedParam`'s three value slots is ever filled, and
+    /// which one it is names the value's kind. An entry with none filled
+    /// states a zero whose kind nothing establishes, so none is written.
+    #[test]
+    fn a_family_parameter_takes_its_kind_from_the_slot_that_is_filled() {
+        let found = read_family_parameters(
+            &family_object(&[
+                (2.460_629_921_259_842_6, -1, 8_142_843, 0),
+                (0.0, -1, 8_142_841, 1),
+                (0.0, 8_142_779, 8_142_806, 0),
+                (0.0, -1, 8_142_822, 0),
+            ]),
+            family_classes(),
+        );
+        assert_eq!(
+            found,
+            vec![
+                Parameter {
+                    id: 8_142_843,
+                    value: ParameterValue::Double(2.460_629_921_259_842_6),
+                },
+                Parameter {
+                    id: 8_142_841,
+                    value: ParameterValue::Integer(1),
+                },
+                Parameter {
+                    id: 8_142_806,
+                    value: ParameterValue::Reference(8_142_779),
+                },
+            ],
+            "the fourth entry fills no slot and is left out"
+        );
+    }
+
+    /// The 30-byte entry shape is the read's own check: values that do not
+    /// pair up are dropped rather than sliced into whatever fits.
+    #[test]
+    fn a_family_parameter_run_whose_values_do_not_pair_is_dropped() {
+        let mut object = family_object(&[(1.0, -1, 7, 0), (2.0, -1, 8, 0)]);
+        object.integers.pop();
+        assert!(read_family_parameters(&object, family_classes()).is_empty());
+
+        let mut spare = family_object(&[(1.0, -1, 7, 0)]);
+        spare.small_integers.push(0);
+        assert!(read_family_parameters(&spare, family_classes()).is_empty());
+
+        // Another class's object is not a family parameter run at all.
+        let other = set_object(set_classes().double, 10);
+        assert!(read_family_parameters(&other, family_classes()).is_empty());
     }
 
     #[test]

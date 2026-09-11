@@ -1026,6 +1026,11 @@ pub fn recover_elements(
     let gnode_class_index = schema_class_index(schema.as_ref(), "GNode");
     let geometry_element_class_index = schema_class_index(schema.as_ref(), "GElement");
     let parameter_set_classes = parameter_set_class_indexes(schema.as_ref());
+    // A loadable family keeps its parameters in `FamilyParams` rather than in
+    // the four typed sets. See [`rvt_model::read_family_parameters`].
+    let family_parameter_classes = schema
+        .as_ref()
+        .and_then(rvt_model::FamilyParameterClassIndexes::detect);
     let compound_structure_classes = schema
         .as_ref()
         .and_then(rvt_model::CompoundStructureClassIndexes::detect);
@@ -1060,6 +1065,7 @@ pub fn recover_elements(
         gnode_class_index,
         geometry_element_class_index,
         parameter_set_classes,
+        family_parameter_classes,
         compound_structure_classes,
         brep_body_class_indices,
         brep_classes,
@@ -1175,6 +1181,7 @@ pub fn recover_elements(
                     if let Some(element) = decoded.element {
                         let ElementDecode {
                             declared_parameters,
+                            family_parameters,
                             declared_name,
                             declared_ids: declared,
                             compound_structures,
@@ -1190,6 +1197,22 @@ pub fn recover_elements(
                             if let Some(found) = declared_parameters {
                                 entry.parameters = found.parameters;
                             }
+                            // A loadable family keeps its parameters in
+                            // `FamilyParams` and a system family in the four
+                            // typed sets, so a record may hold either or both.
+                            // A value the typed sets already stated stands:
+                            // this adds what they did not carry rather than
+                            // restating what they did.
+                            let stated = entry
+                                .parameters
+                                .iter()
+                                .map(|parameter| parameter.id)
+                                .collect::<BTreeSet<_>>();
+                            entry.parameters.extend(
+                                family_parameters
+                                    .into_iter()
+                                    .filter(|parameter| !stated.contains(&parameter.id)),
+                            );
                         }
                         if entry.name.is_none() {
                             entry.name = declared_name.map(|name| (name, "declared"));
@@ -1330,6 +1353,7 @@ struct RecordContext<'a> {
     gnode_class_index: Option<u16>,
     geometry_element_class_index: Option<u16>,
     parameter_set_classes: Option<ParameterSetClassIndexes>,
+    family_parameter_classes: Option<rvt_model::FamilyParameterClassIndexes>,
     compound_structure_classes: Option<rvt_model::CompoundStructureClassIndexes>,
     brep_body_class_indices: Vec<u16>,
     brep_classes: Option<rvt_model::BrepClassIndexes>,
@@ -1394,6 +1418,9 @@ struct PlacedBody {
 /// What an element-class record's body states about the element.
 struct ElementDecode {
     declared_parameters: Option<ParameterSets>,
+    /// What a loadable family stores on this record. See
+    /// [`rvt_model::read_family_parameters`].
+    family_parameters: Vec<rvt_model::Parameter>,
     declared_name: Option<String>,
     declared_ids: Vec<Option<i32>>,
     compound_structures: Vec<rvt_model::CompoundStructure>,
@@ -1594,10 +1621,17 @@ fn decode_element(context: &RecordContext<'_>, header: RecordHeader, body: &[u8]
     // The declarations name the four parameter sets outright, so they are read
     // from the walk rather than searched for, and without waiting on the
     // heuristic that locates the element's fixed tail.
-    let declared_parameters = (|| {
+    let (declared_parameters, family_parameters) = (|| {
         let classes = context.parameter_set_classes?;
-        ParameterSets::from_record(context.schema?, header.class_index, body, classes)
-    })();
+        Some(rvt_model::read_record_parameters(
+            context.schema?,
+            header.class_index,
+            body,
+            classes,
+            context.family_parameter_classes,
+        ))
+    })()
+    .unwrap_or((None, Vec::new()));
     // The declarations name the property a record's name is the value of, so
     // it is read rather than scanned for. The scan stays as the fallback for a
     // record whose class declares no such property.
@@ -1636,6 +1670,7 @@ fn decode_element(context: &RecordContext<'_>, header: RecordHeader, body: &[u8]
     });
     ElementDecode {
         declared_parameters,
+        family_parameters,
         declared_name,
         declared_ids,
         compound_structures,

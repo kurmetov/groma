@@ -31,6 +31,7 @@ pub use member::{
     MemberRecordError, MemberRecords, MemberWalk, RecordHeader, RecordLayout, RecordString,
 };
 pub use parameter::{
+    FamilyParameterClassIndexes, read_family_parameters, read_record_parameters,
     AUTODESK_SPEC_PREFIX, MAX_PARAMETERS_PER_SET, Parameter, ParameterSetClassIndexes,
     ParameterSets, ParameterSpec, ParameterValue,
 };
