@@ -300,6 +300,25 @@ impl Surface {
             } => Some(std::f64::consts::TAU * reference_radius),
         }
     }
+
+    /// The period of the *second* parameter, where the surface closes in it.
+    ///
+    /// A surface of revolution turned from a full circle - a torus, a sphere -
+    /// closes in its profile as well as about its axis, and its profile
+    /// parameter is an arc length, so it repeats every circumference. A
+    /// boundary crossing that seam reads as a jump the width of the profile
+    /// unless it is unwrapped, and a jump makes a loop no tiling can take:
+    /// this is what left 5 249 faces of the plumbing model untiled.
+    #[must_use]
+    pub fn v_period(self) -> Option<f64> {
+        match self {
+            Self::Plane { .. } | Self::Cylinder { .. } => None,
+            Self::Revolution { profile, .. } => match profile {
+                Profile::Line { .. } => None,
+                Profile::Arc { radius, .. } => Some(std::f64::consts::TAU * radius),
+            },
+        }
+    }
 }
 
 /// The profile parameter whose point sits nearest `(radial, axial)`, found by

@@ -150,11 +150,18 @@ not in a form this exporter has not learned yet.
 A tiling that stops short used to be handed back as far as it got - a region
 with a piece missing and no sign of it. It is refused now, and the face is
 counted among the ones the tessellator could not read. What the stalls were was
-measured before refusing them: most were faces stating two loops side by side,
-which are two regions rather than a boundary and a hole, and those are now
-grouped by containment and tiled properly. What remains is faces on surfaces of
-revolution whose boundary runs up to the axis, where the loop is not simple in
-the surface's own parameters - 5 249 of the plumbing model's 5 301 stalls.
+measured before refusing them, and both causes were fixed rather than counted.
+Most were faces stating two loops side by side - two regions rather than a
+boundary and a hole - and a face's loops are now grouped into regions by
+containment. The rest were on surfaces of revolution: a torus closes about its
+axis *and* around its own profile, and only the first parameter was being
+unwrapped, so a boundary crossing the profile's seam read as a jump that no
+tiling can take. Both parameters are unwrapped now.
+
+Three of the four corpus models therefore refuse **fewer** faces than before
+this change while refusing every partial tiling - the plumbing model 3 579
+against 3 881, the structural 56 against 65 - and two of them draw more surface
+than they did.
 
 ## Performance
 

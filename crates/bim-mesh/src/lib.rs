@@ -316,7 +316,7 @@ fn tessellate_face(face: &BimBrepFace, options: &MeshOptions, mesh: &mut Mesh) -
     let period = surface.u_period();
     let unwrapped: Vec<Ring> = rings
         .iter()
-        .map(|points| unwrap_ring(&surface, points, period))
+        .map(|points| unwrap_ring(&surface, points, period, surface.v_period()))
         .collect();
 
     // A face that closes all the way round its surface has no outer loop in
@@ -487,16 +487,29 @@ struct Ring {
     area: f64,
 }
 
-fn unwrap_ring(surface: &Surface, points: &[Vec3], period: Option<f64>) -> Ring {
+fn unwrap_ring(
+    surface: &Surface,
+    points: &[Vec3],
+    period: Option<f64>,
+    profile_period: Option<f64>,
+) -> Ring {
     let mut uv: Vec<Point2> = Vec::with_capacity(points.len());
-    let mut previous: Option<f64> = None;
+    let mut previous: Option<Point2> = None;
     for at in points {
         let mut current = surface.to_uv(*at);
-        if let (Some(period), Some(previous)) = (period, previous) {
-            let turns = ((previous - current[0]) / period).round();
-            current[0] = period.mul_add(turns, current[0]);
+        // Both parameters are unwrapped against the point before, and for the
+        // same reason: a boundary is continuous on the surface, so where it
+        // crosses a seam the parameter that jumped is the one to carry over.
+        // A surface of revolution turned from a circle has two seams.
+        if let Some(previous) = previous {
+            for (axis, period) in [period, profile_period].into_iter().enumerate() {
+                if let Some(period) = period {
+                    let turns = ((previous[axis] - current[axis]) / period).round();
+                    current[axis] = period.mul_add(turns, current[axis]);
+                }
+            }
         }
-        previous = Some(current[0]);
+        previous = Some(current);
         uv.push(current);
     }
     let encircles = period.is_some_and(|period| {
@@ -1266,6 +1279,58 @@ mod tests {
             "nine square metres less one, tiled to {}",
             area(&mesh)
         );
+    }
+
+    /// A patch of a torus whose boundary crosses the seam of its own profile,
+    /// taken from the plumbing model - a pipe fitting's rounded corner. The
+    /// profile is a closed circle, so its parameter repeats every
+    /// circumference, and until both parameters were unwrapped this loop read
+    /// as a jump from one side of the profile to the other and tiled to
+    /// nothing. 5 249 faces of that model are this shape.
+    #[test]
+    fn a_torus_patch_across_the_profile_seam_is_tiled() {
+        let centre = [5.621_608_084_172_652, 1.845_311_026_619_267_6, -0.667];
+        let corners = [
+            [5.621_608_084_172_652, 1.798_811_026_619_267_6, -0.667],
+            [5.621_608_084_172_652, 1.812_430_561_294_093_4, -0.699_880_465_325_181_2],
+            [5.621_608_084_172_652, 1.845_311_026_619_267_8, -0.713_5],
+            [5.635_108_084_172_652, 1.845_311_026_619_267_8, -0.7],
+            [5.621_608_084_172_652, 1.845_311_026_619_267_8, -0.686_5],
+            [5.621_608_084_172_652, 1.831_522_444_386_13, -0.680_788_582_233_144_3],
+            [5.621_608_084_172_652, 1.825_811_026_619_267_5, -0.667],
+            [5.635_108_084_172_652, 1.812_311_026_619_267_7, -0.667],
+        ];
+        let face = BimBrepFace {
+            surface: BimBrepSurface::Revolution {
+                center: at(centre),
+                x_axis: [0.0, 1.0, 0.0],
+                y_axis: [0.0, 0.0, 1.0],
+                z_axis: [-1.0, 0.0, 0.0],
+                profile: bim_core::BimBrepProfile::Arc {
+                    center: at([0.033, 0.0, 0.0]),
+                    x_axis: [1.0, 0.0, 0.0],
+                    y_axis: [0.0, 0.0, 1.0],
+                    radius: BimNumber {
+                        value: 0.013_5,
+                        unit: Some(metres_unit()),
+                    },
+                },
+            },
+            loops: vec![(0..corners.len())
+                .map(|index| line(corners[index], corners[(index + 1) % corners.len()]))
+                .collect()],
+        };
+        let mesh = tessellate(
+            &BimGeometry::Brep(BimBrep {
+                faces: vec![face],
+                complete: false,
+            }),
+            &MeshOptions::default(),
+        );
+        assert_eq!(mesh.skipped_faces, 0, "the patch is a patch, not a refusal");
+        // A quarter of the torus's minor circle, over an eighth of a turn
+        // about the axis: small, and above nothing.
+        assert!(area(&mesh) > 1e-4, "tiled to {}", area(&mesh));
     }
 
     #[test]
