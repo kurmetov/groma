@@ -14,6 +14,7 @@ use bim_core::{
 use crate::{
     ClassMapping, EntityRef, ExportSettings, IfcGuid, LengthUnit, Mapped, StepFile, StepHeader,
     StepValue,
+    extrusion::{self, NotAPrism, SolidReport},
     ifc4_entities::{
         Attribute, IFC4_BASE_QUANTITY_SETS, IFC4_COMMON_PROPERTY_SETS, IFC4_ELEMENT_TYPES,
         IFC4_ELEMENTS, IFC4_SPATIAL_ELEMENT_TYPES, Ifc4Entity,
@@ -101,7 +102,25 @@ pub fn metadata_ifc(
     model: &BimModel,
     options: &MetadataOptions,
 ) -> Result<StepFile, MetadataError> {
+    metadata_ifc_reported(model, options).map(|(file, _)| file)
+}
+
+/// The same file, and what the writer made of the model's solids.
+///
+/// The tally is the exporter's own funnel: how many bodies were written as a
+/// sweep of their profile, and for the rest, which test refused them. A caller
+/// that reports it is saying what this file is made of; nothing about the file
+/// depends on whether anyone asks.
+///
+/// # Errors
+///
+/// The same as [`metadata_ifc`].
+pub fn metadata_ifc_reported(
+    model: &BimModel,
+    options: &MetadataOptions,
+) -> Result<(StepFile, SolidReport), MetadataError> {
     validate_model(model)?;
+    let mut report = SolidReport::default();
     let lengths = Lengths::new(options.settings.length_unit);
     let mut file = StepFile::new(step_header(options));
     let ownership = push_ownership(&mut file, options.creation_time);
@@ -165,6 +184,7 @@ pub fn metadata_ifc(
     push_elements(
         &mut file,
         &model.elements,
+        &mut report,
         WriteContext {
             options,
             owner: ownership,
@@ -178,7 +198,7 @@ pub fn metadata_ifc(
         context,
         origin_axis,
     );
-    Ok(file)
+    Ok((file, report))
 }
 
 fn validate_model(model: &BimModel) -> Result<(), MetadataError> {
@@ -493,6 +513,7 @@ fn push_storeys(
 fn push_elements(
     file: &mut StepFile,
     elements: &[BimElement],
+    report: &mut SolidReport,
     context: WriteContext<'_>,
     building: EntityRef,
     building_placement: EntityRef,
@@ -548,7 +569,7 @@ fn push_elements(
         };
         let spatial = written_as.name == "IFCSPACE";
         let entity = if spatial {
-            push_space(file, element, context, placement, geometry_context)
+            push_space(file, element, context, placement, geometry_context, report)
         } else {
             push_element(
                 file,
@@ -557,6 +578,7 @@ fn push_elements(
                 context,
                 placement,
                 geometry_context,
+                report,
             )
         };
         if spatial {
@@ -634,6 +656,7 @@ fn push_space(
     context: WriteContext<'_>,
     placement: EntityRef,
     geometry_context: ElementGeometryContext,
+    report: &mut SolidReport,
 ) -> EntityRef {
     let representation = element.geometry.as_ref().and_then(|geometry| {
         push_geometry(
@@ -641,6 +664,7 @@ fn push_space(
             geometry,
             geometry_context.representation_context,
             geometry_context.frame,
+            report,
         )
     });
     file.push(
@@ -774,6 +798,7 @@ fn push_element(
     context: WriteContext<'_>,
     placement: EntityRef,
     geometry_context: ElementGeometryContext,
+    report: &mut SolidReport,
 ) -> EntityRef {
     let object_type = element.class_name.as_deref().or_else(|| {
         element
@@ -788,6 +813,7 @@ fn push_element(
             geometry,
             geometry_context.representation_context,
             geometry_context.frame,
+            report,
         )
     });
     let mut attributes = vec![
@@ -1050,6 +1076,7 @@ fn push_geometry(
     geometry: &BimGeometry,
     representation_context: EntityRef,
     frame: GeometryFrame,
+    report: &mut SolidReport,
 ) -> Option<EntityRef> {
     match geometry {
         BimGeometry::AxisLine(line) => {
@@ -1099,9 +1126,207 @@ fn push_geometry(
         BimGeometry::BoundingBox(bounds) => {
             push_bounding_box(file, bounds, representation_context, frame)
         }
-        BimGeometry::Brep(brep) => push_brep(file, brep, representation_context, frame),
-        BimGeometry::Assembly(parts) => push_assembly(file, parts, representation_context, frame),
+        BimGeometry::Brep(brep) => push_brep(file, brep, representation_context, frame, report),
+        BimGeometry::Assembly(parts) => {
+            push_assembly(file, parts, representation_context, frame, report)
+        }
     }
+}
+
+/// Count a curved solid whose every curve turns about one axis.
+///
+/// The upper bound on what a profile that could hold an arc would reach: a
+/// sweep's curved walls are cylinders about its own direction and its curved
+/// profile edges are arcs in a plane square to it, so every curve of a curved
+/// prism turns about one axis. This says nothing about the rest of the tests -
+/// see [`SolidReport::curves_about_one_axis`].
+fn note_curves(brep: &BimBrep, report: &mut SolidReport) {
+    let mut axis: Option<[f64; 3]> = None;
+    let mut curved = false;
+    let mut turns = |direction: [f64; 3]| {
+        curved = true;
+        match axis {
+            None => {
+                axis = Some(direction);
+                true
+            }
+            Some(held) => {
+                let cross = [
+                    held[1].mul_add(direction[2], -(held[2] * direction[1])),
+                    held[2].mul_add(direction[0], -(held[0] * direction[2])),
+                    held[0].mul_add(direction[1], -(held[1] * direction[0])),
+                ];
+                dot(cross, cross).sqrt() <= extrusion::TOLERANCE
+            }
+        }
+    };
+    for face in &brep.faces {
+        let aligned = match &face.surface {
+            BimBrepSurface::Plane { .. } => true,
+            BimBrepSurface::Cylinder { z_axis, .. } => turns(*z_axis),
+            // A cone, a sphere, a torus or a ruled patch is not the wall of a
+            // sweep whatever the profile can hold.
+            BimBrepSurface::Revolution { .. } | BimBrepSurface::Ruled { .. } => false,
+        };
+        if !aligned {
+            return;
+        }
+        for edges in &face.loops {
+            for edge in edges {
+                let aligned = match &edge.curve {
+                    BimBrepCurve::Line => true,
+                    BimBrepCurve::Arc(arc) => turns(arc.z_axis),
+                    BimBrepCurve::Polyline(_) => false,
+                };
+                if !aligned {
+                    return;
+                }
+            }
+        }
+    }
+    if curved {
+        report.curves_about_one_axis.saw(brep.faces.len());
+    }
+}
+
+/// The prism this body is, where it is one.
+///
+/// Two things have to hold before the question is even asked. The shell must
+/// be complete - a sweep is a closed solid, and half a boundary is not one -
+/// and every face must be a polygon on a plane, because a cylindrical face or
+/// an arc edge would put a curve in the profile and this writes a polyline.
+/// The rounded solids therefore keep their boundary representation; what it
+/// would take to read them is an arc in the profile curve, and the faces they
+/// hold say how much that is worth.
+fn prism_of(brep: &BimBrep, frame: GeometryFrame) -> Result<extrusion::Prism, NotAPrism> {
+    if !brep.complete {
+        return Err(NotAPrism::ShellIncomplete);
+    }
+    let mut shell = Vec::with_capacity(brep.faces.len());
+    for face in &brep.faces {
+        if !matches!(face.surface, BimBrepSurface::Plane { .. }) {
+            return Err(NotAPrism::SurfaceIsCurved);
+        }
+        if face.loops.is_empty() {
+            return Err(NotAPrism::NotASolid);
+        }
+        let mut boundaries = Vec::with_capacity(face.loops.len());
+        for edges in &face.loops {
+            boundaries.push(polygon_of(edges, frame)?);
+        }
+        shell.push(boundaries);
+    }
+    extrusion::recognise(&shell)
+}
+
+/// One boundary loop as the polygon it closes, in the element's own
+/// coordinates.
+///
+/// Each edge contributes its start, the way the tessellator reads a loop: the
+/// next edge's start is this edge's end, and the last closes on the first. A
+/// point stated twice over carries no direction and would put a zero-length
+/// side in the profile, so the repeats go.
+fn polygon_of(edges: &[BimBrepEdge], frame: GeometryFrame) -> Result<extrusion::Polygon, NotAPrism> {
+    let mut polygon = Vec::with_capacity(edges.len());
+    for edge in edges {
+        if !matches!(edge.curve, BimBrepCurve::Line) {
+            return Err(NotAPrism::EdgeIsCurved);
+        }
+        polygon.push(local_coordinates(&edge.start, frame).ok_or(NotAPrism::PointNotReadable)?);
+    }
+    polygon.dedup_by(|left, right| coincident(*left, *right));
+    if polygon.len() > 1 && coincident(polygon[0], polygon[polygon.len() - 1]) {
+        polygon.pop();
+    }
+    if polygon.len() < 3 {
+        return Err(NotAPrism::NotASolid);
+    }
+    Ok(polygon)
+}
+
+/// Two points of one loop that are the same point. A tenth of the recognition
+/// tolerance, so that a side this drops is one no test downstream could have
+/// told from nothing.
+fn coincident(left: [f64; 3], right: [f64; 3]) -> bool {
+    left.into_iter()
+        .zip(right)
+        .all(|(left, right)| (left - right).abs() <= extrusion::TOLERANCE / 10.0)
+}
+
+/// One recognised prism as `IfcExtrudedAreaSolid`: the profile in its own
+/// plane, that plane's placement, and the depth swept along it.
+///
+/// The profile is stated in the placement's own coordinates and swept along
+/// its Z, which is the form every reader expects and the one that keeps the
+/// profile's two numbers two rather than three.
+fn push_extruded_area_solid(
+    file: &mut StepFile,
+    prism: &extrusion::Prism,
+    lengths: Lengths,
+) -> EntityRef {
+    let outer = push_profile_curve(file, lengths, &prism.outer);
+    let profile = if prism.voids.is_empty() {
+        file.push(
+            "IFCARBITRARYCLOSEDPROFILEDEF",
+            vec![enumeration("AREA"), omitted(), reference(outer)],
+        )
+    } else {
+        let voids = prism
+            .voids
+            .iter()
+            .map(|boundary| reference(push_profile_curve(file, lengths, boundary)))
+            .collect();
+        file.push(
+            "IFCARBITRARYPROFILEDEFWITHVOIDS",
+            vec![
+                enumeration("AREA"),
+                omitted(),
+                reference(outer),
+                StepValue::List(voids),
+            ],
+        )
+    };
+    let origin = push_cartesian_point(file, lengths, prism.origin);
+    let axis = push_direction(file, prism.direction);
+    let reference_direction = push_direction(file, prism.x_axis);
+    let position = file.push(
+        "IFCAXIS2PLACEMENT3D",
+        vec![
+            reference(origin),
+            reference(axis),
+            reference(reference_direction),
+        ],
+    );
+    let along = push_direction(file, [0.0, 0.0, 1.0]);
+    file.push(
+        "IFCEXTRUDEDAREASOLID",
+        vec![
+            reference(profile),
+            reference(position),
+            reference(along),
+            lengths.value(prism.depth),
+        ],
+    )
+}
+
+/// A profile's boundary as a closed `IfcPolyline`.
+///
+/// ISO 10303-42 makes a polyline closed by repeating its first point as its
+/// last, which is what `IfcArbitraryClosedProfileDef` requires of the curve it
+/// is given.
+fn push_profile_curve(
+    file: &mut StepFile,
+    lengths: Lengths,
+    boundary: &[[f64; 2]],
+) -> EntityRef {
+    let mut points: Vec<StepValue> = boundary
+        .iter()
+        .map(|point| reference(push_cartesian_point_2d(file, lengths, *point)))
+        .collect();
+    if let Some(first) = points.first().cloned() {
+        points.push(first);
+    }
+    file.push("IFCPOLYLINE", vec![StepValue::List(points)])
 }
 
 /// `IfcAdvancedBrep`/`IfcClosedShell` when [`BimBrep::complete`] holds, so a
@@ -1151,14 +1376,25 @@ fn push_brep_item(
     Some((item, representation_type))
 }
 
-/// One body's shape representation, from the item [`push_brep_item`] wrote.
+/// One body's shape representation: the sweep it is, where it is one, and
+/// otherwise the item [`push_brep_item`] wrote.
 fn push_brep(
     file: &mut StepFile,
     brep: &BimBrep,
     representation_context: EntityRef,
     frame: GeometryFrame,
+    report: &mut SolidReport,
 ) -> Option<EntityRef> {
-    let (item, representation_type) = push_brep_item(file, brep, frame)?;
+    let read = prism_of(brep, frame);
+    report.saw(read.as_ref().map_err(|refusal| *refusal), brep.faces.len());
+    note_curves(brep, report);
+    let (item, representation_type) = match read {
+        Ok(prism) => (
+            push_extruded_area_solid(file, &prism, frame.lengths),
+            "SweptSolid",
+        ),
+        Err(_) => push_brep_item(file, brep, frame)?,
+    };
     let body = push_body_representation(
         file,
         representation_context,
@@ -1185,7 +1421,33 @@ fn push_assembly(
     parts: &[BimBrep],
     representation_context: EntityRef,
     frame: GeometryFrame,
+    report: &mut SolidReport,
 ) -> Option<EntityRef> {
+    if parts.is_empty() {
+        return None;
+    }
+    // Every member is recognised before any of them is written, because the
+    // `RepresentationType` has to be true of all the items under it: a set
+    // where one member is a sweep and the next is not is written as boundary
+    // representations throughout. Recognition reads and writes nothing, so
+    // asking first costs the file no entity that then goes unreferenced.
+    let read: Vec<Result<extrusion::Prism, NotAPrism>> =
+        parts.iter().map(|part| prism_of(part, frame)).collect();
+    for (part, outcome) in parts.iter().zip(&read) {
+        report.saw(outcome.as_ref().map_err(|refusal| *refusal), part.faces.len());
+        note_curves(part, report);
+    }
+    if let Ok(prisms) = read.into_iter().collect::<Result<Vec<_>, _>>() {
+        let items = prisms
+            .iter()
+            .map(|prism| push_extruded_area_solid(file, prism, frame.lengths))
+            .collect();
+        let body = push_body_representation(file, representation_context, "SweptSolid", items);
+        return Some(file.push(
+            "IFCPRODUCTDEFINITIONSHAPE",
+            vec![omitted(), omitted(), StepValue::List(vec![reference(body)])],
+        ));
+    }
     let mut items = Vec::with_capacity(parts.len());
     for part in parts {
         match push_brep_item(file, part, frame) {
@@ -3892,6 +4154,87 @@ mod tests {
             }],
             complete,
         }
+    }
+
+    /// A box is a sweep of its own footprint, and is written as one: the
+    /// profile states in four points what the shell states in six faces, and
+    /// the solid is the same solid.
+    #[test]
+    fn writes_a_box_as_the_sweep_of_its_footprint() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Wall;
+        model.elements[0].geometry = Some(BimGeometry::Brep(box_brep(true)));
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("'Body','SweptSolid'"), "{text}");
+        assert!(text.contains("=IFCARBITRARYCLOSEDPROFILEDEF(.AREA.,$,"));
+        assert!(
+            !text.contains("=IFCADVANCEDBREP(") && !text.contains("=IFCADVANCEDFACE("),
+            "the shell is not written beside the sweep"
+        );
+        // 1 x 2 x 3 metres, standing on its footprint: the depth is the
+        // height, and the profile is the metre-by-two-metre base.
+        let solid = text
+            .lines()
+            .find(|line| line.contains("=IFCEXTRUDEDAREASOLID("))
+            .expect("a swept solid");
+        assert!(solid.ends_with(",3.);"), "{solid}");
+        let profile = text
+            .lines()
+            .find(|line| line.contains("=IFCPOLYLINE("))
+            .expect("a profile curve");
+        // Four corners, and the first stated again to close the curve.
+        assert_eq!(profile.matches('#').count() - 1, 5, "{profile}");
+    }
+
+    /// The one thing a sweep may not do is stand in for a shell that is not
+    /// closed. An incomplete box is the same six faces with one of them
+    /// missing, as far as anything downstream can tell.
+    #[test]
+    fn writes_an_incomplete_box_as_the_open_shell_it_is() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Wall;
+        model.elements[0].geometry = Some(BimGeometry::Brep(box_brep(false)));
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("=IFCEXTRUDEDAREASOLID("), "{text}");
+        assert!(text.contains("'Body','SurfaceModel'"));
+    }
+
+    /// Every item under one `RepresentationType` has to be what the type says.
+    /// Two boxes are two sweeps; a box beside something that is not one keeps
+    /// the pair on the boundary-representation path rather than mixing them.
+    #[test]
+    fn writes_an_assembly_of_boxes_as_sweeps_and_a_mixed_one_as_shells() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Wall;
+        model.elements[0].geometry = Some(BimGeometry::Assembly(vec![
+            box_brep(true),
+            box_brep(true),
+        ]));
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("'Body','SweptSolid'"), "{text}");
+        assert_eq!(text.matches("=IFCEXTRUDEDAREASOLID(").count(), 2);
+
+        model.elements[0].geometry = Some(BimGeometry::Assembly(vec![
+            box_brep(true),
+            quarter_disc_brep(true),
+        ]));
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("=IFCEXTRUDEDAREASOLID("), "{text}");
+        assert!(text.contains("'Body','AdvancedBrep'"));
     }
 
     #[test]

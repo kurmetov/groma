@@ -1527,3 +1527,129 @@ mod tests {
         assert!((direction[2] - 2.0 / 5.0_f64.sqrt()).abs() < 1e-12);
     }
 }
+
+#[cfg(test)]
+mod prism_tests {
+    use super::{IDENTITY, Region, Vec3, prism};
+
+    /// The area a shell tiles to, which is what a viewer draws and what a
+    /// measurement of the model reads.
+    fn tiled_area(brep: bim_core::BimBrep) -> f64 {
+        let mesh = bim_mesh::tessellate(
+            &bim_core::BimGeometry::Brep(brep),
+            &bim_mesh::MeshOptions::default(),
+        );
+        let mut area = 0.0;
+        for triangle in mesh.indices.chunks_exact(3) {
+            let corner = |at: usize| {
+                let at = triangle[at] as usize * 3;
+                [
+                    mesh.positions[at],
+                    mesh.positions[at + 1],
+                    mesh.positions[at + 2],
+                ]
+            };
+            let (first, second, third) = (corner(0), corner(1), corner(2));
+            let along = [
+                second[0] - first[0],
+                second[1] - first[1],
+                second[2] - first[2],
+            ];
+            let across = [
+                third[0] - first[0],
+                third[1] - first[1],
+                third[2] - first[2],
+            ];
+            let cross = [
+                along[1] * across[2] - along[2] * across[1],
+                along[2] * across[0] - along[0] * across[2],
+                along[0] * across[1] - along[1] * across[0],
+            ];
+            area += 0.5 * cross.iter().map(|value| value * value).sum::<f64>().sqrt();
+        }
+        area
+    }
+
+    /// Twice the area of a ring, and its perimeter, in its own plane.
+    fn ring(points: &[Vec3]) -> (f64, f64) {
+        let mut twice = 0.0;
+        let mut perimeter = 0.0;
+        for (at, point) in points.iter().enumerate() {
+            let next = points[(at + 1) % points.len()];
+            twice += point[0] * next[1] - next[0] * point[1];
+            perimeter += ((next[0] - point[0]).powi(2) + (next[1] - point[1]).powi(2)).sqrt();
+        }
+        (twice.abs() / 2.0, perimeter)
+    }
+
+    fn expected(region: &Region, depth: f64) -> f64 {
+        let (mut area, mut perimeter) = ring(&region.outer);
+        for hole in &region.holes {
+            let (hole_area, hole_perimeter) = ring(hole);
+            area -= hole_area;
+            perimeter += hole_perimeter;
+        }
+        2.0 * area + perimeter * depth
+    }
+
+    /// Both caps of a swept profile must tile to the profile's own area.
+    #[test]
+    fn both_caps_of_a_prism_tile_to_the_profile_area() {
+        let region = Region {
+            outer: vec![
+                [0.0, 0.0, 0.0],
+                [4.0, 0.0, 0.0],
+                [4.0, 3.0, 0.0],
+                [2.0, 3.0, 0.0],
+                [2.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            holes: vec![vec![
+                [0.25, 0.25, 0.0],
+                [0.25, 0.75, 0.0],
+                [0.75, 0.75, 0.0],
+                [0.75, 0.25, 0.0],
+            ]],
+        };
+        let brep = prism(&region, [0.0, 0.0, 2.0], &IDENTITY).expect("a prism");
+        let area = tiled_area(brep);
+        let want = expected(&region, 2.0);
+        assert!((area - want).abs() < 1e-6, "tiled {area} m² of a solid with {want}");
+    }
+
+    /// One slab of the architectural corpus, to its own numbers: six corners
+    /// and two openings, swept 200 mm. Read through the boundary
+    /// representation the same solid tiles to 1099 m² of surface; read as the
+    /// sweep it tiled to 882, all of it lost on the cap the sweep runs from.
+    #[test]
+    fn a_corpus_slab_tiles_the_same_from_either_end() {
+        let region = Region {
+            outer: vec![
+                [0.0, -37.25, 0.0],
+                [14.65, -37.25, 0.0],
+                [14.65, 1.375, 0.0],
+                [10.1, 1.375, 0.0],
+                [10.1, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            holes: vec![
+                vec![
+                    [4.95, -17.2, 0.0],
+                    [4.95, -19.9, 0.0],
+                    [2.95, -19.9, 0.0],
+                    [2.95, -17.2, 0.0],
+                ],
+                vec![
+                    [2.75, -15.225, 0.0],
+                    [2.75, -19.125, 0.0],
+                    [0.2, -19.125, 0.0],
+                    [0.2, -15.225, 0.0],
+                ],
+            ],
+        };
+        let brep = prism(&region, [0.0, 0.0, 0.2], &IDENTITY).expect("a prism");
+        let area = tiled_area(brep);
+        let want = expected(&region, 0.2);
+        assert!((area - want).abs() < 1e-3, "tiled {area} m² of a solid with {want}");
+    }
+}

@@ -9,6 +9,8 @@
 //! by the standard rightmost-vertex construction, so the clipper only ever
 //! sees one simple polygon.
 
+use std::collections::HashMap;
+
 /// Two-dimensional point in a surface's parameter space.
 pub type Point2 = [f64; 2];
 
@@ -126,7 +128,26 @@ pub fn triangulate(outer: &[Point2], holes: &[&[Point2]]) -> Vec<[usize; 3]> {
     clip_ears(&chain)
 }
 
-/// Splice `hole` into `chain` along a mutually visible pair of vertices.
+/// Splice `hole` into `chain` along a pair of vertices that can see each
+/// other.
+///
+/// The hole is entered at its rightmost vertex and joined to the chain by the
+/// standard construction - cast a ray, take an endpoint of the edge it hits,
+/// step to a reflex vertex if one blocks the way - which is right for a hole
+/// in a plain ring. It is not always right once the chain carries a bridge
+/// already cut: on one slab of the architectural corpus, two openings whose
+/// rightmost vertices both see the same far corner, the second bridge was
+/// derived onto a vertex it could not reach, the chain stopped being simple,
+/// and the ear clipper stalled with a third of the cap tiled.
+///
+/// So the derived bridge is **tested** - it must cross nothing, run through
+/// the region, and land on a corner no bridge has landed on already. That last
+/// one is what the slab needed: both openings derived onto the same far
+/// corner, and a corner cut twice leaves the clipper an ear it cannot tell
+/// from its own corner. Where the derived bridge fails a test, the chain is
+/// searched for a vertex that passes, nearest first; where nothing passes the
+/// derived bridge is used anyway, which is what this did before the test
+/// existed.
 fn bridge_hole(chain: &mut Vec<Vertex>, hole: &[Vertex]) {
     let Some(hole_index) = hole
         .iter()
@@ -141,7 +162,21 @@ fn bridge_hole(chain: &mut Vec<Vertex>, hole: &[Vertex]) {
         return;
     };
     let origin = hole[hole_index].at;
-    let Some(outer_index) = visible_from(chain, origin) else {
+    // How often each corner of the caller's own list is already in the chain:
+    // more than once means a bridge is cut there.
+    let mut cut: HashMap<usize, usize> = HashMap::new();
+    for vertex in chain.iter() {
+        *cut.entry(vertex.origin).or_default() += 1;
+    }
+    let free = |chain: &[Vertex], index: usize| {
+        cut.get(&chain[index].origin).copied().unwrap_or(0) <= 1
+    };
+    let derived = visible_from(chain, origin);
+    let outer_index = match derived {
+        Some(index) if free(chain, index) && reaches(chain, hole, hole_index, index) => Some(index),
+        _ => nearest_reachable(chain, hole, hole_index, origin, &free).or(derived),
+    };
+    let Some(outer_index) = outer_index else {
         return;
     };
 
@@ -154,6 +189,25 @@ fn bridge_hole(chain: &mut Vec<Vertex>, hole: &[Vertex]) {
     spliced.push(chain[outer_index]);
     spliced.extend_from_slice(&chain[outer_index + 1..]);
     *chain = spliced;
+}
+
+/// The nearest chain vertex the hole's entry vertex can actually be joined to.
+fn nearest_reachable(
+    chain: &[Vertex],
+    hole: &[Vertex],
+    hole_index: usize,
+    origin: Point2,
+    free: &impl Fn(&[Vertex], usize) -> bool,
+) -> Option<usize> {
+    let mut order: Vec<usize> = (0..chain.len()).collect();
+    order.sort_by(|left, right| {
+        distance2(chain[*left].at, origin)
+            .partial_cmp(&distance2(chain[*right].at, origin))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order
+        .into_iter()
+        .find(|index| free(chain, *index) && reaches(chain, hole, hole_index, *index))
 }
 
 /// The chain vertex to bridge `origin` to: Eberly's construction, casting a
@@ -221,6 +275,94 @@ fn visible_from(chain: &[Vertex], origin: Point2) -> Option<usize> {
     Some(chosen)
 }
 
+/// Can the hole's entry vertex be joined to `target` without leaving the
+/// region or crossing anything?
+///
+/// Three things are asked, and they are the whole of what a bridge needs: the
+/// segment crosses no edge of the chain or of the hole, it runs inside the
+/// chain, and it runs outside the hole. Touching at the two ends does not
+/// count as crossing - that is what a bridge is - and neither does touching
+/// another vertex that sits exactly on the line, which a bridge already cut
+/// leaves behind.
+fn reaches(chain: &[Vertex], hole: &[Vertex], hole_index: usize, target: usize) -> bool {
+    let from = hole[hole_index].at;
+    let to = chain[target].at;
+    if distance2(from, to) <= f64::MIN_POSITIVE {
+        return false;
+    }
+    for (ring, skip) in [(chain, Some(target)), (hole, Some(hole_index))] {
+        for index in 0..ring.len() {
+            let next = (index + 1) % ring.len();
+            if skip == Some(index) || skip == Some(next) {
+                continue;
+            }
+            if crosses(from, to, ring[index].at, ring[next].at) {
+                return false;
+            }
+        }
+    }
+    let middle = [f64::midpoint(from[0], to[0]), f64::midpoint(from[1], to[1])];
+    encloses(chain, middle) && !encloses(hole, middle)
+}
+
+/// Do two segments meet anywhere but at their own ends?
+fn crosses(a: Point2, b: Point2, c: Point2, d: Point2) -> bool {
+    let (first, second) = (cross(a, b, c), cross(a, b, d));
+    let (third, fourth) = (cross(c, d, a), cross(c, d, b));
+    // A shared endpoint, or a corner that lies on the line: neither is a
+    // crossing, and a bridge meets both.
+    if coincident(a, c) || coincident(a, d) || coincident(b, c) || coincident(b, d) {
+        return false;
+    }
+    if first == 0.0 && on_segment(a, b, c) {
+        return true;
+    }
+    if second == 0.0 && on_segment(a, b, d) {
+        return true;
+    }
+    if third == 0.0 && on_segment(c, d, a) {
+        return true;
+    }
+    if fourth == 0.0 && on_segment(c, d, b) {
+        return true;
+    }
+    (first > 0.0) != (second > 0.0) && (third > 0.0) != (fourth > 0.0)
+}
+
+/// Does `point`, known to be on the line through `a` and `b`, lie between
+/// them?
+fn on_segment(a: Point2, b: Point2, point: Point2) -> bool {
+    point[0] >= a[0].min(b[0])
+        && point[0] <= a[0].max(b[0])
+        && point[1] >= a[1].min(b[1])
+        && point[1] <= a[1].max(b[1])
+}
+
+/// Is `point` inside `ring`? Even-odd, which is what a chain carrying bridges
+/// asks for: a corridor cut in and back out crosses any ray twice.
+fn encloses(ring: &[Vertex], point: Point2) -> bool {
+    let mut inside = false;
+    for index in 0..ring.len() {
+        let start = ring[index].at;
+        let end = ring[(index + 1) % ring.len()].at;
+        if (start[1] > point[1]) != (end[1] > point[1]) {
+            let span = end[1] - start[1];
+            if span.abs() <= f64::MIN_POSITIVE {
+                continue;
+            }
+            let ratio = (point[1] - start[1]) / span;
+            if (end[0] - start[0]).mul_add(ratio, start[0]) > point[0] {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn distance2(a: Point2, b: Point2) -> f64 {
+    (a[0] - b[0]).mul_add(a[0] - b[0], (a[1] - b[1]) * (a[1] - b[1]))
+}
+
 /// Ear-clip one simple, counter-clockwise polygon.
 fn clip_ears(chain: &[Vertex]) -> Vec<[usize; 3]> {
     let mut remaining: Vec<usize> = (0..chain.len()).collect();
@@ -231,6 +373,12 @@ fn clip_ears(chain: &[Vertex]) -> Vec<[usize; 3]> {
     let mut cursor = 0_usize;
     while remaining.len() > 3 {
         if without_progress > remaining.len() {
+            // What has been clipped so far, which is a region with a piece
+            // missing and no sign of it for the caller. Whether that is better
+            // than nothing is a question of its own: on the architectural
+            // model 3 879 faces come back partly tiled, and refusing them
+            // would take the skipped-face count from 6 005 to 9 884 and show
+            // holes where there is now something wrong. Left as it was found.
             return triangles;
         }
         let count = remaining.len();
@@ -356,5 +504,54 @@ mod tests {
     #[test]
     fn a_degenerate_loop_yields_nothing_rather_than_a_guess() {
         assert!(triangulate(&[[0.0, 0.0], [1.0, 0.0]], &[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::{Point2, triangulate};
+
+    fn tiled(outer: &[Point2], holes: &[&[Point2]]) -> f64 {
+        let all: Vec<Point2> = outer
+            .iter()
+            .chain(holes.iter().flat_map(|hole| hole.iter()))
+            .copied()
+            .collect();
+        let mut area = 0.0;
+        for [a, b, c] in triangulate(outer, holes) {
+            let (a, b, c) = (all[a], all[b], all[c]);
+            area += ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs() / 2.0;
+        }
+        area
+    }
+
+    /// One slab of the architectural corpus, in the parameter plane of the cap
+    /// the sweep runs from - which is the face that tiled to 320 m² of its own
+    /// 536, because a hole was bridged to a vertex the bridge could not see.
+    #[test]
+    fn tiles_a_slab_of_the_corpus_from_the_cap_that_failed() {
+        let outer: Vec<Point2> = vec![
+            [0.0, 0.0],
+            [0.0, -10.1],
+            [-1.375, -10.1],
+            [-1.375, -14.65],
+            [37.25, -14.65],
+            [37.25, 0.0],
+        ];
+        let first: Vec<Point2> = vec![
+            [15.225, -0.2],
+            [19.125, -0.2],
+            [19.125, -2.75],
+            [15.225, -2.75],
+        ];
+        let second: Vec<Point2> = vec![
+            [17.2, -2.95],
+            [19.9, -2.95],
+            [19.9, -4.95],
+            [17.2, -4.95],
+        ];
+        let want = 551.96875 - 5.4 - 9.945;
+        let area = tiled(&outer, &[&first, &second]);
+        assert!((area - want).abs() < 1e-6, "tiled {area}, want {want}");
     }
 }

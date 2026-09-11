@@ -12,7 +12,7 @@ use std::{
 };
 
 use bim_mesh::MeshOptions;
-use ifc_export::{LengthUnit, MetadataOptions, metadata_ifc, uuid_v5};
+use ifc_export::{LengthUnit, MetadataOptions, extrusion::SolidReport, metadata_ifc_reported, uuid_v5};
 // The whole semantic reconstruction moved into `rvt-import`. Glob-imported
 // because the probe commands below read the same intermediate the pipeline
 // builds, and naming each item here would be a second list to keep in step.
@@ -89,6 +89,43 @@ pub(crate) fn export_json(
         stage.total();
     }
     Ok(())
+}
+
+/// What the bodies came to: how many were written as the sweep of a profile,
+/// and for the rest, which test of [`ifc_export::extrusion`] refused them.
+///
+/// A funnel rather than a score. The refusals are what says where the next
+/// step is - a file whose solids are mostly refused for a curved face is one
+/// waiting on an arc in the profile, and one refused for caps in pieces is
+/// waiting on coplanar faces being merged.
+fn report_solids(report: &SolidReport) {
+    let (solids, faces) = (report.solids(), report.faces());
+    if solids == 0 {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    // Counts within one file, far below the precision of a double.
+    let share = |count: usize, whole: usize| 100.0 * count as f64 / whole as f64;
+    let line = |what: &str, tally: &ifc_export::extrusion::Tally| {
+        println!(
+            "{what}: {} ({:.1}%), holding {} faces ({:.1}%)",
+            tally.solids,
+            share(tally.solids, solids),
+            tally.faces,
+            share(tally.faces, faces)
+        );
+    };
+    line(
+        &format!("Solids written as a swept profile, of {solids}"),
+        &report.swept,
+    );
+    for (refusal, tally) in &report.refused {
+        line(&format!("  {}", refusal.label()), tally);
+    }
+    line(
+        "  of the curved, those whose curves turn about one axis",
+        &report.curves_about_one_axis,
+    );
 }
 
 /// The export setup a run asks for: a saved file, and whatever the flags say
@@ -284,7 +321,7 @@ pub(crate) fn export_ifc(
         settings,
     };
     stage.begins("assemble");
-    let file = metadata_ifc(&conversion.model, &options)?;
+    let (file, solids) = metadata_ifc_reported(&conversion.model, &options)?;
     stage.finished("assemble");
 
     stage.begins("write");
@@ -329,6 +366,7 @@ pub(crate) fn export_ifc(
     println!("Building storeys: {level_count}");
     println!("Elements: {element_count}");
     println!("Elements with verified geometry: {geometry_count}");
+    report_solids(&solids);
     conversion.report_model();
     conversion.report_geometry_funnels();
     conversion.report_properties();

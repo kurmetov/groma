@@ -101,6 +101,50 @@ a profile and a depth - where this exporter writes the boundary representation
 it recovered. Recognising a prism and writing it as one is the next lever, and
 it is a change to what the file says rather than to how it says it.
 
+## What a solid is written as
+
+A boundary representation states every face of a solid, and this exporter wrote
+them all. Revit's own export writes a wall, a floor or a column as a profile
+and a depth instead, and that difference is most of the size gap between the
+two files. A solid is now recognised as a prism - one planar profile swept
+along a straight line - and written as an `IfcExtrudedAreaSolid` where it is
+one:
+
+| Source | Solids swept | The faces they held | Export before | after |
+| --- | ---: | ---: | ---: | ---: |
+| 231 MB architectural `.rvt` | 9 247 of 12 939 (71.5%) | 16.3% | 207.5 MB | **179.2 MB** |
+| 185 MB electrical `.rvt` | 1 652 of 6 723 (24.6%) | 4.7% | 105.5 MB | **102.1 MB** |
+| 454 MB structural `.rvt` | 71 of 787 (9.0%) | 3.1% | 8.9 MB | **8.8 MB** |
+| 93 MB plumbing `.rvt` | 196 of 9 076 (2.2%) | 0.5% | 120.6 MB | **120.2 MB** |
+
+Nothing is simplified to get there. A shell is written as a sweep only where it
+**is** that sweep: every face planar, the shell closed - each edge used once
+from either side, all in one piece - exactly two faces square to the direction
+and facing each other, every other face parallel to it, and the two bounding
+the same region. Those tests are what make the claim, and
+[`extrusion.rs`](crates/ifc-export/src/extrusion.rs) carries the argument that
+they are enough, along with the two shapes in the corpus that taught it what
+they had to be.
+
+An export says which test refused the rest, because that is where the next step
+is rather than a guess about it:
+
+```
+Solids written as a swept profile, of 12939: 9247 (71.5%), holding 63459 faces (16.3%)
+  a face was curved: 88 (0.7%), holding 3784 faces (1.0%)
+  an edge was curved: 1938 (15.0%), holding 290712 faces (74.5%)
+  the caps were stated in pieces: 1198 (9.3%), holding 12862 faces (3.3%)
+  ...
+  of the curved, those whose curves turn about one axis: 567 (4.4%), holding 6179 faces (1.6%)
+```
+
+Read it and the arc stops being tempting: three quarters of that model's faces
+sit in solids with a curved edge, but only a twentieth of those solids turn all
+their curves about one axis, which a swept profile would need. A profile that
+could hold an arc is worth 1.6% of the faces there, and 8.8% to 15.6% on the
+other three. The size that is left is in solids that are genuinely complicated,
+not in a form this exporter has not learned yet.
+
 ## Performance
 
 A conversion is measured the way decode accuracy is: against the reference
