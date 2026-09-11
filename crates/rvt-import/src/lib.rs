@@ -1522,10 +1522,13 @@ fn decode_geometry(
             // between them.
             let placement_box = body_placement_box(exact_bounds, graph_bounds);
             let (brep, placed) = place_declared_body(brep, placement_box.as_ref());
-            // Second pass, and only where the first found nothing: a record
-            // whose solid the file joins to the geometry of what was cut out
-            // of it. See `place_body_less_its_cut_faces`.
-            let (brep, placed) = if placed {
+            // Second pass, where the first left something other than a closed
+            // solid: either nothing placed, or what placed does not bound a
+            // volume by its own loops because the file joined a face to it
+            // that the record's box does not bound. See
+            // `place_body_less_its_cut_faces`; a body that places and closes
+            // is never re-read, so nothing that is a solid today can change.
+            let (brep, placed) = if placed && brep.bounds_a_volume() {
                 (brep, placed)
             } else {
                 place_body_less_its_cut_faces(
@@ -1533,6 +1536,7 @@ fn decode_geometry(
                     classes,
                     &context.brep_body_class_indices,
                     placement_box.as_ref(),
+                    &brep,
                 )
                 .map_or((brep, placed), |trimmed| (trimmed, true))
             };
@@ -2495,29 +2499,53 @@ pub const FACE_INSIDE_THE_BOX_FLAG: i64 = 0x0008_0000;
 /// Place the body a record's box bounds, after dropping the faces that are not
 /// in it.
 ///
-/// A wall's record does not hold the wall alone. Where something is cut out of
-/// it, the file joins the cut geometry into the same shell: element 4975869 of
-/// AR S1 declares one closed shell of 26 faces of which the wall is 22, the
-/// other four being the far caps of two window voids, 0.12 m past one face of
-/// the wall and 0.25 m past the other. `GBRep.m_pFaces` and `GEdge.m_pFace`
-/// cannot separate those - the file declares them as one shell - so the wall
-/// had no body at all: nothing reproduced the box, and the box alone is not
-/// offered as an extent.
+/// A wall's record does not hold the wall alone, and the file joins what is
+/// beside it into the same shell in two ways.
 ///
-/// The faces themselves say which is which, in [`FACE_INSIDE_THE_BOX_FLAG`].
-/// Dropping the ones that lack it and assembling the record again is what this
-/// does, and the result is accepted only when it meets the test the first pass
-/// applies plus one more: exactly one body reproduces the box, and its faces
-/// bound a volume by their own loops
+/// *Outside the box.* Where something is cut out of the wall, the cut geometry
+/// is joined to it: element 4975869 of AR S1 declares one closed shell of 26
+/// faces of which the wall is 22, the other four being the far caps of two
+/// window voids, 0.12 m past one face of the wall and 0.25 m past the other.
+/// `GBRep.m_pFaces` and `GEdge.m_pFace` cannot separate those - the file
+/// declares them as one shell - so the wall had no body at all: nothing
+/// reproduced the box, and the box alone is not offered as an extent.
+///
+/// *Inside it.* A face can also sit in the interior of the shell, where it
+/// changes no extent and so costs the body nothing at placement: wall 5572231
+/// is a 2 750 x 250 x 3 243 mm wall of 7 faces, and the seventh spans its whole
+/// footprint 3 004 mm up, at the top of the layers its compound structure
+/// separates on. The box is reproduced with it, and so it was exported - as a
+/// closed solid whose volume is the wall's 2.206 m³ plus that face's own
+/// contribution to the divergence integral, 8.441 m³ in total. Revit's own
+/// number for it is 2.206 m³.
+///
+/// The faces themselves say which is which in both cases, in
+/// [`FACE_INSIDE_THE_BOX_FLAG`]. Dropping the ones that lack it and assembling
+/// the record again is what this does, and the result is accepted only when it
+/// meets the test the first pass applies plus two more: exactly one body
+/// reproduces the box, its faces bound a volume by their own loops
 /// ([`rvt_model::SymbolBrep::bounds_a_volume`]) - so a trim that opens a shell
-/// is refused rather than exported. Nothing that places on
-/// the first pass reaches this, so no body placed today can change.
+/// is refused rather than exported - and the body it places is `first_pass`
+/// less some of its faces rather than a different body.
+///
+/// That last guard is what the interior case needs and the exterior one never
+/// exercises. A record trimmed of a face beyond its box can place a *second*
+/// body on that box: element 7281744 is a 10 mm panel whose shell reaches
+/// y = 4.5276 ft, where its box ends, and whose two coincident layer sheets
+/// reach it too - so dropping the face that carries the shell there leaves the
+/// sheets to reproduce the box between them, and two coincident sheets pair
+/// every edge, so they bound a volume as well. What they bound is not the
+/// panel: 254 ft³, where the panel's whole box holds 0.25 ft³. Requiring a
+/// subset refuses all 98 such records on AR S1 and
+/// costs nothing anywhere: of the 4 407 trims the corpus accepts through the
+/// unplaced door, every one is already a subset.
 #[must_use]
 pub fn place_body_less_its_cut_faces(
     objects: &[rvt_model::SerialObject],
     classes: &rvt_model::BrepClassIndexes,
     body_classes: &[u16],
     bounds: Option<&GElementBounds>,
+    first_pass: &rvt_model::SymbolBrep,
 ) -> Option<rvt_model::SymbolBrep> {
     let bounds = bounds?;
     let mut dropped = 0_usize;
@@ -2537,7 +2565,18 @@ pub fn place_body_less_its_cut_faces(
     }
     let trimmed = rvt_model::assemble_symbol_brep(&kept, classes, body_classes);
     let (trimmed, placed) = place_declared_body(trimmed, Some(bounds));
-    (placed && trimmed.bounds_a_volume()).then_some(trimmed)
+    (placed && trimmed.bounds_a_volume() && is_trim_of(&trimmed, first_pass)).then_some(trimmed)
+}
+
+/// Whether one body is another read again with some of its faces dropped:
+/// every face it carries is one the other carried, and it carries fewer.
+fn is_trim_of(trimmed: &rvt_model::SymbolBrep, first_pass: &rvt_model::SymbolBrep) -> bool {
+    !trimmed.face_ids.is_empty()
+        && trimmed.face_ids.len() < first_pass.face_ids.len()
+        && trimmed
+            .face_ids
+            .iter()
+            .all(|face| first_pass.face_ids.contains(face))
 }
 
 /// Whether a body is already placed, by reproducing the bounds block carried
@@ -5251,6 +5290,448 @@ mod tests {
             &quarter,
             &bounds([40.0, 4.5, 0.0], [41.0, 6.0, 9.0])
         ));
+    }
+
+    /// Schema class indices for the fixtures below. Arbitrary: the module
+    /// takes them from the caller and never looks a class up by name.
+    const FIXTURE_FACE: u16 = 700;
+    const FIXTURE_EDGE_LOOP: u16 = 701;
+    const FIXTURE_EDGE: u16 = 702;
+    const FIXTURE_PLANE: u16 = 703;
+    const FIXTURE_GBREP: u16 = 704;
+
+    fn fixture_classes() -> rvt_model::BrepClassIndexes {
+        rvt_model::BrepClassIndexes {
+            face: FIXTURE_FACE,
+            edge_loop: FIXTURE_EDGE_LOOP,
+            edge: FIXTURE_EDGE,
+            plane: FIXTURE_PLANE,
+            // Nothing in these fixtures is curved, and a class index no
+            // object carries resolves nothing.
+            cyl_surf: 800,
+            cone_surf: 801,
+            surf_rev: 802,
+            ruled_surf: 803,
+            g_line: 804,
+            g_arc: 805,
+        }
+    }
+
+    fn fixture_object(object_id: u32, class_index: u16) -> rvt_model::SerialObject {
+        rvt_model::SerialObject {
+            object_id,
+            class_index,
+            offset: 0,
+            bytes: 0,
+            references: Vec::new(),
+            identifiers: Vec::new(),
+            numbers: Vec::new(),
+            integers: Vec::new(),
+            strings: Vec::new(),
+            small_integers: Vec::new(),
+            alternate_integers: Vec::new(),
+        }
+    }
+
+    /// One face of a fixture: the plane it lies in, the corners its boundary
+    /// runs through in order, whether it declares a loop object, and whether
+    /// it carries [`FACE_INSIDE_THE_BOX_FLAG`].
+    ///
+    /// `joins` names the face on the other side of each of its edges, in the
+    /// same order as `corners`, for the edges no other face of the fixture
+    /// traverses. That is how a face lands *inside* a shell: its edges name
+    /// the faces they cut across, and those faces' own loops never use them.
+    struct FixtureFace {
+        face: u32,
+        plane: u32,
+        origin: [f64; 3],
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+        corners: Vec<[f64; 3]>,
+        joins: Vec<u32>,
+        declares_a_loop: bool,
+        inside_the_box: bool,
+    }
+
+    /// One edge of a fixture: where it runs, and for each side the face that
+    /// names it and whether that face's own boundary traverses it.
+    struct FixtureEdge {
+        from: [f64; 3],
+        to: [f64; 3],
+        sides: Vec<(usize, bool)>,
+    }
+
+    /// The edges these faces run between their corners, and for each face the
+    /// edge its every step reaches.
+    ///
+    /// Corners are matched bit for bit, which is exact here because a fixture
+    /// states the same corner to both faces that reach it.
+    fn fixture_edges(faces: &[FixtureFace]) -> (Vec<FixtureEdge>, Vec<Vec<usize>>) {
+        let key = |point: [f64; 3]| point.map(f64::to_bits);
+        let index_of = |wanted: u32| {
+            faces
+                .iter()
+                .position(|face| face.face == wanted)
+                .expect("the joined face is in the fixture")
+        };
+        let mut edges: Vec<FixtureEdge> = Vec::new();
+        let mut by_ends: BTreeMap<([u64; 3], [u64; 3]), usize> = BTreeMap::new();
+        let mut steps: Vec<Vec<usize>> = Vec::new();
+        for (at, face) in faces.iter().enumerate() {
+            let mut face_steps = Vec::new();
+            for (index, from) in face.corners.iter().enumerate() {
+                let to = face.corners[(index + 1) % face.corners.len()];
+                let (first, last) = (key(*from), key(to));
+                let ends = if first <= last {
+                    (first, last)
+                } else {
+                    (last, first)
+                };
+                let fresh = !by_ends.contains_key(&ends);
+                let edge = *by_ends.entry(ends).or_insert_with(|| {
+                    edges.push(FixtureEdge {
+                        from: *from,
+                        to,
+                        sides: Vec::new(),
+                    });
+                    edges.len() - 1
+                });
+                edges[edge].sides.push((at, true));
+                if fresh {
+                    if let Some(other) = face.joins.get(index) {
+                        edges[edge].sides.push((index_of(*other), false));
+                    }
+                }
+                assert!(edges[edge].sides.len() < 3, "three faces reached one edge");
+                face_steps.push(edge);
+            }
+            steps.push(face_steps);
+        }
+        (edges, steps)
+    }
+
+    /// Assemble the `SerialObject`s a record would carry for these faces: a
+    /// `Plane` and a `Face` each, one `EdgeLoop` per face that declares one,
+    /// one `Edge` for each pair of corners two faces run between - with the
+    /// `(u, v)` each of the two faces states it at - and one `GBRep` node
+    /// naming every face.
+    ///
+    /// Every `Edge` is written in the traversal order of the first face that
+    /// reached it, with `m_flags` clear, so the *other* face reads it
+    /// reversed: that is how two faces sharing an edge traverse it, and it is
+    /// what lets these fixtures be written as corner lists.
+    fn fixture_record(faces: &[FixtureFace]) -> Vec<rvt_model::SerialObject> {
+        let (edges, steps) = fixture_edges(faces);
+        let mut objects = fixture_surface_objects(faces, &steps);
+        objects.extend(fixture_edge_objects(faces, &edges, &steps));
+        let mut node = fixture_object(500, FIXTURE_GBREP);
+        node.references = faces
+            .iter()
+            .map(|face| rvt_model::GElementNodeReference {
+                object_id: face.face,
+                class_index: FIXTURE_FACE,
+            })
+            .collect();
+        objects.push(node);
+        objects
+    }
+
+    fn fixture_edge_id(edge: usize) -> u32 {
+        1000 + u32::try_from(edge).unwrap()
+    }
+
+    fn fixture_loop_id(face: &FixtureFace) -> u32 {
+        face.face + 100
+    }
+
+    /// A `Plane`, a `Face` and - where the face declares one - an `EdgeLoop`
+    /// for each of these faces.
+    fn fixture_surface_objects(
+        faces: &[FixtureFace],
+        steps: &[Vec<usize>],
+    ) -> Vec<rvt_model::SerialObject> {
+        let mut objects = Vec::new();
+        for face in faces {
+            let mut plane = fixture_object(face.plane, FIXTURE_PLANE);
+            plane.numbers = vec![0.0; 4];
+            plane.numbers.extend(face.origin);
+            plane.numbers.extend(face.x_axis);
+            plane.numbers.extend(face.y_axis);
+            objects.push(plane);
+
+            let mut object = fixture_object(face.face, FIXTURE_FACE);
+            object.references = vec![
+                rvt_model::GElementNodeReference {
+                    object_id: if face.declares_a_loop {
+                        fixture_loop_id(face)
+                    } else {
+                        0
+                    },
+                    class_index: FIXTURE_EDGE_LOOP,
+                },
+                rvt_model::GElementNodeReference {
+                    object_id: face.plane,
+                    class_index: FIXTURE_PLANE,
+                },
+            ];
+            // `GFaceMarks::read` wants every field: m_tag, m_controlCommand,
+            // m_categoryId, m_cutType and m_renderStyleId, then the two flag
+            // words.
+            object.integers = vec![i32::try_from(face.face).unwrap(), 0, -1, 0, -1];
+            object.alternate_integers = vec![
+                if face.inside_the_box {
+                    FACE_INSIDE_THE_BOX_FLAG
+                } else {
+                    0
+                },
+                0x4,
+            ];
+            objects.push(object);
+        }
+        for (at, face) in faces.iter().enumerate() {
+            if !face.declares_a_loop {
+                continue;
+            }
+            let mut object = fixture_object(fixture_loop_id(face), FIXTURE_EDGE_LOOP);
+            object.references = vec![rvt_model::GElementNodeReference {
+                object_id: 0,
+                class_index: FIXTURE_EDGE_LOOP,
+            }];
+            object.identifiers = vec![
+                face.face,
+                fixture_edge_id(steps[at][0]),
+                fixture_edge_id(steps[at][steps[at].len() - 1]),
+            ];
+            objects.push(object);
+        }
+        objects
+    }
+
+    /// One `Edge` per edge, carrying the two faces that name it, the next
+    /// link each of them reads, and the `(u, v)` each states its endpoints at.
+    fn fixture_edge_objects(
+        faces: &[FixtureFace],
+        edges: &[FixtureEdge],
+        steps: &[Vec<usize>],
+    ) -> Vec<rvt_model::SerialObject> {
+        let mut objects = Vec::new();
+        for (at, edge) in edges.iter().enumerate() {
+            let mut object = fixture_object(fixture_edge_id(at), FIXTURE_EDGE);
+            let face_of = |side: usize| {
+                edge.sides
+                    .get(side)
+                    .map_or(0, |(face, _)| faces[*face].face)
+            };
+            // `identifiers` is [pFace0, pFace1, next0, next1, prev0, prev1].
+            // Only the next links are read, and only for a face that declares
+            // a loop and traverses this edge; the loop's own id ends the ring.
+            let next = |side: usize| {
+                let Some(&(face, traverses)) = edge.sides.get(side) else {
+                    return 0;
+                };
+                if !traverses || !faces[face].declares_a_loop {
+                    return 0;
+                }
+                let index = steps[face]
+                    .iter()
+                    .position(|step| *step == at)
+                    .expect("the face reached this edge");
+                if index + 1 == steps[face].len() {
+                    fixture_loop_id(&faces[face])
+                } else {
+                    fixture_edge_id(steps[face][index + 1])
+                }
+            };
+            object.identifiers = vec![face_of(0), face_of(1), next(0), next(1), 0, 0];
+            object.small_integers = vec![0];
+            let uv = |point: [f64; 3], side: usize| -> [f64; 2] {
+                let Some((face, _)) = edge.sides.get(side) else {
+                    return [0.0, 0.0];
+                };
+                let face = &faces[*face];
+                let local = [
+                    point[0] - face.origin[0],
+                    point[1] - face.origin[1],
+                    point[2] - face.origin[2],
+                ];
+                let dot =
+                    |axis: [f64; 3]| local[0] * axis[0] + local[1] * axis[1] + local[2] * axis[2];
+                [dot(face.x_axis), dot(face.y_axis)]
+            };
+            // An `EdgePnt` pair per endpoint, each face's own first: the
+            // layout `resolve_edge` reads off the end of the numbers.
+            for point in [edge.from, edge.to] {
+                let (first, second) = (uv(point, 0), uv(point, 1));
+                object
+                    .numbers
+                    .extend([first[0], first[1], second[0], second[1]]);
+            }
+            objects.push(object);
+        }
+        objects
+    }
+
+    /// The extent of the fixture box: 1 x 1 x 2, from the origin.
+    const FIXTURE_BOX: [f64; 3] = [1.0, 1.0, 2.0];
+
+    /// The six faces of [`FIXTURE_BOX`], each declaring a loop and each wound
+    /// so that its normal points out of the box - which is what lets two
+    /// faces share an edge, since they have to traverse it in opposite
+    /// directions.
+    ///
+    /// Face ids run 1..=6 in the order the axes come: 1 and 2 are x = 0 and
+    /// x = 1, 3 and 4 are y = 0 and y = 1, 5 and 6 are z = 0 and z = 2.
+    fn fixture_box_faces() -> Vec<FixtureFace> {
+        let mut faces = Vec::new();
+        for axis in 0..3 {
+            for far in [false, true] {
+                let (first, second) = ((axis + 1) % 3, (axis + 2) % 3);
+                // The near face's normal is -axis, so its two in-plane axes
+                // come the other way round.
+                let (first, second) = if far {
+                    (first, second)
+                } else {
+                    (second, first)
+                };
+                let mut origin = [0.0; 3];
+                if far {
+                    origin[axis] = FIXTURE_BOX[axis];
+                }
+                let mut x_axis = [0.0; 3];
+                x_axis[first] = 1.0;
+                let mut y_axis = [0.0; 3];
+                y_axis[second] = 1.0;
+                let corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+                    .into_iter()
+                    .map(|uv| {
+                        let mut corner = origin;
+                        corner[first] += uv[0] * FIXTURE_BOX[first];
+                        corner[second] += uv[1] * FIXTURE_BOX[second];
+                        corner
+                    })
+                    .collect();
+                let face = u32::try_from(axis * 2).unwrap() + u32::from(far) + 1;
+                faces.push(FixtureFace {
+                    face,
+                    plane: face + 50,
+                    origin,
+                    x_axis,
+                    y_axis,
+                    corners,
+                    joins: Vec::new(),
+                    declares_a_loop: true,
+                    inside_the_box: true,
+                });
+            }
+        }
+        faces
+    }
+
+    /// [`fixture_box_faces`] plus one face spanning the box's footprint
+    /// halfway up - the shape of wall 5572231, whose seventh face is the top
+    /// of the layers its compound structure separates on.
+    ///
+    /// The interior face declares no loop, as that wall's does not, so it is
+    /// ordered from the edges that name it; the six faces of the box declare
+    /// theirs, which is what leaves the interior face's edges over instead of
+    /// breaking their own boundaries.
+    fn box_with_an_interior_face(interior_inside_the_box: bool) -> Vec<FixtureFace> {
+        let mut faces = fixture_box_faces();
+        let height = FIXTURE_BOX[2] / 2.0;
+        faces.push(FixtureFace {
+            face: 7,
+            plane: 57,
+            origin: [0.0, 0.0, height],
+            x_axis: [1.0, 0.0, 0.0],
+            y_axis: [0.0, 1.0, 0.0],
+            corners: vec![
+                [0.0, 0.0, height],
+                [FIXTURE_BOX[0], 0.0, height],
+                [FIXTURE_BOX[0], FIXTURE_BOX[1], height],
+                [0.0, FIXTURE_BOX[1], height],
+            ],
+            // Each of its edges cuts across one of the four sides, whose own
+            // loops never use them: y = 0, then x = 1, y = 1 and x = 0.
+            joins: vec![3, 2, 4, 1],
+            declares_a_loop: false,
+            inside_the_box: interior_inside_the_box,
+        });
+        faces
+    }
+
+    #[test]
+    fn a_face_inside_the_shell_is_dropped_where_the_records_box_does_not_bound_it() {
+        let objects = fixture_record(&box_with_an_interior_face(false));
+        let classes = fixture_classes();
+        let assembled = rvt_model::assemble_symbol_brep(&objects, &classes, &[FIXTURE_GBREP]);
+        assert!(
+            assembled.excluded_faces.is_empty(),
+            "{:?}",
+            assembled.excluded_faces
+        );
+        assert_eq!(assembled.faces.len(), 7);
+        assert_eq!(assembled.bodies.len(), 1);
+
+        let box_of_the_record = bounds([0.0, 0.0, 0.0], [1.0, 1.0, 2.0]);
+        let (placed_body, placed) = place_declared_body(assembled, Some(&box_of_the_record));
+        // The interior face changes no extent, so the body reproduces the box
+        // with it - and the shell it writes is not a solid: the four edges the
+        // interior face draws are drawn by nothing else.
+        assert!(placed);
+        assert!(placed_body.is_closed());
+        assert!(!placed_body.bounds_a_volume());
+
+        let trimmed = place_body_less_its_cut_faces(
+            &objects,
+            &classes,
+            &[FIXTURE_GBREP],
+            Some(&box_of_the_record),
+            &placed_body,
+        )
+        .expect("the trim reads the box's own six faces");
+        assert_eq!(trimmed.face_ids, [1, 2, 3, 4, 5, 6]);
+        assert!(trimmed.bounds_a_volume());
+        assert!(body_is_placed_in(&trimmed, &box_of_the_record));
+    }
+
+    #[test]
+    fn a_face_the_records_box_bounds_is_never_dropped() {
+        // The same seven faces, with the interior one marked as the box's own.
+        // Nothing is dropped, so nothing is re-read: a body is only ever
+        // trimmed of the faces the record itself sets apart.
+        let objects = fixture_record(&box_with_an_interior_face(true));
+        let classes = fixture_classes();
+        let assembled = rvt_model::assemble_symbol_brep(&objects, &classes, &[FIXTURE_GBREP]);
+        let box_of_the_record = bounds([0.0, 0.0, 0.0], [1.0, 1.0, 2.0]);
+        let (placed_body, placed) = place_declared_body(assembled, Some(&box_of_the_record));
+        assert!(placed);
+        assert!(!placed_body.bounds_a_volume());
+        assert!(
+            place_body_less_its_cut_faces(
+                &objects,
+                &classes,
+                &[FIXTURE_GBREP],
+                Some(&box_of_the_record),
+                &placed_body,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_trim_that_places_a_different_body_is_refused() {
+        let body = |face_ids: &[u32]| rvt_model::SymbolBrep {
+            face_ids: face_ids.to_vec(),
+            ..rvt_model::SymbolBrep::default()
+        };
+        // The same body, less one face.
+        assert!(is_trim_of(&body(&[1, 2, 3]), &body(&[1, 2, 3, 4])));
+        // A body carrying a face the first pass did not: not this body read
+        // again, however well it places. See `place_body_less_its_cut_faces`.
+        assert!(!is_trim_of(&body(&[1, 2, 9]), &body(&[1, 2, 3, 4])));
+        // Nothing dropped, and nothing left.
+        assert!(!is_trim_of(&body(&[1, 2, 3, 4]), &body(&[1, 2, 3, 4])));
+        assert!(!is_trim_of(&body(&[]), &body(&[1, 2, 3, 4])));
     }
 
     #[test]
