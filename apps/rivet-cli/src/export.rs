@@ -37,9 +37,24 @@ pub(crate) fn export_json(
     output: Option<&Path>,
     limit: Option<usize>,
     full: bool,
+    progress: bool,
     max_member_bytes: u64,
 ) -> Result<(), Box<dyn Error>> {
+    // Announced stages and the export itself cannot share stdout: one JSON
+    // object per element and one JSON object per stage would arrive on the
+    // same stream, and a reader could not tell an element from a stage.
+    if progress && output.is_none() {
+        return Err("--progress writes its stages to stdout, where the export goes \
+                    without --output; give the export a file"
+            .into());
+    }
+    // The two halves of a JSON export, which scale differently: reading the
+    // records is the model's size, writing them is the element count.
+    let mut stage = Stage::new(progress);
+    stage.begins("decode");
     let recovered = recover_elements(path, max_member_bytes)?;
+    stage.finished("decode");
+    stage.begins("write");
     let writer: Box<dyn Write> = match output {
         Some(output) => Box::new(BufWriter::with_capacity(
             EXPORT_WRITE_BUFFER_BYTES,
@@ -62,11 +77,16 @@ pub(crate) fn export_json(
         full,
     };
     let written = write_exported_elements(writer, path, &recovered, &metadata, limit)?;
+    stage.finished("write");
+    // Both of these are prose on stdout, which is where the export itself goes
+    // when no file was named - so an export to stdout says nothing but the
+    // export.
     if output.is_some() {
         println!(
             "Elements written: {written} of {}",
             recovered.elements.len()
         );
+        stage.total();
     }
     Ok(())
 }
@@ -193,6 +213,10 @@ pub(crate) fn export_scene(
     Ok(())
 }
 
+// The command's own arguments, one parameter each. They are the flags
+// `rivet export-ifc` declares, and grouping them into a struct here would put
+// a second shape between the parser and this function for nothing.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn export_ifc(
     paths: &[PathBuf],
     output: Option<&Path>,
@@ -200,6 +224,7 @@ pub(crate) fn export_ifc(
     include_unplaced: bool,
     limit: Option<usize>,
     settings_arguments: &IfcSettingsArguments<'_>,
+    progress: bool,
     max_bytes: u64,
 ) -> Result<(), Box<dyn Error>> {
     let settings = settings_arguments.resolve()?;
@@ -208,7 +233,13 @@ pub(crate) fn export_ifc(
     }
     let output = default_output(paths, output, "ifc")?;
 
-    let mut stage = Stage::new(false);
+    // The same three-stage report `export-scene` gives, because a caller
+    // driving a progress display over an export that takes a minute needs to
+    // know which minute it is in. Reading the sources is `decode` and `model`;
+    // what is left is assembling the entity graph and writing it out, which
+    // scale differently enough - one with the element count, the other with
+    // the geometry - to be worth telling apart.
+    let mut stage = Stage::new(progress);
     let conversion = read_sources(
         paths,
         &ReadOptions {
@@ -252,12 +283,42 @@ pub(crate) fn export_ifc(
         building_name: "Building".to_owned(),
         settings,
     };
+    stage.begins("assemble");
     let file = metadata_ifc(&conversion.model, &options)?;
+    stage.finished("assemble");
+
+    stage.begins("write");
     let mut writer = BufWriter::with_capacity(EXPORT_WRITE_BUFFER_BYTES, File::create(&output)?);
     file.write_to(&mut writer)?;
     writer.flush()?;
+    stage.finished("write");
 
     println!("IFC written: {}", output.display());
+    // What the file actually cost, next to what it was made from. The ratio is
+    // the question every reader of a several-hundred-megabyte export asks
+    // first, and it was not answered anywhere before.
+    if let Ok(written) = std::fs::metadata(&output) {
+        let source_bytes: u64 = paths
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|entry| entry.len())
+            .sum();
+        print!(
+            "Bytes: {} ({})",
+            written.len(),
+            describe_bytes(written.len())
+        );
+        if source_bytes > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            // Both are file lengths, bounded by what is on this disk.
+            let ratio = written.len() as f64 / source_bytes as f64;
+            print!(
+                ", {ratio:.1}x the {} of source",
+                describe_bytes(source_bytes)
+            );
+        }
+        println!();
+    }
     println!("Model namespace: {}", format_uuid(namespace));
     println!("Length unit: {}", options.settings.length_unit);
     if let Some(mapping) = options.settings.class_mapping() {
@@ -271,6 +332,7 @@ pub(crate) fn export_ifc(
     conversion.report_model();
     conversion.report_geometry_funnels();
     conversion.report_properties();
+    stage.total();
     Ok(())
 }
 

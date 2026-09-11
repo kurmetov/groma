@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::io::{self, Write};
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+};
 
 mod class_mapping;
 mod ifc4_entities;
@@ -117,20 +120,66 @@ struct Entity {
     arguments: Vec<StepValue>,
 }
 
+/// The entity types written once per distinct value.
+///
+/// IFC gives an instance of these no identity beyond what it states: two
+/// `IfcCartesianPoint`s with the same coordinates are the same point, and a
+/// reader that follows a reference to either arrives at the same thing. So one
+/// is written and referenced wherever that value recurs.
+///
+/// Everything else keeps one instance per use even where two would read alike.
+/// A product, a representation, a property set, a relationship, a face, a loop
+/// and a shell all stay one per use, because there the instance *is* the thing
+/// rather than the value, and a reader counting them would otherwise get a
+/// different answer.
+///
+/// The list is deliberately short of the topology above an edge. Sharing a
+/// face or a shell between two products is legal and would collapse repeated
+/// families further, but it also makes one solid's boundary another's, which
+/// is a claim about the model rather than about how it is written down.
+///
+/// `IfcPolyline` is on the list and has the one exception to it. This exporter
+/// writes one both as an edge's geometry, where it is a curve like any other,
+/// and as the sole item of an `Axis` representation, where IFC intends an item
+/// to belong to the one representation holding it. The second is written
+/// through [`StepFile::push_once`], so two pipes with the same local
+/// centreline keep an item each.
+const SHARED_BY_VALUE: &[&str] = &[
+    "IFCAXIS1PLACEMENT",
+    "IFCAXIS2PLACEMENT2D",
+    "IFCAXIS2PLACEMENT3D",
+    "IFCCARTESIANPOINT",
+    "IFCCIRCLE",
+    "IFCCYLINDRICALSURFACE",
+    "IFCDIRECTION",
+    "IFCEDGECURVE",
+    "IFCLINE",
+    "IFCPLANE",
+    "IFCPOLYLINE",
+    "IFCVECTOR",
+    "IFCVERTEXPOINT",
+];
+
 /// Small, deterministic ISO 10303-21 emitter. It deliberately models syntax,
 /// not IFC semantics; higher layers remain responsible for entity signatures.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct StepFile {
     header: StepHeader,
     entities: Vec<Entity>,
+    /// Where a value in [`SHARED_BY_VALUE`] was already written, by the text
+    /// the file states it as. Keying on that text is what makes the test
+    /// exact: two arguments are the same value when the file would say them
+    /// the same way, which is the only equality the reader can see.
+    shared: HashMap<Box<[u8]>, EntityRef>,
 }
 
 impl StepFile {
     #[must_use]
-    pub const fn new(header: StepHeader) -> Self {
+    pub fn new(header: StepHeader) -> Self {
         Self {
             header,
             entities: Vec::new(),
+            shared: HashMap::new(),
         }
     }
 
@@ -142,6 +191,39 @@ impl StepFile {
     pub fn push(&mut self, name: impl Into<String>, arguments: Vec<StepValue>) -> EntityRef {
         let name = name.into();
         assert!(is_express_identifier(&name), "invalid EXPRESS identifier");
+        if SHARED_BY_VALUE.contains(&name.as_str()) {
+            let mut key = Vec::new();
+            key.extend_from_slice(name.as_bytes());
+            // A value `write_to` would refuse - a real that is not finite - is
+            // not shared, so that it is still written and still reported.
+            if write_values(&mut key, &arguments).is_ok() {
+                if let Some(&already) = self.shared.get(key.as_slice()) {
+                    return already;
+                }
+                let written = self.append(name, arguments);
+                self.shared.insert(key.into_boxed_slice(), written);
+                return written;
+            }
+        }
+        self.append(name, arguments)
+    }
+
+    /// Append one entity that is never shared, whatever its name.
+    ///
+    /// For the one place a type on [`SHARED_BY_VALUE`] is written as something
+    /// with an identity of its own rather than as a value: an `IfcPolyline`
+    /// that is a representation's item rather than an edge's geometry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `name` is not an uppercase EXPRESS identifier.
+    pub fn push_once(&mut self, name: impl Into<String>, arguments: Vec<StepValue>) -> EntityRef {
+        let name = name.into();
+        assert!(is_express_identifier(&name), "invalid EXPRESS identifier");
+        self.append(name, arguments)
+    }
+
+    fn append(&mut self, name: String, arguments: Vec<StepValue>) -> EntityRef {
         self.entities.push(Entity { name, arguments });
         EntityRef(self.entities.len() as u64)
     }
@@ -220,7 +302,7 @@ fn write_value(writer: &mut impl Write, value: &StepValue) -> io::Result<()> {
         StepValue::Omitted => write!(writer, "$"),
         StepValue::Derived => write!(writer, "*"),
         StepValue::Integer(value) => write!(writer, "{value}"),
-        StepValue::Real(value) if value.is_finite() => write!(writer, "{value:.15e}"),
+        StepValue::Real(value) if value.is_finite() => write_real(writer, *value),
         StepValue::Real(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "STEP real value must be finite",
@@ -252,6 +334,95 @@ fn write_value(writer: &mut impl Write, value: &StepValue) -> io::Result<()> {
             write!(writer, "{name}(")?;
             write_value(writer, value)?;
             write!(writer, ")")
+        }
+    }
+}
+
+/// How many significant digits of a real the file states.
+///
+/// Twelve, and the twelfth is where the measurement says to stop. A corner
+/// this exporter states twice - once for each solid that meets there - comes
+/// out of two different chains of matrix multiplications, so the two doubles
+/// differ in their last few bits although the model has one corner. Rounding
+/// the 650 562 coordinates of the SMALL export to a given number of digits and
+/// counting the distinct points left:
+///
+/// | digits | distinct points | of the bytes their digits took |
+/// | ---: | ---: | ---: |
+/// | 16 | 213 933 | 97.5% |
+/// | 15 | 194 430 | 91.6% |
+/// | 14 | 139 639 | 83.2% |
+/// | 13 | 70 317 | 70.9% |
+/// | **12** | **49 868** | **61.5%** |
+/// | 11 | 46 811 | 57.1% |
+/// | 10 | 46 203 | 54.0% |
+/// | 9 | 46 017 | 50.7% |
+///
+/// The count falls by four fifths down to twelve digits and then stops
+/// falling: past that there is no more arithmetic noise to merge, and what
+/// would merge next are points the model really does state apart. Twelve is
+/// therefore where noise ends rather than a tolerance anyone chose, and it is
+/// six orders of magnitude finer than the `1e-5` metre precision the file's
+/// own `IfcGeometricRepresentationContext` declares.
+///
+/// This is the one thing in the emitter that does not write back exactly what
+/// it was given, and it is stated here rather than hidden in a formatter.
+const SIGNIFICANT_DIGITS: usize = 12;
+
+/// Write a real the way STEP asks for one, in the fewest digits that read back
+/// as the same value to [`SIGNIFICANT_DIGITS`].
+///
+/// The emitter wrote fifteen fractional digits in exponential form before
+/// this, which spends nineteen bytes stating zero. ISO 10303-21 requires the
+/// decimal point, which is why a whole number keeps a trailing one.
+pub(crate) fn write_real(writer: &mut impl Write, value: f64) -> io::Result<()> {
+    // `Display` never uses an exponent, which is what a coordinate wants and
+    // ruinous outside that range: 1e-300 would be three hundred zeroes. So the
+    // range where the plain form is the short one picks it, and `LowerExp`
+    // - also shortest-round-trip - takes everything else.
+    //
+    // Negative zero is the same point as zero and is written as one, so that
+    // the two share an entity rather than reading as two.
+    if value == 0.0 {
+        return writer.write_all(b"0.");
+    }
+    // Rounded by writing the digits that are kept and reading them back, which
+    // is exact where scaling by a power of ten is not: `3300.000000000003`
+    // becomes `3300.` rather than `3299.9999999999995`.
+    let mut rounding = [0_u8; 32];
+    let mut digits = io::Cursor::new(&mut rounding[..]);
+    write!(digits, "{value:.*E}", SIGNIFICANT_DIGITS - 1)?;
+    let kept = usize::try_from(digits.position()).unwrap_or(0);
+    let value = std::str::from_utf8(&rounding[..kept])
+        .ok()
+        .and_then(|text| text.parse::<f64>().ok())
+        .filter(|rounded| rounded.is_finite())
+        .unwrap_or(value);
+    if value == 0.0 {
+        return writer.write_all(b"0.");
+    }
+    let mut buffer = [0_u8; 64];
+    let mut at = io::Cursor::new(&mut buffer[..]);
+    if (1e-4..1e15).contains(&value.abs()) {
+        write!(at, "{value}")?;
+    } else {
+        write!(at, "{value:E}")?;
+    }
+    let written = usize::try_from(at.position()).unwrap_or(0);
+    let text = &buffer[..written];
+    // Both forms can come back without a point - `12`, or `1E300` - and
+    // neither is a STEP real until it has one.
+    match text.iter().position(|byte| *byte == b'E') {
+        Some(exponent) if !text[..exponent].contains(&b'.') => {
+            writer.write_all(&text[..exponent])?;
+            writer.write_all(b".")?;
+            writer.write_all(&text[exponent..])
+        }
+        Some(_) => writer.write_all(text),
+        None if text.contains(&b'.') => writer.write_all(text),
+        None => {
+            writer.write_all(text)?;
+            writer.write_all(b".")
         }
     }
 }
@@ -386,9 +557,8 @@ mod tests {
         assert_eq!(guid.as_str(), "0Xz$ZUW55RYOQ00PNlUOjg");
     }
 
-    #[test]
-    fn emits_header_entities_references_and_unicode() {
-        let header = StepHeader {
+    fn header() -> StepHeader {
+        StepHeader {
             description: vec!["ViewDefinition [DesignTransferView_V1.0]".to_owned()],
             file_name: "model.ifc".to_owned(),
             timestamp: "2026-09-04T12:00:00+06:00".to_owned(),
@@ -398,8 +568,12 @@ mod tests {
             originating_system: "Rivet".to_owned(),
             authorization: String::new(),
             schema: "IFC4".to_owned(),
-        };
-        let mut file = StepFile::new(header);
+        }
+    }
+
+    #[test]
+    fn emits_header_entities_references_and_unicode() {
+        let mut file = StepFile::new(header());
         let point = file.push(
             "IFCCARTESIANPOINT",
             vec![StepValue::List(vec![
@@ -423,9 +597,134 @@ mod tests {
         assert!(
             text.contains("FILE_DESCRIPTION(('ViewDefinition [DesignTransferView_V1.0]'),'2;1');")
         );
-        assert!(text.contains("#1=IFCCARTESIANPOINT((0.000000000000000e0"));
+        assert!(text.contains("#1=IFCCARTESIANPOINT((0.,0.,0.));"));
         assert!(text.contains("#2=IFCAXIS2PLACEMENT3D(#1,$,'\\X2\\"));
         assert!(text.ends_with("END-ISO-10303-21;\n"));
+    }
+
+    /// Every real the file states must read back as the value it was written
+    /// from, to the digits [`SIGNIFICANT_DIGITS`] keeps - that is the whole
+    /// licence for the short form and for the rounding.
+    #[test]
+    fn writes_the_shortest_real_that_reads_back_the_same() {
+        for value in [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.1,
+            1.0 / 3.0,
+            3.048,
+            3_300.000_000_000_003,
+            1e-5,
+            1e15,
+            1e300,
+            -1e-300,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            std::f64::consts::PI,
+        ] {
+            let mut bytes = Vec::new();
+            write_real(&mut bytes, value).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                text.contains('.'),
+                "{value} wrote {text}, which is not a STEP real"
+            );
+            // `0.` and `1.E300` are STEP reals and not Rust literals; the
+            // point is there for the schema and says nothing about the value.
+            let literal = text.replace(".E", ".0E");
+            let literal = literal
+                .strip_suffix('.')
+                .map_or(literal.clone(), |head| format!("{head}.0"));
+            let read: f64 = literal.parse().expect("a number");
+            let expected: f64 = format!("{value:.*E}", SIGNIFICANT_DIGITS - 1)
+                .parse()
+                .expect("a number");
+            // Exact equality is the claim: both sides are the same decimal
+            // text parsed by the same parser, so anything but equality means
+            // the shortest form lost a digit the rounding kept.
+            #[allow(clippy::float_cmp)]
+            {
+                assert_eq!(read, expected, "{value} wrote {text}");
+            }
+        }
+        let mut bytes = Vec::new();
+        write_real(&mut bytes, -0.0).unwrap();
+        assert_eq!(bytes, b"0.", "negative zero is the same point as zero");
+    }
+
+    /// The rounding is what collapses a corner two chains of matrix
+    /// multiplications state slightly differently into the one point the model
+    /// has. It must reach the writer, and it must reach the sharing.
+    #[test]
+    fn states_a_coordinate_without_its_arithmetic_noise() {
+        let mut bytes = Vec::new();
+        write_real(&mut bytes, 3_300.000_000_000_003).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), "3300.");
+
+        let mut file = StepFile::new(header());
+        let point = |file: &mut StepFile, z: f64| {
+            file.push(
+                "IFCCARTESIANPOINT",
+                vec![StepValue::List(vec![
+                    StepValue::Real(0.0),
+                    StepValue::Real(0.0),
+                    StepValue::Real(z),
+                ])],
+            )
+        };
+        assert_eq!(
+            point(&mut file, 3.3),
+            point(&mut file, 3.300_000_000_000_000_3),
+            "one corner, however the arithmetic reached it"
+        );
+        // Twelve digits apart is a distinction the model states, not noise.
+        assert_ne!(point(&mut file, 3.3), point(&mut file, 3.300_000_000_1));
+    }
+
+    /// A resource with no identity beyond its value is written once. Anything
+    /// a reader can count as an object of its own is not.
+    #[test]
+    fn shares_a_value_and_never_an_object() {
+        let mut file = StepFile::new(header());
+        let point = |file: &mut StepFile| {
+            file.push(
+                "IFCCARTESIANPOINT",
+                vec![StepValue::List(vec![
+                    StepValue::Real(1.5),
+                    StepValue::Real(0.0),
+                    StepValue::Real(0.0),
+                ])],
+            )
+        };
+        let first = point(&mut file);
+        let second = point(&mut file);
+        assert_eq!(first, second, "one point, referenced twice");
+
+        let elsewhere = file.push(
+            "IFCCARTESIANPOINT",
+            vec![StepValue::List(vec![
+                StepValue::Real(1.5),
+                StepValue::Real(0.0),
+                StepValue::Real(1.0),
+            ])],
+        );
+        assert_ne!(first, elsewhere, "a different point is a different entity");
+
+        let wall =
+            |file: &mut StepFile| file.push("IFCWALL", vec![StepValue::String("W1".to_owned())]);
+        assert_ne!(
+            wall(&mut file),
+            wall(&mut file),
+            "two walls that read alike are still two walls"
+        );
+
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.matches("=IFCCARTESIANPOINT((1.5,0.,0.));").count(), 1);
+        assert_eq!(text.matches("=IFCWALL(").count(), 2);
     }
 
     #[test]

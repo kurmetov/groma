@@ -47,6 +47,60 @@ to the record walk: such a change can buy one class by selling another, and this
 is what catches that. Without `RIVET_CORPUS` the gate skips, so `cargo test`
 stays fast and CI stays meaningful.
 
+## Size
+
+An IFC export used to be several times the size of the model it came from: a
+93 MB Revit file wrote 702 MB, and a 231 MB one wrote 1.29 GB. Same corpus,
+same commit, before and after:
+
+| Source | Before | After | |
+| --- | ---: | ---: | ---: |
+| 93 MB `.rvt` | 702 MB | **121 MB** | 5.8× smaller |
+| 185 MB `.rvt` | 695 MB | **106 MB** | 6.6× smaller |
+| 231 MB `.rvt` | 1.29 GB | **208 MB** | 6.2× smaller |
+| 454 MB `.rvt` | 41 MB | **8.9 MB** | 4.7× smaller |
+
+Three things, and the first two take nothing out of the file.
+
+**A geometric resource is written once.** IFC gives an `IfcCartesianPoint` no
+identity beyond its coordinates, so two with the same coordinates are one
+point; the same holds for directions, vectors, lines, circles, surfaces,
+placements, vertices and edges. The exporter wrote one per use: 2.17 million
+cartesian points where 153 thousand were distinct, and 1.53 million directions
+where 17 thousand were. Everything a reader can count as an object of its own -
+a product, a representation, a property set, a face, a loop, a shell - is still
+written once per use.
+
+**A real is written in the digits it needs.** Every number was fifteen
+fractional digits in exponential form, which spends nineteen bytes stating
+zero.
+
+**A coordinate is written without its arithmetic noise.** A corner stated twice
+comes out of two different chains of matrix multiplications, so the two doubles
+differ in their last bits although the model has one corner. Rounding to twelve
+significant digits merges those and stops there: past twelve the count of
+distinct points stops falling, which is the measurement that says the noise has
+gone and nothing else with it. Twelve digits is six orders of magnitude finer
+than the `1e-5` metre precision the file's own
+`IfcGeometricRepresentationContext` declares. This is the one thing here that
+does not write back exactly what it was given, and
+[`SIGNIFICANT_DIGITS`](crates/ifc-export/src/lib.rs) carries the table it was
+chosen from.
+
+What came out is the same model. On the 93 MB file both exports hold 16 451
+products; IfcOpenShell geometrizes the same 397 of the same 400 sampled
+products from each, and reading each back into a scene gives the same 16 437
+elements, the same 12 storeys, and a summed triangle area of 1570.43 m² against
+1570.54 m² - 0.007%, which is the tessellator's own variation over the 79
+vertices where two coincident corners became one. It also costs downstream
+readers less: IfcOpenShell parses the file in 4.7 s where it took 20.8 s.
+
+For scale, Revit's own IFC export of that 231 MB model is 80 MB. It is smaller
+than our 208 MB because it writes walls, floors and columns as swept solids -
+a profile and a depth - where this exporter writes the boundary representation
+it recovered. Recognising a prism and writing it as one is the next lever, and
+it is a change to what the file says rather than to how it says it.
+
 ## Performance
 
 A conversion is measured the way decode accuracy is: against the reference

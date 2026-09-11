@@ -389,7 +389,11 @@ impl Uploads {
             .arg("export-json")
             .arg(source)
             .arg("--output")
-            .arg(&output);
+            .arg(&output)
+            // Stdout is free once the export has a file of its own, so this
+            // conversion reports its stages like the other two rather than
+            // leaving the page to show one unexplained total.
+            .arg("--progress");
         if full {
             command.arg("--full");
         }
@@ -422,6 +426,10 @@ impl Uploads {
             command.arg(source);
         }
         command.arg("--output").arg(&output);
+        // The stages go to the caller the way a scene conversion's do, so the
+        // page watching an export shows where the minute went rather than the
+        // word "converting".
+        command.arg("--progress");
         request.apply(&mut command);
         command
             .stdout(Stdio::piped())
@@ -461,6 +469,11 @@ pub struct Job {
     pub source: Option<String>,
     pub format: Option<String>,
     pub bytes: u64,
+    /// What the conversion wrote, once it has. Beside `bytes` this is the
+    /// answer to the question a reader of a several-hundred-megabyte export
+    /// asks first, and it is measured from the file rather than reported by
+    /// the converter so that it describes what is actually on the disk.
+    pub produced_bytes: Option<u64>,
     /// Seconds since the Unix epoch, for ordering a history a reader scrolls.
     pub started: u64,
 }
@@ -487,6 +500,7 @@ impl Job {
             source: None,
             format: None,
             bytes: 0,
+            produced_bytes: None,
             started: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
@@ -515,6 +529,7 @@ impl Job {
             "source": self.source,
             "format": self.format,
             "bytes": self.bytes,
+            "producedBytes": self.produced_bytes,
             "started": self.started,
         })
     }
@@ -566,8 +581,13 @@ impl IfcRequest {
         };
         for (key, value) in params {
             match key.as_str() {
-                // The model this export is for, handled by the caller.
-                "name" => {}
+                // The model this export is for and, where several files are
+                // read as one, which set they belong to and whether this is
+                // the last of them. All three are the upload's business, not
+                // the exporter's, and are handled before this is reached -
+                // they are named here so that a federated export is not
+                // refused for asking for a setting that is not one.
+                "name" | "set" | "complete" => {}
                 "length-unit" => match value.as_str() {
                     "metre" | "millimetre" => request.length_unit = Some(value.clone()),
                     other => {
@@ -626,7 +646,13 @@ pub enum Product {
 }
 
 /// Read the converter's stages into `job` until it exits.
-pub fn follow(mut child: Child, name: &str, product: Product, job: &std::sync::Mutex<Job>) {
+pub fn follow(
+    mut child: Child,
+    name: &str,
+    product: Product,
+    produced: Option<&Path>,
+    job: &std::sync::Mutex<Job>,
+) {
     let update = |change: &dyn Fn(&mut Job)| {
         if let Ok(mut held) = job.lock() {
             change(&mut held);
@@ -683,6 +709,9 @@ pub fn follow(mut child: Child, name: &str, product: Product, job: &std::sync::M
         held.running = None;
         if succeeded {
             held.state = JobState::Done;
+            held.produced_bytes = produced
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|entry| entry.len());
             match product {
                 Product::Scene => held.scene = Some(name.to_owned()),
                 Product::Ifc => held.ifc = Some(name.to_owned()),
@@ -822,6 +851,21 @@ mod tests {
         assert!(request.no_types);
         assert!(request.no_ifc_common_property_sets);
         assert!(!request.no_revit_property_sets);
+    }
+
+    /// A federated export names its set on every request of it. Those three
+    /// are the upload's parameters rather than the exporter's, and refusing
+    /// them is what stopped several files being exported as one model.
+    #[test]
+    fn reads_a_setup_that_also_names_a_federated_set() {
+        let request = IfcRequest::from_params(&params(&[
+            ("name", "tower-2.rvt"),
+            ("set", "tower"),
+            ("complete", "true"),
+            ("length-unit", "millimetre"),
+        ]))
+        .expect("a readable setup");
+        assert_eq!(request.length_unit.as_deref(), Some("millimetre"));
     }
 
     /// A setting the exporter does not have, or a value it cannot honour, is

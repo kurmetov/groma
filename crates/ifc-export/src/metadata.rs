@@ -1861,7 +1861,10 @@ fn push_axis_line(
     }
     let start = push_cartesian_point(file, frame.lengths, start);
     let end = push_cartesian_point(file, frame.lengths, end);
-    let line = file.push(
+    // The item of this representation, not a curve some edge also uses: an
+    // `IfcRepresentationItem` belongs to the representation that holds it, so
+    // two elements with the same local centreline keep one each.
+    let line = file.push_once(
         "IFCPOLYLINE",
         vec![StepValue::List(vec![reference(start), reference(end)])],
     );
@@ -2669,6 +2672,15 @@ fn enumeration(value: &str) -> StepValue {
 
 #[cfg(test)]
 mod tests {
+    /// One real, written exactly as the emitter writes it. A test that spells
+    /// a number out itself is a second formatter to keep in step, so it asks
+    /// the one formatter instead.
+    fn real(value: f64) -> String {
+        let mut bytes = Vec::new();
+        crate::write_real(&mut bytes, value).expect("a finite real");
+        String::from_utf8(bytes).expect("ascii")
+    }
+
     use bim_core::BimElementType;
 
     use bim_core::{
@@ -2903,7 +2915,7 @@ mod tests {
         ] {
             assert!(text.contains(&format!("={entity}(")), "missing {entity}");
         }
-        assert!(text.contains("IFCLENGTHMEASURE(2.500000000000000e0)"));
+        assert!(text.contains("IFCLENGTHMEASURE(2.5)"));
         assert!(text.contains("=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)"));
         assert!(text.contains("=IFCOWNERHISTORY(#3,#4,$,.ADDED.,1788506400,#3,#4,1788506400)"));
         assert!(text.contains("'\\X2\\042D04420430043600200031\\X0\\'"));
@@ -2941,19 +2953,19 @@ mod tests {
         // Still square metres, beside a millimetre length.
         assert!(text.contains("=IFCSIUNIT(*,.AREAUNIT.,$,.SQUARE_METRE.)"));
         assert!(
-            text.contains("IFCLENGTHMEASURE(2.500000000000000e3)"),
+            text.contains("IFCLENGTHMEASURE(2500.)"),
             "the property's 2.5 m should be written as 2500 mm"
         );
         assert!(
-            text.contains("IFCAREAMEASURE(1.200000000000000e1)"),
+            text.contains("IFCAREAMEASURE(12.)"),
             "the property's 12 m2 should stay 12 m2"
         );
         // The storey's own elevation, 3.048 m, and the model's precision.
         assert!(
-            text.contains("=IFCBUILDINGSTOREY(") && text.contains(",3.048000000000000e3)"),
+            text.contains("=IFCBUILDINGSTOREY(") && text.contains(",3048.)"),
             "the storey elevation should be written in millimetres"
         );
-        assert!(text.contains("1.000000000000000e-2,"), "precision in mm");
+        assert!(text.contains("0.01,"), "precision in mm");
     }
 
     #[test]
@@ -3211,7 +3223,7 @@ mod tests {
         assert!(text.contains("=IFCELEMENTQUANTITY("));
         assert!(text.contains("'Qto_WallBaseQuantities'"));
         assert!(
-            text.contains("=IFCQUANTITYVOLUME('NetVolume',$,$,6.000000000000000e0,$)"),
+            text.contains("=IFCQUANTITYVOLUME('NetVolume',$,$,6.,$)"),
             "one by two by three metres is six cubic metres"
         );
         // A wall's quantity set has no name for a total surface area, so none
@@ -3226,7 +3238,7 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("'Qto_BuildingElementProxyQuantities'"));
         assert!(
-            text.contains("=IFCQUANTITYAREA('NetSurfaceArea',$,$,2.200000000000000e1,$)"),
+            text.contains("=IFCQUANTITYAREA('NetSurfaceArea',$,$,22.,$)"),
             "twenty-two square metres of surface"
         );
     }
@@ -3752,7 +3764,7 @@ mod tests {
         }
         assert!(text.contains("'Body','AdvancedSweptSolid'"));
         // World Z=3.5 m is represented 0.452 m above the 3.048 m storey.
-        let local_start = format!("({:.15e},{:.15e},{:.15e})", 1.0, 2.0, 3.5 - 3.048);
+        let local_start = format!("({},{},{})", real(1.0), real(2.0), real(3.5 - 3.048));
         assert!(text.contains(&local_start));
     }
 
@@ -3788,9 +3800,9 @@ mod tests {
         assert!(text.contains("=IFCPRODUCTDEFINITIONSHAPE("));
         assert!(!text.contains("=IFCSWEPTDISKSOLID("));
         assert!(!text.contains("'Body'"));
-        let relative_origin = format!("({:.15e},{:.15e},{:.15e})", 1.0, 2.0, 3.0 - 3.048);
+        let relative_origin = format!("({},{},{})", real(1.0), real(2.0), real(3.0 - 3.048));
         assert!(text.contains(&relative_origin));
-        assert!(text.contains("(0.000000000000000e0,0.000000000000000e0,5.000000000000000e-1)"));
+        assert!(text.contains("(0.,0.,0.5)"));
     }
 
     #[test]
@@ -3825,10 +3837,8 @@ mod tests {
         assert!(text.contains("=IFCBOUNDINGBOX("));
         assert!(text.contains("'Box','BoundingBox'"));
         assert!(!text.contains("'Body'"));
-        assert!(
-            text.contains("(-1.000000000000000e-1,-2.000000000000000e-1,-3.000000000000000e-1)")
-        );
-        assert!(text.contains(",2.000000000000000e-1,4.000000000000000e-1,6.000000000000000e-1)"));
+        assert!(text.contains("(-0.1,-0.2,-0.3)"));
+        assert!(text.contains(",0.2,0.4,0.6)"));
     }
 
     fn metres_point(coordinates: [f64; 3]) -> BimPoint3 {
@@ -3913,7 +3923,7 @@ mod tests {
         assert!(!text.contains("=IFCSHELLBASEDSURFACEMODEL("));
         assert!(text.contains("'Body','AdvancedBrep'"));
         // World Z=3.048 m sits exactly at the storey elevation.
-        assert!(text.contains("(2.000000000000000e0,0.000000000000000e0,0.000000000000000e0)"));
+        assert!(text.contains("(2.,0.,0.)"));
     }
 
     #[test]
@@ -3933,10 +3943,7 @@ mod tests {
         file.write_to(&mut bytes).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("=IFCPOLYLINE("), "{text}");
-        assert!(
-            text.contains("(1.400000000000000e0,1.400000000000000e0,0.000000000000000e0)"),
-            "{text}"
-        );
+        assert!(text.contains("(1.4,1.4,0.)"), "{text}");
         assert!(text.contains("=IFCADVANCEDBREP("), "{text}");
     }
 
@@ -4020,14 +4027,8 @@ mod tests {
         );
         assert!(text.contains("=IFCAXIS1PLACEMENT("), "{text}");
         // The profile's two ends, in the profile plane: (radius, height).
-        assert!(
-            text.contains("((9.000000000000000e-1,-1.000000000000000e-1))"),
-            "{text}"
-        );
-        assert!(
-            text.contains("((3.100000000000000e0,2.100000000000000e0))"),
-            "{text}"
-        );
+        assert!(text.contains("((0.9,-0.1))"), "{text}");
+        assert!(text.contains("((3.1,2.1))"), "{text}");
         // IFC4 has no conical surface at all.
     }
 
@@ -4045,14 +4046,8 @@ mod tests {
         );
         assert!(text.contains("=IFCSURFACEOFREVOLUTION("), "{text}");
         // The apex, and the far end a 5% margin past the face's reach.
-        assert!(
-            text.contains("((0.000000000000000e0,0.000000000000000e0))"),
-            "{text}"
-        );
-        assert!(
-            text.contains("((2.100000000000000e0,2.100000000000000e0))"),
-            "{text}"
-        );
+        assert!(text.contains("((0.,0.))"), "{text}");
+        assert!(text.contains("((2.1,2.1))"), "{text}");
     }
 
     #[test]
@@ -4068,10 +4063,7 @@ mod tests {
             (-3.0, 2.0),
         );
         assert!(text.contains("=IFCSURFACEOFREVOLUTION("), "{text}");
-        assert!(
-            text.contains("((0.000000000000000e0,-1.000000000000000e0))"),
-            "{text}"
-        );
+        assert!(text.contains("((0.,-1.))"), "{text}");
     }
 
     #[test]
@@ -4086,7 +4078,7 @@ mod tests {
             (0.0, 1.0),
         );
         assert!(text.contains("=IFCCYLINDRICALSURFACE("), "{text}");
-        assert!(text.contains("1.500000000000000e0"), "{text}");
+        assert!(text.contains("1.5"), "{text}");
     }
 
     #[test]
@@ -4104,7 +4096,7 @@ mod tests {
         assert!(!text.contains("=IFCSURFACEOFREVOLUTION("));
         // The plane sits at the height the line runs at, not at the frame's
         // own origin.
-        assert!(text.contains("0.000000000000000e0,0.000000000000000e0,4.000000000000000e0"));
+        assert!(text.contains("0.,0.,4."));
     }
 
     #[test]
@@ -4120,10 +4112,7 @@ mod tests {
         );
         assert!(text.contains("=IFCTOROIDALSURFACE("), "{text}");
         // Major radius then minor, in that order.
-        assert!(
-            text.contains("2.000000000000000e0,5.000000000000000e-1);"),
-            "{text}"
-        );
+        assert!(text.contains("2.,0.5);"), "{text}");
     }
 
     #[test]
@@ -4144,14 +4133,11 @@ mod tests {
         assert!(!text.contains("=IFCTOROIDALSURFACE("));
         // The profile circle, in the plane that holds the axis: centred a
         // major radius out, and swept a whole turn in radians.
-        assert!(
-            text.contains("((5.000000000000000e-1,0.000000000000000e0))"),
-            "{text}"
-        );
+        assert!(text.contains("((0.5,0.))"), "{text}");
         assert!(
             text.contains(&format!(
-                "IFCPARAMETERVALUE({:.15e})),.T.,.PARAMETER.);",
-                std::f64::consts::TAU
+                "IFCPARAMETERVALUE({})),.T.,.PARAMETER.);",
+                real(std::f64::consts::TAU)
             )),
             "{text}"
         );
@@ -4169,7 +4155,7 @@ mod tests {
             (0.25, 1.75),
         );
         assert!(text.contains("=IFCSPHERICALSURFACE("), "{text}");
-        assert!(text.contains("7.500000000000000e-1);"), "{text}");
+        assert!(text.contains("0.75);"), "{text}");
         assert!(!text.contains("=IFCTOROIDALSURFACE("));
     }
 

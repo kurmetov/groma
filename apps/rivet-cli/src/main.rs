@@ -266,6 +266,11 @@ enum Command {
         /// against, and the faces and edges the decode could not read.
         #[arg(long)]
         full: bool,
+        /// Announce each stage on stdout as one JSON object the moment it
+        /// ends, for a caller driving a progress display. Needs `--output`,
+        /// which is what leaves stdout free to say anything.
+        #[arg(long)]
+        progress: bool,
         /// Maximum decoded bytes accepted from one member.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
@@ -446,6 +451,10 @@ enum Command {
         /// repeated exactly.
         #[arg(long)]
         write_settings: Option<PathBuf>,
+        /// Announce each stage on stdout as one JSON object the moment it
+        /// ends, for a caller driving a progress display.
+        #[arg(long)]
+        progress: bool,
         /// Maximum decoded bytes accepted from one member.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
@@ -660,8 +669,16 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             output,
             limit,
             full,
+            progress,
             max_member_bytes,
-        } => export_json(&file, output.as_deref(), limit, full, max_member_bytes),
+        } => export_json(
+            &file,
+            output.as_deref(),
+            limit,
+            full,
+            progress,
+            max_member_bytes,
+        ),
         Command::SerialProbe {
             file,
             class,
@@ -745,6 +762,7 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             no_types,
             class_mapping,
             write_settings,
+            progress,
             max_member_bytes,
         } => export_ifc(
             &files,
@@ -763,6 +781,7 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
                 class_mapping: class_mapping.as_deref(),
                 write_settings: write_settings.as_deref(),
             },
+            progress,
             max_member_bytes,
         ),
         Command::ExportScene {

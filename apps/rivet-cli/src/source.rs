@@ -136,6 +136,8 @@ pub(crate) fn stage_label(name: &str) -> &'static str {
         "decode" => "Decode",
         "model" => "Model",
         "tessellate" => "Tessellate and pack",
+        "assemble" => "Assemble the IFC",
+        "write" => "Write the file",
         _ => "Stage",
     }
 }

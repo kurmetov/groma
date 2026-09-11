@@ -542,7 +542,13 @@ fn serve_upload(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match uploads.convert(&sources, &stem, &formats) {
-            Ok(child) => upload::follow(child, &stem, upload::Product::Scene, &job),
+            Ok(child) => upload::follow(
+                child,
+                &stem,
+                upload::Product::Scene,
+                Some(&uploads.scenes.join(format!("{stem}.rvs"))),
+                &job,
+            ),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
                     held.state = upload::JobState::Failed;
@@ -625,7 +631,13 @@ fn serve_export_ifc(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match uploads.export_ifc(&sources, &stem, &settings) {
-            Ok(child) => upload::follow(child, &stem, upload::Product::Ifc, &job),
+            Ok(child) => upload::follow(
+                child,
+                &stem,
+                upload::Product::Ifc,
+                Some(&uploads.exports().join(format!("{stem}.ifc"))),
+                &job,
+            ),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
                     held.state = upload::JobState::Failed;
@@ -727,7 +739,13 @@ fn serve_export_json(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match uploads.export_json(&source, &stem, full) {
-            Ok(child) => upload::follow(child, &stem, upload::Product::Json, &job),
+            Ok(child) => upload::follow(
+                child,
+                &stem,
+                upload::Product::Json,
+                Some(&uploads.exports().join(format!("{stem}.jsonl"))),
+                &job,
+            ),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
                     held.state = upload::JobState::Failed;
@@ -996,7 +1014,7 @@ fn handle(
                      complete, and every file held is read as one model",
                     "POST /export-ifc?name=&set=&complete=&length-unit=&no-types=\
                      &no-revit-property-sets=&no-revit-type-property-sets=\
-                     &no-ifc-common-property-sets=&class-mapping=",
+                     &no-ifc-common-property-sets=&base-quantities=&class-mapping=",
                     "POST /export-json?name=&full=",
                     "/exports/{name}.ifc|.jsonl",
                     "/jobs",
