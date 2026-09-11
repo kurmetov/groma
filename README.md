@@ -145,6 +145,17 @@ could hold an arc is worth 1.6% of the faces there, and 8.8% to 15.6% on the
 other three. The size that is left is in solids that are genuinely complicated,
 not in a form this exporter has not learned yet.
 
+### A face is tiled whole or not at all
+
+A tiling that stops short used to be handed back as far as it got - a region
+with a piece missing and no sign of it. It is refused now, and the face is
+counted among the ones the tessellator could not read. What the stalls were was
+measured before refusing them: most were faces stating two loops side by side,
+which are two regions rather than a boundary and a hole, and those are now
+grouped by containment and tiled properly. What remains is faces on surfaces of
+revolution whose boundary runs up to the axis, where the loop is not simple in
+the surface's own parameters - 5 249 of the plumbing model's 5 301 stalls.
+
 ## Performance
 
 A conversion is measured the way decode accuracy is: against the reference

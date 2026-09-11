@@ -373,13 +373,12 @@ fn clip_ears(chain: &[Vertex]) -> Vec<[usize; 3]> {
     let mut cursor = 0_usize;
     while remaining.len() > 3 {
         if without_progress > remaining.len() {
-            // What has been clipped so far, which is a region with a piece
-            // missing and no sign of it for the caller. Whether that is better
-            // than nothing is a question of its own: on the architectural
-            // model 3 879 faces come back partly tiled, and refusing them
-            // would take the skipped-face count from 6 005 to 9 884 and show
-            // holes where there is now something wrong. Left as it was found.
-            return triangles;
+            // A tiling that stops short is not a tiling. What it leaves is a
+            // region with a piece missing and nothing to say so: a viewer
+            // draws it, a measurement adds it up, and neither can tell. So the
+            // clip is abandoned whole, the caller sees a face it could not
+            // read, and the count of those is the honest number.
+            return Vec::new();
         }
         let count = remaining.len();
         let previous = remaining[(cursor + count - 1) % count];
@@ -499,6 +498,34 @@ mod tests {
         let triangles = triangulate(&shape, &[]);
         assert_eq!(triangles.len(), 4);
         assert!((area(&shape, &triangles) - 5.0).abs() < 1e-9);
+    }
+
+    /// A loop the clipper cannot finish yields nothing, not the part it
+    /// managed: a caller cannot tell a region with a piece missing from a
+    /// region, and a viewer draws both.
+    ///
+    /// The loop is one face of the plumbing model, in its own surface's two
+    /// parameters - a patch of a surface of revolution running up to the axis,
+    /// where every angle is the same point and the boundary walks three of
+    /// them in a row. 5 249 faces of that model stall this way and were coming
+    /// back part-tiled.
+    #[test]
+    fn a_loop_the_clipper_cannot_finish_yields_nothing() {
+        let at_the_axis = [
+            [0.029_837_845_374_570_723, 0.0],
+            [0.014_918_922_687_286_172, 0.0],
+            [0.0, 0.062_831_853_071_795_87],
+            [0.0, 0.047_123_889_803_846_9],
+            [0.0, 0.031_415_926_535_897_934],
+            [0.014_918_922_687_285_592, 0.031_415_926_535_897_934],
+            [0.029_837_845_374_570_723, 0.031_415_926_535_897_934],
+            [0.029_837_845_374_570_723, 0.047_123_889_803_846_9],
+        ];
+        assert!(
+            triangulate(&at_the_axis, &[]).is_empty(),
+            "{:?}",
+            triangulate(&at_the_axis, &[])
+        );
     }
 
     #[test]

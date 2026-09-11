@@ -359,35 +359,122 @@ fn tessellate_face(face: &BimBrepFace, options: &MeshOptions, mesh: &mut Mesh) -
         return false;
     }
 
-    // The loop enclosing the most parameter area is the outer bound; the rest
-    // are holes. The source states the outer loop first, but a face read from
-    // a partial record may not, and area settles it either way.
-    let mut order: Vec<usize> = (0..unwrapped.len()).collect();
-    order.sort_by(|left, right| {
-        unwrapped[*right]
-            .area
-            .partial_cmp(&unwrapped[*left].area)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Which loop bounds what, by containment: a loop inside no other bounds a
+    // region, a loop inside one of those is a hole in it, and a loop inside a
+    // hole bounds a region again.
+    //
+    // Taking the largest loop for the boundary and the rest for holes is right
+    // for the faces a kernel states and wrong for some of the ones this
+    // decodes: on the 231 MB architectural model 1 054 faces carry a loop
+    // lying wholly outside the loop that would have been chosen - two disjoint
+    // regions stated on one face - and reading the second as a hole in the
+    // first leaves a polygon that cannot be tiled at all.
     let mut vertices: Vec<Point2> = Vec::new();
-    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(order.len());
-    for index in &order {
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(unwrapped.len());
+    for ring in &unwrapped {
         let start = vertices.len();
-        vertices.extend_from_slice(&unwrapped[*index].uv);
+        vertices.extend_from_slice(&ring.uv);
         spans.push((start, vertices.len()));
     }
-    let outer = &vertices[spans[0].0..spans[0].1].to_vec();
-    let holes: Vec<&[Point2]> = spans[1..]
-        .iter()
-        .map(|(start, end)| &vertices[*start..*end])
-        .collect();
-    let triangles = triangulate::triangulate(outer, &holes);
+    let mut triangles = Vec::new();
+    let mut tiled_every_region = true;
+    for (outer, holes) in regions(&unwrapped) {
+        let boundary = vertices[spans[outer].0..spans[outer].1].to_vec();
+        let cut: Vec<Vec<Point2>> = holes
+            .iter()
+            .map(|hole| vertices[spans[*hole].0..spans[*hole].1].to_vec())
+            .collect();
+        let borrowed: Vec<&[Point2]> = cut.iter().map(Vec::as_slice).collect();
+        let region = triangulate::triangulate(&boundary, &borrowed);
+        if region.is_empty() {
+            tiled_every_region = false;
+            continue;
+        }
+        // `triangulate` indexes the boundary and then each hole in turn; the
+        // caller's own numbering is what the rest of this works in.
+        let mut at = |index: usize| {
+            if index < boundary.len() {
+                return spans[outer].0 + index;
+            }
+            let mut index = index - boundary.len();
+            for (hole, points) in holes.iter().zip(&cut) {
+                if index < points.len() {
+                    return spans[*hole].0 + index;
+                }
+                index -= points.len();
+            }
+            spans[outer].0
+        };
+        triangles.extend(region.into_iter().map(|corners| corners.map(&mut at)));
+    }
     if triangles.is_empty() {
         return false;
     }
     let triangles = refine(&surface, &mut vertices, triangles, options);
     emit(&surface, &vertices, &triangles, mesh);
-    true
+    // A face is read when every region of it is: one region tiled out of two
+    // is a face with a piece missing, which is what the count is for.
+    tiled_every_region
+}
+
+/// Group a face's loops into the regions they bound: each outer loop with the
+/// loops that are holes in it.
+///
+/// Containment is read from one point of each loop, which settles it for loops
+/// that do not cross - and loops that cross bound nothing this can tile, so
+/// the tiling refuses them rather than this. Depth decides the role: a loop
+/// inside an even number of others bounds material, an odd number makes it a
+/// hole, and a hole's own holes are regions inside it.
+fn regions(rings: &[Ring]) -> Vec<(usize, Vec<usize>)> {
+    let mut inside: Vec<Vec<usize>> = vec![Vec::new(); rings.len()];
+    for (at, ring) in rings.iter().enumerate() {
+        let Some(point) = ring.uv.first() else {
+            continue;
+        };
+        for (other, around) in rings.iter().enumerate() {
+            if other != at && encloses(&around.uv, *point) {
+                inside[at].push(other);
+            }
+        }
+    }
+    let mut grouped = Vec::new();
+    for at in 0..rings.len() {
+        if inside[at].len() % 2 != 0 || rings[at].uv.len() < 3 {
+            continue;
+        }
+        // Its holes are the loops one level in: inside this one, and inside
+        // nothing else that is itself inside this one.
+        let holes = (0..rings.len())
+            .filter(|other| {
+                inside[*other].len() == inside[at].len() + 1
+                    && inside[*other].contains(&at)
+                    && rings[*other].uv.len() >= 3
+            })
+            .collect();
+        grouped.push((at, holes));
+    }
+    grouped
+}
+
+/// Is `point` inside this loop? Even-odd, the same rule the grouping's depth
+/// count is built on.
+fn encloses(ring: &[Point2], point: Point2) -> bool {
+    let mut inside = false;
+    for index in 0..ring.len() {
+        let start = ring[index];
+        let end = ring[(index + 1) % ring.len()];
+        if (start[1] > point[1]) != (end[1] > point[1]) {
+            let span = end[1] - start[1];
+            if span.abs() <= f64::MIN_POSITIVE {
+                continue;
+            }
+            let ratio = (point[1] - start[1]) / span;
+            if (end[0] - start[0]).mul_add(ratio, start[0]) > point[0] {
+                inside = !inside;
+            }
+        }
+    }
+    inside
 }
 
 /// One boundary loop carried into the surface's parameter plane, with the
@@ -1096,6 +1183,88 @@ mod tests {
         assert!(
             (there - back).abs() < there * 1e-9,
             "the same wall covers {there} one way round and {back} the other"
+        );
+    }
+
+    /// A face stating two loops that lie side by side bounds two regions, and
+    /// both are tiled. Reading the second as a hole in the first - which is
+    /// what taking the largest loop for the boundary does - leaves a polygon
+    /// that tiles to nothing at all. 1 054 faces of the 231 MB architectural
+    /// model are stated this way.
+    #[test]
+    fn a_face_whose_loops_lie_side_by_side_tiles_both() {
+        let square = |x: f64, side: f64| {
+            vec![
+                line([x, 0.0, 0.0], [x + side, 0.0, 0.0]),
+                line([x + side, 0.0, 0.0], [x + side, side, 0.0]),
+                line([x + side, side, 0.0], [x, side, 0.0]),
+                line([x, side, 0.0], [x, 0.0, 0.0]),
+            ]
+        };
+        let face = BimBrepFace {
+            surface: BimBrepSurface::Plane {
+                origin: at([0.0, 0.0, 0.0]),
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+            },
+            loops: vec![square(0.0, 1.0), square(2.0, 3.0)],
+        };
+        let mesh = tessellate(
+            &BimGeometry::Brep(BimBrep {
+                faces: vec![face],
+                complete: false,
+            }),
+            &MeshOptions::default(),
+        );
+        assert_eq!(mesh.skipped_faces, 0);
+        assert!(
+            (area(&mesh) - 10.0).abs() < 1e-9,
+            "one square metre beside nine, tiled to {}",
+            area(&mesh)
+        );
+    }
+
+    /// And a loop that really is a hole is still a hole.
+    #[test]
+    fn a_face_whose_second_loop_is_inside_the_first_cuts_it_out() {
+        let square = |x: f64, y: f64, side: f64, forward: bool| {
+            let corners = [
+                [x, y, 0.0],
+                [x + side, y, 0.0],
+                [x + side, y + side, 0.0],
+                [x, y + side, 0.0],
+            ];
+            (0..4)
+                .map(|at| {
+                    let (from, to) = if forward {
+                        (corners[at], corners[(at + 1) % 4])
+                    } else {
+                        (corners[(4 - at) % 4], corners[(3 - at) % 4])
+                    };
+                    line(from, to)
+                })
+                .collect::<Vec<_>>()
+        };
+        let face = BimBrepFace {
+            surface: BimBrepSurface::Plane {
+                origin: at([0.0, 0.0, 0.0]),
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+            },
+            loops: vec![square(0.0, 0.0, 3.0, true), square(1.0, 1.0, 1.0, false)],
+        };
+        let mesh = tessellate(
+            &BimGeometry::Brep(BimBrep {
+                faces: vec![face],
+                complete: false,
+            }),
+            &MeshOptions::default(),
+        );
+        assert_eq!(mesh.skipped_faces, 0);
+        assert!(
+            (area(&mesh) - 8.0).abs() < 1e-9,
+            "nine square metres less one, tiled to {}",
+            area(&mesh)
         );
     }
 
