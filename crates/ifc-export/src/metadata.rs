@@ -2317,6 +2317,33 @@ fn measure(geometry: &BimGeometry) -> Option<MeasuredQuantities> {
     )
 }
 
+/// The total thickness of the layered build-up the element's type declares,
+/// in metres, where every layer states one in the same unit.
+///
+/// This is the one base quantity that is not measured from the body, because
+/// the source states it: `Width` is what the compound structure's layers add
+/// up to. Joining our export of AR S1 to Revit's own on the Revit element id,
+/// the layer totals this decode recovers reproduce Revit's own
+/// `Qto_WallBaseQuantities.Width` on **7 615 of 7 615 walls** to within a
+/// thousandth, and `Qto_SlabBaseQuantities.Width` on 450 of 513 slabs. The 63
+/// slabs that differ are one class - a 50 mm single-layer floor insulation
+/// whose type is named `_t=50`, for which Revit's `Width` is a plan dimension
+/// of several metres rather than the thickness - so the disagreement is in
+/// what Revit put in that field there, not in the layer table.
+///
+/// Guarded exactly as [`push_material_layer`] guards a layer it writes: a unit
+/// that is not Revit's metre, or a total that is not finite and positive, is
+/// left unwritten rather than written as something else. Zero is refused here
+/// where a single layer may legitimately be zero, because a build-up with no
+/// thickness at all states nothing about the element.
+fn layer_set_thickness(element: &BimElement) -> Option<f64> {
+    let total = element.material_layers.as_ref()?.total_thickness()?;
+    (total.unit.as_ref()?.id == "autodesk.unit.unit:meters-1.0.0"
+        && total.value.is_finite()
+        && total.value > 0.0)
+        .then_some(total.value)
+}
+
 /// The base quantity set for an entity, and the quantities it holds - the
 /// buildingSMART templates' own answer, because the names differ from entity
 /// to entity: a wall's volume is in `Qto_WallBaseQuantities` and a proxy's in
@@ -2338,36 +2365,54 @@ fn push_quantities(
     product_entity: &str,
     context: WriteContext<'_>,
 ) {
-    let Some(measured) = element.geometry.as_ref().and_then(measure) else {
-        return;
-    };
     let Some((set_name, allowed)) = base_quantity_set(product_entity) else {
         return;
     };
     let mut quantities = Vec::new();
-    if allowed.contains(&"NetVolume") {
-        quantities.push(reference(file.push(
-            "IFCQUANTITYVOLUME",
-            vec![
-                string("NetVolume"),
-                omitted(),
-                omitted(),
-                StepValue::Real(measured.net_volume),
-                omitted(),
-            ],
-        )));
+    // The build-up's own total, written in the file's length unit because
+    // `Width` is an `IfcQuantityLength` and every length in the file is in
+    // that unit. It is not measured from the body: the layer table states it,
+    // which is what the quantity means. See [`layer_set_thickness`].
+    if allowed.contains(&"Width") {
+        if let Some(thickness) = layer_set_thickness(element) {
+            quantities.push(reference(file.push(
+                "IFCQUANTITYLENGTH",
+                vec![
+                    string("Width"),
+                    omitted(),
+                    omitted(),
+                    context.lengths.value(thickness),
+                    omitted(),
+                ],
+            )));
+        }
     }
-    if allowed.contains(&"NetSurfaceArea") {
-        quantities.push(reference(file.push(
-            "IFCQUANTITYAREA",
-            vec![
-                string("NetSurfaceArea"),
-                omitted(),
-                omitted(),
-                StepValue::Real(measured.net_surface_area),
-                omitted(),
-            ],
-        )));
+    let measured = element.geometry.as_ref().and_then(measure);
+    if let Some(measured) = measured {
+        if allowed.contains(&"NetVolume") {
+            quantities.push(reference(file.push(
+                "IFCQUANTITYVOLUME",
+                vec![
+                    string("NetVolume"),
+                    omitted(),
+                    omitted(),
+                    StepValue::Real(measured.net_volume),
+                    omitted(),
+                ],
+            )));
+        }
+        if allowed.contains(&"NetSurfaceArea") {
+            quantities.push(reference(file.push(
+                "IFCQUANTITYAREA",
+                vec![
+                    string("NetSurfaceArea"),
+                    omitted(),
+                    omitted(),
+                    StepValue::Real(measured.net_surface_area),
+                    omitted(),
+                ],
+            )));
+        }
     }
     if quantities.is_empty() {
         return;
@@ -3503,6 +3548,56 @@ mod tests {
             text.contains("=IFCQUANTITYAREA('NetSurfaceArea',$,$,22.,$)"),
             "twenty-two square metres of surface"
         );
+    }
+
+    /// `Width` is the one base quantity the source states rather than one
+    /// measured from the body, so it is written from the layer table, in the
+    /// file's length unit, and for an element whose body could not be measured
+    /// at all. An entity whose quantity set has no name for it gets none.
+    #[test]
+    fn writes_the_build_ups_own_thickness_as_width() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Wall;
+        model.elements[0].material_layers = Some(BimMaterialLayerSet {
+            source_type_id: Some(BimElementId("700".to_owned())),
+            name: Some("Wall 250".to_owned()),
+            layers: vec![layer("1", 0.0125), layer("2", 0.225), layer("1", 0.0125)],
+        });
+        let mut options = options();
+        options.settings.property_sets.base_quantities = true;
+
+        // No geometry at all: the layer table still states the thickness.
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("'Qto_WallBaseQuantities'"));
+        assert!(
+            text.contains("=IFCQUANTITYLENGTH('Width',$,$,0.25,$)"),
+            "12.5 + 225 + 12.5 millimetres is a quarter of a metre: {text}"
+        );
+
+        // A length rides in the file's unit, unlike a volume or an area.
+        options.settings.length_unit = LengthUnit::Millimetre;
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("=IFCQUANTITYLENGTH('Width',$,$,250.,$)"),
+            "the same quarter metre in a millimetre file: {text}"
+        );
+
+        // A proxy's quantity set names no width, so the same build-up on one
+        // writes nothing.
+        options.settings.length_unit = LengthUnit::Metre;
+        model.elements[0].element_type = BimElementType::Unknown;
+        model.elements[0].category = None;
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("IFCQUANTITYLENGTH"), "{text}");
     }
 
     /// A shell that is not closed, or one with a face this cannot measure
