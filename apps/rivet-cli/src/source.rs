@@ -54,6 +54,10 @@ pub(crate) fn report_geometry_recovery(geometry_statistics: &GeometryStatistics)
         "Recovered transform-verified family-symbol bounds: {}",
         geometry_statistics.verified_symbol_bounds
     );
+    println!(
+        "Bodies whose closed-shell claim requires face-loop closure: {}",
+        geometry_statistics.bodies_requiring_loop_closure
+    );
     report_symbol_link_funnel(geometry_statistics);
     report_nested_assembly_funnel(geometry_statistics);
 }

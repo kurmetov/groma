@@ -749,6 +749,11 @@ pub struct ExportedElement {
     /// through its transform - so a body reproducing it is in the same frame
     /// as the box: already placed, needing no symbol and no transform.
     pub brep_is_placed: bool,
+    /// A cut-face pass found a different body on the same box rather than the
+    /// kept body with faces removed. The kept body's topology may still call
+    /// it closed, but only its own face loops may license a closed-shell claim
+    /// after that contradiction; see [`place_body_less_its_cut_faces`].
+    pub brep_requires_loop_closure: bool,
     /// What each box on the record the kept body came from says about it. See
     /// [`BodyBoxResiduals`]: measurement for a possible second placement tier.
     pub brep_box_residuals: BodyBoxResiduals,
@@ -1129,6 +1134,7 @@ pub fn recover_elements(
                             let PlacedBody {
                                 brep,
                                 placed,
+                                requires_loop_closure,
                                 placement_box,
                             } = read;
                             if keep_body(&brep, placed, entry) {
@@ -1166,6 +1172,7 @@ pub fn recover_elements(
                                     ),
                                 };
                                 entry.brep_is_placed = placed;
+                                entry.brep_requires_loop_closure = requires_loop_closure;
                                 entry.brep = Some(brep);
                             }
                         }
@@ -1412,6 +1419,7 @@ struct GeometryDecode {
 struct PlacedBody {
     brep: rvt_model::SymbolBrep,
     placed: bool,
+    requires_loop_closure: bool,
     placement_box: Option<GElementBounds>,
 }
 
@@ -1528,21 +1536,33 @@ fn decode_geometry(
             // that the record's box does not bound. See
             // `place_body_less_its_cut_faces`; a body that places and closes
             // is never re-read, so nothing that is a solid today can change.
+            let mut requires_loop_closure = false;
             let (brep, placed) = if placed && brep.bounds_a_volume() {
                 (brep, placed)
             } else {
-                place_body_less_its_cut_faces(
+                match cut_face_trim(
                     &objects,
                     classes,
                     &context.brep_body_class_indices,
                     placement_box.as_ref(),
                     &brep,
-                )
-                .map_or((brep, placed), |trimmed| (trimmed, true))
+                ) {
+                    CutFaceTrim::Accepted(trimmed) => (*trimmed, true),
+                    CutFaceTrim::DifferentBody => {
+                        // The source's topology calls the kept body closed,
+                        // while its own loops do not. A second body landing on
+                        // the same box is the contradiction that makes the
+                        // topological claim unsafe for this record alone.
+                        requires_loop_closure = true;
+                        (brep, placed)
+                    }
+                    CutFaceTrim::Refused => (brep, placed),
+                }
             };
             body_read = Some(PlacedBody {
                 brep,
                 placed,
+                requires_loop_closure,
                 placement_box,
             });
         }
@@ -2496,6 +2516,18 @@ pub fn place_declared_body(
 /// and a null `m_renderStyleId` fires on 214 185 faces that are inside the box.
 pub const FACE_INSIDE_THE_BOX_FLAG: i64 = 0x0008_0000;
 
+/// What rebuilding a record without the faces its own mark sets apart found.
+enum CutFaceTrim {
+    /// The same placed body with some of its faces removed.
+    Accepted(Box<rvt_model::SymbolBrep>),
+    /// A closed body landed on the same box, but it is made from different
+    /// faces. This is evidence against the first body's topological closure,
+    /// not permission to replace it with the second body.
+    DifferentBody,
+    /// No single volume-bounding body landed on the record's box.
+    Refused,
+}
+
 /// Place the body a record's box bounds, after dropping the faces that are not
 /// in it.
 ///
@@ -2547,7 +2579,22 @@ pub fn place_body_less_its_cut_faces(
     bounds: Option<&GElementBounds>,
     first_pass: &rvt_model::SymbolBrep,
 ) -> Option<rvt_model::SymbolBrep> {
-    let bounds = bounds?;
+    match cut_face_trim(objects, classes, body_classes, bounds, first_pass) {
+        CutFaceTrim::Accepted(trimmed) => Some(*trimmed),
+        CutFaceTrim::DifferentBody | CutFaceTrim::Refused => None,
+    }
+}
+
+fn cut_face_trim(
+    objects: &[rvt_model::SerialObject],
+    classes: &rvt_model::BrepClassIndexes,
+    body_classes: &[u16],
+    bounds: Option<&GElementBounds>,
+    first_pass: &rvt_model::SymbolBrep,
+) -> CutFaceTrim {
+    let Some(bounds) = bounds else {
+        return CutFaceTrim::Refused;
+    };
     let mut dropped = 0_usize;
     let kept = objects
         .iter()
@@ -2561,11 +2608,18 @@ pub fn place_body_less_its_cut_faces(
         .cloned()
         .collect::<Vec<_>>();
     if dropped == 0 {
-        return None;
+        return CutFaceTrim::Refused;
     }
     let trimmed = rvt_model::assemble_symbol_brep(&kept, classes, body_classes);
     let (trimmed, placed) = place_declared_body(trimmed, Some(bounds));
-    (placed && trimmed.bounds_a_volume() && is_trim_of(&trimmed, first_pass)).then_some(trimmed)
+    if !(placed && trimmed.bounds_a_volume()) {
+        return CutFaceTrim::Refused;
+    }
+    if is_trim_of(&trimmed, first_pass) {
+        CutFaceTrim::Accepted(Box::new(trimmed))
+    } else {
+        CutFaceTrim::DifferentBody
+    }
 }
 
 /// Whether one body is another read again with some of its faces dropped:
@@ -2897,6 +2951,9 @@ pub struct GeometryStatistics {
     pub verified_family_instance_placements: usize,
     pub verified_ginstance_transforms: usize,
     pub verified_symbol_bounds: usize,
+    /// Kept bodies whose topological closure was contradicted by a cut-face
+    /// rebuild selecting a different set of faces on the same box.
+    pub bodies_requiring_loop_closure: usize,
     /// What an element declaring several placements says about itself. A
     /// nested family writes one `InstInfoBase` per sub-instance, and no single
     /// transform describes it, so the export reads none of them. These count
@@ -3082,6 +3139,8 @@ pub fn geometry_statistics(
             )
     };
     for element in elements.values() {
+        statistics.bodies_requiring_loop_closure +=
+            usize::from(element.brep_requires_loop_closure);
         if let Some(line) = element.pipe_line_candidate {
             statistics.pipe_candidates += 1;
             statistics.pipe_candidates_with_bounds +=
@@ -3861,7 +3920,12 @@ fn nested_assembly(
         if !agrees(min, max) {
             return Err(NestedRefusal::HullDisagreed);
         }
-        let brep = normalize_placed_brep(own).ok_or(NestedRefusal::MemberNotConverted)?;
+        let brep = normalize_brep(
+            own,
+            &IDENTITY_TRANSFORM,
+            element.brep_requires_loop_closure,
+        )
+        .ok_or(NestedRefusal::MemberNotConverted)?;
         if !brep.complete {
             return Err(NestedRefusal::OwnBodyUnusable);
         }
@@ -3878,14 +3942,14 @@ fn nested_assembly(
         // the hull above - the member's box is stated in the frame its own
         // transform lands in, and the hull carried that box through this same
         // placement.
-        let (local, placement) = if let Some(local) = symbol.brep.as_ref() {
-            (local, *placement)
+        let (source, placement) = if symbol.brep.is_some() {
+            (*symbol, *placement)
         } else {
             let inner = symbol
                 .verified_symbol_bounds
                 .as_ref()
                 .and_then(|verified| elements.get(&verified.symbol_element_id))
-                .and_then(|inner| inner.brep.as_ref())
+                .filter(|inner| inner.brep.is_some())
                 .ok_or(NestedRefusal::MemberHasNoBody)?;
             let transform = symbol
                 .ginstance_transform
@@ -3895,7 +3959,8 @@ fn nested_assembly(
                 GInstanceTransformFields::composed(placement, &transform),
             )
         };
-        let brep = normalize_brep(local, &placement).ok_or(NestedRefusal::MemberNotConverted)?;
+        let brep = normalize_element_brep(source, &placement)
+            .ok_or(NestedRefusal::MemberNotConverted)?;
         if !brep.complete {
             return Err(NestedRefusal::MemberIncomplete);
         }
@@ -3956,7 +4021,7 @@ fn normalize_geometry(
     // that box is in the symbol's own local frame. On AR S1 that is 81 records
     // which would otherwise pile their bodies at the origin.
     if element.brep_is_placed && element.category_source != Some("declared") {
-        if let Some(brep) = element.brep.as_ref().and_then(normalize_placed_brep) {
+        if let Some(brep) = normalize_element_brep(element, &IDENTITY_TRANSFORM) {
             // Closed bodies only, for the reason the symbol path gives below:
             // IfcOpenShell refuses a large share of open shells.
             if brep.complete {
@@ -3986,13 +4051,10 @@ fn normalize_geometry(
         return Some(BimGeometry::Assembly(parts));
     }
     let symbol = element.verified_symbol_bounds?;
-    if let (Some(local_brep), Some(transform)) = (
-        elements
-            .get(&symbol.symbol_element_id)
-            .and_then(|symbol_element| symbol_element.brep.as_ref()),
-        element.ginstance_transform,
-    ) {
-        if let Some(brep) = normalize_brep(local_brep, &transform) {
+    if let (Some(symbol_element), Some(transform)) =
+        (elements.get(&symbol.symbol_element_id), element.ginstance_transform)
+    {
+        if let Some(brep) = normalize_element_brep(symbol_element, &transform) {
             // Only a body whose every face resolved is emitted. An incomplete
             // one is schema-valid as an open `IfcShellBasedSurfaceModel`, and
             // for a handful of records it geometrizes, but at corpus scale it
@@ -4037,7 +4099,18 @@ const IDENTITY_TRANSFORM: GInstanceTransformFields = GInstanceTransformFields {
 /// feet, to the metres the exporter works in.
 #[must_use]
 pub fn normalize_placed_brep(placed: &rvt_model::SymbolBrep) -> Option<BimBrep> {
-    normalize_brep(placed, &IDENTITY_TRANSFORM)
+    normalize_brep(placed, &IDENTITY_TRANSFORM, false)
+}
+
+fn normalize_element_brep(
+    element: &ExportedElement,
+    transform: &GInstanceTransformFields,
+) -> Option<BimBrep> {
+    normalize_brep(
+        element.brep.as_ref()?,
+        transform,
+        element.brep_requires_loop_closure,
+    )
 }
 
 fn normalize_brep_points(
@@ -4200,6 +4273,7 @@ fn world_brep_surface(
 fn normalize_brep(
     local: &rvt_model::SymbolBrep,
     transform: &GInstanceTransformFields,
+    requires_loop_closure: bool,
 ) -> Option<BimBrep> {
     let metres = |value: f64| revit_catalog::internal_feet_to_metres(value);
     let world_point = |local_point: [f64; 3]| -> Option<BimPoint3> {
@@ -4259,13 +4333,16 @@ fn normalize_brep(
     }
     Some(BimBrep {
         faces,
-        // Closed means the boundary closes, not merely that the record
-        // excluded no face - see `SymbolBrep::is_closed`. A body trimmed of
-        // the cut geometry the file joined to it can never satisfy that test,
-        // because the faces it dropped are still named by the edges that
-        // reach them; what it can satisfy is the same claim read off the faces
-        // being written - see `SymbolBrep::bounds_a_volume`.
-        complete: local.is_closed() || local.bounds_a_volume(),
+        // Usually the source topology and the loops being written are two
+        // independent ways to establish closure, and either is enough. A
+        // cut-face pass can make them contradict each other, however: element
+        // 7281744's kept shell is topologically closed while its own loops
+        // leave an edge unmatched, and rebuilding the record lands a different
+        // body on the same box. Only for that measured population does the
+        // face-loop reading become mandatory. The different rebuilt body is
+        // not substituted; it is evidence against this one's closed claim.
+        complete: local.bounds_a_volume()
+            || (!requires_loop_closure && local.is_closed()),
     })
 }
 
@@ -5136,6 +5213,7 @@ mod tests {
         // What the recovery sets when the body reproduces the bounds of the
         // record it came from; see `body_is_placed_in`.
         wall.brep_is_placed = true;
+        wall.brep_requires_loop_closure = true;
         wall.brep_box_residuals = BodyBoxResiduals {
             exact: Some(0.0),
             graph: Some(0.0),
@@ -5197,6 +5275,11 @@ mod tests {
         let instance = &rows["FamilyInstance"];
         assert_eq!(instance.body_ids, 0);
         assert_eq!(instance.model_elements_with_a_verified_symbol_body, 1);
+
+        assert_eq!(
+            geometry_statistics(&elements, None).bodies_requiring_loop_closure,
+            1
+        );
     }
 
     fn bounds(min: [f64; 3], max: [f64; 3]) -> rvt_model::GElementBounds {
@@ -5695,6 +5778,27 @@ mod tests {
     }
 
     #[test]
+    fn topology_alone_does_not_turn_unmatched_face_loops_into_a_closed_shell() {
+        let objects = fixture_record(&box_with_an_interior_face(true));
+        let classes = fixture_classes();
+        let assembled = rvt_model::assemble_symbol_brep(&objects, &classes, &[FIXTURE_GBREP]);
+        let box_of_the_record = bounds([0.0, 0.0, 0.0], [1.0, 1.0, 2.0]);
+        let (body, placed) = place_declared_body(assembled, Some(&box_of_the_record));
+
+        // The source's edge references name two faces on every side, but the
+        // interior face draws four edges no other loop draws. This is the
+        // shape of the panel population that used to become a closed shell
+        // with a volume hundreds of thousands of times too large.
+        assert!(placed);
+        assert!(body.is_closed());
+        assert!(!body.bounds_a_volume());
+
+        let normalized = normalize_brep(&body, &IDENTITY_TRANSFORM, true)
+            .expect("finite planar body");
+        assert!(!normalized.complete);
+    }
+
+    #[test]
     fn a_face_the_records_box_bounds_is_never_dropped() {
         // The same seven faces, with the interior one marked as the box's own.
         // Nothing is dropped, so nothing is re-read: a body is only ever
@@ -5761,9 +5865,10 @@ mod tests {
     #[test]
     fn a_placed_body_is_emitted_without_a_symbol_or_a_transform() {
         let mut wall = ExportedElement::default();
-        let mut body = square_body([40.0, 5.0, 0.0]);
-        let mut lid = square_body([40.0, 5.0, 9.0]);
-        body.faces.append(&mut lid.faces);
+        let objects = fixture_record(&fixture_box_faces());
+        let classes = fixture_classes();
+        let body = rvt_model::assemble_symbol_brep(&objects, &classes, &[FIXTURE_GBREP]);
+        assert!(body.bounds_a_volume());
         wall.brep = Some(body);
         wall.brep_is_placed = true;
 
@@ -5772,12 +5877,23 @@ mod tests {
             panic!("a placed body should reach the export: {geometry:?}");
         };
         assert!(brep.complete);
-        assert_eq!(brep.faces.len(), 2);
+        assert_eq!(brep.faces.len(), 6);
         // Carried straight through in the source's own project coordinates,
         // converted to metres and to nothing else.
-        let start = &brep.faces[0].loops[0][0].start;
-        assert_eq!(start.unit.id, "autodesk.unit.unit:meters-1.0.0");
-        for (actual, feet) in start.coordinates.into_iter().zip([40.0, 5.0, 0.0]) {
+        let mut max = [f64::NEG_INFINITY; 3];
+        for point in brep
+            .faces
+            .iter()
+            .flat_map(|face| &face.loops)
+            .flatten()
+            .flat_map(|edge| [&edge.start, &edge.end])
+        {
+            assert_eq!(point.unit.id, "autodesk.unit.unit:meters-1.0.0");
+            for (axis, coordinate) in point.coordinates.iter().enumerate() {
+                max[axis] = max[axis].max(*coordinate);
+            }
+        }
+        for (actual, feet) in max.into_iter().zip([1.0, 1.0, 2.0]) {
             assert!((actual - feet * 0.304_8).abs() < 1.0e-12, "{actual}");
         }
 
