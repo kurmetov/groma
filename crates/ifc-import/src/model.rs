@@ -193,6 +193,7 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
             // not as project identity - nothing here reads `Name`/`LongName`
             // back into one.
             project: None,
+            site: None,
             documents: Vec::new(),
             elements,
             levels,

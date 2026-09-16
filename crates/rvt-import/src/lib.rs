@@ -23,7 +23,7 @@ use bim_core::{
     BimBrepRuling, BimBrepSurface, BimCategory, BimElement, BimElementId, BimElementType,
     BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimMaterial, BimMaterialLayer,
     BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3, BimProjectIdentity,
-    BimProperty, BimPropertyValue, BimSource, BimSweptDisk, BimUnit,
+    BimProperty, BimPropertyValue, BimSiteLocation, BimSource, BimSweptDisk, BimUnit,
 };
 use revit_catalog::Catalog;
 use rvt_container::{
@@ -33,9 +33,9 @@ use rvt_container::{
 use rvt_model::{
     ELEMENT_TAIL_BYTES, ElemTable, ElementFields, ElementHeaderFields,
     FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds, GElementGraphFields,
-    GInstanceTransformFields, LevelFields, MemberWalk, ParameterSetClassIndexes, ParameterSets,
-    ParameterSpec, ParameterValue, PipeLineGeometryFields, RecordHeader, RecordLayout,
-    RecordString, RvtPoint3,
+    GeoSiteFields, GInstanceTransformFields, LevelFields, MemberWalk, ParameterSetClassIndexes,
+    ParameterSets, ParameterSpec, ParameterValue, PipeLineGeometryFields, RecordHeader,
+    RecordLayout, RecordString, RvtPoint3,
 };
 use rvt_schema::Schema;
 use std::{
@@ -677,6 +677,9 @@ pub struct ExportedElement {
     pub main_design_option_id: Option<i32>,
     /// `Plane.m_origin[2]` for a `Level`, in Revit internal feet.
     pub elevation_feet: Option<f64>,
+    /// A `GeoSite`'s own latitude, longitude and elevation. See
+    /// [`rvt_model::GeoSiteFields`] for why a project can carry more than one.
+    pub geo_site: Option<rvt_model::GeoSiteFields>,
     /// First readable string in the body, with how it was located.
     pub name: Option<(String, &'static str)>,
     pub parameters: Vec<rvt_model::Parameter>,
@@ -1026,6 +1029,7 @@ pub fn recover_elements(
     let header_class_index = schema_class_index(schema.as_ref(), ELEMENT_HEADER_CLASS);
     let level_class_index = schema_class_index(schema.as_ref(), "Level");
     let plane_class_index = schema_class_index(schema.as_ref(), "Plane");
+    let geo_site_class_index = schema_class_index(schema.as_ref(), "GeoSite");
     let pipe_curve_class_index = schema_class_index(schema.as_ref(), "RbsPipeCurve");
     let family_instance_class_index = schema_class_index(schema.as_ref(), "FamilyInstance");
     let curve_driver_class_index = schema_class_index(schema.as_ref(), "RbsCurveDriver");
@@ -1070,6 +1074,7 @@ pub fn recover_elements(
         header_class_index,
         level_class_index,
         plane_class_index,
+        geo_site_class_index,
         pipe_curve_class_index,
         family_instance_class_index,
         curve_driver_class_index,
@@ -1204,6 +1209,7 @@ pub fn recover_elements(
                             compound_structures,
                             fields,
                             elevation_feet,
+                            geo_site,
                             pipe_line_candidate,
                             fitting_center_line_candidate,
                             parameter_spec,
@@ -1304,6 +1310,9 @@ pub fn recover_elements(
                         if let Some(elevation_feet) = elevation_feet {
                             entry.elevation_feet = Some(elevation_feet);
                         }
+                        if let Some(geo_site) = geo_site {
+                            entry.geo_site = Some(geo_site);
+                        }
                         if Some(header.class_index) == context.pipe_curve_class_index
                             && context.curve_driver_class_index.is_some()
                         {
@@ -1361,6 +1370,7 @@ struct RecordContext<'a> {
     header_class_index: Option<u16>,
     level_class_index: Option<u16>,
     plane_class_index: Option<u16>,
+    geo_site_class_index: Option<u16>,
     pipe_curve_class_index: Option<u16>,
     family_instance_class_index: Option<u16>,
     curve_driver_class_index: Option<u16>,
@@ -1445,6 +1455,7 @@ struct ElementDecode {
     compound_structures: Vec<rvt_model::CompoundStructure>,
     fields: Option<ElementFieldsDecode>,
     elevation_feet: Option<f64>,
+    geo_site: Option<rvt_model::GeoSiteFields>,
     pipe_line_candidate: Option<PipeLineGeometryFields>,
     fitting_center_line_candidate: Option<FittingCenterLineFields>,
     parameter_spec: Option<String>,
@@ -1716,6 +1727,13 @@ fn decode_element(context: &RecordContext<'_>, header: RecordHeader, body: &[u8]
                     .plane_class_index
                     .and_then(|plane_index| LevelFields::parse(body, plane_index))
                     .map(|fields| fields.elevation_feet)
+            })
+            .flatten(),
+        geo_site: (Some(header.class_index) == context.geo_site_class_index)
+            .then(|| {
+                context
+                    .schema
+                    .and_then(|schema| GeoSiteFields::parse(schema, header.class_index, body))
             })
             .flatten(),
         pipe_line_candidate: (Some(header.class_index) == context.pipe_curve_class_index)
@@ -2282,6 +2300,50 @@ fn project_identity(recovered: &RecoveredElements) -> Option<BimProjectIdentity>
     })
 }
 
+/// Where the project sits, read off every `GeoSite` record the file carries.
+///
+/// A project can keep more than one named location (`Manage > Location` does
+/// not delete an alternate when another becomes active), and nothing this
+/// reader has found yet says which `GeoSite` record is the active one - see
+/// [`rvt_model::GeoSiteFields`]. Guessing which one to trust would be a wrong
+/// site silently written into every export of a file that has more than one,
+/// so this only ever states a location when every non-deleted `GeoSite`
+/// record in the file agrees, bit for bit. Measured against AR S1: 18
+/// records, one value.
+fn site_location(recovered: &RecoveredElements) -> Option<BimSiteLocation> {
+    const RADIANS_TO_DEGREES: f64 = 180.0 / std::f64::consts::PI;
+    let mut distinct = BTreeSet::new();
+    let mut agreed = None;
+    for element in recovered.elements.values() {
+        if element.moribund {
+            continue;
+        }
+        let Some(fields) = element.geo_site else {
+            continue;
+        };
+        distinct.insert((
+            fields.latitude_radians.to_bits(),
+            fields.longitude_radians.to_bits(),
+            fields.elevation_feet.to_bits(),
+        ));
+        agreed = Some(fields);
+    }
+    if distinct.len() != 1 {
+        return None;
+    }
+    let fields = agreed?;
+    Some(BimSiteLocation {
+        latitude_degrees: fields.latitude_radians * RADIANS_TO_DEGREES,
+        longitude_degrees: fields.longitude_radians * RADIANS_TO_DEGREES,
+        elevation: revit_catalog::internal_feet_to_metres(fields.elevation_feet).map(|value| {
+            BimNumber {
+                value,
+                unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
+            }
+        }),
+    })
+}
+
 /// The storeys of *this* model, and the map that folds every recovered `Level`
 /// onto the one that represents it.
 fn building_storeys(
@@ -2657,6 +2719,7 @@ pub fn metadata_model(
                 release: recovered.release.map(|release| release.to_string()),
             }),
             project: project_identity(recovered),
+            site: site_location(recovered),
             documents: Vec::new(),
             elements,
             levels,
@@ -5797,6 +5860,106 @@ mod tests {
             elements: BTreeMap::new(),
         };
         assert!(project_identity(&recovered).is_none());
+    }
+
+    /// Every `GeoSite` record in the file states the same location, so
+    /// `site_location` trusts it - and converts Revit's radians the same way
+    /// `internal_feet_to_metres` already converts a level's elevation.
+    /// Values are AR S1's own: Revit's default Boston siting, which
+    /// `s1_revit.ifc` states as `IfcSite` `(42,24,53,508911)` degrees-minutes-
+    /// seconds / `(-71,-15,-29,-58837)` / `0.` - `ifc-export`'s own test
+    /// converts these same degrees into that compound form and checks it
+    /// against that exact statement.
+    #[test]
+    fn site_location_agrees_when_every_geo_site_record_does() {
+        let geo_site = rvt_model::GeoSiteFields {
+            latitude_radians: 0.740_279_021_367_38,
+            longitude_radians: -1.243_687_973_267_624_5,
+            elevation_feet: 0.0,
+        };
+        let mut elements = BTreeMap::new();
+        for (id, name) in [(1367, "52939_2004"), (7_031_652, "ОБРАЗЕЦ")] {
+            elements.insert(
+                id,
+                ExportedElement {
+                    geo_site: Some(geo_site),
+                    name: Some((name.to_owned(), "declared")),
+                    ..ExportedElement::default()
+                },
+            );
+        }
+        let recovered = RecoveredElements {
+            release: None,
+            catalog: None,
+            parameter_values_schema_bound: false,
+            schema: None,
+            partition_paths: Vec::new(),
+            parameter_names: BTreeMap::new(),
+            parameter_specs: BTreeMap::new(),
+            elements,
+        };
+        let site = site_location(&recovered).expect("every record agrees");
+        assert!((site.latitude_degrees - 42.414_863_586_425_76).abs() < 1e-9);
+        assert!((site.longitude_degrees - -71.258_071_899_414_03).abs() < 1e-9);
+        assert_eq!(site.elevation.map(|value| value.value), Some(0.0));
+    }
+
+    /// Two named locations whose coordinates genuinely differ - a project
+    /// that really does carry more than one site - is refused rather than
+    /// guessed at: there is nothing here yet that says which one is active.
+    #[test]
+    fn site_location_refuses_to_guess_between_disagreeing_records() {
+        let mut elements = BTreeMap::new();
+        elements.insert(
+            1,
+            ExportedElement {
+                geo_site: Some(rvt_model::GeoSiteFields {
+                    latitude_radians: 0.7,
+                    longitude_radians: -1.2,
+                    elevation_feet: 0.0,
+                }),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            2,
+            ExportedElement {
+                geo_site: Some(rvt_model::GeoSiteFields {
+                    latitude_radians: 0.9,
+                    longitude_radians: -1.4,
+                    elevation_feet: 0.0,
+                }),
+                ..ExportedElement::default()
+            },
+        );
+        let recovered = RecoveredElements {
+            release: None,
+            catalog: None,
+            parameter_values_schema_bound: false,
+            schema: None,
+            partition_paths: Vec::new(),
+            parameter_names: BTreeMap::new(),
+            parameter_specs: BTreeMap::new(),
+            elements,
+        };
+        assert!(site_location(&recovered).is_none());
+    }
+
+    /// No `GeoSite` record at all names no site - the common case, since most
+    /// files never touch `Manage > Location`.
+    #[test]
+    fn site_location_is_none_without_a_geo_site_record() {
+        let recovered = RecoveredElements {
+            release: None,
+            catalog: None,
+            parameter_values_schema_bound: false,
+            schema: None,
+            partition_paths: Vec::new(),
+            parameter_names: BTreeMap::new(),
+            parameter_specs: BTreeMap::new(),
+            elements: BTreeMap::new(),
+        };
+        assert!(site_location(&recovered).is_none());
     }
 
     /// An element wears the build-up its type declares, and says which record

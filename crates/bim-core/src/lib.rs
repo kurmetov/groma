@@ -18,6 +18,12 @@ pub struct BimModel {
     /// `None` for a federated model, because several files name several
     /// projects and none of them is *the* project of the assembled whole.
     pub project: Option<BimProjectIdentity>,
+    /// Where the project sits, when the file states one location and every
+    /// record of it agrees. `None` for a federated model, same reasoning as
+    /// [`Self::project`]; also `None` for a single file whose named
+    /// locations disagree - see [`BimSiteLocation`] for why that is refused
+    /// rather than guessed at.
+    pub site: Option<BimSiteLocation>,
     /// The source files this model was assembled from, one entry per file.
     ///
     /// Empty for a model a reader produced directly; [`federate`] fills it,
@@ -57,6 +63,21 @@ pub struct BimProjectIdentity {
     pub address: Option<String>,
     /// `PROJECT_STATUS`, written as `IfcProject.Phase`.
     pub phase: Option<String>,
+}
+
+/// Where a project's `Manage > Location` places it.
+///
+/// A Revit project can carry more than one named site (an alternate the user
+/// switched away from is not deleted, just no longer active), and a reader
+/// that cannot yet tell which record is the active one has to choose between
+/// guessing and refusing - see whichever field on the importer side reads
+/// this, and its own reasoning for picking "every record in the file agrees"
+/// as the one case safe enough not to guess.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BimSiteLocation {
+    pub latitude_degrees: f64,
+    pub longitude_degrees: f64,
+    pub elevation: Option<BimNumber>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -635,6 +656,7 @@ pub fn federate(sources: Vec<(BimDocument, BimModel)>) -> (BimModel, BimFederati
         if !qualify {
             out.source = model.source.clone();
             out.project = model.project.clone();
+            out.site = model.site;
         }
         out.elements.append(&mut model.elements);
         out.levels.append(&mut model.levels);
@@ -841,6 +863,7 @@ mod tests {
                 number: Some("PN-1".to_owned()),
                 ..BimProjectIdentity::default()
             }),
+            site: None,
             documents: Vec::new(),
             elements: vec![element(id, at)],
             levels: vec![BimLevel {

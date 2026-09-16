@@ -135,7 +135,7 @@ pub fn metadata_ifc_reported(
         "IFCLOCALPLACEMENT",
         vec![StepValue::Omitted, StepValue::Reference(origin_axis)],
     );
-    let site = push_site(&mut file, options, ownership, site_placement);
+    let site = push_site(&mut file, options, ownership, site_placement, model.site.as_ref());
     let building_placement = file.push(
         "IFCLOCALPLACEMENT",
         vec![
@@ -456,7 +456,20 @@ fn push_site(
     options: &MetadataOptions,
     owner: EntityRef,
     placement: EntityRef,
+    site: Option<&bim_core::BimSiteLocation>,
 ) -> EntityRef {
+    let (ref_latitude, ref_longitude, ref_elevation) = site.map_or(
+        (omitted(), omitted(), omitted()),
+        |site| {
+            (
+                compound_plane_angle(site.latitude_degrees),
+                compound_plane_angle(site.longitude_degrees),
+                site.elevation
+                    .as_ref()
+                    .map_or_else(omitted, |elevation| StepValue::Real(elevation.value)),
+            )
+        },
+    );
     file.push(
         "IFCSITE",
         vec![
@@ -476,12 +489,46 @@ fn push_site(
             omitted(),
             omitted(),
             enumeration("ELEMENT"),
-            omitted(),
-            omitted(),
-            omitted(),
+            ref_latitude,
+            ref_longitude,
+            ref_elevation,
             omitted(),
             omitted(),
         ],
+    )
+}
+
+/// A decimal angle as `IfcCompoundPlaneAngleMeasure`: degrees, minutes,
+/// seconds, and millionths of a second, all sharing the angle's own sign.
+///
+/// Every component but the last is truncated, not rounded, down to the
+/// fractional second - and that one is truncated too, not rounded, which is
+/// what keeps this matching Revit's own arithmetic exactly rather than
+/// agreeing with it to within a millionth of an arcsecond: rounding the last
+/// component lands one high wherever the true value sits in the top half of
+/// its millionth, and `s1_revit.ifc`'s own `IfcSite` states a longitude,
+/// `(-71,-15,-29,-58837)`, where it does.
+fn compound_plane_angle(degrees: f64) -> StepValue {
+    let sign = if degrees < 0.0 { -1 } else { 1 };
+    let remainder = degrees.abs();
+    let whole_degrees = remainder.floor();
+    let remainder = (remainder - whole_degrees) * 60.0;
+    let minutes = remainder.floor();
+    let remainder = (remainder - minutes) * 60.0;
+    let seconds = remainder.floor();
+    let remainder = (remainder - seconds) * 1_000_000.0;
+    let millionths = remainder.floor();
+    StepValue::List(
+        [whole_degrees, minutes, seconds, millionths]
+            .into_iter()
+            .map(|component| {
+                #[allow(clippy::cast_possible_truncation)]
+                // Each component is already floored and bounded well within
+                // i64 by the arithmetic above (a degree count, a 0..60
+                // minute/second, or a 0..1_000_000 fraction).
+                StepValue::Integer(sign * component as i64)
+            })
+            .collect(),
     )
 }
 
@@ -4029,6 +4076,7 @@ mod tests {
         BimModel {
             source: None,
             project: None,
+            site: None,
             documents: Vec::new(),
             levels: vec![BimLevel {
                 id: level_id.clone(),
@@ -5190,6 +5238,61 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("'Test Project'"));
         assert!(!text.contains("=IFCPOSTALADDRESS("));
+    }
+
+    /// `IfcSite.RefLatitude`/`RefLongitude`/`RefElevation` are written from
+    /// `BimModel.site` when the model carries one, in IFC's own
+    /// degrees-minutes-seconds-plus-fraction form. The degrees are AR S1's
+    /// own `GeoSite` record, converted from the radians the file stores;
+    /// `s1_revit.ifc`'s own `IfcSite` states the same location as
+    /// `(42,24,53,508911)`/`(-71,-15,-29,-58837)`/`0.`, which this matches
+    /// exactly - not just to within rounding.
+    #[test]
+    fn writes_the_sites_own_location_as_a_compound_angle() {
+        let mut sited = model();
+        sited.site = Some(bim_core::BimSiteLocation {
+            latitude_degrees: 0.740_279_021_367_38 * (180.0 / std::f64::consts::PI),
+            longitude_degrees: -1.243_687_973_267_624_5 * (180.0 / std::f64::consts::PI),
+            elevation: Some(BimNumber {
+                value: 0.0,
+                unit: Some(bim_core::BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
+            }),
+        });
+
+        let file = metadata_ifc(&sited, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        let site = text
+            .lines()
+            .find(|line| line.contains("=IFCSITE("))
+            .expect("the site");
+        assert!(
+            site.contains("(42,24,53,508911)"),
+            "latitude should match Revit's own export exactly: {site}"
+        );
+        assert!(
+            site.contains("(-71,-15,-29,-58837)"),
+            "longitude should match Revit's own export exactly: {site}"
+        );
+    }
+
+    /// No `BimModel.site` - most files, which never touch
+    /// *Manage > Location* or whose alternates disagree - leaves
+    /// `RefLatitude`/`RefLongitude`/`RefElevation` unset, as before this
+    /// feature existed.
+    #[test]
+    fn writes_no_site_location_where_the_model_carries_none() {
+        let file = metadata_ifc(&model(), &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let site = text
+            .lines()
+            .find(|line| line.contains("=IFCSITE("))
+            .expect("the site");
+        assert!(site.ends_with(",$,$,$,$,$);"), "{site}");
     }
 
     /// A mapping table decides what a category becomes, ahead of the built-in

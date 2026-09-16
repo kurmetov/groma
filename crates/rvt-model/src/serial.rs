@@ -748,6 +748,50 @@ pub fn walk_record_traced(
     (walk, trace)
 }
 
+/// A `GeoSite` record's location, in the units the record itself declares:
+/// latitude and longitude in radians, elevation in Revit's internal feet -
+/// the same convention `LevelFields::elevation_feet` documents.
+///
+/// `GeoSite` is one of the classes Revit's *Manage > Location* dialog can
+/// carry several of (a project keeps a record per named alternate site, not
+/// just the active one), so a caller with more than one of these has to
+/// decide which one is true - this only reads what one record states.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GeoSiteFields {
+    pub latitude_radians: f64,
+    pub longitude_radians: f64,
+    pub elevation_feet: f64,
+}
+
+impl GeoSiteFields {
+    /// Read `m_dLatitude`, `m_dLongitude` and `m_dElevation` off a `GeoSite`
+    /// record body, by declaration rather than a fixed offset - `GeoSite`'s
+    /// own base classes are a long, version-dependent chain, so the numbers
+    /// this reads are wherever the schema currently says they are.
+    ///
+    /// `None` where the record does not tile exactly against the schema, one
+    /// of the three properties is not declared, or any value read is not
+    /// finite.
+    #[must_use]
+    pub fn parse(schema: &Schema, class_index: u16, body: &[u8]) -> Option<Self> {
+        let (walk, trace) = walk_record_traced(schema, class_index, body);
+        walk.stop.is_none().then_some(())?;
+        let read = |property: &str| {
+            let entry = trace
+                .iter()
+                .find(|entry| entry.class == "GeoSite" && entry.property == property)?;
+            let bytes: [u8; 8] = body.get(entry.offset..entry.offset + 8)?.try_into().ok()?;
+            let value = f64::from_le_bytes(bytes);
+            value.is_finite().then_some(value)
+        };
+        Some(Self {
+            latitude_radians: read("m_dLatitude")?,
+            longitude_radians: read("m_dLongitude")?,
+            elevation_feet: read("m_dElevation")?,
+        })
+    }
+}
+
 /// Read `body` as a complete record: the declared properties of `class_index`,
 /// a two-byte stream prefix, one serialized node per reference in the order
 /// the references were read, and a trailing `u32` repeating the body length.
@@ -1704,6 +1748,69 @@ mod tests {
             record_walk.consumed, top_level_walk.consumed,
             "the record-body reading of m_flags should desync the rest of this body"
         );
+    }
+
+    #[test]
+    fn geo_site_fields_reads_latitude_longitude_and_elevation_by_declaration() {
+        let schema = Schema {
+            classes: vec![class(
+                FIRST_CLASS_INDEX,
+                "GeoSite",
+                TypeReference::None,
+                vec![
+                    property("m_dLatitude", FieldType::Float64, 0x00, 0, None),
+                    property("m_dLongitude", FieldType::Float64, 0x00, 0, None),
+                    property("m_dElevation", FieldType::Float64, 0x00, 0, None),
+                ],
+            )],
+            top_level_class_count: 1,
+            property_count: 3,
+            parsed_property_count: 3,
+            consumed_bytes: 0,
+            trailing_bytes: Vec::new(),
+            unresolved_references: Vec::new(),
+            inline_index_mismatches: Vec::new(),
+        };
+        let mut body = Vec::new();
+        body.extend(0.740_279_021_367_38_f64.to_le_bytes());
+        body.extend((-1.243_687_973_267_624_5_f64).to_le_bytes());
+        body.extend(613.0_f64.to_le_bytes());
+        body.extend(0_u32.to_le_bytes()); // length trailer, unchecked here
+
+        let fields = GeoSiteFields::parse(&schema, FIRST_CLASS_INDEX, &body).unwrap();
+        // Exact equality is the claim: these are the same bytes this test
+        // just wrote, read back.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(fields.latitude_radians, 0.740_279_021_367_38);
+            assert_eq!(fields.longitude_radians, -1.243_687_973_267_624_5);
+            assert_eq!(fields.elevation_feet, 613.0);
+        }
+    }
+
+    #[test]
+    fn geo_site_fields_refuses_a_record_the_declarations_do_not_tile() {
+        let schema = Schema {
+            classes: vec![class(
+                FIRST_CLASS_INDEX,
+                "GeoSite",
+                TypeReference::None,
+                vec![
+                    property("m_dLatitude", FieldType::Float64, 0x00, 0, None),
+                    property("m_dLongitude", FieldType::Float64, 0x00, 0, None),
+                    property("m_dElevation", FieldType::Float64, 0x00, 0, None),
+                ],
+            )],
+            top_level_class_count: 1,
+            property_count: 3,
+            parsed_property_count: 3,
+            consumed_bytes: 0,
+            trailing_bytes: Vec::new(),
+            unresolved_references: Vec::new(),
+            inline_index_mismatches: Vec::new(),
+        };
+        let short_body = vec![0_u8; 4];
+        assert!(GeoSiteFields::parse(&schema, FIRST_CLASS_INDEX, &short_body).is_none());
     }
 
     #[test]
