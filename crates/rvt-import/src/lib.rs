@@ -4549,28 +4549,24 @@ fn normalize_geometry(
         .placed_symbol_body
         .and_then(|symbol_element_id| elements.get(&symbol_element_id))
     {
-        if let Some(brep) = normalize_element_brep(symbol, &IDENTITY_TRANSFORM) {
-            // Complete bodies only, for the reason both other body paths give.
-            if brep.complete {
-                return Some(BimGeometry::Brep(brep));
-            }
+        if let Some(geometry) = normalize_symbol_geometry(symbol, &IDENTITY_TRANSFORM) {
+            return Some(geometry);
         }
     }
     let symbol = element.verified_symbol_bounds?;
     if let (Some(symbol_element), Some(transform)) =
         (elements.get(&symbol.symbol_element_id), element.ginstance_transform)
     {
-        if let Some(brep) = normalize_element_brep(symbol_element, &transform) {
-            // Only a body whose every face resolved is emitted. An incomplete
-            // one is schema-valid as an open `IfcShellBasedSurfaceModel`, and
-            // for a handful of records it geometrizes, but at corpus scale it
-            // does not: of SMALL's 1 771 incomplete shells IfcOpenShell builds
-            // 831 and fails on 940, while all 695 complete bodies build. A
-            // body the reference kernel refuses is not something to ship, so
-            // an incomplete one falls back to the symbol's verified box.
-            if brep.complete {
-                return Some(BimGeometry::Brep(brep));
-            }
+        // Only a body whose every face resolved is emitted. An incomplete one
+        // is schema-valid as an open `IfcShellBasedSurfaceModel`, and for a
+        // handful of records it geometrizes, but at corpus scale it does not:
+        // of SMALL's 1 771 incomplete shells IfcOpenShell builds 831 and fails
+        // on 940, while all 695 complete bodies build. A body the reference
+        // kernel refuses is not something to ship, so an incomplete one falls
+        // back to the symbol's verified box. See `normalize_symbol_geometry`
+        // for what "complete" allows beyond a single closed shell.
+        if let Some(geometry) = normalize_symbol_geometry(symbol_element, &transform) {
+            return Some(geometry);
         }
     }
     // A box flat on an axis is an extent, not a volume, and the IFC writer
@@ -4623,6 +4619,44 @@ fn normalize_element_brep(
         transform,
         element.brep_requires_loop_closure,
     )
+}
+
+/// A symbol's body where the whole record reads as one closed shell - or,
+/// failing that, as the several closed shells it declares side by side.
+///
+/// A record is not always one body: a door's frame and its panel are two
+/// closed solids under one `FamilySymbol`, and `SymbolBrep::bounds_a_volume`
+/// and `SymbolBrep::is_closed` both judge the record as a whole, so a
+/// perfectly closed frame sitting beside a perfectly closed panel - or beside
+/// an open construction surface the loop-closure gate below already screens
+/// out - reads as neither. `SymbolBrep::body` already exists to hand back one
+/// declared body on its own; this is the first place anything asks for every
+/// one of them; see the geometry gaps this closed on AR S1's doors, measured
+/// against `s1_revit.ifc`.
+///
+/// Each candidate body is put through exactly the same
+/// [`normalize_brep`]/`complete` test the whole-record reading uses - a body
+/// this cannot verify closes on its own is left out rather than guessed
+/// into the assembly, same as a lone symbol whose only body does not close.
+/// Two or more surviving bodies become a
+/// [`BimGeometry::Assembly`]; fewer than that is not an assembly reading and
+/// falls through to whatever a caller tries next.
+fn normalize_symbol_geometry(
+    symbol: &ExportedElement,
+    transform: &GInstanceTransformFields,
+) -> Option<BimGeometry> {
+    if let Some(brep) = normalize_element_brep(symbol, transform) {
+        if brep.complete {
+            return Some(BimGeometry::Brep(brep));
+        }
+    }
+    let local = symbol.brep.as_ref()?;
+    let parts: Vec<BimBrep> = (0..local.bodies.len())
+        .filter_map(|index| local.body(index))
+        .filter_map(|body| normalize_brep(&body, transform, symbol.brep_requires_loop_closure))
+        .filter(|brep| brep.complete)
+        .collect();
+    (parts.len() >= 2).then_some(BimGeometry::Assembly(parts))
 }
 
 fn normalize_brep_points(
@@ -6252,6 +6286,151 @@ mod tests {
             }],
             ..rvt_model::SymbolBrep::default()
         }
+    }
+
+    /// A closed unit cube's six faces, corner at `origin`. A real
+    /// `BrepBody`'s `edges`/`one_sided_edges`/`open_edges` come from the
+    /// source record's own `GEdge.m_pFace` bookkeeping, which this synthetic
+    /// fixture has none of to read - a cube has twelve edges and closes, so
+    /// that is what is asserted directly.
+    fn closed_box_faces(origin: [f64; 3]) -> Vec<rvt_model::BrepFace> {
+        let point = |dx: f64, dy: f64, dz: f64| {
+            [origin[0] + dx, origin[1] + dy, origin[2] + dz]
+        };
+        let edge = |from: [f64; 3], to: [f64; 3]| rvt_model::BrepEdge {
+            start: from,
+            end: to,
+            curve: rvt_model::BrepCurve::Line,
+        };
+        let quad = |corners: [[f64; 3]; 4]| rvt_model::BrepFace {
+            surface: rvt_model::BrepSurface::Plane {
+                origin: corners[0],
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+            },
+            loops: vec![vec![
+                edge(corners[0], corners[1]),
+                edge(corners[1], corners[2]),
+                edge(corners[2], corners[3]),
+                edge(corners[3], corners[0]),
+            ]],
+            material_id: None,
+        };
+        vec![
+            quad([point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0), point(1.0, 1.0, 0.0), point(0.0, 1.0, 0.0)]),
+            quad([point(0.0, 0.0, 1.0), point(0.0, 1.0, 1.0), point(1.0, 1.0, 1.0), point(1.0, 0.0, 1.0)]),
+            quad([point(0.0, 0.0, 0.0), point(0.0, 1.0, 0.0), point(0.0, 1.0, 1.0), point(0.0, 0.0, 1.0)]),
+            quad([point(1.0, 0.0, 0.0), point(1.0, 0.0, 1.0), point(1.0, 1.0, 1.0), point(1.0, 1.0, 0.0)]),
+            quad([point(0.0, 0.0, 0.0), point(0.0, 0.0, 1.0), point(1.0, 0.0, 1.0), point(1.0, 0.0, 0.0)]),
+            quad([point(0.0, 1.0, 0.0), point(1.0, 1.0, 0.0), point(1.0, 1.0, 1.0), point(0.0, 1.0, 1.0)]),
+        ]
+    }
+
+    /// A door's frame and its panel are two closed solids under one
+    /// `FamilySymbol` - not one solid, and not a hint to merge them into one.
+    /// Placed touching, the way a panel sits inside its frame: the merged,
+    /// whole-record reading of `SymbolBrep::bounds_a_volume` sees a shared
+    /// edge at their common face used four times, not two, and reads the
+    /// record as an open `Gap` rather than a closed volume - the exact
+    /// failure `report_symbol_link_funnel` measured on AR S1's doors, 325 of
+    /// 424 real instances reduced to a bounding box. `requires_loop_closure`
+    /// is set so the merged reading cannot pass some other way and mask
+    /// whether the split path was actually what supplied the geometry.
+    #[test]
+    fn a_symbol_declaring_two_touching_closed_bodies_becomes_an_assembly() {
+        let frame = closed_box_faces([0.0, 0.0, 0.0]);
+        let panel = closed_box_faces([1.0, 0.0, 0.0]);
+        let combined = rvt_model::SymbolBrep {
+            faces: frame.into_iter().chain(panel).collect(),
+            bodies: vec![
+                rvt_model::BrepBody {
+                    node_id: 0,
+                    faces: (0..6).collect(),
+                    edges: 12,
+                    one_sided_edges: 0,
+                    open_edges: 0,
+                },
+                rvt_model::BrepBody {
+                    node_id: 1,
+                    faces: (6..12).collect(),
+                    edges: 12,
+                    one_sided_edges: 0,
+                    open_edges: 0,
+                },
+            ],
+            ..rvt_model::SymbolBrep::default()
+        };
+        let symbol = ExportedElement {
+            brep: Some(combined),
+            brep_requires_loop_closure: true,
+            ..ExportedElement::default()
+        };
+
+        // The merged, whole-record reading really does fail - otherwise this
+        // test would pass regardless of whether the split path exists.
+        assert!(
+            !normalize_element_brep(&symbol, &IDENTITY_TRANSFORM).is_some_and(|brep| brep.complete),
+            "the merged reading of two touching bodies should not itself be complete"
+        );
+
+        let geometry = normalize_symbol_geometry(&symbol, &IDENTITY_TRANSFORM)
+            .expect("two independently closed bodies should assemble");
+        let BimGeometry::Assembly(parts) = geometry else {
+            panic!("expected an assembly, got something else");
+        };
+        assert_eq!(parts.len(), 2);
+        for part in &parts {
+            assert!(part.complete, "{part:?}");
+            assert_eq!(part.faces.len(), 6);
+        }
+    }
+
+    /// One closed body and one open, one-sided sheet beside it - a
+    /// construction surface, say - is not two bodies to assemble: an
+    /// assembly of one part is not an assembly reading at all, so this falls
+    /// through to whatever the merged or box fallback gives instead.
+    #[test]
+    fn a_single_closed_body_beside_an_open_one_is_not_an_assembly() {
+        let closed = closed_box_faces([0.0, 0.0, 0.0]);
+        let open = vec![rvt_model::BrepFace {
+            surface: rvt_model::BrepSurface::Plane {
+                origin: [5.0, 0.0, 0.0],
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+            },
+            loops: vec![vec![rvt_model::BrepEdge {
+                start: [5.0, 0.0, 0.0],
+                end: [6.0, 0.0, 0.0],
+                curve: rvt_model::BrepCurve::Line,
+            }]],
+            material_id: None,
+        }];
+        let combined = rvt_model::SymbolBrep {
+            faces: closed.into_iter().chain(open).collect(),
+            bodies: vec![
+                rvt_model::BrepBody {
+                    node_id: 0,
+                    faces: (0..6).collect(),
+                    edges: 12,
+                    one_sided_edges: 0,
+                    open_edges: 0,
+                },
+                rvt_model::BrepBody {
+                    node_id: 1,
+                    faces: vec![6],
+                    edges: 1,
+                    one_sided_edges: 1,
+                    open_edges: 0,
+                },
+            ],
+            ..rvt_model::SymbolBrep::default()
+        };
+        let symbol = ExportedElement {
+            brep: Some(combined),
+            brep_requires_loop_closure: true,
+            ..ExportedElement::default()
+        };
+        assert!(normalize_symbol_geometry(&symbol, &IDENTITY_TRANSFORM).is_none());
     }
 
     #[test]
