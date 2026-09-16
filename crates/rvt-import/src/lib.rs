@@ -648,6 +648,28 @@ fn declared_id(values: &[Option<i32>], property: &str) -> Option<i32> {
     *values.get(at)?
 }
 
+/// Fold this record's own reading of [`TYPE_ELEMENT_ID_PROPERTIES`] into
+/// `entry`, unconditionally - unlike every other declared id, which keeps
+/// whichever record was visited first.
+///
+/// A duplicate record of one element in an earlier partition can carry a
+/// stale type reference from before the element's family type was last
+/// changed: AR S1 has real pairs where the earlier partition's
+/// `m_masterSymbolId` names a door 100 mm narrower than the later
+/// partition's, and only the later one matches `s1_revit.ifc`. So the record
+/// from the latest partition processed always wins here, not the first one
+/// seen - the opposite of `declared_id`'s callers just below this.
+fn fold_type_element_id(entry: &mut ExportedElement, declared: &[Option<i32>]) {
+    if let Some((property, id)) = TYPE_ELEMENT_ID_PROPERTIES
+        .iter()
+        .zip(declared)
+        .find_map(|(property, id)| Some((*property, (*id)?)))
+    {
+        entry.type_element_id = Some(id);
+        entry.type_element_property = Some(property);
+    }
+}
+
 /// One element as it is emitted to JSON.
 // A flat record of what the file said about one element, so each flag is an
 // independent reading and there is no state here for them to be folded into.
@@ -1246,23 +1268,13 @@ pub fn recover_elements(
                         if entry.name.is_none() {
                             entry.name = declared_name.map(|name| (name, "declared"));
                         }
-                        if entry.type_element_id.is_none()
-                            || entry.family_element_id.is_none()
+                        fold_type_element_id(entry, &declared);
+                        if entry.family_element_id.is_none()
                             || entry.declared_category_id.is_none()
                             || entry.design_option_set_id.is_none()
                             || entry.main_design_option_id.is_none()
                             || entry.host_id.is_none()
                         {
-                            if entry.type_element_id.is_none() {
-                                if let Some((property, id)) = TYPE_ELEMENT_ID_PROPERTIES
-                                    .iter()
-                                    .zip(&declared)
-                                    .find_map(|(property, id)| Some((*property, (*id)?)))
-                                {
-                                    entry.type_element_id = Some(id);
-                                    entry.type_element_property = Some(property);
-                                }
-                            }
                             entry.family_element_id = entry
                                 .family_element_id
                                 .or_else(|| declared_id(&declared, FAMILY_ID_PROPERTY));
@@ -6199,6 +6211,38 @@ mod tests {
         // A negative identifier is not an element, and must not wrap round.
         assert_eq!(element(Some(-2)).type_element_reference(), Some(5));
         assert_eq!(ExportedElement::default().type_element_reference(), None);
+    }
+
+    /// A duplicate record from a later partition overwrites the type
+    /// reference an earlier one already set - real AR S1 pairs where the
+    /// earlier partition's copy names a door 100 mm narrower than the one
+    /// `s1_revit.ifc` agrees with.
+    #[test]
+    fn a_later_records_type_reference_overwrites_an_earlier_ones() {
+        let declared_naming = |property: &str, id: i32| {
+            let mut values = vec![None; TYPE_ELEMENT_ID_PROPERTIES.len()];
+            let at = TYPE_ELEMENT_ID_PROPERTIES
+                .iter()
+                .position(|candidate| *candidate == property)
+                .unwrap();
+            values[at] = Some(id);
+            values
+        };
+        let mut entry = ExportedElement::default();
+        fold_type_element_id(&mut entry, &declared_naming("m_masterSymbolId", 5_110_107));
+        assert_eq!(entry.type_element_id, Some(5_110_107));
+
+        fold_type_element_id(&mut entry, &declared_naming("m_masterSymbolId", 8_364_806));
+        assert_eq!(
+            entry.type_element_id,
+            Some(8_364_806),
+            "the later record should win, not the first"
+        );
+
+        // A later record naming nothing leaves the last real answer alone -
+        // this only overwrites when it has something to overwrite with.
+        fold_type_element_id(&mut entry, &vec![None; TYPE_ELEMENT_ID_PROPERTIES.len()]);
+        assert_eq!(entry.type_element_id, Some(8_364_806));
     }
 
     #[test]
