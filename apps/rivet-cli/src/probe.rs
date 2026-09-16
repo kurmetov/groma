@@ -4460,11 +4460,20 @@ impl IfcSettingsArguments<'_> {
         if self.no_ifc_common_property_sets {
             settings.property_sets.ifc_common = false;
         }
-        if self.base_quantities {
-            settings.property_sets.base_quantities = true;
+        if self.no_base_quantities {
+            settings.property_sets.base_quantities = false;
+        }
+        if self.no_shared_bodies {
+            settings.shared_bodies = false;
+        }
+        if self.elements_without_a_body {
+            settings.elements_without_a_body = true;
         }
         if self.no_types {
             settings.types = false;
+        }
+        if self.no_openings {
+            settings.openings = false;
         }
         if let Some(path) = self.class_mapping {
             settings.class_mapping_file = Some(path.to_path_buf());

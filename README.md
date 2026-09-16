@@ -478,24 +478,61 @@ what the element is. Press `2`/`3` to switch between plan and 3D, `X` to
 toggle X-ray, `M` to enter or leave measurement mode, and `F` to frame the
 selection or model.
 
-The same page is also the model library. Without a `?scene=` parameter it
-lists every scene the server holds as a card - a preview, the model's name,
-whether it came from an RVT or an IFC, the application that wrote it, and its
-element, triangle and level counts - with a drop zone that converts a dropped
-or chosen `.rvt` or `.ifc` and opens it when it is done. What a card shows is
-read from that scene's own manifest by range, so listing a 450 MB scene costs
-the same two short requests as listing a small one, and the server never
-inflates a scene to describe it. A preview is rendered by the viewer itself
-the first time a model is opened and cached through `PUT /previews/{scene}`,
-so it is a picture of the real geometry rather than an approximation of it.
+The same page is also the workspace, and it has three screens behind three
+routes. `/files` lists every scene the server holds as a card - a preview, the
+model's name, whether it came from an RVT or an IFC, the application that
+wrote it, and its element and level counts - and can be searched, sorted, and
+filtered by раздел. A раздел is named by its own code - АР, КЖ, КМ, ОВ, ВК,
+ЭОМ, ГП - and is not a field in any of these files: a name carrying a code
+(`..._AR01_...`, `КЖ`, `OV`, `ВК`) is read as the engineer's own answer, and a
+name that carries none falls back to what the model actually holds, weighted
+by how much of it there is - and then only to the base code of a family,
+because a category can say "structural" but never "КЖ rather than КМ". A file dropped on
+that screen is converted to a scene and opened in 3D as soon as the server has
+read it, because listing models is what someone was doing when they dropped
+one. Several models can be ticked and opened together - one tab each, and only
+the one on screen fetches geometry - which is how the architecture, the
+structure and the services of a building are read side by side; `＋` in the tab
+strip goes back for another.
+
+`/convert` is the conversion screen, and it opens nothing. It walks three
+steps in order - the files, then the output, then start - because the order is
+not ceremony: the output decides which files are even allowed (JSON reads one
+RVT), and the summary before the button is the last chance to see what a
+conversion that runs for minutes is about to be given. A step that cannot be
+honoured is refused rather than half-entered. Confirming starts a numbered
+conversion that joins a queue below: how many files it holds, how far
+it has come, and how long it has taken. Opening a queue card shows every
+source file of that conversion on its own row, each with its own progress, the
+stages it has finished with their seconds, what it produced and what it can be
+downloaded as. `/viewer` draws the models that are open, one tab each.
+
+What a card shows is read from that scene's own manifest by range, so listing
+a 450 MB scene costs the same two short requests as listing a small one, and
+the server never inflates a scene to describe it. A preview is rendered by the
+viewer itself the first time a model is opened and cached through
+`PUT /previews/{scene}`, so it is a picture of the real geometry rather than
+an approximation of it.
 
 Being one page is what makes it embeddable: another application mounts a
-single URL in an `iframe` and gets the library, the upload and the 3D view,
-with `?scene=NAME` linking straight to one model. Every route the page calls
-is resolved against the directory the page was served from, so the whole
-viewer also works behind a path prefix - proxied at `/rivet/viewer` inside
-another application - and it degrades rather than breaks where an embedder
-denies it history or storage access.
+single URL in an `iframe` and gets the library, the conversions and the 3D
+view, with `/viewer?tabs=NAME` linking straight to one model. Every route the
+page calls is resolved against the directory the page was served from, so the
+whole viewer also works behind a path prefix - proxied at `/rivet/viewer`
+inside another application - and it degrades rather than breaks where an
+embedder denies it history or storage access.
+
+The product shell is written in React (`web/src/viewer-ui.jsx`) and bundled
+with Anime.js into `web/viewer-ui.js`; the WebGL reader remains a focused
+inline engine in `web/viewer.html`. Rebuild the UI before compiling the Rust
+server whenever the React components change:
+
+```bash
+npm ci
+npm run build:web
+cargo build --release -p rivet-api
+```
+
 Unknown stream bytes are always available through `dump-stream` and the
 `rvt-container` API.
 

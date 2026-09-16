@@ -115,8 +115,12 @@ pub struct PropertySetSettings {
     /// written rather than guessed.
     pub ifc_common: bool,
     /// IFC's own `Qto_..BaseQuantities`, measured from the solid this file
-    /// carries - Revit's *Export base quantities*, and off by default as it
-    /// is there.
+    /// carries - Revit's *Export base quantities*.
+    ///
+    /// On, unlike Revit's own default, because a file whose elements carry no
+    /// quantities is the first thing a reader of this export asks about, and
+    /// what is written is measured rather than estimated: an element whose
+    /// body this cannot measure exactly gets none.
     ///
     /// Only `NetVolume` and `NetSurfaceArea`, and only for a closed shell of
     /// planar faces: a curved face would have to be tessellated, and a
@@ -132,7 +136,7 @@ impl Default for PropertySetSettings {
             revit_parameters: true,
             revit_type_parameters: true,
             ifc_common: true,
-            base_quantities: false,
+            base_quantities: true,
         }
     }
 }
@@ -141,10 +145,14 @@ impl Default for PropertySetSettings {
 /// Address* and the project information beside it: a name for the spatial
 /// tree's three roots, the phase the model is in, and the postal address.
 ///
-/// Every field is optional and nothing is invented. Where one is unset the
-/// exporter keeps what it wrote before this existed - the source file's own
-/// stem for the project, and `Site` and `Building` for the two below it -
-/// because none of the three is recoverable from a decoded model today.
+/// Every field is optional and nothing is invented; an RVT source now fills
+/// `name`, `long_name`, `building_name`, `phase` and one line of address from
+/// its own `ProjectInfo` record (see `rvt_import::project_identity`) wherever
+/// this was left unset, so this struct exists mainly for a caller who wants
+/// to override that, or a source this cannot read one from. Whatever is
+/// still unset after that keeps what the exporter wrote before either
+/// existed - the source file's own stem for the project, and `Site` and
+/// `Building` for the two below it.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ProjectSettings {
@@ -178,6 +186,9 @@ impl ProjectSettings {
 }
 
 /// One export's settings.
+// One field per switch, on purpose: this is the list of what `export-ifc`
+// accepts, and keeping it flat is what makes it readable beside `--help`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ExportSettings {
@@ -199,6 +210,45 @@ pub struct ExportSettings {
     #[serde(skip)]
     class_mapping: Option<ClassMapping>,
     pub project: ProjectSettings,
+    /// Write an element whose body this export does not carry - one whose
+    /// geometry did not decode, and one whose family draws itself in plan and
+    /// has no solid at all.
+    ///
+    /// Off, because a product with no body is not a thing anyone can clash,
+    /// measure or look at: it is a row in a schedule wearing a product's
+    /// clothes. A plan-symbol family - a floor drain drawn as a circle, a
+    /// chair drawn as an outline - carries no solid in the source either, so
+    /// what would be written for it is a name at a point. An element written
+    /// from a verified extent and nothing else is held back for the same
+    /// reason: a box is what is known about where the thing is, not what the
+    /// thing is.
+    ///
+    /// A space is never held back by this: a room is bounded by other
+    /// people's walls, and is a product whether or not a body was read for it.
+    pub elements_without_a_body: bool,
+    /// Write a body once and place it through an `IfcRepresentationMap` for
+    /// every element that carries it, rather than repeating it per element.
+    ///
+    /// On. A family places one symbol's solid over and over, and this export
+    /// writes every body in the element's own frame, so those placements are
+    /// the same body to the last picometre; written out each time, one Revit
+    /// file's 12 386 products cost 5.0 million entities and 246 MB where
+    /// 1.3 million and 75 MB say the same thing. Off writes every element's
+    /// body under the element itself, which is what this exported before
+    /// mapping existed and what a reader that cannot follow a mapped item
+    /// needs.
+    pub shared_bodies: bool,
+    /// Write an `IfcOpeningElement` for every element that names a host - a
+    /// door or a window, almost always - relating the host to the opening
+    /// with `IfcRelVoidsElement` and the opening to the element with
+    /// `IfcRelFillsElement`.
+    ///
+    /// On. Left out, a wall with a doorway in it is a closed volume with no
+    /// stated hole, and nothing marks the door as belonging to that wall
+    /// rather than merely standing near it - both of which a clash check or a
+    /// coordination tool reads from these two relationships, not from
+    /// proximity.
+    pub openings: bool,
 }
 
 impl Default for ExportSettings {
@@ -211,6 +261,9 @@ impl Default for ExportSettings {
             class_mapping_file: None,
             class_mapping: None,
             project: ProjectSettings::default(),
+            elements_without_a_body: false,
+            shared_bodies: true,
+            openings: true,
         }
     }
 }
@@ -331,9 +384,17 @@ mod tests {
         assert!(settings.property_sets.revit_parameters);
         assert!(settings.property_sets.revit_type_parameters);
         assert!(settings.property_sets.ifc_common);
-        // Off, as Revit's own *Export base quantities* is.
-        assert!(!settings.property_sets.base_quantities);
+        // On, unlike Revit's own *Export base quantities*: a file whose
+        // elements carry no quantities is the first thing a reader of this
+        // export asks about, and every quantity written is measured.
+        assert!(settings.property_sets.base_quantities);
         assert!(settings.types);
+        // And an element this carries no body for is not written at all.
+        assert!(!settings.elements_without_a_body);
+        // A body two elements share is written once and placed twice.
+        assert!(settings.shared_bodies);
+        // A door or a window relates to the wall it cuts.
+        assert!(settings.openings);
         // The one deliberate change: the header no longer claims a view the
         // bodies we write are not allowed in.
         assert_eq!(

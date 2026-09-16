@@ -178,6 +178,18 @@ const SOURCE_MAPPINGS: &[SourceMapping] = &[
         category_name: "OST_Doors",
         element_type: BimElementType::Door,
     },
+    // The one row above with no reference join behind it. Revit's own export
+    // of AR S1 carries not one furnishing element - the category is off in
+    // its export settings - so there is nothing to join against, and the
+    // pairing is Revit's own from `data/importIFCClassMapping.txt`. Without
+    // the row the model's 1 036 furniture instances arrive as anonymous
+    // proxies, which is what "there is no furniture" looks like to a reader
+    // even when every one of them is present.
+    SourceMapping {
+        class_name: Some("FamilyInstance"),
+        category_name: "OST_Furniture",
+        element_type: BimElementType::FurnishingElement,
+    },
 ];
 
 /// Infer a format-neutral element type from the source class/category pair.
@@ -269,6 +281,7 @@ pub fn ifc_entity_name(element_type: BimElementType) -> &'static str {
         BimElementType::Plate => "IFCPLATE",
         BimElementType::Window => "IFCWINDOW",
         BimElementType::Door => "IFCDOOR",
+        BimElementType::FurnishingElement => "IFCFURNISHINGELEMENT",
         BimElementType::Unknown => "IFCBUILDINGELEMENTPROXY",
         // A space never reaches `push_element`: `push_elements` sends a
         // spatial type to `push_space`, whose attributes are a spatial

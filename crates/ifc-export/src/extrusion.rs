@@ -167,6 +167,15 @@ pub struct SolidReport {
     /// test above. It is here because the alternative to measuring it is
     /// guessing whether the arc is worth writing.
     pub curves_about_one_axis: Tally,
+    /// Elements left out of the file for carrying no body. See
+    /// `ExportSettings::elements_without_a_body`, which decides whether they
+    /// are; this only counts what that decided, so a reader of the report can
+    /// see what the file is missing and why.
+    pub bodiless_elements: usize,
+    /// Placements of a body this file already holds: an element whose
+    /// geometry is another element's, written once and mapped rather than
+    /// repeated. See the note on `BodyWriter` in `metadata`.
+    pub mapped_bodies: usize,
 }
 
 /// Some solids, and the faces they hold.
@@ -193,13 +202,33 @@ impl SolidReport {
     /// Every solid the export offered this, swept or not.
     #[must_use]
     pub fn solids(&self) -> usize {
-        self.swept.solids + self.refused.values().map(|tally| tally.solids).sum::<usize>()
+        self.swept.solids
+            + self
+                .refused
+                .values()
+                .map(|tally| tally.solids)
+                .sum::<usize>()
     }
 
     /// Every face those solids hold.
     #[must_use]
     pub fn faces(&self) -> usize {
-        self.swept.faces + self.refused.values().map(|tally| tally.faces).sum::<usize>()
+        self.swept.faces
+            + self
+                .refused
+                .values()
+                .map(|tally| tally.faces)
+                .sum::<usize>()
+    }
+
+    /// Record one element held back for carrying no body.
+    pub fn count_bodiless(&mut self) {
+        self.bodiless_elements += 1;
+    }
+
+    /// Record one element placing a body the file already holds.
+    pub fn count_mapped_body(&mut self) {
+        self.mapped_bodies += 1;
     }
 
     /// Record one solid's outcome, and the size of the shell it came from.
@@ -413,7 +442,8 @@ impl Corners {
         for x in -1..=1 {
             for y in -1..=1 {
                 for z in -1..=1 {
-                    let Some(held) = self.cells.get(&[cell[0] + x, cell[1] + y, cell[2] + z]) else {
+                    let Some(held) = self.cells.get(&[cell[0] + x, cell[1] + y, cell[2] + z])
+                    else {
                         continue;
                     };
                     for id in held {
@@ -710,10 +740,18 @@ mod tests {
             prism.direction
         );
         assert!((prism.depth - 4.0).abs() < 1e-12, "{}", prism.depth);
-        assert_eq!(prism.outer.len(), 4, "four sides, where the shell had six faces");
+        assert_eq!(
+            prism.outer.len(),
+            4,
+            "four sides, where the shell had six faces"
+        );
         assert!(prism.voids.is_empty());
         // The profile is the footprint: the same area, wound as IFC asks.
-        assert!((area(&prism.outer) - 6.0).abs() < 1e-12, "{:?}", prism.outer);
+        assert!(
+            (area(&prism.outer) - 6.0).abs() < 1e-12,
+            "{:?}",
+            prism.outer
+        );
     }
 
     /// The profile is stated in the plane's own two directions, so a reader
@@ -727,18 +765,18 @@ mod tests {
             .iter()
             .map(|point| {
                 [0, 1, 2].map(|axis| {
-                    prism.x_axis[axis].mul_add(
-                        point[0],
-                        y_axis[axis].mul_add(point[1], prism.origin[axis]),
-                    )
+                    prism.x_axis[axis]
+                        .mul_add(point[0], y_axis[axis].mul_add(point[1], prism.origin[axis]))
                 })
             })
             .collect();
         for corner in RECTANGLE {
             assert!(
-                rebuilt.iter().any(|point| (point[0] - corner[0]).abs() < 1e-12
-                    && (point[1] - corner[1]).abs() < 1e-12
-                    && (point[2] - 1.5).abs() < 1e-12),
+                rebuilt
+                    .iter()
+                    .any(|point| (point[0] - corner[0]).abs() < 1e-12
+                        && (point[1] - corner[1]).abs() < 1e-12
+                        && (point[2] - 1.5).abs() < 1e-12),
                 "{corner:?} is not among {rebuilt:?}"
             );
         }
@@ -756,7 +794,11 @@ mod tests {
         ];
         let prism = recognise(&prism_faces(&ell, 0.0, 0.5)).expect("a prism");
         assert_eq!(prism.outer.len(), 6);
-        assert!((area(&prism.outer) - 4.0).abs() < 1e-12, "{:?}", prism.outer);
+        assert!(
+            (area(&prism.outer) - 4.0).abs() < 1e-12,
+            "{:?}",
+            prism.outer
+        );
     }
 
     /// A shaft through the solid is a void of the profile, wound against it,
@@ -931,11 +973,12 @@ mod tests {
         let base = [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]];
         let top = [[0.5, 0.5], [1.5, 0.5], [1.5, 1.5], [0.5, 1.5]];
         let mut faces = vec![
-            vec![base
-                .iter()
-                .rev()
-                .map(|at| [at[0], at[1], 0.0])
-                .collect::<Polygon>()],
+            vec![
+                base.iter()
+                    .rev()
+                    .map(|at| [at[0], at[1], 0.0])
+                    .collect::<Polygon>(),
+            ],
             vec![top.iter().map(|at| [at[0], at[1], 1.0]).collect()],
         ];
         for (index, point) in base.iter().enumerate() {
@@ -943,7 +986,11 @@ mod tests {
             faces.push(vec![vec![
                 [point[0], point[1], 0.0],
                 [next[0], next[1], 0.0],
-                [top[(index + 1) % top.len()][0], top[(index + 1) % top.len()][1], 1.0],
+                [
+                    top[(index + 1) % top.len()][0],
+                    top[(index + 1) % top.len()][1],
+                    1.0,
+                ],
                 [top[index][0], top[index][1], 1.0],
             ]]);
         }
@@ -960,11 +1007,13 @@ mod tests {
     fn refuses_an_antiprism_whose_caps_match() {
         let square = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         let mut faces = vec![
-            vec![square
-                .iter()
-                .rev()
-                .map(|at| [at[0], at[1], 0.0])
-                .collect::<Polygon>()],
+            vec![
+                square
+                    .iter()
+                    .rev()
+                    .map(|at| [at[0], at[1], 0.0])
+                    .collect::<Polygon>(),
+            ],
             vec![square.iter().map(|at| [at[0], at[1], 1.0]).collect()],
         ];
         for (index, point) in square.iter().enumerate() {
@@ -978,7 +1027,11 @@ mod tests {
             faces.push(vec![vec![
                 [point[0], point[1], 0.0],
                 [above[0], above[1], 1.0],
-                [square[(index + 1) % square.len()][0], square[(index + 1) % square.len()][1], 1.0],
+                [
+                    square[(index + 1) % square.len()][0],
+                    square[(index + 1) % square.len()][1],
+                    1.0,
+                ],
             ]]);
         }
         assert_eq!(recognise(&faces), Err(NotAPrism::FaceNotSquareOrParallel));
@@ -1104,4 +1157,3 @@ mod tests {
         assert!(prism.outer.len() < shell_points / 3, "{shell_points}");
     }
 }
-

@@ -462,7 +462,14 @@ impl<'parsed> Builder<'parsed> {
         let mut loops = Vec::with_capacity(inner.len() + 1);
         loops.push(outer);
         loops.extend(inner);
-        Some(BimBrepFace { surface, loops })
+        // A per-face material is not read back: IFC states one through
+        // `IfcStyledItem`, a separate presentation layer this reader does not
+        // walk, not through the face itself.
+        Some(BimBrepFace {
+            surface,
+            loops,
+            material: None,
+        })
     }
 
     /// The analytic surface an advanced face lies on, in world coordinates.
@@ -532,12 +539,12 @@ impl<'parsed> Builder<'parsed> {
                     x_axis: x,
                     y_axis: y,
                     z_axis: normalize(frame.basis[2])?,
-                    profile: BimBrepProfile::Arc {
+                    profile: Box::new(BimBrepProfile::Arc {
                         center: point3([major, 0.0, 0.0]),
                         x_axis: [1.0, 0.0, 0.0],
                         y_axis: [0.0, 0.0, 1.0],
                         radius: number_in_metres(minor),
-                    },
+                    }),
                 })
             }
             "IFCSURFACEOFREVOLUTION" => self.surface_of_revolution(entity, place, same_sense),
@@ -554,7 +561,9 @@ impl<'parsed> Builder<'parsed> {
     }
 
     /// `IfcSurfaceOfRevolution`, whose profile is stated in `Position` and
-    /// whose revolution axis is independently stated by `AxisPosition`.
+    /// whose revolution axis is stated by `AxisPosition` in that same frame:
+    /// the profile is swept in the surface's own coordinates and `Position`
+    /// then places the swept surface, axis and all.
     fn surface_of_revolution(
         &self,
         entity: &Entity,
@@ -573,12 +582,12 @@ impl<'parsed> Builder<'parsed> {
             .parsed()
             .follow(axis.attribute(0))
             .and_then(cartesian_point)
-            .map(|point| place.point(scale(point, self.sampler.units.length)))?;
+            .map(|point| position.point(scale(point, self.sampler.units.length)))?;
         let z = self
             .parsed()
             .follow(axis.attribute(1))
             .and_then(direction)
-            .map(|axis| place.direction(axis))
+            .map(|axis| position.direction(axis))
             .and_then(normalize)?;
         // Position's first direction is the radial zero. Square it to the
         // separately stated axis: the schema requires that relation, but
@@ -596,7 +605,7 @@ impl<'parsed> Builder<'parsed> {
             x_axis: x,
             y_axis: y,
             z_axis: z,
-            profile,
+            profile: Box::new(profile),
         })
     }
 
@@ -611,10 +620,12 @@ impl<'parsed> Builder<'parsed> {
             return None;
         }
         let curve = self.parsed().follow(profile.attribute(2))?;
-        let basis = if curve.type_name == "IFCTRIMMEDCURVE" {
-            self.parsed().follow(curve.attribute(0))?
-        } else {
-            curve
+        let basis = match curve.type_name.as_str() {
+            "IFCTRIMMEDCURVE" => self.parsed().follow(curve.attribute(0))?,
+            // Pieces of one circle are that circle as far as the surface is
+            // concerned: the face's own boundary is what trims it.
+            "IFCCOMPOSITECURVE" => self.single_basis_circle(curve).unwrap_or(curve),
+            _ => curve,
         };
         if basis.type_name == "IFCCIRCLE" {
             return self.revolved_circle_profile(basis, position, center, axes);
@@ -628,6 +639,27 @@ impl<'parsed> Builder<'parsed> {
             origin: point3(local_first),
             direction: normalize(subtract(local_last, local_first))?,
         })
+    }
+
+    /// The one circle every segment of a composite curve trims, if there is
+    /// one: the same `IfcCircle` entity, not merely an equal one.
+    fn single_basis_circle(&self, composite: &Entity) -> Option<&Entity> {
+        let mut basis: Option<&Entity> = None;
+        for segment in composite.attribute(0)?.as_list()? {
+            let segment = self.parsed().follow(Some(segment))?;
+            let trimmed = self.parsed().follow(segment.attribute(2))?;
+            if trimmed.type_name != "IFCTRIMMEDCURVE" {
+                return None;
+            }
+            let circle = self.parsed().follow(trimmed.attribute(0))?;
+            if circle.type_name != "IFCCIRCLE"
+                || basis.is_some_and(|held| !std::ptr::eq(held, circle))
+            {
+                return None;
+            }
+            basis = Some(circle);
+        }
+        basis
     }
 
     fn revolved_circle_profile(
@@ -741,7 +773,7 @@ impl<'parsed> Builder<'parsed> {
                     Some(BimBrepCurve::Line)
                 } else {
                     Some(BimBrepCurve::Polyline(
-                        points.into_iter().map(point3).collect(),
+                        points.into_iter().map(point3).collect::<Vec<_>>().into(),
                     ))
                 }
             }
@@ -785,14 +817,14 @@ impl<'parsed> Builder<'parsed> {
                 last -= std::f64::consts::TAU;
             }
         }
-        Some(BimBrepCurve::Arc(BimBrepArc {
+        Some(BimBrepCurve::Arc(Box::new(BimBrepArc {
             center: point3(frame.origin),
             x_axis: x,
             z_axis: z,
             radius: number_in_metres(radius),
             start_angle: first,
             end_angle: last,
-        }))
+        })))
     }
 
     fn polygonal_face_set(&mut self, entity: &Entity, place: &Affine) {
@@ -1190,6 +1222,7 @@ pub fn planar_face(outer: &[Vec3], holes: &[Vec<Vec3>]) -> Option<BimBrepFace> {
             y_axis: y,
         },
         loops,
+        material: None,
     })
 }
 
@@ -1488,7 +1521,7 @@ mod tests {
             let BimBrepSurface::Revolution { profile, .. } = surface else {
                 panic!("revolution");
             };
-            let BimBrepProfile::Arc { center, radius, .. } = profile else {
+            let BimBrepProfile::Arc { center, radius, .. } = *profile else {
                 panic!("arc profile");
             };
             same(center.coordinates[0], major);
@@ -1498,33 +1531,53 @@ mod tests {
 
     #[test]
     fn reads_the_line_profile_of_a_surface_of_revolution() {
-        let parsed = file(
-            "#1=IFCCARTESIANPOINT((0.,0.,0.));\n\
-             #2=IFCDIRECTION((0.,-1.,0.));\n\
-             #3=IFCDIRECTION((1.,0.,0.));\n\
-             #4=IFCAXIS2PLACEMENT3D(#1,#2,#3);\n\
-             #5=IFCDIRECTION((0.,0.,1.));\n\
-             #6=IFCAXIS1PLACEMENT(#1,#5);\n\
-             #7=IFCCARTESIANPOINT((2.,3.));\n\
-             #8=IFCCARTESIANPOINT((4.,7.));\n\
-             #9=IFCPOLYLINE((#7,#8));\n\
-             #10=IFCARBITRARYOPENPROFILEDEF(.CURVE.,$,#9);\n\
-             #11=IFCSURFACEOFREVOLUTION(#10,#4,#6);\n",
-        );
-        let surface = builder(&parsed)
-            .advanced_surface(parsed.get(11).expect("surface"), &IDENTITY, true)
-            .expect("surface of revolution");
-        let BimBrepSurface::Revolution { profile, .. } = surface else {
-            panic!("revolution");
-        };
-        let BimBrepProfile::Line { origin, direction } = profile else {
-            panic!("line profile");
-        };
-        for (found, stated) in origin.coordinates.iter().zip([2.0, 0.0, 3.0]) {
-            same(*found, stated);
+        // The same surface with `Position` at the origin and moved off it. The
+        // axis is stated in `Position`'s own frame - its `y`, through its
+        // origin - so moving `Position` moves the axis with it, and the
+        // profile read against that axis is the same both times.
+        for (location, centre) in [("0.,0.,0.", [0.0; 3]), ("5.,6.,7.", [5.0, 6.0, 7.0])] {
+            let parsed = file(&format!(
+                "#1=IFCCARTESIANPOINT(({location}));\n\
+                 #2=IFCDIRECTION((0.,-1.,0.));\n\
+                 #3=IFCDIRECTION((1.,0.,0.));\n\
+                 #4=IFCAXIS2PLACEMENT3D(#1,#2,#3);\n\
+                 #5=IFCDIRECTION((0.,1.,0.));\n\
+                 #12=IFCCARTESIANPOINT((0.,0.,0.));\n\
+                 #6=IFCAXIS1PLACEMENT(#12,#5);\n\
+                 #7=IFCCARTESIANPOINT((2.,3.));\n\
+                 #8=IFCCARTESIANPOINT((4.,7.));\n\
+                 #9=IFCPOLYLINE((#7,#8));\n\
+                 #10=IFCARBITRARYOPENPROFILEDEF(.CURVE.,$,#9);\n\
+                 #11=IFCSURFACEOFREVOLUTION(#10,#4,#6);\n",
+            ));
+            let surface = builder(&parsed)
+                .advanced_surface(parsed.get(11).expect("surface"), &IDENTITY, true)
+                .expect("surface of revolution");
+            let BimBrepSurface::Revolution {
+                center,
+                z_axis,
+                profile,
+                ..
+            } = surface
+            else {
+                panic!("revolution");
+            };
+            for (found, stated) in center.coordinates.iter().zip(centre) {
+                same(*found, stated);
+            }
+            // `Position`'s `y` is the element's `z`.
+            for (found, stated) in z_axis.iter().zip([0.0, 0.0, 1.0]) {
+                same(*found, stated);
+            }
+            let BimBrepProfile::Line { origin, direction } = *profile else {
+                panic!("line profile");
+            };
+            for (found, stated) in origin.coordinates.iter().zip([2.0, 0.0, 3.0]) {
+                same(*found, stated);
+            }
+            assert!((direction[0] - 1.0 / 5.0_f64.sqrt()).abs() < 1e-12);
+            assert!((direction[2] - 2.0 / 5.0_f64.sqrt()).abs() < 1e-12);
         }
-        assert!((direction[0] - 1.0 / 5.0_f64.sqrt()).abs() < 1e-12);
-        assert!((direction[2] - 2.0 / 5.0_f64.sqrt()).abs() < 1e-12);
     }
 }
 

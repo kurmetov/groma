@@ -269,6 +269,113 @@ impl SymbolBrep {
         faces_closure(self.faces.iter()) == FaceClosure::Closes
     }
 
+    /// Exact, same-winding face copies that can be removed while the faces
+    /// left behind still bound a volume by their own loops.
+    ///
+    /// A coincident face pair is not by itself removable: duplicating one of
+    /// a box's boundary faces leaves a hole when both copies are dropped. The
+    /// pair is redundant only when the remainder independently closes. This
+    /// is the shape measured on AR S1's thin finish walls: six box faces plus
+    /// an interior sheet stated twice with the same surface, loops and edge
+    /// directions. The duplicate sheet pairs its own edges and makes the
+    /// endpoint-count closure test pass, but it is not part of the volume's
+    /// boundary.
+    #[must_use]
+    pub fn redundant_duplicate_face_indexes(&self) -> Vec<usize> {
+        let mut duplicate = vec![false; self.faces.len()];
+        for left in 0..self.faces.len() {
+            for right in left + 1..self.faces.len() {
+                if self.faces[left] == self.faces[right] {
+                    duplicate[left] = true;
+                    duplicate[right] = true;
+                }
+            }
+        }
+        if !duplicate.iter().any(|duplicate| *duplicate)
+            || faces_closure(
+                self.faces
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, face)| (!duplicate[index]).then_some(face)),
+            ) != FaceClosure::Closes
+        {
+            return Vec::new();
+        }
+        duplicate
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, duplicate)| duplicate.then_some(index))
+            .collect()
+    }
+
+    /// Faces of the bodies the record itself declares free surfaces, where
+    /// the faces left behind bound a volume by their own loops and hold every
+    /// one of those surfaces inside their extent.
+    ///
+    /// A free surface is the file's statement, not a reading of ours: every
+    /// edge naming the body's faces leaves `GEdge.m_pFace` null on one side,
+    /// so there is nothing on the other side to enclose. Its edges are still
+    /// drawn once each, and that alone refuses the whole record under a
+    /// closure test. The worked example is the sill every window in AR S1
+    /// places: a closed L-section of eight faces, and four rectangles in the
+    /// planes of its top and bottom, all on one symbol. The importer's
+    /// `place_declared_body` separates a placed record's solid from these by its box; a family
+    /// symbol's box is the whole family's, so it cannot.
+    ///
+    /// Both conditions are required. A record that does not close without its
+    /// surfaces is not a solid with surfaces beside it, and a surface reaching
+    /// outside the solid is drawing something the solid does not, so dropping
+    /// it would lose geometry rather than a construction plane.
+    #[must_use]
+    pub fn free_surface_face_indexes(&self) -> Vec<usize> {
+        let mut free = vec![false; self.faces.len()];
+        for body in &self.bodies {
+            if body.edges > 0 && body.one_sided_edges == body.edges {
+                for index in &body.faces {
+                    if let Some(free) = free.get_mut(*index) {
+                        *free = true;
+                    }
+                }
+            }
+        }
+        let remainder = || {
+            self.faces
+                .iter()
+                .enumerate()
+                .filter_map(|(index, face)| (!free[index]).then_some(face))
+        };
+        if !free.iter().any(|free| *free) || faces_closure(remainder()) != FaceClosure::Closes {
+            return Vec::new();
+        }
+        // The solid's extent from the points its edges pass through, which can
+        // only fall short of it; a surface's from everything it could reach,
+        // an arc's whole circle included, which can only overshoot. Either
+        // error refuses rather than admits.
+        let Some((low, high)) = extent(remainder().flat_map(face_points_within)) else {
+            return Vec::new();
+        };
+        let inside = self
+            .faces
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| free[*index])
+            .all(|(_, face)| {
+                extent(face_points_reachable(face)).is_some_and(|(face_low, face_high)| {
+                    (0..3).all(|axis| {
+                        face_low[axis] >= low[axis] - CLOSURE_TOLERANCE_FEET
+                            && face_high[axis] <= high[axis] + CLOSURE_TOLERANCE_FEET
+                    })
+                })
+            });
+        if !inside {
+            return Vec::new();
+        }
+        free.into_iter()
+            .enumerate()
+            .filter_map(|(index, free)| free.then_some(index))
+            .collect()
+    }
+
     /// The best reading the bodies of this record support.
     ///
     /// [`SymbolBrep::bounds_a_volume`] puts its question to the record as a
@@ -529,6 +636,16 @@ pub struct BrepFace {
     /// The face's boundary loops: the first is the outer bound, any further
     /// loops are holes (`GEdgeLoop.m_nextLoop`).
     pub loops: Vec<BrepLoop>,
+    /// `GFace.m_renderStyleId`: the `MaterialElem` this face is painted with,
+    /// where one is assigned by face rather than inherited from the
+    /// category. The same reference a compound layer's own material is
+    /// named by - see `CompoundStructureLayer.m_materialId` - so a `Face`
+    /// with a positive id here names a real element of the file. Revit
+    /// writes a negative sentinel (`-1`, `-4000010`, `-4000011`, ...) for
+    /// "by category" and similar defaults, none of which is a material this
+    /// export can resolve without knowing the element's own category
+    /// default, so those are `None` here rather than a guessed reference.
+    pub material_id: Option<i32>,
 }
 
 pub type BrepLoop = Vec<BrepEdge>;
@@ -1822,6 +1939,11 @@ fn assemble_face(
         .copied()
         .flatten()
         .ok_or("face has no supported surface")?;
+    // `GNode.m_GInfo` contributes `m_tag`, `m_controlCommand` and
+    // `m_categoryId`, and `GFace` itself contributes `m_cutType` then
+    // `m_renderStyleId` next - the fifth declared integer, in that order.
+    // See `BrepFace::material_id`.
+    let material_id = face.integers.get(4).copied().filter(|id| *id > 0);
     let Some(first_loop) = face
         .references
         .first()
@@ -1846,6 +1968,7 @@ fn assemble_face(
                 BrepFace {
                     surface,
                     loops: rings,
+                    material_id,
                 },
                 None,
             )
@@ -1903,7 +2026,14 @@ fn assemble_face(
         visited.push(next_object.object_id);
         current = next_object;
     }
-    Ok((BrepFace { surface, loops }, stopped))
+    Ok((
+        BrepFace {
+            surface,
+            loops,
+            material_id,
+        },
+        stopped,
+    ))
 }
 
 /// Order the edges that name a face into its closed rings by their endpoints.
@@ -2137,6 +2267,51 @@ fn reverse_curve(curve: &BrepCurve) -> BrepCurve {
             BrepCurve::Polyline(points)
         }
     }
+}
+
+/// The points a face's edges are known to pass through: their ends, and a
+/// polyline's interior points.
+fn face_points_within(face: &BrepFace) -> impl Iterator<Item = [f64; 3]> + '_ {
+    face.loops.iter().flatten().flat_map(|edge| {
+        let interior = match &edge.curve {
+            BrepCurve::Polyline(points) => points.as_slice(),
+            BrepCurve::Line | BrepCurve::Arc(_) => &[],
+        };
+        [edge.start, edge.end]
+            .into_iter()
+            .chain(interior.iter().copied())
+    })
+}
+
+/// Points bounding everywhere a face's edges could reach: those above, and
+/// the box of an arc's whole circle.
+fn face_points_reachable(face: &BrepFace) -> impl Iterator<Item = [f64; 3]> + '_ {
+    face_points_within(face).chain(
+        face.loops
+            .iter()
+            .flatten()
+            .flat_map(|edge| match &edge.curve {
+                BrepCurve::Arc(arc) => {
+                    let reach = [arc.radius.abs(); 3];
+                    vec![
+                        add3(arc.center, scale3(reach, -1.0)),
+                        add3(arc.center, reach),
+                    ]
+                }
+                BrepCurve::Line | BrepCurve::Polyline(_) => Vec::new(),
+            }),
+    )
+}
+
+fn extent(points: impl Iterator<Item = [f64; 3]>) -> Option<([f64; 3], [f64; 3])> {
+    points.fold(None, |extent, point| {
+        let (mut low, mut high) = extent.unwrap_or((point, point));
+        for axis in 0..3 {
+            low[axis] = low[axis].min(point[axis]);
+            high[axis] = high[axis].max(point[axis]);
+        }
+        Some((low, high))
+    })
 }
 
 fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -2992,6 +3167,7 @@ mod tests {
                     })
                     .collect(),
             ],
+            material_id: None,
         }
     }
 
@@ -3038,6 +3214,108 @@ mod tests {
         // - and the body an exporter would take still does.
         assert!(!with_a_free_surface.bounds_a_volume());
         assert_eq!(with_a_free_surface.openness(), BrepOpenness::BoundsAVolume);
+    }
+
+    #[test]
+    fn removes_exact_duplicate_faces_only_when_the_remainder_closes() {
+        let square = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let mut reverse = square;
+        reverse.reverse();
+        let sheet = loop_face(&[
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [3.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ]);
+        let with_a_redundant_sheet = SymbolBrep {
+            faces: vec![
+                loop_face(&square),
+                loop_face(&reverse),
+                sheet.clone(),
+                sheet,
+            ],
+            ..SymbolBrep::default()
+        };
+        assert_eq!(
+            with_a_redundant_sheet.redundant_duplicate_face_indexes(),
+            [2, 3]
+        );
+
+        // Two copies of the only boundary leave no independently closed
+        // remainder, so equality alone never licenses dropping geometry.
+        let duplicate_boundary = SymbolBrep {
+            faces: vec![loop_face(&square), loop_face(&square)],
+            ..SymbolBrep::default()
+        };
+        assert!(
+            duplicate_boundary
+                .redundant_duplicate_face_indexes()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn drops_declared_free_surfaces_only_inside_a_solid_that_closes_without_them() {
+        let square = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let mut reverse = square;
+        reverse.reverse();
+        let record = |sheet: &[[f64; 3]], sheet_body: BrepBody| SymbolBrep {
+            faces: vec![loop_face(&square), loop_face(&reverse), loop_face(sheet)],
+            bodies: vec![body(&[0, 1], 4, 0, 0), sheet_body],
+            ..SymbolBrep::default()
+        };
+        let inner = [
+            [0.25, 0.25, 0.0],
+            [0.75, 0.25, 0.0],
+            [0.75, 0.75, 0.0],
+            [0.25, 0.75, 0.0],
+        ];
+
+        // The sill: a surface the file declares free, in the plane of a solid
+        // that closes on its own.
+        assert_eq!(
+            record(&inner, body(&[2], 4, 4, 0)).free_surface_face_indexes(),
+            [2]
+        );
+
+        // Reaching outside the solid, it draws something the solid does not.
+        let outside = [
+            [0.5, 0.5, 0.0],
+            [2.0, 0.5, 0.0],
+            [2.0, 2.0, 0.0],
+            [0.5, 2.0, 0.0],
+        ];
+        assert!(
+            record(&outside, body(&[2], 4, 4, 0))
+                .free_surface_face_indexes()
+                .is_empty()
+        );
+
+        // A face whose edges the file pairs is not a free surface, whatever
+        // this reader makes of its loops.
+        assert!(
+            record(&inner, body(&[2], 4, 0, 4))
+                .free_surface_face_indexes()
+                .is_empty()
+        );
+
+        // Without a solid that closes on its own there is nothing to keep.
+        let only_surfaces = SymbolBrep {
+            faces: vec![loop_face(&square), loop_face(&inner)],
+            bodies: vec![body(&[0], 4, 4, 0), body(&[1], 4, 4, 0)],
+            ..SymbolBrep::default()
+        };
+        assert!(only_surfaces.free_surface_face_indexes().is_empty());
     }
 
     /// The four readings that are not a solid, each from the counters that

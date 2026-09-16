@@ -12,7 +12,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bim_convert::Format;
+use bim_convert::{
+    Format,
+    memory::{max_ifc_bytes, megabytes, memory_to_convert},
+};
 use bim_core::{BimDocument, BimDocumentId, BimFederationReport, BimModel};
 // The whole semantic reconstruction moved into `rvt-import`. Glob-imported
 // because the probe commands below read the same intermediate the pipeline
@@ -21,7 +24,7 @@ use bim_core::{BimDocument, BimDocumentId, BimFederationReport, BimModel};
 // Sibling modules of one binary; naming each item would be a second list to keep in step.
 use crate::inspect::*;
 use rvt_import::{
-    BOX_GAP_BUCKETS, GeometryStatistics, geometry_statistics,
+    BOX_GAP_BUCKETS, GeometryStatistics, PropertyCounts, geometry_statistics,
     mapped_family_instance_placement_counts, metadata_model, recover_elements,
 };
 use scene_pack::SourceInfo;
@@ -55,8 +58,16 @@ pub(crate) fn report_geometry_recovery(geometry_statistics: &GeometryStatistics)
         geometry_statistics.verified_symbol_bounds
     );
     println!(
+        "Placed instances whose family states a flat plan symbol and no solid: {}",
+        geometry_statistics.instances_whose_symbol_body_is_flat
+    );
+    println!(
         "Bodies whose closed-shell claim requires face-loop closure: {}",
         geometry_statistics.bodies_requiring_loop_closure
+    );
+    println!(
+        "Bodies with a redundant exact duplicate face pair: {}",
+        geometry_statistics.bodies_with_redundant_duplicate_faces
     );
     report_symbol_link_funnel(geometry_statistics);
     report_nested_assembly_funnel(geometry_statistics);
@@ -148,6 +159,32 @@ pub(crate) fn stage_label(name: &str) -> &'static str {
 
 /// Read the command's arguments as pack options, refusing the values the
 /// format cannot express before a long decode has been paid for.
+/// What a conversion may spend on reading its sources.
+///
+/// The two are not one number wearing two hats, which is what they used to
+/// be. An RVT is read a compressed member at a time, so what bounds it is the
+/// largest member it will inflate - a constant, and nothing to do with how
+/// large the file is. An IFC is read whole, so what bounds it is the machine:
+/// the source, the table it parses into and the model built from that table
+/// are all held at once. Sharing `--max-member-bytes` between them meant a
+/// 1.8 GB IFC was refused by a flag whose default describes one gzip member.
+#[derive(Clone, Copy)]
+pub(crate) struct SourceLimits {
+    /// Largest decoded RVT member accepted.
+    pub(crate) max_member_bytes: u64,
+    /// Largest IFC source text accepted, or `None` to let this host's own
+    /// memory decide - see [`bim_convert::memory::max_ifc_bytes`].
+    pub(crate) max_ifc_bytes: Option<u64>,
+}
+
+impl SourceLimits {
+    /// The IFC ceiling in force: what was asked for, or what this host can
+    /// afford.
+    pub(crate) fn ifc_ceiling(self) -> u64 {
+        self.max_ifc_bytes.unwrap_or_else(max_ifc_bytes)
+    }
+}
+
 /// What reading a source file costs and how much of it to read, whatever the
 /// format turns out to be.
 pub(crate) struct ReadOptions {
@@ -157,8 +194,7 @@ pub(crate) struct ReadOptions {
     pub(crate) include_unplaced: bool,
     /// Stop after this many elements, per source file.
     pub(crate) limit: Option<usize>,
-    /// Largest decoded RVT member, or largest IFC source text, accepted.
-    pub(crate) max_bytes: u64,
+    pub(crate) limits: SourceLimits,
     /// The furthest a chord may sit from the curve it approximates, in
     /// metres, where the reader tessellates a curve to build the model.
     pub(crate) chord_tolerance: f64,
@@ -198,9 +234,7 @@ pub(crate) struct RvtDetail {
     /// identifier, and a federated model has qualified every one of them.
     pub(crate) mapped_family_instances: usize,
     pub(crate) mapped_family_instance_placements: usize,
-    pub(crate) included_properties: usize,
-    pub(crate) included_type_properties: usize,
-    pub(crate) omitted_properties: usize,
+    pub(crate) properties: PropertyCounts,
 }
 
 /// What the STEP reader read, and the parts of the file it does not cover.
@@ -273,13 +307,12 @@ pub(crate) fn read_rvt_source(
     stage: &mut Stage,
 ) -> Result<SourceModel, Box<dyn Error>> {
     stage.begins("decode");
-    let recovered = recover_elements(path, options.max_bytes)?;
+    let recovered = recover_elements(path, options.limits.max_member_bytes)?;
     stage.finished("decode");
 
     stage.begins("model");
     let geometry = geometry_statistics(&recovered.elements, recovered.schema.as_ref());
-    let (model, included_properties, included_type_properties, omitted_properties) =
-        metadata_model(&recovered, options.include_unplaced, options.limit);
+    let (model, properties) = metadata_model(&recovered, options.include_unplaced, options.limit);
     let (mapped_family_instances, mapped_family_instance_placements) =
         mapped_family_instance_placement_counts(&model, &recovered);
     stage.finished("model");
@@ -292,9 +325,7 @@ pub(crate) fn read_rvt_source(
             geometry,
             mapped_family_instances,
             mapped_family_instance_placements,
-            included_properties,
-            included_type_properties,
-            omitted_properties,
+            properties,
         })),
     })
 }
@@ -307,15 +338,22 @@ pub(crate) fn read_ifc_source(
 ) -> Result<SourceModel, Box<dyn Error>> {
     // The STEP reader holds the whole file, so its cost is a multiple of the
     // source rather than of one bounded member; the ceiling is checked before
-    // a long read is paid for. See `Format::memory_ratio`.
+    // a long read is paid for. Unless an operator states one, the ceiling is
+    // this machine's: what it can hold is what it can convert, and a number
+    // compiled in cannot know that. See `Format::memory_ratio`.
     let source_bytes = std::fs::metadata(path)?.len();
-    if source_bytes > options.max_bytes {
+    let ceiling = options.limits.ifc_ceiling();
+    if source_bytes > ceiling {
+        let needed = memory_to_convert(source_bytes, Format::Ifc).unwrap_or(source_bytes);
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "IFC source is {source_bytes} bytes, above the configured {}-byte \
-                 safe parsing limit; raise --max-member-bytes only on a host with enough memory",
-                options.max_bytes
+                "IFC source is {source_bytes} bytes ({} MB), above the {} MB safe parsing \
+                 limit this host allows; reading it is expected to need about {} MB of \
+                 memory. Raise it with --max-ifc-bytes on a host with the memory for it.",
+                megabytes(source_bytes),
+                megabytes(ceiling),
+                megabytes(needed)
             ),
         )
         .into());
@@ -474,15 +512,21 @@ impl SourceDetail {
     pub(crate) fn report_properties(&self) {
         match self {
             Self::Rvt(detail) => {
-                println!("Recovered Revit properties: {}", detail.included_properties);
+                println!("Recovered Revit properties: {}", detail.properties.included);
                 println!(
                     "Recovered Revit properties from the element's type: {}",
-                    detail.included_type_properties
+                    detail.properties.included_from_type
                 );
-                if detail.omitted_properties > 0 {
+                if detail.properties.unverified > 0 {
                     println!(
                         "Unverified parameter candidates omitted for this Revit release: {}",
-                        detail.omitted_properties
+                        detail.properties.unverified
+                    );
+                }
+                if detail.properties.unnamed > 0 {
+                    println!(
+                        "Parameters omitted because nothing in the file or the catalogue names them: {}",
+                        detail.properties.unnamed
                     );
                 }
             }

@@ -57,7 +57,7 @@ mod probe;
 mod source;
 
 #[allow(clippy::wildcard_imports)] // The modules of one binary, split for reading.
-use crate::{export::*, inspect::*, probe::*};
+use crate::{export::*, inspect::*, probe::*, source::SourceLimits};
 
 #[derive(Debug, Parser)]
 #[command(name = "rivet", version, about = "Read-only RVT inspection")]
@@ -427,12 +427,24 @@ enum Command {
         /// Leave out the parameters the element's type carries.
         #[arg(long)]
         no_revit_type_property_sets: bool,
-        /// Write IFC's own `Qto_..BaseQuantities`, measured from the solid
-        /// this file carries: `NetVolume`, and `NetSurfaceArea` where the
-        /// entity's quantity set has a name for it. Only a closed shell of
+        /// Leave out IFC's own `Qto_..BaseQuantities`, which are otherwise
+        /// measured from the solid this file carries. Only a closed shell of
         /// planar faces is measured; nothing else is estimated.
         #[arg(long)]
-        base_quantities: bool,
+        no_base_quantities: bool,
+        /// Write every element's body under the element itself, rather than
+        /// writing a body once and placing it through an
+        /// `IfcRepresentationMap` for each element that carries it. Larger by
+        /// several times; what a reader that cannot follow a mapped item
+        /// needs.
+        #[arg(long)]
+        no_shared_bodies: bool,
+        /// Write an element even where this export carries no body for it -
+        /// a family that draws itself in plan, or geometry that did not
+        /// decode. Left out otherwise, as a product with no body is nothing
+        /// anyone can clash, measure or look at.
+        #[arg(long)]
+        elements_without_a_body: bool,
         /// A class mapping table in Revit's tab-separated form: a category,
         /// an empty subcategory column, the IFC class to write it as, and the
         /// predefined type. `Not Exported` keeps a category out of the file.
@@ -447,6 +459,11 @@ enum Command {
         /// type's parameters back on every element of it.
         #[arg(long)]
         no_types: bool,
+        /// Leave out the `IfcOpeningElement` a door or a window would
+        /// otherwise get, and the relationships that tie it to the wall it
+        /// cuts and the element that fills it.
+        #[arg(long)]
+        no_openings: bool,
         /// Write the setup this run used to this JSON file, so it can be
         /// repeated exactly.
         #[arg(long)]
@@ -455,9 +472,15 @@ enum Command {
         /// ends, for a caller driving a progress display.
         #[arg(long)]
         progress: bool,
-        /// Maximum decoded bytes accepted from one member.
+        /// Maximum decoded bytes accepted from one RVT member.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
+        /// Maximum source bytes accepted from an IFC file. Left unsaid, the
+        /// ceiling is what this host's own memory allows: an IFC is read
+        /// whole, so what it costs is a multiple of its size rather than of
+        /// one member.
+        #[arg(long)]
+        max_ifc_bytes: Option<u64>,
     },
     /// Export the binary scene a viewer loads: the elements, the triangles
     /// their geometry tessellates to, and their properties.
@@ -494,10 +517,15 @@ enum Command {
         /// ends, for a caller driving a progress display.
         #[arg(long)]
         progress: bool,
-        /// Maximum decoded bytes accepted from one RVT member, or source
-        /// bytes accepted from an IFC file.
+        /// Maximum decoded bytes accepted from one RVT member.
         #[arg(long, default_value_t = 256 * 1024 * 1024)]
         max_member_bytes: u64,
+        /// Maximum source bytes accepted from an IFC file. Left unsaid, the
+        /// ceiling is what this host's own memory allows: an IFC is read
+        /// whole, so what it costs is a multiple of its size rather than of
+        /// one member.
+        #[arg(long)]
+        max_ifc_bytes: Option<u64>,
     },
     /// Print record bodies of one class as hex, for field analysis.
     Bodies {
@@ -758,12 +786,16 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             no_revit_property_sets,
             no_revit_type_property_sets,
             no_ifc_common_property_sets,
-            base_quantities,
+            no_base_quantities,
+            no_shared_bodies,
+            elements_without_a_body,
             no_types,
+            no_openings,
             class_mapping,
             write_settings,
             progress,
             max_member_bytes,
+            max_ifc_bytes,
         } => export_ifc(
             &files,
             output.as_deref(),
@@ -776,13 +808,19 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
                 no_revit_property_sets,
                 no_revit_type_property_sets,
                 no_ifc_common_property_sets,
-                base_quantities,
+                no_base_quantities,
+                no_shared_bodies,
+                elements_without_a_body,
                 no_types,
+                no_openings,
                 class_mapping: class_mapping.as_deref(),
                 write_settings: write_settings.as_deref(),
             },
             progress,
-            max_member_bytes,
+            SourceLimits {
+                max_member_bytes,
+                max_ifc_bytes,
+            },
         ),
         Command::ExportScene {
             files,
@@ -796,6 +834,7 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             compression,
             progress,
             max_member_bytes,
+            max_ifc_bytes,
         } => export_scene(
             &files,
             output.as_deref(),
@@ -809,7 +848,10 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
                 compression,
             },
             progress,
-            max_member_bytes,
+            SourceLimits {
+                max_member_bytes,
+                max_ifc_bytes,
+            },
         ),
         Command::Bodies {
             file,

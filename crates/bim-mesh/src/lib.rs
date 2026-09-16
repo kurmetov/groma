@@ -1022,6 +1022,7 @@ mod tests {
                     line(ring[2], ring[3]),
                     line(ring[3], ring[0]),
                 ]],
+                material: None,
             })
             .collect();
         BimBrep {
@@ -1088,7 +1089,7 @@ mod tests {
         let arc = |start: [f64; 3], end: [f64; 3], z: f64, from: f64, to: f64| BimBrepEdge {
             start: at(start),
             end: at(end),
-            curve: BimBrepCurve::Arc(BimBrepArc {
+            curve: BimBrepCurve::Arc(Box::new(BimBrepArc {
                 center: at([0.0, 0.0, z]),
                 x_axis: [1.0, 0.0, 0.0],
                 z_axis: [0.0, 0.0, 1.0],
@@ -1098,7 +1099,7 @@ mod tests {
                 },
                 start_angle: from,
                 end_angle: to,
-            }),
+            })),
         };
         let pi = std::f64::consts::PI;
         BimBrepFace {
@@ -1118,6 +1119,7 @@ mod tests {
                 line(axis(pi, 0.0), axis(pi, height)),
                 arc(axis(pi, height), axis(0.0, height), height, -pi, 0.0),
             ]],
+            material: None,
         }
     }
 
@@ -1221,6 +1223,7 @@ mod tests {
                 y_axis: [0.0, 1.0, 0.0],
             },
             loops: vec![square(0.0, 1.0), square(2.0, 3.0)],
+            material: None,
         };
         let mesh = tessellate(
             &BimGeometry::Brep(BimBrep {
@@ -1265,6 +1268,7 @@ mod tests {
                 y_axis: [0.0, 1.0, 0.0],
             },
             loops: vec![square(0.0, 0.0, 3.0, true), square(1.0, 1.0, 1.0, false)],
+            material: None,
         };
         let mesh = tessellate(
             &BimGeometry::Brep(BimBrep {
@@ -1306,7 +1310,7 @@ mod tests {
                 x_axis: [0.0, 1.0, 0.0],
                 y_axis: [0.0, 0.0, 1.0],
                 z_axis: [-1.0, 0.0, 0.0],
-                profile: bim_core::BimBrepProfile::Arc {
+                profile: Box::new(bim_core::BimBrepProfile::Arc {
                     center: at([0.033, 0.0, 0.0]),
                     x_axis: [1.0, 0.0, 0.0],
                     y_axis: [0.0, 0.0, 1.0],
@@ -1314,11 +1318,12 @@ mod tests {
                         value: 0.013_5,
                         unit: Some(metres_unit()),
                     },
-                },
+                }),
             },
             loops: vec![(0..corners.len())
                 .map(|index| line(corners[index], corners[(index + 1) % corners.len()]))
                 .collect()],
+            material: None,
         };
         let mesh = tessellate(
             &BimGeometry::Brep(BimBrep {

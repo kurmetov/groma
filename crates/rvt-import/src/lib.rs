@@ -22,8 +22,8 @@ use bim_core::{
     BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
     BimBrepRuling, BimBrepSurface, BimCategory, BimElement, BimElementId, BimElementType,
     BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimMaterial, BimMaterialLayer,
-    BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty,
-    BimPropertyValue, BimSource, BimSweptDisk, BimUnit,
+    BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3, BimProjectIdentity,
+    BimProperty, BimPropertyValue, BimSource, BimSweptDisk, BimUnit,
 };
 use revit_catalog::Catalog;
 use rvt_container::{
@@ -734,6 +734,11 @@ pub struct ExportedElement {
     pub geometry_bounds: Option<GElementBounds>,
     pub placement_bounds: Option<GElementBounds>,
     pub verified_symbol_bounds: Option<VerifiedSymbolBounds>,
+    /// A symbol whose body is already in the model's project coordinates and
+    /// belongs to this element: see [`attach_placed_symbol_bodies`]. Held
+    /// apart from `verified_symbol_bounds` because nothing here is placed -
+    /// the body is where it already was - so the two say different things.
+    pub placed_symbol_body: Option<u32>,
     /// The boundary representation decoded from this id's own `GElement`
     /// record, in its own local frame and Revit internal feet. Populated for
     /// any id that carries one - typically a `FamilySymbol` - and looked up
@@ -801,6 +806,11 @@ impl ExportedElement {
 pub struct VerifiedSymbolBounds {
     pub symbol_element_id: u32,
     pub bounds: GElementBounds,
+    /// The same extent in the model's own project coordinates, decoded from
+    /// the instance's record rather than computed from `bounds`: the link was
+    /// accepted only because the two agree to 1e-8 ft through the instance's
+    /// transform, so this is the placed box with no rotation hull taken.
+    pub instance_bounds: GElementBounds,
 }
 
 /// Per-class string calibration plus the identifiers of parameter elements.
@@ -1316,6 +1326,7 @@ pub fn recover_elements(
     }
 
     attach_symbol_bounds(&mut elements);
+    attach_placed_symbol_bodies(&mut elements);
     attach_fitting_axes(&mut elements, catalog);
     verify_family_instance_placements(&mut elements);
     inherit_symbol_names(&mut elements);
@@ -1944,6 +1955,100 @@ fn verify_family_instance_placements(elements: &mut BTreeMap<u32, ExportedElemen
     }
 }
 
+/// Link an element to a symbol whose body is *already placed*, where the
+/// bounds cross-check has nothing to check.
+///
+/// [`attach_symbol_bounds`] verifies a placement by carrying the symbol's box
+/// through the instance's transform and requiring the instance's own box back.
+/// That is the right question for a family symbol drawn in its own local
+/// frame. It is not the question here: these placements declare the identity
+/// transform and name a symbol whose body reproduces its *own* record's box,
+/// so the body is in the model's project coordinates already and there is no
+/// transform to get wrong. Carrying an identity through and demanding the two
+/// boxes match then refuses the link for a reason that has nothing to do with
+/// placement - a stair run's box runs to the top of its storey while the
+/// treads it is drawn from stop partway up, so the boxes differ in one
+/// coordinate and agree in the other five.
+///
+/// What stands in for the cross-check is containment plus exclusivity: the
+/// placed body lies inside the element's own declared box, and no other
+/// element names that symbol. Neither is a placement claim, because none is
+/// needed; together they say the body the file already put here is this
+/// element's and nothing else's.
+///
+/// On AR S1 this links 35 elements, every one of which reaches the exporter
+/// with no geometry without it: the 22 `StairsRun` and 12 `StairsLanding` of
+/// the model's 11 stairs - whose treads and risers are a
+/// `StairsTriserSymbol` of their own, 114 closed faces with a zero box
+/// residual - and one family instance. Not one shares its symbol with another
+/// element, and not one is refused by the containment test, so neither guard
+/// is doing work it cannot be measured on; they are here because a body drawn
+/// twice, or drawn on the wrong element, is worse than one not drawn.
+fn attach_placed_symbol_bodies(elements: &mut BTreeMap<u32, ExportedElement>) {
+    let mut named: BTreeMap<u32, usize> = BTreeMap::new();
+    for element in elements.values() {
+        if let Some(symbol) = element
+            .ginstance_transform
+            .and_then(|transform| transform.symbol_element_id)
+        {
+            *named.entry(symbol).or_default() += 1;
+        }
+    }
+    let placed = elements
+        .iter()
+        .filter_map(|(id, element)| {
+            element
+                .brep_placement_box
+                .filter(|_| element.brep_is_placed)
+                .map(|bounds| (*id, bounds))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for element in elements.values_mut() {
+        let Some(transform) = element.ginstance_transform else {
+            continue;
+        };
+        if !declares_identity(&transform) {
+            continue;
+        }
+        let Some(symbol_element_id) = transform.symbol_element_id else {
+            continue;
+        };
+        if named.get(&symbol_element_id).copied() != Some(1) {
+            continue;
+        }
+        let Some(symbol_box) = placed.get(&symbol_element_id) else {
+            continue;
+        };
+        let Some(own_box) = element.placement_bounds else {
+            continue;
+        };
+        if !own_box.contains_box(symbol_box) {
+            continue;
+        }
+        element.placed_symbol_body = Some(symbol_element_id);
+    }
+}
+
+/// Whether a placement is the identity as the file wrote it, not merely close
+/// to one: a transform that moves the body at all is the cross-check's to verify.
+fn declares_identity(transform: &GInstanceTransformFields) -> bool {
+    let same = |ours: f64, theirs: f64| (ours - theirs).abs() <= f64::EPSILON;
+    transform
+        .origin
+        .coordinates_feet
+        .iter()
+        .zip(IDENTITY_TRANSFORM.origin.coordinates_feet)
+        .chain(
+            transform
+                .basis
+                .iter()
+                .flatten()
+                .zip(IDENTITY_TRANSFORM.basis.into_iter().flatten()),
+        )
+        .all(|(ours, theirs)| same(*ours, theirs))
+}
+
 fn attach_symbol_bounds(elements: &mut BTreeMap<u32, ExportedElement>) {
     // Every element that carries a box, not only those of one class. What an
     // instance is placed from is whatever its `InstInfoBase.m_symbolId` names,
@@ -2010,6 +2115,7 @@ fn attach_symbol_bounds(elements: &mut BTreeMap<u32, ExportedElement>) {
         element.verified_symbol_bounds = Some(VerifiedSymbolBounds {
             symbol_element_id,
             bounds: symbol_bounds,
+            instance_bounds,
         });
         // An instance whose own record did not yield a category takes its
         // symbol's. In Revit a family instance's category *is* its family's,
@@ -2140,6 +2246,42 @@ fn is_building_element_class(class_name: &str) -> bool {
 /// definitions the same rule already drops.
 const SYSTEM_RUN_CLASS: &str = "RbsCurve";
 
+/// What the project's `ProjectInfo` element declares about it, read off the
+/// five built-in parameters Revit's own IFC export reaches for the project,
+/// building and site metadata it writes. Measured against AR S1: id 1365 is
+/// the model's one `ProjectInfo` record, and every value below reproduces
+/// what `s1_revit.ifc` states word for word - including the mapping, which
+/// is not the obvious one: `PROJECT_NUMBER` is `IfcProject.Name`, and
+/// `PROJECT_NAME` - the long descriptive sentence - is `IfcProject.LongName`.
+fn project_identity(recovered: &RecoveredElements) -> Option<BimProjectIdentity> {
+    const PROJECT_NUMBER: i32 = -1_006_316;
+    const PROJECT_NAME: i32 = -1_006_317;
+    const PROJECT_ADDRESS: i32 = -1_006_318;
+    const PROJECT_STATUS: i32 = -1_006_320;
+    const PROJECT_BUILDING_NAME: i32 = -1_019_006;
+
+    let project_info_class = schema_class_index(recovered.schema.as_ref(), "ProjectInfo")?;
+    let element = recovered
+        .elements
+        .values()
+        .find(|element| !element.moribund && element.class_index == Some(project_info_class))?;
+    let text = |code: i32| {
+        element.parameters.iter().find_map(|parameter| {
+            let ParameterValue::Text(text) = &parameter.value else {
+                return None;
+            };
+            (parameter.id == code && !text.is_empty()).then(|| text.clone())
+        })
+    };
+    Some(BimProjectIdentity {
+        number: text(PROJECT_NUMBER),
+        name: text(PROJECT_NAME),
+        building_name: text(PROJECT_BUILDING_NAME),
+        address: text(PROJECT_ADDRESS),
+        phase: text(PROJECT_STATUS),
+    })
+}
+
 /// The storeys of *this* model, and the map that folds every recovered `Level`
 /// onto the one that represents it.
 fn building_storeys(
@@ -2155,45 +2297,50 @@ fn building_storeys(
                 .is_some_and(|class| class.name == "Level")
         })
     };
-    // A storey is a storey of *this* model only if something the export emits
-    // stands on it. The record walk recovers every `Level` the file mentions,
-    // including those a linked model or another section contributes, and they
-    // are not distinguishable by any field on the level itself: AR S1 yields
-    // 163 of them for 15 real storeys, the same name repeated at two
-    // elevations, and KJ files reach 1 236. Asking which levels the exported
-    // elements actually reference settles it against the reference export
-    // exactly - 12 levels, 12 distinct (name, elevation) pairs, every one of
-    // them a storey Revit also emits and none that it does not. The three of
-    // Revit's 15 not reached are storeys nothing we export stands on.
+    // The record walk recovers every `Level` the file mentions, including
+    // those a linked model or another section contributes, and they are not
+    // distinguishable by any field on the level itself: AR S1 yields 163 of
+    // them for 15 real storeys, the same name repeated at up to six
+    // elevations a file's history has drifted through. Asking which levels
+    // the exported elements actually reference settles the *right* elevation
+    // for a storey that split into architecturally distinct copies - AR S1's
+    // "02 Этаж" keeps 3.3 m and 4.2 m among its records, and only the
+    // occupied one, 3.3 m, is where Revit's own export puts it too.
     let occupied_levels = recovered
         .elements
         .values()
         .filter(|element| is_model_element(element))
         .filter_map(|element| element.level_id)
         .collect::<BTreeSet<_>>();
+    // Family documents contribute their own reference levels to the project
+    // database. In the corpus those carry a family reference; top-level
+    // project storeys do not.
+    let is_project_level = |element: &ExportedElement| {
+        !element.moribund
+            && is_level(element)
+            && element.family_id.is_none()
+            && element.header_family_id.is_none()
+    };
+    let level_elevation = |element: &ExportedElement| {
+        element.elevation_feet.and_then(|value| {
+            Some(BimNumber {
+                value: revit_catalog::internal_feet_to_metres(value)?,
+                unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
+            })
+        })
+    };
 
-    let levels = recovered
+    let occupied = recovered
         .elements
         .iter()
         .filter(|(id, element)| {
-            !element.moribund
-                && is_level(element)
-                // Family documents contribute their own reference levels to
-                // the project database. In the corpus those carry a family
-                // reference; top-level project storeys do not.
-                && element.family_id.is_none()
-                && element.header_family_id.is_none()
+            is_project_level(element)
                 && i32::try_from(**id).is_ok_and(|id| occupied_levels.contains(&id))
         })
         .map(|(id, element)| BimLevel {
             id: BimElementId(id.to_string()),
             name: element.name.as_ref().map(|(name, _)| name.clone()),
-            elevation: element.elevation_feet.and_then(|value| {
-                Some(BimNumber {
-                    value: revit_catalog::internal_feet_to_metres(value)?,
-                    unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
-                })
-            }),
+            elevation: level_elevation(element),
         })
         .collect::<Vec<_>>();
 
@@ -2204,7 +2351,7 @@ fn building_storeys(
     // it, so an element standing on any of them still lands somewhere.
     let mut canonical_level = BTreeMap::new();
     let mut seen_storeys: BTreeMap<(Option<&str>, Option<u64>), BimElementId> = BTreeMap::new();
-    for level in &levels {
+    for level in &occupied {
         let key = (
             level.name.as_deref(),
             level.elevation.as_ref().map(|value| value.value.to_bits()),
@@ -2212,13 +2359,85 @@ fn building_storeys(
         let canonical = seen_storeys.entry(key).or_insert_with(|| level.id.clone());
         canonical_level.insert(level.id.clone(), canonical.clone());
     }
-    let levels = levels
+    let mut levels = occupied
         .iter()
         .filter(|level| canonical_level.get(&level.id) == Some(&level.id))
         .cloned()
         .collect::<Vec<_>>();
 
+    include_unoccupied_storeys(
+        recovered,
+        &is_project_level,
+        &level_elevation,
+        &mut levels,
+        &mut canonical_level,
+    );
+
     (levels, canonical_level)
+}
+
+/// A storey nothing exported stands on - a roof no AR element sits at, a
+/// level kept for a discipline this file does not carry - is still a real
+/// storey of the project, and Revit's own export writes it exactly as it
+/// does an occupied one, empty of contents. Measured against it on AR S1:
+/// "01 `ПромЭтаж`", "25 Кровля 5" and "25 Кровля 6" are exactly the three
+/// storeys occupancy leaves out in [`building_storeys`], each a single
+/// record with no elevation to disambiguate - unlike the architecturally
+/// split names occupancy already resolved, nothing here is ambiguous. Where a
+/// name really is split several ways with none of them occupied, the split
+/// this file's own history agrees on most - simple frequency, the same
+/// signal that would have picked the wrong elevation for "02 Этаж" had it run
+/// first there - is the best of nothing better available.
+fn include_unoccupied_storeys(
+    recovered: &RecoveredElements,
+    is_project_level: &dyn Fn(&ExportedElement) -> bool,
+    level_elevation: &dyn Fn(&ExportedElement) -> Option<BimNumber>,
+    levels: &mut Vec<BimLevel>,
+    canonical_level: &mut BTreeMap<BimElementId, BimElementId>,
+) {
+    let occupied_names: BTreeSet<Option<&str>> =
+        levels.iter().map(|level| level.name.as_deref()).collect();
+    let mut unoccupied_elevations: BTreeMap<&str, BTreeMap<Option<u64>, (u32, BimElementId)>> =
+        BTreeMap::new();
+    for (id, element) in &recovered.elements {
+        if !is_project_level(element) || canonical_level.contains_key(&BimElementId(id.to_string()))
+        {
+            continue;
+        }
+        let Some((name, _)) = &element.name else {
+            continue;
+        };
+        if occupied_names.contains(&Some(name.as_str())) {
+            continue;
+        }
+        let elevation_bits = level_elevation(element).map(|value| value.value.to_bits());
+        let bucket = unoccupied_elevations
+            .entry(name.as_str())
+            .or_default()
+            .entry(elevation_bits)
+            .or_insert((0, BimElementId(id.to_string())));
+        bucket.0 += 1;
+    }
+    for (name, candidates) in unoccupied_elevations {
+        let Some((&elevation_bits, (_, canonical))) =
+            candidates.iter().max_by_key(|(_, (count, _))| *count)
+        else {
+            continue;
+        };
+        levels.push(BimLevel {
+            id: canonical.clone(),
+            name: Some(name.to_owned()),
+            elevation: elevation_bits.map(|bits| BimNumber {
+                value: f64::from_bits(bits),
+                unit: Some(BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
+            }),
+        });
+        for (id, element) in &recovered.elements {
+            if is_project_level(element) && element.name.as_ref().is_some_and(|(n, _)| n == name) {
+                canonical_level.insert(BimElementId(id.to_string()), canonical.clone());
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)] // The selection's clauses, each with its measurement.
@@ -2227,7 +2446,7 @@ pub fn metadata_model(
     recovered: &RecoveredElements,
     include_unplaced: bool,
     limit: Option<usize>,
-) -> (BimModel, usize, usize, usize) {
+) -> (BimModel, PropertyCounts) {
     let class_name = |element: &ExportedElement| {
         element.class_index.and_then(|index| {
             recovered
@@ -2371,21 +2590,28 @@ pub fn metadata_model(
 
     let (levels, canonical_level) = building_storeys(recovered, &is_model_element);
 
-    let candidates = recovered
+    // Selected before any is normalized, because an element's geometry depends
+    // on which others are products: a nested family leaves out the members
+    // that are drawn by products of their own.
+    let products = recovered
         .elements
         .iter()
-        .filter(|(_, element)| is_candidate(element));
-
-    let mut included_properties = 0_usize;
-    let mut included_type_properties = 0_usize;
-    let mut omitted_properties = 0_usize;
-    let elements = candidates
+        .filter(|(_, element)| is_candidate(element))
+        .map(|(id, _)| *id)
         .take(limit.unwrap_or(usize::MAX))
+        .collect::<BTreeSet<_>>();
+    let is_product = |id: u32| products.contains(&id);
+
+    let mut counts = PropertyCounts::default();
+    let elements = products
+        .iter()
+        .filter_map(|id| Some((id, recovered.elements.get(id)?)))
         .map(|(id, element)| {
             let mut normalized = normalize_element(
                 *id,
                 element,
                 &recovered.elements,
+                &is_product,
                 recovered.schema.as_ref(),
                 &recovered.parameter_names,
                 &recovered.parameter_specs,
@@ -2396,16 +2622,27 @@ pub fn metadata_model(
                 .as_ref()
                 .and_then(|level_id| canonical_level.get(level_id).cloned());
             let mut properties = trusted_source_properties(&normalized);
+            // A parameter nothing names is not written into the model. See
+            // `placeholder_parameter_name`: the reader recovered a value and
+            // its code, and neither the file nor Autodesk's table says what
+            // the code means, so a property sheet can only repeat the code
+            // back at its reader. It stays in the JSON export, which writes
+            // the intermediate.
+            for set in [&mut normalized.properties, &mut normalized.type_properties] {
+                let before = set.len();
+                set.retain(|property| !names_nothing(property));
+                counts.unnamed += before - set.len();
+            }
             // The type's values come from the same reader as the element's own
             // and carry the same risk of an unverified parameter code, so they
             // are held to the same catalogue check rather than to none.
             if recovered.parameter_values_schema_bound {
-                included_properties += normalized.properties.len();
+                counts.included += normalized.properties.len();
                 properties.append(&mut normalized.properties);
-                included_type_properties += normalized.type_properties.len();
+                counts.included_from_type += normalized.type_properties.len();
             } else {
-                omitted_properties += normalized.properties.len();
-                omitted_properties += normalized.type_properties.len();
+                counts.unverified += normalized.properties.len();
+                counts.unverified += normalized.type_properties.len();
                 normalized.type_properties.clear();
             }
             normalized.properties = properties;
@@ -2419,15 +2656,30 @@ pub fn metadata_model(
                 application: "Autodesk Revit".to_owned(),
                 release: recovered.release.map(|release| release.to_string()),
             }),
+            project: project_identity(recovered),
             documents: Vec::new(),
             elements,
             levels,
             relations: Vec::new(),
         },
-        included_properties,
-        included_type_properties,
-        omitted_properties,
+        counts,
     )
+}
+
+/// How many of the parameters the reader recovered stand in the model, and
+/// why the rest do not.
+///
+/// Each number is a different reading: `included` and `included_from_type` are
+/// what a reader of the model gets, `unverified` is what this Revit release's
+/// catalogue could not speak for, and `unnamed` is what nothing names. They
+/// are reported rather than summed, since a count of "left out" alone says
+/// nothing about which of the two reasons applies.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PropertyCounts {
+    pub included: usize,
+    pub included_from_type: usize,
+    pub unverified: usize,
+    pub unnamed: usize,
 }
 
 /// Class name used for a record whose class index the schema did not resolve.
@@ -2951,9 +3203,18 @@ pub struct GeometryStatistics {
     pub verified_family_instance_placements: usize,
     pub verified_ginstance_transforms: usize,
     pub verified_symbol_bounds: usize,
+    /// Instances whose link to a symbol is verified and whose symbol's body
+    /// is flat: every face lies in one plane, so the family draws a plan
+    /// symbol and states no solid. Counted because the alternative is a
+    /// reader concluding the conversion lost the geometry. Revit's own export
+    /// of AR S1 writes nothing for these either.
+    pub instances_whose_symbol_body_is_flat: usize,
     /// Kept bodies whose topological closure was contradicted by a cut-face
     /// rebuild selecting a different set of faces on the same box.
     pub bodies_requiring_loop_closure: usize,
+    /// Kept bodies containing exact, same-winding duplicate faces whose
+    /// removal leaves an independently closed boundary.
+    pub bodies_with_redundant_duplicate_faces: usize,
     /// What an element declaring several placements says about itself. A
     /// nested family writes one `InstInfoBase` per sub-instance, and no single
     /// transform describes it, so the export reads none of them. These count
@@ -3120,6 +3381,18 @@ fn tally_box_cross_check_refusal(
     }
 }
 
+/// Whether every face of a body lies in one plane: a family that draws a plan
+/// symbol rather than stating a solid. Read from the body's own extent, which
+/// is the one measurement that does not depend on how the faces are wound.
+#[must_use]
+fn body_is_flat(brep: &rvt_model::SymbolBrep) -> bool {
+    body_extent_feet(brep).is_some_and(|(min, max)| {
+        min.into_iter()
+            .zip(max)
+            .any(|(low, high)| (high - low).abs() <= BODY_BOUNDS_TOLERANCE_FEET)
+    })
+}
+
 #[allow(clippy::too_many_lines)] // One pass over the elements, tallying each funnel.
 #[must_use]
 pub fn geometry_statistics(
@@ -3141,6 +3414,12 @@ pub fn geometry_statistics(
     for element in elements.values() {
         statistics.bodies_requiring_loop_closure +=
             usize::from(element.brep_requires_loop_closure);
+        statistics.bodies_with_redundant_duplicate_faces += usize::from(
+            element
+                .brep
+                .as_ref()
+                .is_some_and(|brep| !brep.redundant_duplicate_face_indexes().is_empty()),
+        );
         if let Some(line) = element.pipe_line_candidate {
             statistics.pipe_candidates += 1;
             statistics.pipe_candidates_with_bounds +=
@@ -3178,6 +3457,11 @@ pub fn geometry_statistics(
                 }
                 if element.verified_symbol_bounds.is_some() {
                     statistics.instances_whose_bounds_match_the_symbol += 1;
+                    statistics.instances_whose_symbol_body_is_flat += usize::from(
+                        symbol.is_some_and(|symbol| {
+                            symbol.brep.as_ref().is_some_and(body_is_flat)
+                        }),
+                    );
                 }
                 let symbol_category = symbol.and_then(|symbol| symbol.category);
                 if symbol_category.is_none() {
@@ -3292,7 +3576,7 @@ pub fn geometry_statistics(
         statistics.verified_ginstance_transforms +=
             usize::from(element.ginstance_transform.is_some());
         statistics.verified_symbol_bounds += usize::from(element.verified_symbol_bounds.is_some());
-        let refusal = match nested_assembly(element, elements) {
+        let refusal = match nested_assembly(element, elements, &|_| false) {
             Ok(_) => "the assembly is written",
             Err(NestedRefusal::NotSeveral) => continue,
             Err(NestedRefusal::NoElementBounds) => "the element declares no box",
@@ -3304,6 +3588,7 @@ pub fn geometry_statistics(
             Err(NestedRefusal::MemberHasNoBody) => "a member's symbol carries no decoded body",
             Err(NestedRefusal::MemberNotConverted) => "a member's body would not convert",
             Err(NestedRefusal::MemberIncomplete) => "a member's body does not close",
+            Err(NestedRefusal::EveryMemberDrawnAlone) => "every member is a product of its own",
             Err(NestedRefusal::OwnBodyUnusable) => {
                 "the hull needs the record's own body and it does not close"
             }
@@ -3508,11 +3793,16 @@ fn parameter_metadata(
 
 /// Cross the format boundary once: raw Revit identifiers stay available as
 /// external IDs, while numbers with a known spec become unit-bearing values.
+///
+/// `is_product` says which other ids the caller writes as products of their
+/// own; see [`drawn_as_its_own_product`].
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn normalize_element(
     id: u32,
     element: &ExportedElement,
     elements: &BTreeMap<u32, ExportedElement>,
+    is_product: &dyn Fn(u32) -> bool,
     schema: Option<&Schema>,
     parameter_names: &BTreeMap<i32, String>,
     parameter_specs: &BTreeMap<i32, String>,
@@ -3564,7 +3854,8 @@ pub fn normalize_element(
         (element.name.as_ref().map(|(name, _)| name.clone()), None)
     };
 
-    let geometry = normalize_geometry(element, element_type, elements);
+    let geometry = normalize_geometry(element, element_type, elements, is_product)
+        .map(|geometry| resolve_face_materials(geometry, elements));
     if let Some(BimGeometry::Brep(brep)) = &geometry {
         if let Some(extent) = brep_extent_metres(brep) {
             if extent < MIN_PLAUSIBLE_BREP_EXTENT_METRES {
@@ -3601,6 +3892,12 @@ pub fn normalize_element(
             .and_then(|id| elements.get(&id))
             .and_then(|type_element| type_element.name.as_ref())
             .map(|(name, _)| name.clone()),
+        // The wall, floor or roof this element is cut into - a door or a
+        // window declares one, almost nothing else does.
+        host_id: element
+            .host_id
+            .and_then(|id| u32::try_from(id).ok())
+            .map(|id| BimElementId(id.to_string())),
         placement: normalize_placement(element.ginstance_transform),
         geometry,
         properties,
@@ -3839,11 +4136,15 @@ enum NestedRefusal {
     MemberNotConverted,
     /// A member's body decoded but does not close: see `BimBrep::complete`.
     MemberIncomplete,
+    /// The hull agrees and every member is drawn by a product of its own, so
+    /// the element has nothing left to draw. See [`drawn_as_its_own_product`].
+    EveryMemberDrawnAlone,
 }
 
 fn nested_assembly(
     element: &ExportedElement,
     elements: &BTreeMap<u32, ExportedElement>,
+    is_product: &dyn Fn(u32) -> bool,
 ) -> Result<Vec<BimBrep>, NestedRefusal> {
     let placements = &element.declared_placements;
     if placements.is_empty() {
@@ -3934,48 +4235,141 @@ fn nested_assembly(
 
     let mut parts = Vec::with_capacity(symbols.len() + usize::from(own_body.is_some()));
     parts.extend(own_body);
+    let mut drawn_alone = 0_usize;
     for (placement, symbol) in &symbols {
-        // A member that carries no body of its own is not necessarily empty:
-        // it can be an instance, and then the body is one hop further, through
-        // the symbol link its own box already verified. The two transforms
-        // compose, and the composition is the route the member's box took into
-        // the hull above - the member's box is stated in the frame its own
-        // transform lands in, and the hull carried that box through this same
-        // placement.
-        let (source, placement) = if symbol.brep.is_some() {
-            (*symbol, *placement)
-        } else {
-            let inner = symbol
-                .verified_symbol_bounds
-                .as_ref()
-                .and_then(|verified| elements.get(&verified.symbol_element_id))
-                .filter(|inner| inner.brep.is_some())
-                .ok_or(NestedRefusal::MemberHasNoBody)?;
-            let transform = symbol
-                .ginstance_transform
-                .ok_or(NestedRefusal::MemberHasNoBody)?;
-            (
-                inner,
-                GInstanceTransformFields::composed(placement, &transform),
-            )
-        };
-        let brep = normalize_element_brep(source, &placement)
-            .ok_or(NestedRefusal::MemberNotConverted)?;
-        if !brep.complete {
-            return Err(NestedRefusal::MemberIncomplete);
+        // A member that is an element of its own is drawn by its own product,
+        // and drawing it here as well puts the same solid in the model twice:
+        // a window's sill, each shaft of a composite column. It still counted
+        // towards the hull above, because the element's box bounds it.
+        if placement
+            .symbol_element_id
+            .is_some_and(|member| drawn_as_its_own_product(member, elements, is_product))
+        {
+            drawn_alone += 1;
+            continue;
         }
-        parts.push(brep);
+        parts.push(member_part(placement, symbol, elements)?);
     }
     if parts.is_empty() {
-        return Err(NestedRefusal::MemberHasNoBody);
+        return Err(if drawn_alone > 0 {
+            NestedRefusal::EveryMemberDrawnAlone
+        } else {
+            NestedRefusal::MemberHasNoBody
+        });
     }
     Ok(parts)
+}
+
+/// One member's closed body, carried through the placement that names it.
+///
+/// A member that carries no body of its own is not necessarily empty: it can
+/// be an instance, and then the body is one hop further, through the symbol
+/// link its own box already verified. The two transforms compose, and the
+/// composition is the route the member's box took into the hull - the
+/// member's box is stated in the frame its own transform lands in, and the
+/// hull carried that box through this same placement.
+fn member_part(
+    placement: &GInstanceTransformFields,
+    symbol: &ExportedElement,
+    elements: &BTreeMap<u32, ExportedElement>,
+) -> Result<BimBrep, NestedRefusal> {
+    let (source, placement) = if symbol.brep.is_some() {
+        (symbol, *placement)
+    } else {
+        let inner = symbol
+            .verified_symbol_bounds
+            .as_ref()
+            .and_then(|verified| elements.get(&verified.symbol_element_id))
+            .filter(|inner| inner.brep.is_some())
+            .ok_or(NestedRefusal::MemberHasNoBody)?;
+        let transform = symbol
+            .ginstance_transform
+            .ok_or(NestedRefusal::MemberHasNoBody)?;
+        (
+            inner,
+            GInstanceTransformFields::composed(placement, &transform),
+        )
+    };
+    let brep =
+        normalize_element_brep(source, &placement).ok_or(NestedRefusal::MemberNotConverted)?;
+    if !brep.complete {
+        return Err(NestedRefusal::MemberIncomplete);
+    }
+    Ok(brep)
+}
+
+/// Whether a nested family's member is drawn by a product of its own.
+///
+/// Revit places a shared nested family as an element in its own right, and
+/// the export writes it as one: on AR S1 every member of an exported assembly
+/// that is a `FamilyInstance` - 768 column shafts, 268 proxy parts, 185 window
+/// sills - is also a product of its own, and not one that is a `FamilySymbol`
+/// is. Which ids become products is the caller's selection, so it is asked
+/// rather than guessed from the record. The member also has to carry a body
+/// by itself: one that would fall back to a box, or to nothing, is still
+/// drawn here, since leaving it out would lose a solid the host can draw.
+///
+/// Measured by what the two files draw, per solid: of AR S1's 509 hosts that
+/// lose a part to this, 501 lose one whose world box the member's own product
+/// reproduces to 0.1 mm. The other 8 are proxies whose anchors the host drew
+/// 28 to 45 m across, because the writer stated a cone's axis in the wrong
+/// frame - a fault that showed only where the cone sat far from its product's
+/// origin, and that the member's own product therefore never had.
+fn drawn_as_its_own_product(
+    member: u32,
+    elements: &BTreeMap<u32, ExportedElement>,
+    is_product: &dyn Fn(u32) -> bool,
+) -> bool {
+    is_product(member)
+        && elements.get(&member).is_some_and(|member| {
+            matches!(
+                normalize_geometry(member, BimElementType::Unknown, elements, &|_| false),
+                Some(BimGeometry::Brep(_) | BimGeometry::Assembly(_))
+            )
+        })
+}
+
+/// Fill in the name of every face material [`normalize_brep`] left with only
+/// an identity, now that `elements` is in scope to read it from - the same
+/// `MaterialElem` a compound layer's own material names, so
+/// `normalize_material_layers` is not repeated here, only its lookup.
+fn resolve_face_materials(
+    geometry: BimGeometry,
+    elements: &BTreeMap<u32, ExportedElement>,
+) -> BimGeometry {
+    let name_of = |id: &str| {
+        id.parse::<u32>()
+            .ok()
+            .and_then(|id| elements.get(&id))
+            .and_then(|material| material.name.as_ref())
+            .map(|(name, _)| name.clone())
+    };
+    let resolve_brep = |mut brep: BimBrep| {
+        for face in &mut brep.faces {
+            if let Some(material) = &mut face.material {
+                if let Some(id) = material.id.as_ref().map(|id| id.value.clone()) {
+                    material.name = name_of(&id);
+                }
+            }
+        }
+        brep
+    };
+    match geometry {
+        BimGeometry::Brep(brep) => BimGeometry::Brep(resolve_brep(brep)),
+        BimGeometry::Assembly(parts) => {
+            BimGeometry::Assembly(parts.into_iter().map(resolve_brep).collect())
+        }
+        other @ (BimGeometry::AxisLine(_)
+        | BimGeometry::BoundingBox(_)
+        | BimGeometry::SweptDisk(_)) => other,
+    }
 }
 
 fn normalize_geometry(
     element: &ExportedElement,
     element_type: BimElementType,
     elements: &BTreeMap<u32, ExportedElement>,
+    is_product: &dyn Fn(u32) -> bool,
 ) -> Option<BimGeometry> {
     let metres = |value| revit_catalog::internal_feet_to_metres(value);
     let point = |coordinates: [f64; 3]| {
@@ -4047,8 +4441,27 @@ fn normalize_geometry(
     }
     // Several declared placements, verified as a set. See `nested_assembly`:
     // this is the only path for an element no single transform describes.
-    if let Ok(parts) = nested_assembly(element, elements) {
-        return Some(BimGeometry::Assembly(parts));
+    match nested_assembly(element, elements, is_product) {
+        Ok(parts) => return Some(BimGeometry::Assembly(parts)),
+        // The element is its members, and they are drawn. A box here would
+        // draw them again.
+        Err(NestedRefusal::EveryMemberDrawnAlone) => return None,
+        Err(_) => {}
+    }
+    // A body the file already placed, reached by a declared placement the
+    // cross-check cannot speak for. See `attach_placed_symbol_bodies`. Asked
+    // before the verified symbol because an element that has one of these has
+    // no verified symbol at all - the same cross-check refused it.
+    if let Some(symbol) = element
+        .placed_symbol_body
+        .and_then(|symbol_element_id| elements.get(&symbol_element_id))
+    {
+        if let Some(brep) = normalize_element_brep(symbol, &IDENTITY_TRANSFORM) {
+            // Complete bodies only, for the reason both other body paths give.
+            if brep.complete {
+                return Some(BimGeometry::Brep(brep));
+            }
+        }
     }
     let symbol = element.verified_symbol_bounds?;
     if let (Some(symbol_element), Some(transform)) =
@@ -4070,13 +4483,19 @@ fn normalize_geometry(
     // A box flat on an axis is an extent, not a volume, and the IFC writer
     // will not make an `IfcBoundingBox` of one; saying so here keeps a product
     // from carrying a representation that silently holds nothing.
+    //
+    // The instance's box, not the symbol's: project coordinates are the frame
+    // every geometry here is carried in, and the placed-body path above
+    // states its own box in them. Handing the symbol's local box over instead
+    // left the two boxes in two frames, which the writer could not tell apart
+    // and read as one.
     symbol
-        .bounds
+        .instance_bounds
         .is_volumetric()
         .then(|| {
             Some(BimGeometry::BoundingBox(BimBoundingBox {
-                min: point(symbol.bounds.min)?,
-                max: point(symbol.bounds.max)?,
+                min: point(symbol.instance_bounds.min)?,
+                max: point(symbol.instance_bounds.max)?,
             }))
         })
         .flatten()
@@ -4140,10 +4559,10 @@ fn world_ruling(
             start,
             end,
         } => BimBrepRuling::Curve {
-            profile: BimBrepProfile::Line {
+            profile: Box::new(BimBrepProfile::Line {
                 origin: world_point(origin)?,
                 direction: world_direction(direction),
-            },
+            }),
             start: metres(start)?,
             end: metres(end)?,
         },
@@ -4158,7 +4577,7 @@ fn world_ruling(
             start,
             end,
         } => BimBrepRuling::Curve {
-            profile: BimBrepProfile::Arc {
+            profile: Box::new(BimBrepProfile::Arc {
                 center: world_point(center)?,
                 x_axis: world_direction(x_axis),
                 y_axis: world_direction(y_axis),
@@ -4166,7 +4585,7 @@ fn world_ruling(
                     value: metres(radius)?,
                     unit: Some(metres_unit()),
                 },
-            },
+            }),
             start,
             end,
         },
@@ -4256,7 +4675,7 @@ fn world_brep_surface(
             x_axis: world_direction(x_axis),
             y_axis: world_direction(y_axis),
             z_axis: world_direction(z_axis),
-            profile: normalize_brep_profile(profile)?,
+            profile: Box::new(normalize_brep_profile(profile)?),
         },
         // `RuledSurf` states both profiles in the body's own coordinates
         // rather than in a frame of the surface's, so unlike a
@@ -4297,8 +4716,15 @@ fn normalize_brep(
         }
         world
     };
-    let mut faces = Vec::with_capacity(local.faces.len());
-    for face in &local.faces {
+    let mut redundant_faces = local.redundant_duplicate_face_indexes();
+    if redundant_faces.is_empty() {
+        redundant_faces = local.free_surface_face_indexes();
+    }
+    let mut faces = Vec::with_capacity(local.faces.len() - redundant_faces.len());
+    for (face_index, face) in local.faces.iter().enumerate() {
+        if redundant_faces.binary_search(&face_index).is_ok() {
+            continue;
+        }
         let surface = world_brep_surface(face.surface, &world_point, &world_direction)?;
         let mut loops = Vec::with_capacity(face.loops.len());
         for loop_edges in &face.loops {
@@ -4306,7 +4732,7 @@ fn normalize_brep(
             for edge in loop_edges {
                 let curve = match &edge.curve {
                     rvt_model::BrepCurve::Line => BimBrepCurve::Line,
-                    rvt_model::BrepCurve::Arc(arc) => BimBrepCurve::Arc(BimBrepArc {
+                    rvt_model::BrepCurve::Arc(arc) => BimBrepCurve::Arc(Box::new(BimBrepArc {
                         center: world_point(arc.center)?,
                         x_axis: world_direction(arc.x_axis),
                         z_axis: world_direction(arc.z_axis),
@@ -4316,9 +4742,11 @@ fn normalize_brep(
                         },
                         start_angle: arc.start_angle,
                         end_angle: arc.end_angle,
-                    }),
+                    })),
                     rvt_model::BrepCurve::Polyline(points) => {
-                        BimBrepCurve::Polyline(normalize_brep_points(points, &world_point)?)
+                        BimBrepCurve::Polyline(
+                            normalize_brep_points(points, &world_point)?.into_boxed_slice(),
+                        )
                     }
                 };
                 edges.push(BimBrepEdge {
@@ -4329,7 +4757,24 @@ fn normalize_brep(
             }
             loops.push(edges);
         }
-        faces.push(BimBrepFace { surface, loops });
+        // `MaterialElem` is looked up once every element's own geometry has
+        // been built, in `resolve_face_materials` - not here, where the
+        // element table is not in scope. Carried as a bare identity meanwhile
+        // so the lookup that comes after this has something to resolve.
+        let material = face.material_id.map(|id| {
+            Box::new(BimMaterial {
+                id: Some(BimExternalId {
+                    system: "autodesk.revit.elementId".to_owned(),
+                    value: id.to_string(),
+                }),
+                name: None,
+            })
+        });
+        faces.push(BimBrepFace {
+            surface,
+            loops,
+            material,
+        });
     }
     Some(BimBrep {
         faces,
@@ -4341,7 +4786,14 @@ fn normalize_brep(
         // body on the same box. Only for that measured population does the
         // face-loop reading become mandatory. The different rebuilt body is
         // not substituted; it is evidence against this one's closed claim.
-        complete: local.bounds_a_volume()
+        // Exact, same-winding duplicate faces are omitted only when the
+        // remainder closes independently. In that case the loops actually
+        // written provide the closed-shell claim; the duplicated interior
+        // sheet is not allowed to add a spurious divergence volume. Surfaces
+        // the file declares free are omitted on the same terms, and inside the
+        // solid only: see `SymbolBrep::free_surface_face_indexes`.
+        complete: !redundant_faces.is_empty()
+            || local.bounds_a_volume()
             || (!requires_loop_closure && local.is_closed()),
     })
 }
@@ -4352,6 +4804,35 @@ fn metres_unit() -> BimUnit {
     // call this for every coordinate they convert, and a model runs to
     // hundreds of millions of them.
     BimUnit::metres()
+}
+
+/// The name a property carries when nothing names its parameter.
+///
+/// A parameter is named by its own `ParameterElement` where the file declares
+/// one, and otherwise by Autodesk's published `BuiltInParameter` table. A
+/// built-in code the table does not list has neither, and its own code stands
+/// in. Two codes reach every wall in AR S1 that way - -1 001 111 and
+/// -1 001 101, 10 966 elements each - and Revit's own IFC export writes
+/// neither: they are internal bookkeeping, not parameters a reader can use.
+///
+/// [`metadata_model`] drops what still carries this name, so the canonical
+/// model holds only parameters something names. The JSON export keeps them,
+/// since it writes the decoded intermediate rather than the model. Both sides
+/// ask here, so the rule is stated once.
+#[must_use]
+pub fn placeholder_parameter_name(id: i32) -> String {
+    format!("param_{id}")
+}
+
+/// Whether nothing in the file or in the catalogue names this property's
+/// parameter. See [`placeholder_parameter_name`].
+#[must_use]
+pub fn names_nothing(property: &BimProperty) -> bool {
+    property.id.as_ref().is_some_and(|id| {
+        id.value
+            .parse::<i32>()
+            .is_ok_and(|code| property.name == placeholder_parameter_name(code))
+    })
 }
 
 #[must_use]
@@ -4366,8 +4847,18 @@ fn normalize_property(
         .get(&parameter.id)
         .cloned()
         .or_else(|| built_in.map(|parameter| parameter.display_name.to_owned()))
-        .unwrap_or_else(|| format!("param_{}", parameter.id));
-    let specification = parameter_specs.get(&parameter.id).cloned();
+        .unwrap_or_else(|| placeholder_parameter_name(parameter.id));
+    // A user parameter declares its spec on its own `ParameterElement`; a
+    // built-in one declares nothing anywhere in the file and takes it from
+    // Revit's definition, which is what the catalog holds. Without the
+    // fallback every built-in double left as a raw internal number: on AR S1
+    // that is `Unconnected Height` reaching the IFC as 13.12 rather than as a
+    // 4 m length.
+    let specification = parameter_specs.get(&parameter.id).cloned().or_else(|| {
+        catalog
+            .and_then(|catalog| catalog.built_in_parameter_specification(parameter.id))
+            .map(str::to_owned)
+    });
     let value = match &parameter.value {
         ParameterValue::Double(number) => {
             let normalized = specification
@@ -4524,9 +5015,12 @@ mod tests {
             ..ExportedElement::default()
         };
 
-        let Some(BimGeometry::SweptDisk(geometry)) =
-            normalize_geometry(&element, BimElementType::PipeSegment, &BTreeMap::new())
-        else {
+        let Some(BimGeometry::SweptDisk(geometry)) = normalize_geometry(
+            &element,
+            BimElementType::PipeSegment,
+            &BTreeMap::new(),
+            &|_| false,
+        ) else {
             panic!("verified pipe geometry was not promoted");
         };
         assert!((geometry.directrix.start.coordinates[0] - 3.6576).abs() < 1.0e-12);
@@ -4536,8 +5030,13 @@ mod tests {
         let mut mismatched = element;
         mismatched.geometry_bounds.as_mut().unwrap().max[2] += 1.0;
         assert!(
-            normalize_geometry(&mismatched, BimElementType::PipeSegment, &BTreeMap::new())
-                .is_none()
+            normalize_geometry(
+                &mismatched,
+                BimElementType::PipeSegment,
+                &BTreeMap::new(),
+                &|_| false
+            )
+            .is_none()
         );
     }
 
@@ -4555,9 +5054,12 @@ mod tests {
             }),
             ..ExportedElement::default()
         };
-        let Some(BimGeometry::AxisLine(line)) =
-            normalize_geometry(&element, BimElementType::PipeFitting, &BTreeMap::new())
-        else {
+        let Some(BimGeometry::AxisLine(line)) = normalize_geometry(
+            &element,
+            BimElementType::PipeFitting,
+            &BTreeMap::new(),
+            &|_| false,
+        ) else {
             panic!("verified fitting axis was not promoted");
         };
         for (actual, expected) in line
@@ -4601,11 +5103,82 @@ mod tests {
     }
 
     #[test]
+    fn links_a_placed_symbol_body_only_when_it_is_unique_and_contained() {
+        let bounds = |min: [f64; 3], max: [f64; 3]| GElementBounds {
+            offset: 0,
+            min,
+            max,
+        };
+        let symbol = |placed: bool| ExportedElement {
+            brep_is_placed: placed,
+            brep_placement_box: Some(bounds([1.0, 1.0, 1.0], [2.0, 2.0, 2.0])),
+            ..ExportedElement::default()
+        };
+        let instance = |origin: [f64; 3], own: GElementBounds| ExportedElement {
+            ginstance_transform: Some(GInstanceTransformFields {
+                offset: 0,
+                basis: IDENTITY_TRANSFORM.basis,
+                origin: rvt_model::RvtPoint3 {
+                    coordinates_feet: origin,
+                },
+                symbol_element_id: Some(5),
+            }),
+            placement_bounds: Some(own),
+            ..ExportedElement::default()
+        };
+        let around = bounds([0.0, 0.0, 0.0], [3.0, 3.0, 3.0]);
+        let model = |instances: Vec<(u32, ExportedElement)>, symbol: ExportedElement| {
+            let mut elements = BTreeMap::new();
+            elements.insert(5, symbol);
+            elements.extend(instances);
+            attach_placed_symbol_bodies(&mut elements);
+            elements
+        };
+
+        // The stair case: identity placement, a symbol whose body is already
+        // placed, its box inside the element's own, and nothing else naming it.
+        let linked = model(vec![(9, instance([0.0; 3], around))], symbol(true));
+        assert_eq!(linked[&9].placed_symbol_body, Some(5));
+
+        // A symbol two elements name is not one element's body.
+        let shared = model(
+            vec![
+                (9, instance([0.0; 3], around)),
+                (11, instance([0.0; 3], around)),
+            ],
+            symbol(true),
+        );
+        assert_eq!(shared[&9].placed_symbol_body, None);
+        assert_eq!(shared[&11].placed_symbol_body, None);
+
+        // A body outside the element's own extent is not this element's.
+        let outside = model(
+            vec![(9, instance([0.0; 3], bounds([5.0; 3], [6.0; 3])))],
+            symbol(true),
+        );
+        assert_eq!(outside[&9].placed_symbol_body, None);
+
+        // A transform that is not the identity has something to verify, and
+        // the bounds cross-check is what verifies it.
+        let moved = model(vec![(9, instance([4.0, 0.0, 0.0], around))], symbol(true));
+        assert_eq!(moved[&9].placed_symbol_body, None);
+
+        // A symbol body in its own local frame is not already placed.
+        let unplaced = model(vec![(9, instance([0.0; 3], around))], symbol(false));
+        assert_eq!(unplaced[&9].placed_symbol_body, None);
+    }
+
+    #[test]
     fn attaches_symbol_bounds_only_when_the_symbol_box_has_volume() {
         let symbol_bounds = |max: [f64; 3]| GElementBounds {
             offset: 54,
             min: [-1.0, -2.0, -3.0],
             max,
+        };
+        let instance_bounds = |max: [f64; 3]| GElementBounds {
+            offset: 12,
+            min: [9.0, 18.0, 27.0],
+            max: [10.0 + max[0], 20.0 + max[1], 30.0 + max[2]],
         };
         let model = |max: [f64; 3]| {
             let mut elements = BTreeMap::new();
@@ -4635,11 +5208,7 @@ mod tests {
                         },
                         symbol_element_id: Some(5),
                     }),
-                    placement_bounds: Some(GElementBounds {
-                        offset: 12,
-                        min: [9.0, 18.0, 27.0],
-                        max: [10.0 + max[0], 20.0 + max[1], 30.0 + max[2]],
-                    }),
+                    placement_bounds: Some(instance_bounds(max)),
                     ..ExportedElement::default()
                 },
             );
@@ -4653,6 +5222,7 @@ mod tests {
             Some(VerifiedSymbolBounds {
                 symbol_element_id: 5,
                 bounds: symbol_bounds([1.0, 2.0, 3.0]),
+                instance_bounds: instance_bounds([1.0, 2.0, 3.0]),
             })
         );
 
@@ -4668,10 +5238,11 @@ mod tests {
             Some(VerifiedSymbolBounds {
                 symbol_element_id: 5,
                 bounds: symbol_bounds([1.0, 2.0, -3.0]),
+                instance_bounds: instance_bounds([1.0, 2.0, -3.0]),
             })
         );
         assert_eq!(
-            normalize_geometry(&flat[&9], BimElementType::Unknown, &flat),
+            normalize_geometry(&flat[&9], BimElementType::Unknown, &flat, &|_| false),
             None
         );
     }
@@ -4925,6 +5496,11 @@ mod tests {
                         min: [0.0, 0.0, 0.0],
                         max: [1.0, 1.0, 1.0],
                     },
+                    instance_bounds: rvt_model::GElementBounds {
+                        offset: 0,
+                        min: [0.0, 0.0, 0.0],
+                        max: [1.0, 1.0, 1.0],
+                    },
                 }),
                 ..ExportedElement::default()
             },
@@ -4963,6 +5539,264 @@ mod tests {
             selected,
             ["100".to_owned(), "103".to_owned()].into_iter().collect(),
         );
+    }
+
+    /// A parameter nothing names does not reach the model. AR S1 carries two
+    /// such codes on every wall - Autodesk publishes neither, and Revit's own
+    /// export writes neither - and the sheet a reader sees is the poorer for
+    /// repeating the code back at them.
+    #[test]
+    fn a_parameter_nothing_names_is_left_out_of_the_model() {
+        let schema = named_classes(&[(12, "Element", None), (13, "SWall", None)]);
+        let mut elements = BTreeMap::new();
+        elements.insert(
+            100,
+            ExportedElement {
+                class_index: Some(13),
+                created_phase_id: Some(3),
+                level_id: Some(1),
+                parameters: vec![
+                    // WALL_BASE_OFFSET, which the catalogue names.
+                    rvt_model::Parameter {
+                        id: -1_001_108,
+                        value: ParameterValue::Double(-0.328_083_989_501_312_35),
+                    },
+                    // Published nowhere, declared nowhere in the file.
+                    rvt_model::Parameter {
+                        id: -1_001_111,
+                        value: ParameterValue::Double(-0.328_083_989_501_312_35),
+                    },
+                ],
+                ..ExportedElement::default()
+            },
+        );
+        let recovered = RecoveredElements {
+            release: Some(2023),
+            catalog: Catalog::for_release(2023),
+            parameter_values_schema_bound: true,
+            schema: Some(schema),
+            partition_paths: Vec::new(),
+            parameter_names: BTreeMap::new(),
+            parameter_specs: BTreeMap::new(),
+            elements,
+        };
+        let (model, counts) = metadata_model(&recovered, false, None);
+        let names = model.elements[0]
+            .properties
+            .iter()
+            .map(|property| property.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"Base Offset"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name.starts_with("param_")),
+            "{names:?}"
+        );
+        assert_eq!(counts.included, 1);
+        assert_eq!(counts.unnamed, 1);
+        assert_eq!(counts.unverified, 0);
+    }
+
+    /// A storey nothing exported stands on is still a real storey of the
+    /// project - "01 `ПромЭтаж`", "25 Кровля 5" and "25 Кровля 6" of AR S1,
+    /// each a single unoccupied `Level` record Revit's own export writes
+    /// anyway.
+    /// Occupancy still wins where it disagrees with the file's history: AR
+    /// S1's "02 Этаж" keeps two elevations among its records and only the
+    /// occupied one is where Revit puts it too. A name split several ways
+    /// with none of them occupied falls back to whichever elevation most of
+    /// that name's own records agree on.
+    #[test]
+    fn a_storey_nothing_stands_on_is_kept_by_its_own_unoccupied_record() {
+        let schema = named_classes(&[(12, "Level", None), (13, "SWall", None)]);
+        let mut elements = BTreeMap::new();
+        let level = |name: &str, elevation_feet: f64| ExportedElement {
+            class_index: Some(12),
+            name: Some((name.to_owned(), "declared")),
+            elevation_feet: Some(elevation_feet),
+            ..ExportedElement::default()
+        };
+        // Occupied storeys, one of them split into two elevations by the
+        // file's own history - only the occupied one, 10 ft, is kept.
+        elements.insert(10, level("01 Этаж", 0.0));
+        elements.insert(11, level("02 Этаж", 10.0));
+        elements.insert(12, level("02 Этаж", 20.0));
+        // A storey with no occupant at all: a single record, kept anyway.
+        elements.insert(13, level("01 ПромЭтаж", -50.0));
+        // A name split three ways with no occupant anywhere: the elevation
+        // two of its three records agree on wins.
+        elements.insert(14, level("Attic", 30.0));
+        elements.insert(15, level("Attic", 30.0));
+        elements.insert(16, level("Attic", 40.0));
+        // Excluded regardless of occupancy: a family document's own
+        // reference level, and one marked deleted.
+        elements.insert(
+            17,
+            ExportedElement {
+                family_id: Some(999),
+                ..level("Family Reference Level", 0.0)
+            },
+        );
+        elements.insert(
+            18,
+            ExportedElement {
+                moribund: true,
+                ..level("Deleted Level", 0.0)
+            },
+        );
+        // What stands on the two occupied storeys - nothing stands on 12, so
+        // its 20 ft never surfaces.
+        elements.insert(
+            100,
+            ExportedElement {
+                class_index: Some(13),
+                level_id: Some(10),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            101,
+            ExportedElement {
+                class_index: Some(13),
+                level_id: Some(11),
+                ..ExportedElement::default()
+            },
+        );
+
+        let recovered = RecoveredElements {
+            release: None,
+            catalog: None,
+            parameter_values_schema_bound: false,
+            schema: Some(schema),
+            partition_paths: Vec::new(),
+            parameter_names: BTreeMap::new(),
+            parameter_specs: BTreeMap::new(),
+            elements,
+        };
+        let is_model_element = |element: &ExportedElement| element.class_index == Some(13);
+        let (levels, canonical) = building_storeys(&recovered, &is_model_element);
+
+        let by_name = levels
+            .iter()
+            .map(|level| {
+                (
+                    level.name.clone(),
+                    level.elevation.as_ref().map(|value| value.value),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(by_name.len(), 4, "{by_name:?}");
+        let feet = revit_catalog::internal_feet_to_metres;
+        assert_eq!(by_name[&Some("01 Этаж".to_owned())], feet(0.0));
+        assert_eq!(
+            by_name[&Some("02 Этаж".to_owned())],
+            feet(10.0),
+            "the occupied record's elevation wins over the unoccupied duplicate"
+        );
+        assert_eq!(
+            by_name[&Some("01 ПромЭтаж".to_owned())],
+            feet(-50.0),
+            "an unoccupied storey with one record is still kept"
+        );
+        assert_eq!(
+            by_name[&Some("Attic".to_owned())],
+            feet(30.0),
+            "the elevation most of an unoccupied name's own records agree on wins"
+        );
+        assert!(!by_name.contains_key(&Some("Family Reference Level".to_owned())));
+        assert!(!by_name.contains_key(&Some("Deleted Level".to_owned())));
+
+        // The minority duplicate of "02 Этаж" is folded to the same storey
+        // as the occupied one, not left dangling or given its own entry.
+        let canonical_02 = canonical.get(&BimElementId("11".to_owned())).cloned();
+        assert_eq!(canonical.get(&BimElementId("12".to_owned())), None);
+        assert_eq!(canonical_02, Some(BimElementId("11".to_owned())));
+    }
+
+    /// The project's `ProjectInfo` element names the project, its number and
+    /// its address; `project_identity` reads exactly those five built-in
+    /// parameters and none of an element's own.
+    #[test]
+    fn project_identity_reads_the_five_built_in_parameters_project_info_carries() {
+        let schema = named_classes(&[(12, "ProjectInfo", None), (13, "SWall", None)]);
+        let mut elements = BTreeMap::new();
+        elements.insert(
+            1365,
+            ExportedElement {
+                class_index: Some(12),
+                parameters: vec![
+                    rvt_model::Parameter {
+                        id: -1_006_316,
+                        value: ParameterValue::Text("SRG-DP-RP-DUIS-66702".to_owned()),
+                    },
+                    rvt_model::Parameter {
+                        id: -1_006_317,
+                        value: ParameterValue::Text("A descriptive project name".to_owned()),
+                    },
+                    rvt_model::Parameter {
+                        id: -1_006_318,
+                        value: ParameterValue::Text("221B Baker Street".to_owned()),
+                    },
+                    rvt_model::Parameter {
+                        id: -1_006_320,
+                        value: ParameterValue::Text("РП".to_owned()),
+                    },
+                    rvt_model::Parameter {
+                        id: -1_019_006,
+                        value: ParameterValue::Text("Section 1".to_owned()),
+                    },
+                    // Not one of the five: never mistaken for one of them.
+                    rvt_model::Parameter {
+                        id: -1_006_319,
+                        value: ParameterValue::Text("Client Name".to_owned()),
+                    },
+                ],
+                ..ExportedElement::default()
+            },
+        );
+        // A wall of some other class: never mistaken for the project's own
+        // record.
+        elements.insert(
+            2,
+            ExportedElement {
+                class_index: Some(13),
+                ..ExportedElement::default()
+            },
+        );
+        let recovered = RecoveredElements {
+            release: None,
+            catalog: None,
+            parameter_values_schema_bound: false,
+            schema: Some(schema),
+            partition_paths: Vec::new(),
+            parameter_names: BTreeMap::new(),
+            parameter_specs: BTreeMap::new(),
+            elements,
+        };
+
+        let identity = project_identity(&recovered).expect("a ProjectInfo record");
+        assert_eq!(identity.number.as_deref(), Some("SRG-DP-RP-DUIS-66702"));
+        assert_eq!(identity.name.as_deref(), Some("A descriptive project name"));
+        assert_eq!(identity.address.as_deref(), Some("221B Baker Street"));
+        assert_eq!(identity.phase.as_deref(), Some("РП"));
+        assert_eq!(identity.building_name.as_deref(), Some("Section 1"));
+    }
+
+    /// No `ProjectInfo` record at all - a file whose class schema does not
+    /// name one, or one whose only record is moribund - names no project.
+    #[test]
+    fn project_identity_is_none_without_a_project_info_record() {
+        let schema = named_classes(&[(12, "SWall", None)]);
+        let recovered = RecoveredElements {
+            release: None,
+            catalog: None,
+            parameter_values_schema_bound: false,
+            schema: Some(schema),
+            partition_paths: Vec::new(),
+            parameter_names: BTreeMap::new(),
+            parameter_specs: BTreeMap::new(),
+            elements: BTreeMap::new(),
+        };
+        assert!(project_identity(&recovered).is_none());
     }
 
     /// An element wears the build-up its type declares, and says which record
@@ -5081,6 +5915,11 @@ mod tests {
                         min: [0.0; 3],
                         max: [1.0; 3],
                     },
+                    instance_bounds: GElementBounds {
+                        offset: 0,
+                        min: [0.0; 3],
+                        max: [1.0; 3],
+                    },
                 }),
                 ..ExportedElement::default()
             },
@@ -5116,6 +5955,11 @@ mod tests {
                 min: [0.0; 3],
                 max: [1.0; 3],
             },
+            instance_bounds: GElementBounds {
+                offset: 0,
+                min: [0.0; 3],
+                max: [1.0; 3],
+            },
         };
         let element = |declared: Option<i32>| ExportedElement {
             type_element_id: declared,
@@ -5139,12 +5983,23 @@ mod tests {
                     min: [-1.0, -2.0, -3.0],
                     max: [1.0, 2.0, 3.0],
                 },
+                // The same box where the instance stands, ten feet along each
+                // axis: what is promoted is the placed extent, because the
+                // writer reads every geometry in project coordinates.
+                instance_bounds: GElementBounds {
+                    offset: 12,
+                    min: [9.0, 18.0, 27.0],
+                    max: [11.0, 22.0, 33.0],
+                },
             }),
             ..ExportedElement::default()
         };
-        let Some(BimGeometry::BoundingBox(bounds)) =
-            normalize_geometry(&element, BimElementType::SanitaryTerminal, &BTreeMap::new())
-        else {
+        let Some(BimGeometry::BoundingBox(bounds)) = normalize_geometry(
+            &element,
+            BimElementType::SanitaryTerminal,
+            &BTreeMap::new(),
+            &|_| false,
+        ) else {
             panic!("verified symbol bounds were not promoted");
         };
         for (actual, expected) in bounds
@@ -5152,7 +6007,7 @@ mod tests {
             .coordinates
             .into_iter()
             .chain(bounds.max.coordinates)
-            .zip([-0.3048, -0.6096, -0.9144, 0.3048, 0.6096, 0.9144])
+            .zip([2.7432, 5.4864, 8.2296, 3.3528, 6.7056, 10.0584])
         {
             assert!((actual - expected).abs() < 1.0e-12);
         }
@@ -5162,11 +6017,17 @@ mod tests {
         // its geometry was verified, and refusing `Unknown` discarded the body
         // of most of the corpus. See `carries_family_symbol_geometry`.
         assert!(
-            normalize_geometry(&element, BimElementType::PipeSegment, &BTreeMap::new()).is_none()
+            normalize_geometry(
+                &element,
+                BimElementType::PipeSegment,
+                &BTreeMap::new(),
+                &|_| false
+            )
+            .is_none()
         );
         for carried in [BimElementType::Unknown, BimElementType::DistributionElement] {
             assert!(matches!(
-                normalize_geometry(&element, carried, &BTreeMap::new()),
+                normalize_geometry(&element, carried, &BTreeMap::new(), &|_| false),
                 Some(BimGeometry::BoundingBox(_))
             ));
         }
@@ -5193,6 +6054,7 @@ mod tests {
                     edge(corner(1.0, 1.0), corner(0.0, 1.0)),
                     edge(corner(0.0, 1.0), corner(0.0, 0.0)),
                 ]],
+                material_id: None,
             }],
             ..rvt_model::SymbolBrep::default()
         }
@@ -5234,6 +6096,11 @@ mod tests {
         instance.verified_symbol_bounds = Some(VerifiedSymbolBounds {
             symbol_element_id: 2,
             bounds: rvt_model::GElementBounds {
+                offset: 0,
+                min: [0.0, 0.0, 0.0],
+                max: [1.0, 1.0, 0.0],
+            },
+            instance_bounds: rvt_model::GElementBounds {
                 offset: 0,
                 min: [0.0, 0.0, 0.0],
                 max: [1.0, 1.0, 0.0],
@@ -5799,6 +6666,29 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_duplicate_interior_sheet_is_not_written_into_the_closed_shell() {
+        let objects = fixture_record(&fixture_box_faces());
+        let classes = fixture_classes();
+        let assembled = rvt_model::assemble_symbol_brep(&objects, &classes, &[FIXTURE_GBREP]);
+        let box_of_the_record = bounds([0.0, 0.0, 0.0], [1.0, 1.0, 2.0]);
+        let (mut body, placed) = place_declared_body(assembled, Some(&box_of_the_record));
+        let sheet = square_body([0.0, 0.0, 1.0]).faces.remove(0);
+        body.faces.extend([sheet.clone(), sheet]);
+
+        // The duplicate sheet pairs its own edges, so the old closure test
+        // accepted all eight faces. Removing the exact pair leaves the box's
+        // independently closed six-face boundary.
+        assert!(placed);
+        assert!(body.bounds_a_volume());
+        assert_eq!(body.redundant_duplicate_face_indexes(), [6, 7]);
+
+        let normalized =
+            normalize_brep(&body, &IDENTITY_TRANSFORM, false).expect("finite planar body");
+        assert!(normalized.complete);
+        assert_eq!(normalized.faces.len(), 6);
+    }
+
+    #[test]
     fn a_face_the_records_box_bounds_is_never_dropped() {
         // The same seven faces, with the interior one marked as the box's own.
         // Nothing is dropped, so nothing is re-read: a body is only ever
@@ -5863,6 +6753,29 @@ mod tests {
     }
 
     #[test]
+    fn a_member_is_left_to_its_own_product_only_when_that_product_draws_it() {
+        let objects = fixture_record(&fixture_box_faces());
+        let classes = fixture_classes();
+        let body = rvt_model::assemble_symbol_brep(&objects, &classes, &[FIXTURE_GBREP]);
+        let member = ExportedElement {
+            brep: Some(body),
+            brep_is_placed: true,
+            ..ExportedElement::default()
+        };
+        let bodiless = ExportedElement::default();
+        let elements = BTreeMap::from([(7, member), (8, bodiless)]);
+
+        // A product that draws the same solid itself.
+        assert!(drawn_as_its_own_product(7, &elements, &|_| true));
+        // Not selected as a product, so the host is the only one to draw it.
+        assert!(!drawn_as_its_own_product(7, &elements, &|_| false));
+        // A product with no body of its own would draw nothing in its place.
+        assert!(!drawn_as_its_own_product(8, &elements, &|_| true));
+        // An id this file did not recover is nobody's product.
+        assert!(!drawn_as_its_own_product(9, &elements, &|_| true));
+    }
+
+    #[test]
     fn a_placed_body_is_emitted_without_a_symbol_or_a_transform() {
         let mut wall = ExportedElement::default();
         let objects = fixture_record(&fixture_box_faces());
@@ -5872,7 +6785,8 @@ mod tests {
         wall.brep = Some(body);
         wall.brep_is_placed = true;
 
-        let geometry = normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new());
+        let geometry =
+            normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new(), &|_| false);
         let Some(BimGeometry::Brep(brep)) = geometry else {
             panic!("a placed body should reach the export: {geometry:?}");
         };
@@ -5902,14 +6816,111 @@ mod tests {
         // it. The same body is refused there.
         wall.category = Some(-2_000_011);
         wall.category_source = Some("declared");
-        assert!(normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new()).is_none());
+        assert!(
+            normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new(), &|_| false).is_none()
+        );
         wall.category = None;
         wall.category_source = None;
 
         // Without the placed flag there is no symbol to fall back to, so the
         // same body is not emitted: the flag is the whole of the gate.
         wall.brep_is_placed = false;
-        assert!(normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new()).is_none());
+        assert!(
+            normalize_geometry(&wall, BimElementType::Wall, &BTreeMap::new(), &|_| false).is_none()
+        );
+    }
+
+    /// `GFace.m_renderStyleId` names a `MaterialElem` the same way a compound
+    /// layer's own material does; `resolve_face_materials` reads that
+    /// element's name once the element table is in scope, the same lookup
+    /// `normalize_material_layers` already trusts.
+    #[test]
+    fn resolve_face_materials_names_a_face_from_its_render_style_id() {
+        let face = BimBrepFace {
+            surface: BimBrepSurface::Plane {
+                origin: BimPoint3 {
+                    coordinates: [0.0, 0.0, 0.0],
+                    unit: metres_unit(),
+                },
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+            },
+            loops: Vec::new(),
+            material: Some(Box::new(BimMaterial {
+                id: Some(BimExternalId {
+                    system: "autodesk.revit.elementId".to_owned(),
+                    value: "42".to_owned(),
+                }),
+                name: None,
+            })),
+        };
+        let elements = BTreeMap::from([(
+            42,
+            ExportedElement {
+                name: Some(("Glass".to_owned(), "declared")),
+                ..ExportedElement::default()
+            },
+        )]);
+
+        let geometry = resolve_face_materials(
+            BimGeometry::Brep(BimBrep {
+                faces: vec![face],
+                complete: true,
+            }),
+            &elements,
+        );
+
+        let BimGeometry::Brep(brep) = geometry else {
+            panic!("still a Brep");
+        };
+        let material = brep.faces[0].material.as_ref().expect("kept its identity");
+        assert_eq!(
+            material.id,
+            Some(BimExternalId {
+                system: "autodesk.revit.elementId".to_owned(),
+                value: "42".to_owned(),
+            })
+        );
+        assert_eq!(material.name.as_deref(), Some("Glass"));
+    }
+
+    /// A `render_style_id` naming nothing this file recovered - a linked
+    /// model's material, say - keeps its identity and states no name rather
+    /// than one made up.
+    #[test]
+    fn an_unresolved_face_material_keeps_its_identity_and_no_name() {
+        let face = BimBrepFace {
+            surface: BimBrepSurface::Plane {
+                origin: BimPoint3 {
+                    coordinates: [0.0, 0.0, 0.0],
+                    unit: metres_unit(),
+                },
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+            },
+            loops: Vec::new(),
+            material: Some(Box::new(BimMaterial {
+                id: Some(BimExternalId {
+                    system: "autodesk.revit.elementId".to_owned(),
+                    value: "999".to_owned(),
+                }),
+                name: None,
+            })),
+        };
+
+        let geometry = resolve_face_materials(
+            BimGeometry::Brep(BimBrep {
+                faces: vec![face],
+                complete: true,
+            }),
+            &BTreeMap::new(),
+        );
+
+        let BimGeometry::Brep(brep) = geometry else {
+            panic!("still a Brep");
+        };
+        let material = brep.faces[0].material.as_ref().expect("kept its identity");
+        assert_eq!(material.name, None);
     }
 
     #[test]

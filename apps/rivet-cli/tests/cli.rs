@@ -1297,7 +1297,7 @@ fn export_scene_refuses_an_ifc_above_the_safe_parsing_limit_before_reading_it() 
         .args([
             "export-scene",
             fixture.path().to_str().unwrap(),
-            "--max-member-bytes",
+            "--max-ifc-bytes",
             "8",
         ])
         .output()
@@ -1306,6 +1306,36 @@ fn export_scene_refuses_an_ifc_above_the_safe_parsing_limit_before_reading_it() 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("safe parsing limit"), "{stderr}");
+    // The refusal says what reading it was expected to cost, because "too
+    // large" without a number is not something an operator can act on.
+    assert!(stderr.contains("expected to need"), "{stderr}");
+}
+
+/// The two ceilings were one flag, and that flag's default describes a single
+/// gzip member - which is how a 1.8 GiB IFC came to be refused by a number
+/// that has nothing to say about it. An IFC is bounded by `--max-ifc-bytes`,
+/// and by this host's memory where that is not given.
+#[test]
+fn the_rvt_member_ceiling_no_longer_bounds_an_ifc_source() {
+    let fixture = ifc_fixture();
+    let scene = tempfile::Builder::new().suffix(".rvs").tempfile().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-scene",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            scene.path().to_str().unwrap(),
+            "--max-member-bytes",
+            "8",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

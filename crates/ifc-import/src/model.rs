@@ -169,6 +169,10 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
                 type_name: type_id
                     .and_then(|type_id| parsed.get(type_id))
                     .and_then(|entity| text(entity.attribute(2))),
+                // `IfcRelFillsElement`/`IfcRelVoidsElement` are not read back
+                // by this importer; a round trip loses no export this reader
+                // is verified against, since none of them write an opening.
+                host_id: None,
                 placement: world.map(placement),
                 geometry,
                 properties: properties(parsed, &index, id, units),
@@ -185,6 +189,10 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
     Import {
         model: BimModel {
             source: source(parsed),
+            // `IfcProject`/`IfcBuilding` are read back as spatial structure,
+            // not as project identity - nothing here reads `Name`/`LongName`
+            // back into one.
+            project: None,
             documents: Vec::new(),
             elements,
             levels,
@@ -456,7 +464,6 @@ fn products<'parsed>(parsed: &'parsed Parsed, index: &Index) -> Vec<(u64, &'pars
                 .is_some_and(|shape| shape.type_name == "IFCPRODUCTDEFINITIONSHAPE");
             shaped || index.contained.contains(id)
         })
-        .map(|(id, entity)| (*id, entity))
         .collect();
     found.sort_unstable_by_key(|(id, _)| *id);
     found
@@ -594,6 +601,9 @@ pub fn element_type(entity_name: &str) -> BimElementType {
         "IFCSTAIRFLIGHT" => BimElementType::StairFlight,
         "IFCCURTAINWALL" => BimElementType::CurtainWall,
         "IFCRAILING" => BimElementType::Railing,
+        "IFCFURNISHINGELEMENT" | "IFCFURNITURE" | "IFCSYSTEMFURNITUREELEMENT" => {
+            BimElementType::FurnishingElement
+        }
         "IFCCOLUMN" => BimElementType::Column,
         "IFCMEMBER" => BimElementType::Member,
         "IFCPLATE" => BimElementType::Plate,

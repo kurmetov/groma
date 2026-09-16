@@ -137,9 +137,19 @@ impl Format {
     ///
     /// An RVT is read a compressed member at a time and bounded by its own
     /// `--max-member-bytes`, so its cost is not a multiple of the file. A
-    /// whole-file text reader's is: measured on the reference model's own
-    /// 643 MB IFC export, 2.20 GB peak - a 3.4x ratio, steady from 65 MB up
-    /// to a synthetic 2.4 GiB. Four is that with headroom.
+    /// whole-file text reader's is, and it is the geometry rather than the
+    /// text that decides it: the reference model's own 643 MB IFC export
+    /// peaks at 2.20 GB - 3.4x - while a 1.8 GiB structural model of 16.6
+    /// million instances and 23.8 million declared edges reaches 9.0 GiB
+    /// through the same `export-scene`, which is 5.0x. Five is the worse of
+    /// the two, because a ceiling set from the lighter file is a ceiling that
+    /// invites the machine to swap on the heavier one.
+    ///
+    /// Writing an IFC back out costs more again - the entity graph of the
+    /// file being written is held alongside the model it is written from, and
+    /// that same structural model peaks at 22.8 GiB through `export-ifc` -
+    /// but that is the exporter's cost and the same for either source format,
+    /// so it is not what this ratio measures.
     #[must_use]
     // The two `None` arms are not the same answer: one format's cost is
     // bounded elsewhere, the other has never been measured. Merging them
@@ -148,7 +158,7 @@ impl Format {
     pub fn memory_ratio(self) -> Option<u64> {
         match self {
             Self::Rvt => None,
-            Self::Ifc => Some(4),
+            Self::Ifc => Some(5),
             // No reader, so no measurement. Deliberately absent rather than
             // guessed from the IFC figure.
             Self::Dwg => None,
@@ -227,7 +237,7 @@ mod tests {
 
     #[test]
     fn only_a_whole_file_reader_declares_a_memory_ratio() {
-        assert_eq!(Format::Ifc.memory_ratio(), Some(4));
+        assert_eq!(Format::Ifc.memory_ratio(), Some(5));
         assert_eq!(Format::Rvt.memory_ratio(), None);
     }
 }

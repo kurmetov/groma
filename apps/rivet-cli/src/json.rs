@@ -790,6 +790,9 @@ pub(crate) fn write_element_json(
         id,
         element,
         elements,
+        // Every record is written, so every member of a nested family is
+        // drawn on its own line.
+        &|_| true,
         metadata.schema,
         metadata.parameter_names,
         metadata.parameter_specs,

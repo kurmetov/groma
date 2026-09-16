@@ -409,6 +409,7 @@ mod tests {
             level_id: None,
             type_id: None,
             type_name: None,
+            host_id: None,
             placement: None,
             geometry: Some(BimGeometry::BoundingBox(BimBoundingBox {
                 min: at(origin),

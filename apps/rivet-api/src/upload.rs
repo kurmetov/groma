@@ -7,146 +7,28 @@
 //! - which is exactly what the progress display needs.
 
 pub use bim_convert::Format;
+// The ceiling, and the checks made against it, moved into `bim-convert` beside
+// the ratio they are arithmetic on, so that this server and the converter it
+// runs cannot disagree about what fits. Re-exported because every caller here
+// has always asked this module for them.
+pub use bim_convert::memory::{max_ifc_bytes, memory_budget, room_to_convert_all};
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 /// Largest upload accepted, unless `--max-upload` says otherwise. The corpus
-/// runs to 450 MB a file, so the default has to clear that. An upload is
-/// streamed to disk a megabyte at a time and costs no memory to hold, so this
-/// guards the disk; what can be *converted* is [`max_ifc_bytes`].
-pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// The share of the memory budget one conversion may plan to occupy.
-///
-/// A conversion is not the only thing on the machine. Sizing the ceiling to
-/// the *whole* budget is what turned a workstation with an editor and a
-/// browser open into a swapping brick: the arithmetic said the file fit, and
-/// it did, with nothing left for anything else. Half is what a single job may
-/// assume, and [`room_to_convert`] still checks the moment it starts.
-const CONVERSION_SHARE: u64 = 2;
-
-/// Smallest IFC ceiling, whatever the host says. Below this the reader is
-/// being denied files it has always managed.
-pub const MIN_MAX_IFC_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Largest IFC ceiling this will choose on its own.
-///
-/// Deliberately modest. A 2 GiB IFC already asks about 7 GB of memory to
-/// parse, which is a lot to spend without being told to; an operator who
-/// wants more says so with `--max-upload` on a host with the memory for it.
-/// Scaling this to a big machine's whole capacity - 14.8 GiB on a 59 GB box -
-/// is exactly the mistake that froze one.
-pub const MAX_AUTOMATIC_IFC_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// The memory this process may actually use, in bytes.
-///
-/// Inside a container `/proc/meminfo` reports the *host's* memory, not the
-/// cgroup's limit, so a 4 GB container reads 59 GB and plans to use all of it
-/// until the kernel kills it. The cgroup limit is checked first for that
-/// reason, v2 then v1, and `MemTotal` is the fallback for a bare host.
-fn memory_budget() -> Option<u64> {
-    let cgroup = [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .into_iter()
-    .filter_map(|path| std::fs::read_to_string(path).ok())
-    .find_map(|text| text.trim().parse::<u64>().ok())
-    // An unlimited cgroup reports "max" (v2) or a number near u64::MAX
-    // (v1), neither of which is a budget.
-    .filter(|limit| *limit < u64::MAX / 2);
-    cgroup
-        .or_else(|| meminfo_field("MemTotal:"))
-        .filter(|budget| *budget > 0)
-}
-
-/// One `/proc/meminfo` field, in bytes.
-fn meminfo_field(field: &str) -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = status.lines().find(|line| line.starts_with(field))?;
-    line.split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(|kilobytes| kilobytes.checked_mul(1024))
-}
-
-/// Largest IFC this host will be asked to convert.
-///
-/// The reader holds the whole entity table in memory, so the ceiling belongs
-/// to the machine rather than to a constant: 256 MB refused files a
-/// workstation converts in twelve seconds, and the same number is still too
-/// generous on a small container. This scales between the two and stops at
-/// [`MAX_AUTOMATIC_IFC_BYTES`], because a default should be safe on a busy
-/// machine rather than merely arithmetically possible on an idle one.
-#[must_use]
-pub fn max_ifc_bytes() -> u64 {
-    memory_budget()
-        .map_or(MIN_MAX_IFC_BYTES, |budget| {
-            budget / (Format::Ifc.memory_ratio().unwrap_or(1) * CONVERSION_SHARE)
-        })
-        .clamp(MIN_MAX_IFC_BYTES, MAX_AUTOMATIC_IFC_BYTES)
-}
-
-/// Whether there is memory free *now* to convert a source of `bytes`, or the
-/// message explaining why not.
-///
-/// The ceiling above is a plan made from capacity; this is the check against
-/// the moment. Refusing here costs the caller a clear error, where going ahead
-/// costs everyone the machine - and a host that swaps is not one anybody can
-/// see a progress bar on.
-pub fn room_to_convert(bytes: u64, format: Format) -> Result<(), String> {
-    // Only a whole-file reader's cost scales with the source, and only such a
-    // format declares a ratio. An RVT is bounded a member at a time instead.
-    let Some(ratio) = format.memory_ratio() else {
-        return Ok(());
-    };
-    let Some(needed) = bytes.checked_mul(ratio) else {
-        return Err("this file is too large to convert".to_owned());
-    };
-    let Some(free) = meminfo_field("MemAvailable:") else {
-        return Ok(());
-    };
-    if needed > free {
-        let megabytes = |value: u64| value / (1024 * 1024);
-        return Err(format!(
-            "converting this {} MB {} needs about {} MB of memory and only {} MB is free; \
-             close something or try again",
-            megabytes(bytes),
-            format.label(),
-            megabytes(needed),
-            megabytes(free)
-        ));
-    }
-    Ok(())
-}
+/// runs to 450 MB a file and the structural models behind it to 1.8 GiB, so
+/// the default has to clear those. An upload is streamed to disk a megabyte at
+/// a time and costs no memory to hold, so this guards the disk; what can be
+/// *converted* is [`max_ifc_bytes`], and that is the check with an opinion
+/// about memory.
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// The name a scene made from a federation takes, sanitised like any other.
 #[must_use]
 pub fn scene_name(set: &str) -> String {
     sanitise(set)
-}
-
-/// Whether there is memory free now to convert a whole federation.
-///
-/// The sources are read one after another but their models are held together,
-/// so what has to fit is the sum. Only a whole-file reader's cost scales with
-/// its source, so only those contribute.
-///
-/// # Errors
-///
-/// The message explaining which conversion will not fit.
-pub fn room_to_convert_all(sources: &[(u64, Format)]) -> Result<(), String> {
-    let mut planned = 0_u64;
-    for (bytes, format) in sources {
-        if format.memory_ratio().is_some() {
-            planned = planned.saturating_add(*bytes);
-        }
-    }
-    // Charged against the format that actually scales; a set of RVTs plans
-    // nothing here and is bounded a member at a time, exactly as one is.
-    room_to_convert(planned, Format::Ifc)
 }
 
 /// What a model may be called once it is on disk. A name is derived from what
@@ -336,15 +218,15 @@ impl Uploads {
             command.arg(source);
         }
         command.arg("--output").arg(&scene).arg("--progress");
-        // The converter guards its own reading with the same flag, and its
-        // default is the constant this server used to stop at. Without saying
-        // so, an IFC this server has just accepted would be refused by the
-        // process it hands it to - so the ceiling the upload was measured
-        // against is passed on. An RVT is left alone: there the flag bounds one
-        // decoded member rather than the source, and is not ours to raise.
+        // The converter guards its own reading with the same ceiling, derived
+        // the same way from the same host. It is passed explicitly all the
+        // same: this server may have been given a different `--max-upload`,
+        // and a file it has just accepted should not then be refused by the
+        // process it hands it to. `--max-member-bytes` is left alone, because
+        // that one bounds a decoded RVT member rather than a source.
         if formats.iter().any(|format| format.memory_ratio().is_some()) {
             command
-                .arg("--max-member-bytes")
+                .arg("--max-ifc-bytes")
                 .arg(max_ifc_bytes().to_string());
         }
         command
@@ -474,8 +356,19 @@ pub struct Job {
     /// asks first, and it is measured from the file rather than reported by
     /// the converter so that it describes what is actually on the disk.
     pub produced_bytes: Option<u64>,
+    /// Jobs started by one confirmation share this identifier. A batch can
+    /// produce one federated output or several independent files, but the UI
+    /// must keep that decision together in history.
+    pub batch: Option<String>,
+    pub batch_label: Option<String>,
+    pub batch_index: usize,
+    pub batch_total: usize,
+    pub target: Option<String>,
     /// Seconds since the Unix epoch, for ordering a history a reader scrolls.
     pub started: u64,
+    /// The converter process while it exists. Kept out of the JSON response;
+    /// the HTTP cancel route uses it to stop real work, not merely hide it.
+    process: Option<std::sync::Arc<std::sync::Mutex<Child>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -483,6 +376,7 @@ pub enum JobState {
     Running,
     Done,
     Failed,
+    Cancelled,
 }
 
 impl Job {
@@ -501,11 +395,34 @@ impl Job {
             format: None,
             bytes: 0,
             produced_bytes: None,
+            batch: None,
+            batch_label: None,
+            batch_index: 1,
+            batch_total: 1,
+            target: None,
             started: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
             notes: Vec::new(),
+            process: None,
         }
+    }
+
+    /// Mark this job cancelled and return its process, when it has started.
+    /// A queued job has no process yet; its worker observes the state before
+    /// launching anything.
+    pub fn cancel(&mut self) -> (bool, Option<std::sync::Arc<std::sync::Mutex<Child>>>) {
+        if self.state != JobState::Running {
+            return (false, None);
+        }
+        self.state = JobState::Cancelled;
+        self.running = None;
+        (true, self.process.clone())
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.state == JobState::Cancelled
     }
 
     #[must_use]
@@ -515,6 +432,7 @@ impl Job {
                 JobState::Running => "running",
                 JobState::Done => "done",
                 JobState::Failed => "failed",
+                JobState::Cancelled => "cancelled",
             },
             "stages": self.finished.iter()
                 .map(|(name, seconds)| serde_json::json!({ "name": name, "seconds": seconds }))
@@ -530,6 +448,11 @@ impl Job {
             "format": self.format,
             "bytes": self.bytes,
             "producedBytes": self.produced_bytes,
+            "batch": self.batch,
+            "batchLabel": self.batch_label,
+            "batchIndex": self.batch_index,
+            "batchTotal": self.batch_total,
+            "target": self.target,
             "started": self.started,
         })
     }
@@ -557,8 +480,11 @@ pub struct IfcRequest {
     pub no_revit_property_sets: bool,
     pub no_revit_type_property_sets: bool,
     pub no_ifc_common_property_sets: bool,
-    pub base_quantities: bool,
+    pub no_base_quantities: bool,
+    pub no_shared_bodies: bool,
+    pub elements_without_a_body: bool,
     pub no_types: bool,
+    pub no_openings: bool,
     /// A class mapping table already on this server, named by path.
     pub class_mapping: Option<PathBuf>,
 }
@@ -583,11 +509,13 @@ impl IfcRequest {
             match key.as_str() {
                 // The model this export is for and, where several files are
                 // read as one, which set they belong to and whether this is
-                // the last of them. All three are the upload's business, not
-                // the exporter's, and are handled before this is reached -
-                // they are named here so that a federated export is not
-                // refused for asking for a setting that is not one.
-                "name" | "set" | "complete" => {}
+                // the last of them; and which confirmed batch this job
+                // belongs to, for the history view. All of it is the upload's
+                // business, not the exporter's, and is handled before this is
+                // reached - it is named here so that a federated export is
+                // not refused for asking for a setting that is not one.
+                "name" | "set" | "complete" | "batch" | "batch-label" | "batch-index"
+                | "batch-total" => {}
                 "length-unit" => match value.as_str() {
                     "metre" | "millimetre" => request.length_unit = Some(value.clone()),
                     other => {
@@ -601,8 +529,18 @@ impl IfcRequest {
                 "no-ifc-common-property-sets" => {
                     request.no_ifc_common_property_sets = flag(value)?;
                 }
-                "base-quantities" => request.base_quantities = flag(value)?,
+                // `base-quantities` was the switch that turned them on when
+                // they were off by default. They are on now, so a caller
+                // still passing it asks for what it already gets, and asking
+                // for `base-quantities=false` is the same as the flag below.
+                "base-quantities" => request.no_base_quantities = !flag(value)?,
+                "no-base-quantities" => request.no_base_quantities = flag(value)?,
+                "no-shared-bodies" => request.no_shared_bodies = flag(value)?,
+                "elements-without-a-body" => {
+                    request.elements_without_a_body = flag(value)?;
+                }
                 "no-types" => request.no_types = flag(value)?,
+                "no-openings" => request.no_openings = flag(value)?,
                 "class-mapping" => request.class_mapping = Some(PathBuf::from(value)),
                 other => return Err(format!("{other} is not an export setting")),
             }
@@ -624,8 +562,11 @@ impl IfcRequest {
                 self.no_ifc_common_property_sets,
                 "--no-ifc-common-property-sets",
             ),
-            (self.base_quantities, "--base-quantities"),
+            (self.no_base_quantities, "--no-base-quantities"),
+            (self.no_shared_bodies, "--no-shared-bodies"),
+            (self.elements_without_a_body, "--elements-without-a-body"),
             (self.no_types, "--no-types"),
+            (self.no_openings, "--no-openings"),
         ] {
             if asked {
                 command.arg(flag);
@@ -651,63 +592,107 @@ pub fn follow(
     name: &str,
     product: Product,
     produced: Option<&Path>,
-    job: &std::sync::Mutex<Job>,
+    job: &std::sync::Arc<std::sync::Mutex<Job>>,
 ) {
-    let update = |change: &dyn Fn(&mut Job)| {
-        if let Ok(mut held) = job.lock() {
-            change(&mut held);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let process = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let kill_now = job.lock().is_ok_and(|mut held| {
+        held.process = Some(std::sync::Arc::clone(&process));
+        held.is_cancelled()
+    });
+    if kill_now {
+        let _ = process
+            .lock()
+            .map_or_else(|mut held| held.get_mut().kill(), |mut held| held.kill());
+    }
+
+    let output_job = std::sync::Arc::clone(job);
+    let output = stdout.map(|stdout| {
+        std::thread::spawn(move || {
+            for read in BufReader::new(stdout).lines().map_while(Result::ok) {
+                match serde_json::from_str::<serde_json::Value>(&read) {
+                    Ok(value) => {
+                        let stage = value["stage"].as_str().unwrap_or_default().to_owned();
+                        let total = value["totalSeconds"].as_f64().unwrap_or_default();
+                        if value["event"] == "begin" {
+                            if let Ok(mut held) = output_job.lock()
+                                && held.state == JobState::Running
+                            {
+                                held.running = Some(stage.clone());
+                                held.seconds = total;
+                            }
+                        } else {
+                            let seconds = value["seconds"].as_f64().unwrap_or_default();
+                            if let Ok(mut held) = output_job.lock()
+                                && held.state == JobState::Running
+                            {
+                                // A federation reports each stage once per source
+                                // file. Summed into one row, because a progress
+                                // display showing "Decode" three times says less
+                                // than one showing what reading the sources cost.
+                                if let Some(entry) =
+                                    held.finished.iter_mut().find(|(held, _)| *held == stage)
+                                {
+                                    entry.1 += seconds;
+                                } else {
+                                    held.finished.push((stage.clone(), seconds));
+                                }
+                                held.running = None;
+                                held.seconds = total;
+                            }
+                        }
+                    }
+                    // The converter prints its summary as prose. Keep it: it is
+                    // what says how many elements and triangles were made.
+                    Err(_) if !read.trim().is_empty() => {
+                        if let Ok(mut held) = output_job.lock()
+                            && held.state == JobState::Running
+                        {
+                            held.notes.push(read);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        })
+    });
+    let errors = stderr.map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        })
+    });
+
+    let status = loop {
+        let waited = process.lock().map_or_else(
+            |mut held| held.get_mut().try_wait(),
+            |mut held| held.try_wait(),
+        );
+        match waited {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(80)),
+            Err(failure) => break Err(failure),
         }
     };
-    if let Some(stdout) = child.stdout.take() {
-        for read in BufReader::new(stdout).lines().map_while(Result::ok) {
-            match serde_json::from_str::<serde_json::Value>(&read) {
-                Ok(value) => {
-                    let stage = value["stage"].as_str().unwrap_or_default().to_owned();
-                    let total = value["totalSeconds"].as_f64().unwrap_or_default();
-                    if value["event"] == "begin" {
-                        update(&|held: &mut Job| {
-                            held.running = Some(stage.clone());
-                            held.seconds = total;
-                        });
-                    } else {
-                        let seconds = value["seconds"].as_f64().unwrap_or_default();
-                        update(&|held: &mut Job| {
-                            // A federation reports each stage once per source
-                            // file. Summed into one row, because a progress
-                            // display showing "Decode" three times says less
-                            // than one showing what reading the sources cost.
-                            if let Some(entry) =
-                                held.finished.iter_mut().find(|(held, _)| *held == stage)
-                            {
-                                entry.1 += seconds;
-                            } else {
-                                held.finished.push((stage.clone(), seconds));
-                            }
-                            held.running = None;
-                            held.seconds = total;
-                        });
-                    }
-                }
-                // The converter prints its summary as prose. Keep it: it is
-                // what says how many elements and triangles were made.
-                Err(_) if !read.trim().is_empty() => {
-                    update(&|held: &mut Job| held.notes.push(read.clone()));
-                }
-                Err(_) => {}
-            }
-        }
+    if let Some(output) = output {
+        let _ = output.join();
     }
-    let status = child.wait();
-    let mut stderr_text = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut stderr_text);
-    }
+    let stderr_text = errors
+        .and_then(|errors| errors.join().ok())
+        .unwrap_or_default();
     let finished = status.as_ref().ok().copied();
     let succeeded = finished.is_some_and(|status| status.success());
     let reason = failure_reason(finished, &stderr_text);
-    update(&|held: &mut Job| {
+    if let Ok(mut held) = job.lock() {
+        held.process = None;
         held.running = None;
-        if succeeded {
+        if held.state == JobState::Cancelled {
+            if let Some(path) = produced {
+                let _ = std::fs::remove_file(path);
+            }
+        } else if succeeded {
             held.state = JobState::Done;
             held.produced_bytes = produced
                 .and_then(|path| std::fs::metadata(path).ok())
@@ -721,7 +706,7 @@ pub fn follow(
             held.state = JobState::Failed;
             held.error = Some(reason.clone());
         }
-    });
+    }
 }
 
 /// Why a conversion did not finish, in terms the page can show.
@@ -762,8 +747,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        Format, IfcRequest, MAX_AUTOMATIC_IFC_BYTES, MIN_MAX_IFC_BYTES, Uploads, conversion_limit,
-        max_ifc_bytes, memory_budget, room_to_convert, room_to_convert_all, sanitise, scene_name,
+        Format, IfcRequest, Job, JobState, Uploads, conversion_limit, max_ifc_bytes, sanitise,
+        scene_name,
     };
 
     fn params(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -771,6 +756,17 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn a_running_job_can_be_cancelled_before_its_process_starts() {
+        let mut job = Job::new();
+        let (accepted, process) = job.cancel();
+        assert!(accepted);
+        assert!(process.is_none());
+        assert_eq!(job.state, JobState::Cancelled);
+        assert_eq!(job.to_json()["state"], "cancelled");
+        assert!(!job.cancel().0, "a cancelled job is not cancelled twice");
     }
 
     /// A set's files decide which document is which in the output, so the
@@ -813,35 +809,13 @@ mod tests {
         assert_eq!(scene_name(""), "model");
     }
 
-    /// A federation's models are held together, so what has to fit is the
-    /// sum - and only the formats whose cost scales with their source count.
-    #[test]
-    fn a_federation_is_charged_as_the_sum_of_its_whole_file_readers() {
-        let ceiling = 8 * MIN_MAX_IFC_BYTES;
-        // Well inside anything, whether counted once or three times.
-        let small = [(1 << 20, Format::Ifc); 3];
-        assert!(room_to_convert_all(&small).is_ok());
-        // An RVT is bounded a member at a time, so a set of them plans
-        // nothing here however large they are.
-        let huge_rvt = [(ceiling, Format::Rvt); 4];
-        assert!(room_to_convert_all(&huge_rvt).is_ok());
-        // And the sum is what is charged, not the largest: three sources that
-        // each fit can still fail together, if the host is small enough to say
-        // so. Only assert the arithmetic, since free memory is not ours.
-        let summed = [(1 << 30, Format::Ifc), (1 << 30, Format::Ifc)];
-        let one = [(2 << 30, Format::Ifc)];
-        assert_eq!(
-            room_to_convert_all(&summed).is_ok(),
-            room_to_convert_all(&one).is_ok()
-        );
-    }
-
     #[test]
     fn reads_an_export_setup_out_of_the_query() {
         let request = IfcRequest::from_params(&params(&[
             ("name", "tower"),
             ("length-unit", "millimetre"),
             ("no-types", "true"),
+            ("no-openings", "true"),
             // A flag with no value is the flag being set, which is how a bare
             // `?no-ifc-common-property-sets` arrives.
             ("no-ifc-common-property-sets", ""),
@@ -849,6 +823,7 @@ mod tests {
         .expect("a readable setup");
         assert_eq!(request.length_unit.as_deref(), Some("millimetre"));
         assert!(request.no_types);
+        assert!(request.no_openings);
         assert!(request.no_ifc_common_property_sets);
         assert!(!request.no_revit_property_sets);
     }
@@ -919,35 +894,5 @@ mod tests {
         // A stated limit below the ceiling still wins: this narrows, never
         // widens, what was configured.
         assert_eq!(conversion_limit(Format::Ifc, 1024), 1024);
-    }
-
-    #[test]
-    fn the_ifc_ceiling_stays_between_its_floor_and_a_modest_default() {
-        let ceiling = max_ifc_bytes();
-        assert!(ceiling >= MIN_MAX_IFC_BYTES, "{ceiling} is below the floor");
-        // The point of the clamp: a big machine must not talk this into a
-        // multi-gigabyte default just because the arithmetic allows it.
-        assert!(
-            ceiling <= MAX_AUTOMATIC_IFC_BYTES,
-            "{ceiling} is above what may be chosen without being asked"
-        );
-        // Reading twice gives the same answer - the ceiling is capacity, not
-        // whatever is free this second.
-        assert_eq!(max_ifc_bytes(), ceiling);
-        if std::path::Path::new("/proc/meminfo").exists() {
-            assert!(memory_budget().is_some_and(|budget| budget > 0));
-        }
-    }
-
-    #[test]
-    fn refuses_a_conversion_the_free_memory_will_not_hold() {
-        // An RVT is not held in memory this way and is never refused here.
-        assert!(room_to_convert(u64::MAX, Format::Rvt).is_ok());
-        // A small IFC always fits.
-        assert!(room_to_convert(1024, Format::Ifc).is_ok());
-        // One the size of the machine does not, and says so rather than
-        // taking the host down to find out.
-        let refusal = room_to_convert(u64::MAX / 2, Format::Ifc);
-        assert!(refusal.is_err(), "an impossible conversion was allowed");
     }
 }

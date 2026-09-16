@@ -208,9 +208,110 @@ impl Entity {
     }
 }
 
+/// Every instance a file declared, addressed by the `#id` it was written
+/// under.
+///
+/// A vector indexed by the identifier itself, because that is what an IFC
+/// identifier is: exporters number their instances from 1 and leave almost no
+/// gaps - 16,565,694 instances under a highest identifier of 16,566,230 in one
+/// 1.9 GB structural file. A hash table of that spends 66 bytes an instance on
+/// buckets it must keep empty to stay fast, against 24 for a slot in a vector,
+/// and pays a cache miss on every one of the millions of references the model
+/// stage follows.
+///
+/// A file that numbers its instances some other way is not refused: an
+/// identifier that would make the vector more than twice the size of the table
+/// it holds goes in a map instead, so the worst case is the hash table this
+/// replaced and the common case is neither slower nor larger.
+#[derive(Default)]
+pub struct Entities {
+    /// Slot `id` holds the instance written as `#id`, where one was.
+    dense: Vec<Option<Entity>>,
+    /// Instances whose identifier is too large to give a slot of its own.
+    sparse: HashMap<u64, Entity>,
+    count: usize,
+}
+
+/// Identifiers above this are only given a slot while the vector stays within
+/// twice the instances it holds. Below it a vector is smaller than a map
+/// whatever the file does.
+const ALWAYS_DENSE_IDS: u64 = 1 << 16;
+
+impl Entities {
+    /// Room for `instances` slots, taken once rather than grown into: every
+    /// doubling copies the vector and holds both halves while it does.
+    #[must_use]
+    pub fn with_capacity(instances: usize) -> Self {
+        Self {
+            dense: Vec::with_capacity(instances),
+            sparse: HashMap::new(),
+            count: 0,
+        }
+    }
+
+    /// The slot `id` would take, or `None` where it belongs in the map: an
+    /// identifier that would grow the vector past twice the instances it
+    /// holds, so that a file numbering in the billions costs what the map
+    /// always cost rather than a slot for every number it skipped.
+    fn slot(&self, id: u64) -> Option<usize> {
+        if id >= ALWAYS_DENSE_IDS && id / 2 > self.count as u64 {
+            return None;
+        }
+        usize::try_from(id).ok()
+    }
+
+    pub fn insert(&mut self, id: u64, entity: Entity) {
+        let Some(slot) = self.slot(id) else {
+            if self.sparse.insert(id, entity).is_none() {
+                self.count += 1;
+            }
+            return;
+        };
+        // The slot is an index, so the vector runs to one past it.
+        if self.dense.len() <= slot {
+            self.dense.resize_with(slot + 1, || None);
+        }
+        if self.dense[slot].replace(entity).is_none() {
+            self.count += 1;
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, id: u64) -> Option<&Entity> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| self.dense.get(index))
+            .and_then(Option::as_ref)
+            .or_else(|| self.sparse.get(&id))
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Every instance with the identifier it was written under, those in the
+    /// vector in identifier order and the rest in the map's own.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &Entity)> {
+        self.dense
+            .iter()
+            .enumerate()
+            .filter_map(|(index, held)| {
+                held.as_ref()
+                    .map(|entity| (u64::try_from(index).unwrap_or(u64::MAX), entity))
+            })
+            .chain(self.sparse.iter().map(|(id, entity)| (*id, entity)))
+    }
+}
+
 /// Everything a file declared.
 pub struct Parsed {
-    pub entities: HashMap<u64, Entity>,
+    pub entities: Entities,
     /// Instances whose text this could not read. They are counted rather than
     /// guessed at, so a caller can say what it did not see.
     pub skipped: usize,
@@ -223,7 +324,7 @@ pub struct Parsed {
 impl Parsed {
     #[must_use]
     pub fn get(&self, id: u64) -> Option<&Entity> {
-        self.entities.get(&id)
+        self.entities.get(id)
     }
 
     /// Follow a reference attribute to the entity it names.
@@ -239,7 +340,6 @@ impl Parsed {
             .entities
             .iter()
             .filter(|(_, entity)| entity.type_name == type_name)
-            .map(|(id, entity)| (*id, entity))
             .collect();
         found.sort_unstable_by_key(|(id, _)| *id);
         found
@@ -268,8 +368,8 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, String> {
         // the table and holds the old one while it does, so the last one alone
         // would add more to the peak than the entities it makes room for; 64
         // bytes an instance is what this corpus averages, and guessing a
-        // little high costs a fraction of what one rehash does.
-        entities: HashMap::with_capacity(bytes.len() / 64),
+        // little high costs a fraction of what one copy does.
+        entities: Entities::with_capacity(bytes.len() / 64),
         skipped: 0,
         application: None,
         schema: None,
@@ -772,7 +872,7 @@ fn decode_escapes(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Value, decode_escapes, parse};
+    use super::{ALWAYS_DENSE_IDS, Entities, Entity, TypeName, Value, decode_escapes, parse};
 
     const MINIMAL: &str = "ISO-10303-21;\n\
         HEADER;\n\
@@ -795,6 +895,64 @@ mod tests {
         assert_eq!(std::mem::size_of::<super::Value>(), 24);
         assert_eq!(std::mem::size_of::<super::Entity>(), 24);
         assert_eq!(std::mem::size_of::<super::TypeName>(), 8);
+    }
+
+    /// An identifier is an index, and the table's size is what that buys.
+    /// Pinned here because the policy has two halves and only the pair is
+    /// correct: a numbered-from-one file must cost a slot an instance, and a
+    /// file numbered in the billions must not cost a slot per number it
+    /// skipped.
+    #[test]
+    fn a_file_numbered_from_one_costs_a_slot_an_instance() {
+        let mut entities = Entities::with_capacity(0);
+        for id in 1..=1000 {
+            entities.insert(id, entity(id));
+        }
+        assert_eq!(entities.len(), 1000);
+        assert_eq!(entities.get(1).expect("#1").type_name, "T1");
+        assert_eq!(entities.get(1000).expect("#1000").type_name, "T1000");
+        assert!(entities.get(0).is_none());
+        assert!(entities.get(1001).is_none());
+        assert!(entities.sparse.is_empty(), "nothing needed the map");
+        // In identifier order, which is the file's own order.
+        let read: Vec<u64> = entities.iter().map(|(id, _)| id).collect();
+        assert_eq!(read, (1..=1000).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn an_identifier_too_large_for_a_slot_goes_in_the_map() {
+        let mut entities = Entities::with_capacity(0);
+        entities.insert(1, entity(1));
+        entities.insert(1 << 40, entity(2));
+        entities.insert(u64::MAX, entity(3));
+        assert_eq!(entities.len(), 3);
+        assert_eq!(entities.get(1).expect("#1").type_name, "T1");
+        assert_eq!(entities.get(1 << 40).expect("a far identifier").type_name, "T2");
+        assert_eq!(entities.get(u64::MAX).expect("the last").type_name, "T3");
+        // The point of the policy: the vector did not grow to meet them.
+        assert!(
+            entities.dense.len() <= usize::try_from(ALWAYS_DENSE_IDS).expect("a small bound"),
+            "the vector grew to {}",
+            entities.dense.len()
+        );
+    }
+
+    /// Two statements may state the same identifier; the later one wins and
+    /// the count still says how many instances there are.
+    #[test]
+    fn a_repeated_identifier_replaces_rather_than_counts_twice() {
+        let mut entities = Entities::with_capacity(0);
+        entities.insert(7, entity(1));
+        entities.insert(7, entity(2));
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities.get(7).expect("#7").type_name, "T2");
+    }
+
+    fn entity(mark: u64) -> Entity {
+        Entity {
+            type_name: TypeName(std::sync::Arc::new(format!("T{mark}"))),
+            attributes: Box::new([]),
+        }
     }
 
     #[test]

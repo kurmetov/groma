@@ -9,6 +9,11 @@
 
 pub mod classify;
 pub mod format;
+pub mod memory;
 
 pub use classify::{element_type_for_source, ifc_entity_name, resolved_element_type};
 pub use format::{Format, SNIFF_BYTES};
+pub use memory::{
+    MAX_AUTOMATIC_IFC_BYTES, MIN_MAX_IFC_BYTES, max_ifc_bytes, memory_to_convert, room_to_convert,
+    room_to_convert_all,
+};

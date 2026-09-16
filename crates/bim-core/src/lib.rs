@@ -12,6 +12,12 @@ pub struct BimModel {
     /// this `None` and states each file in [`BimModel::documents`] instead,
     /// because there is no single application that supplied it.
     pub source: Option<BimSource>,
+    /// What the source file's own project information states about it.
+    ///
+    /// The shorthand for a model read from one file, same as [`Self::source`]:
+    /// `None` for a federated model, because several files name several
+    /// projects and none of them is *the* project of the assembled whole.
+    pub project: Option<BimProjectIdentity>,
     /// The source files this model was assembled from, one entry per file.
     ///
     /// Empty for a model a reader produced directly; [`federate`] fills it,
@@ -26,6 +32,31 @@ pub struct BimModel {
 pub struct BimSource {
     pub application: String,
     pub release: Option<String>,
+}
+
+/// What a Revit project's own `ProjectInfo` element states about itself.
+///
+/// Every field is what the project information dialog holds, not what an
+/// element declares - Revit's own IFC export reaches every one of these from
+/// exactly the built-in parameters named beside them, which is what fixes
+/// the mapping below rather than a guess: `IfcProject.Name` is the project
+/// number, not the project name, and `IfcProject.LongName` is the reverse.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BimProjectIdentity {
+    /// `PROJECT_NUMBER`, which Revit's own export writes as `IfcProject.Name`.
+    pub number: Option<String>,
+    /// `PROJECT_NAME`, the descriptive text Revit's own export writes as
+    /// `IfcProject.LongName`.
+    pub name: Option<String>,
+    /// `PROJECT_BUILDING_NAME`, written as both `IfcBuilding.Name` and
+    /// `IfcBuilding.LongName`.
+    pub building_name: Option<String>,
+    /// `PROJECT_ADDRESS`, written whole as the one line of
+    /// `IfcPostalAddress.AddressLines` on the building - Revit does not
+    /// parse it into a town, a region or a postal code.
+    pub address: Option<String>,
+    /// `PROJECT_STATUS`, written as `IfcProject.Phase`.
+    pub phase: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +78,10 @@ pub struct BimElement {
     /// derived from it: an IFC type is identified by a GUID and an RVT one by
     /// a record number, so neither identifier is anything to show a reader.
     pub type_name: Option<String>,
+    /// The element this one is cut into, for a door, a window or anything
+    /// else a wall, a floor or a roof carries an opening for. `None` for an
+    /// element nothing hosts.
+    pub host_id: Option<BimElementId>,
     pub placement: Option<BimPlacement>,
     pub geometry: Option<BimGeometry>,
     pub properties: Vec<BimProperty>,
@@ -159,6 +194,13 @@ pub enum BimElementType {
     Plate,
     Window,
     Door,
+    /// Furniture. Unlike the loadable families above, no reference join fixes
+    /// this one: Revit's own export of AR S1 carries no furniture at all, its
+    /// export settings having dropped the category. What stands behind it is
+    /// Revit's own published category table, `data/importIFCClassMapping.txt`,
+    /// which pairs `IfcFurnishingElement` with the furniture category and is
+    /// the table Revit reads when it maps the two itself.
+    FurnishingElement,
     /// A wall whose type is a curtain-wall type: a framed assembly rather than
     /// a layered build-up.
     CurtainWall,
@@ -214,6 +256,19 @@ pub struct BimBrepFace {
     /// The face's boundary loops: the first is the outer bound, any further
     /// loops are holes.
     pub loops: Vec<Vec<BimBrepEdge>>,
+    /// The material this one face is painted with, where the source names
+    /// one by face rather than through the element's own layered build-up -
+    /// a door, a window, a piece of furniture, almost anything a
+    /// `material_layers` set does not already cover. `None` for a face with
+    /// no material of its own, which is most of them: the element's
+    /// category default applies instead, and this export states nothing
+    /// about a default it did not read.
+    ///
+    /// Boxed: a model this size holds millions of faces and almost none of
+    /// them carry one, so `Option<BimMaterial>` inline would cost every face
+    /// the 72 bytes only a few of them use - see
+    /// `the_shapes_a_model_holds_millions_of_stay_narrow`.
+    pub material: Option<Box<BimMaterial>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -238,7 +293,10 @@ pub enum BimBrepSurface {
         x_axis: [f64; 3],
         y_axis: [f64; 3],
         z_axis: [f64; 3],
-        profile: BimBrepProfile,
+        /// Boxed for the same reason an arc edge is: a plane is what nearly
+        /// every face of a building is, and it should not be charged for the
+        /// profile of the few that turn.
+        profile: Box<BimBrepProfile>,
     },
     /// Two profiles joined by straight rulings:
     /// `S(u, v) = (1 - v) * first(u) + v * second(u)`, `u` running along the
@@ -261,7 +319,7 @@ pub enum BimBrepRuling {
     /// The interval is an angle for an arc and a length in metres for a line,
     /// matching what the profile's own numbers mean.
     Curve {
-        profile: BimBrepProfile,
+        profile: Box<BimBrepProfile>,
         start: f64,
         end: f64,
     },
@@ -291,12 +349,21 @@ pub struct BimBrepEdge {
     pub curve: BimBrepCurve,
 }
 
+/// How an edge runs between its two endpoints.
+///
+/// Both variants that carry anything are held behind a pointer. A structural
+/// model states tens of millions of edges - 23.8 million in one 1.8 GiB IFC -
+/// and every one of them is as large as the largest variant, so an inline arc
+/// charged its 120 bytes to the straight edges that are the great majority.
+/// Boxed, a [`BimBrepEdge`] is 88 bytes rather than 184, which on that file is
+/// 2.3 GB the model no longer holds.
 #[derive(Clone, Debug, PartialEq)]
 pub enum BimBrepCurve {
     Line,
-    Arc(BimBrepArc),
-    /// A sampled source curve, including its two topological endpoints.
-    Polyline(Vec<BimPoint3>),
+    Arc(Box<BimBrepArc>),
+    /// A sampled source curve, including its two topological endpoints. Held
+    /// as a boxed slice: it is built once and never appended to.
+    Polyline(Box<[BimPoint3]>),
 }
 
 /// `point(angle) = center + radius * (cos(angle) * x_axis + sin(angle) *
@@ -567,6 +634,7 @@ pub fn federate(sources: Vec<(BimDocument, BimModel)>) -> (BimModel, BimFederati
         // well, so every consumer that reads only that still works.
         if !qualify {
             out.source = model.source.clone();
+            out.project = model.project.clone();
         }
         out.elements.append(&mut model.elements);
         out.levels.append(&mut model.levels);
@@ -672,6 +740,9 @@ impl BimModel {
             if let Some(kind) = &element.type_id {
                 element.type_id = Some(kind.qualified(document));
             }
+            if let Some(host) = &element.host_id {
+                element.host_id = Some(host.qualified(document));
+            }
             if let Some(layers) = &mut element.material_layers {
                 if let Some(source) = &layers.source_type_id {
                     layers.source_type_id = Some(source.qualified(document));
@@ -739,6 +810,7 @@ mod tests {
             level_id: Some(BimElementId("level".to_owned())),
             type_id: Some(BimElementId("type".to_owned())),
             type_name: None,
+            host_id: Some(BimElementId("host".to_owned())),
             placement: None,
             geometry: Some(BimGeometry::BoundingBox(BimBoundingBox {
                 min: point(at),
@@ -764,6 +836,10 @@ mod tests {
             source: Some(BimSource {
                 application: "Test".to_owned(),
                 release: None,
+            }),
+            project: Some(BimProjectIdentity {
+                number: Some("PN-1".to_owned()),
+                ..BimProjectIdentity::default()
             }),
             documents: Vec::new(),
             elements: vec![element(id, at)],
@@ -811,6 +887,13 @@ mod tests {
         );
         // The shorthand still answers for a single-source model.
         assert!(federated.source.is_some());
+        assert_eq!(
+            federated.project,
+            Some(BimProjectIdentity {
+                number: Some("PN-1".to_owned()),
+                ..BimProjectIdentity::default()
+            })
+        );
         assert_eq!(report.collisions, 0);
         assert!(report.disjoint.is_empty());
     }
@@ -822,11 +905,15 @@ mod tests {
             (document("b"), model("5678", [0.5, 0.0, 0.0])),
         ]);
 
+        // Two files each name a project; the federated whole names neither,
+        // the same rule this test already applies to `source` below.
+        assert_eq!(federated.project, None);
         assert_eq!(federated.elements.len(), 2);
         let first = &federated.elements[0];
         assert_eq!(first.id, BimElementId("a/1234".to_owned()));
         assert_eq!(first.level_id, Some(BimElementId("a/level".to_owned())));
         assert_eq!(first.type_id, Some(BimElementId("a/type".to_owned())));
+        assert_eq!(first.host_id, Some(BimElementId("a/host".to_owned())));
         assert_eq!(
             first.material_layers.as_ref().unwrap().source_type_id,
             Some(BimElementId("a/type".to_owned()))
@@ -898,6 +985,22 @@ mod tests {
             (document("b"), model("5678", [10_000.0, 0.0, 0.0])),
         ]);
         assert!(report.disjoint.is_empty());
+    }
+
+    /// The geometry a model holds is these three shapes, tens of millions of
+    /// times over, so their size *is* the model's memory: a 1.8 GiB structural
+    /// IFC states 23.8 million edges and 7.1 million faces, where eight bytes
+    /// added here is 250 MB added there. Pinned so that a variant widened
+    /// without a thought is a failing test rather than a machine that swaps.
+    #[test]
+    fn the_shapes_a_model_holds_millions_of_stay_narrow() {
+        assert_eq!(std::mem::size_of::<BimBrepEdge>(), 88);
+        // +8 over the edge-only shape: `material` is a boxed pointer, one
+        // word, so the millions of faces that carry none pay eight bytes
+        // rather than the 72 an inline `Option<BimMaterial>` would cost every
+        // one of them for the few that do.
+        assert_eq!(std::mem::size_of::<BimBrepFace>(), 160);
+        assert_eq!(std::mem::size_of::<BimPoint3>(), 32);
     }
 
     #[test]

@@ -1,14 +1,16 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fmt,
+    hash::{Hash, Hasher},
 };
 
 use bim_convert::{ifc_entity_name, resolved_element_type};
 use bim_core::{
-    BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
+    BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile, BimBrepRuling,
     BimBrepSurface, BimElement, BimElementId, BimExternalId, BimGeometry, BimLevel, BimLineSegment,
-    BimMaterialLayer, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty, BimPropertyValue,
+    BimMaterial, BimMaterialLayer, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty,
+    BimPropertyValue,
 };
 
 use crate::{
@@ -19,6 +21,7 @@ use crate::{
         Attribute, IFC4_BASE_QUANTITY_SETS, IFC4_COMMON_PROPERTY_SETS, IFC4_ELEMENT_TYPES,
         IFC4_ELEMENTS, IFC4_SPATIAL_ELEMENT_TYPES, Ifc4Entity,
     },
+    quantities::{self, Measured},
 };
 
 /// How near the axis of revolution a profile's point must be to call it *on*
@@ -190,11 +193,13 @@ pub fn metadata_ifc_reported(
             owner: ownership,
             lengths,
         },
-        building,
-        building_placement,
-        &storeys,
-        &placements,
-        &elevations,
+        Storeys {
+            entities: &storeys,
+            placements: &placements,
+            elevations: &elevations,
+            building,
+            building_placement,
+        },
         context,
         origin_axis,
     );
@@ -231,17 +236,32 @@ fn validate_model(model: &BimModel) -> Result<(), MetadataError> {
     Ok(())
 }
 
+/// What wrote this file, named the same way everywhere it is named.
+const PREPROCESSOR: &str = concat!("Rivet ", env!("CARGO_PKG_VERSION"));
+
 fn step_header(options: &MetadataOptions) -> StepHeader {
     StepHeader {
-        description: vec![format!(
-            "ViewDefinition [{}]",
-            options.settings.view_definition.view_definition()
-        )],
+        description: vec![
+            format!(
+                "ViewDefinition [{}]",
+                options.settings.view_definition.view_definition()
+            ),
+            // Said in the file itself, because a reader who finds Revit's
+            // element ids, Revit's type names and Revit's categories in here
+            // would otherwise reasonably take it for Revit's own export. It
+            // is not: it is this converter's reading of a Revit model, and
+            // what it does not state about that model is missing rather than
+            // absent from the model.
+            format!(
+                "Converter [{PREPROCESSOR}: converted from an Autodesk Revit model, \
+                 not exported by Revit]"
+            ),
+        ],
         file_name: options.file_name.clone(),
         timestamp: options.timestamp.clone(),
         authors: vec!["Rivet".to_owned()],
         organizations: vec!["Rivet".to_owned()],
-        preprocessor_version: format!("Rivet {}", env!("CARGO_PKG_VERSION")),
+        preprocessor_version: PREPROCESSOR.to_owned(),
         originating_system: "Rivet".to_owned(),
         authorization: String::new(),
         schema: "IFC4".to_owned(),
@@ -336,18 +356,75 @@ fn push_units(file: &mut StepFile, length_unit: LengthUnit) -> EntityRef {
         ("THERMODYNAMICTEMPERATUREUNIT", None, "KELVIN"),
         ("LUMINOUSINTENSITYUNIT", None, "CANDELA"),
     ] {
-        let unit = file.push(
-            "IFCSIUNIT",
-            vec![
-                StepValue::Derived,
-                enumeration(unit_type),
-                prefix.map_or_else(omitted, enumeration),
-                enumeration(name),
-            ],
-        );
-        units.push(reference(unit));
+        units.push(reference(push_si_unit(file, unit_type, prefix, name)));
     }
+    units.extend(push_derived_units(file));
     file.push("IFCUNITASSIGNMENT", vec![StepValue::List(units)])
+}
+
+fn push_si_unit(
+    file: &mut StepFile,
+    unit_type: &str,
+    prefix: Option<&str>,
+    name: &str,
+) -> EntityRef {
+    file.push(
+        "IFCSIUNIT",
+        vec![
+            StepValue::Derived,
+            enumeration(unit_type),
+            prefix.map_or_else(omitted, enumeration),
+            enumeration(name),
+        ],
+    )
+}
+
+/// The SI units a derived measure is stated in.
+///
+/// A property whose spec is a derived quantity - a mass per unit length, a
+/// thermal resistance - is written as the IFC measure for that quantity and
+/// carries no unit of its own, so the unit it is read in is the one declared
+/// here. Revit's own export of AR S1 states its eight the same way: an
+/// exponent product of SI units in the assignment, and a bare measure on the
+/// property.
+///
+/// The metre here is the metre whatever the document's length unit is. The
+/// values are converted into SI by the catalogue, and a millimetre document
+/// does not make a density kilograms per cubic millimetre.
+fn push_derived_units(file: &mut StepFile) -> Vec<StepValue> {
+    let kilogram = push_si_unit(file, "MASSUNIT", Some("KILO"), "GRAM");
+    let metre = push_si_unit(file, "LENGTHUNIT", None, "METRE");
+    let second = push_si_unit(file, "TIMEUNIT", None, "SECOND");
+    let kelvin = push_si_unit(file, "THERMODYNAMICTEMPERATUREUNIT", None, "KELVIN");
+    let mut derived = Vec::new();
+    for (unit_type, factors) in [
+        ("MASSPERLENGTHUNIT", vec![(kilogram, 1), (metre, -1)]),
+        ("MASSDENSITYUNIT", vec![(kilogram, 1), (metre, -3)]),
+        ("AREADENSITYUNIT", vec![(kilogram, 1), (metre, -2)]),
+        // A square metre kelvin per watt. A watt is a kilogram metre squared
+        // per second cubed, so the metres cancel and what is left is kelvin
+        // seconds cubed per kilogram.
+        (
+            "THERMALRESISTANCEUNIT",
+            vec![(kilogram, -1), (second, 3), (kelvin, 1)],
+        ),
+        ("MOMENTOFINERTIAUNIT", vec![(metre, 4)]),
+    ] {
+        let elements = factors
+            .into_iter()
+            .map(|(unit, exponent)| {
+                reference(file.push(
+                    "IFCDERIVEDUNITELEMENT",
+                    vec![reference(unit), StepValue::Integer(exponent)],
+                ))
+            })
+            .collect();
+        derived.push(reference(file.push(
+            "IFCDERIVEDUNIT",
+            vec![StepValue::List(elements), enumeration(unit_type), omitted()],
+        )));
+    }
+    derived
 }
 
 fn push_project(
@@ -509,67 +586,142 @@ fn push_storeys(
     (storeys, placements)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn push_elements(
-    file: &mut StepFile,
-    elements: &[BimElement],
-    report: &mut SolidReport,
-    context: WriteContext<'_>,
+/// The storeys a model's elements stand on, in the three forms the writer
+/// asks of them, and the building that holds an element standing on none.
+#[derive(Clone, Copy)]
+struct Storeys<'a> {
+    entities: &'a BTreeMap<BimElementId, EntityRef>,
+    placements: &'a BTreeMap<BimElementId, EntityRef>,
+    elevations: &'a BTreeMap<BimElementId, f64>,
     building: EntityRef,
     building_placement: EntityRef,
-    storeys: &BTreeMap<BimElementId, EntityRef>,
-    storey_placements: &BTreeMap<BimElementId, EntityRef>,
-    storey_elevations: &BTreeMap<BimElementId, f64>,
+}
+
+/// Where one element stands, and what its body is read into.
+struct ElementFrame {
+    /// The spatial element that holds it, and the name the relationship
+    /// holding it is identified by.
+    container: EntityRef,
+    container_identity: String,
+    /// The placement its own hangs off.
+    parent: EntityRef,
+    frame: GeometryFrame,
+}
+
+impl Storeys<'_> {
+    fn of(&self, element: &BimElement, lengths: Lengths) -> ElementFrame {
+        let (container, container_identity) = element
+            .level_id
+            .as_ref()
+            .and_then(|id| Some((self.entities.get(id).copied()?, format!("storey:{}", id.0))))
+            .unwrap_or((self.building, "building".to_owned()));
+        ElementFrame {
+            container,
+            container_identity,
+            parent: element
+                .level_id
+                .as_ref()
+                .and_then(|id| self.placements.get(id).copied())
+                .unwrap_or(self.building_placement),
+            frame: GeometryFrame {
+                lengths,
+                storey_elevation: element
+                    .level_id
+                    .as_ref()
+                    .and_then(|id| self.elevations.get(id).copied())
+                    .unwrap_or(0.0),
+                placement: element
+                    .placement
+                    .as_ref()
+                    .and_then(validated_metric_placement),
+            },
+        }
+    }
+}
+
+/// Every table one pass over the model's elements fills in, so
+/// [`push_elements`] itself is just the loop and the relationships each table
+/// writes once the loop is done.
+#[derive(Default)]
+struct ElementTables {
+    materials: MaterialLibrary,
+    types: TypeLibrary,
+    // One body per distinct shape, however many elements carry it. See
+    // [`BodyWriter`].
+    bodies: HashMap<u64, EntityRef>,
+    common_sets: CommonPropertySets,
+    containment: BTreeMap<String, (EntityRef, Vec<EntityRef>)>,
+    // A space is part of the spatial structure, so its storey decomposes it
+    // rather than containing it. Kept apart from containment so the two
+    // relationships never carry the same product.
+    decomposition: BTreeMap<String, (EntityRef, Vec<EntityRef>)>,
+    // Every product's entity, by its element's id - see [`track_product`].
+    products_by_id: HashMap<String, EntityRef>,
+    openings: PendingOpenings,
+}
+
+/// What every element of one pass is written against: the spatial tree
+/// [`Storeys::of`] places it in, and the two entities every element's
+/// geometry is written relative to. Fixed for the whole pass, unlike
+/// [`WriteContext`], which every writer in the file needs.
+#[derive(Clone, Copy)]
+struct PassContext<'a> {
+    storeys: &'a Storeys<'a>,
     representation_context: EntityRef,
     origin_axis: EntityRef,
-) {
-    let mut materials = MaterialLibrary::default();
-    let mut types = TypeLibrary::default();
-    let mut common_sets = CommonPropertySets::default();
-    let mut containment: BTreeMap<String, (EntityRef, Vec<EntityRef>)> = BTreeMap::new();
-    // A space is part of the spatial structure, so its storey decomposes it
-    // rather than containing it. Kept apart from the first pass so the two
-    // relationships never carry the same product.
-    let mut decomposition: BTreeMap<String, (EntityRef, Vec<EntityRef>)> = BTreeMap::new();
-    for element in elements {
+}
+
+impl ElementTables {
+    /// Write one element and fold what it contributes into every table above.
+    fn visit(
+        &mut self,
+        file: &mut StepFile,
+        element: &BimElement,
+        report: &mut SolidReport,
+        context: WriteContext<'_>,
+        pass: PassContext<'_>,
+    ) {
+        let PassContext {
+            storeys,
+            representation_context,
+            origin_axis,
+        } = pass;
         // What the element is written as is settled before anything is
         // written: a category the mapping table keeps out of the file leaves
         // nothing behind it - no product, no placement, no property set and no
         // type - and deciding afterwards would leave the placement stranded.
-        let Some(written_as) = resolve_entity(element, context.options.settings.class_mapping())
-        else {
-            continue;
+        let Some(written_as) = write_as(element, context, report) else {
+            return;
         };
-        let (container, container_identity) = element
-            .level_id
-            .as_ref()
-            .and_then(|id| Some((storeys.get(id).copied()?, format!("storey:{}", id.0))))
-            .unwrap_or_else(|| (building, "building".to_owned()));
-        let frame = GeometryFrame {
-            lengths: context.lengths,
-            storey_elevation: element
-                .level_id
-                .as_ref()
-                .and_then(|id| storey_elevations.get(id).copied())
-                .unwrap_or(0.0),
-            placement: element
-                .placement
-                .as_ref()
-                .and_then(validated_metric_placement),
-        };
-        let parent_placement = element
-            .level_id
-            .as_ref()
-            .and_then(|id| storey_placements.get(id).copied())
-            .unwrap_or(building_placement);
-        let placement = push_element_placement(file, parent_placement, origin_axis, frame);
+        let ElementFrame {
+            container,
+            container_identity,
+            parent,
+            frame,
+        } = storeys.of(element, context.lengths);
+        let placement = push_element_placement(file, parent, origin_axis, frame);
         let geometry_context = ElementGeometryContext {
             representation_context,
             frame,
         };
         let spatial = written_as.name == "IFCSPACE";
-        let entity = if spatial {
-            push_space(file, element, context, placement, geometry_context, report)
+        let mut writer = BodyWriter {
+            maps: context
+                .options
+                .settings
+                .shared_bodies
+                .then_some(&mut self.bodies),
+            report,
+        };
+        let written = if spatial {
+            push_space(
+                file,
+                element,
+                context,
+                placement,
+                geometry_context,
+                &mut writer,
+            )
         } else {
             push_element(
                 file,
@@ -578,13 +730,21 @@ fn push_elements(
                 context,
                 placement,
                 geometry_context,
-                report,
+                &mut writer,
             )
         };
+        let entity = written.entity;
+        track_product(
+            &mut self.products_by_id,
+            &mut self.openings,
+            element,
+            placement,
+            written,
+        );
         if spatial {
-            &mut decomposition
+            &mut self.decomposition
         } else {
-            &mut containment
+            &mut self.containment
         }
         .entry(container_identity)
         .or_insert_with(|| (container, Vec::new()))
@@ -593,41 +753,80 @@ fn push_elements(
         // The type comes first: where it holds the type's parameters, the
         // element does not repeat them.
         let type_carries_properties = context.options.settings.types
-            && types.associate(file, element, entity, written_as.name, context);
+            && self
+                .types
+                .associate(file, element, entity, written_as.name, context);
         push_property_set(file, element, entity, context, type_carries_properties);
         if context.options.settings.property_sets.ifc_common {
-            common_sets.associate(file, element, entity, written_as.name, context);
+            self.common_sets
+                .associate(file, element, entity, written_as.name, context);
         }
         if context.options.settings.property_sets.base_quantities {
             push_quantities(file, element, entity, written_as.name, context);
         }
         if !spatial {
-            materials.associate(file, element, entity, context.lengths);
+            self.materials
+                .associate(file, element, entity, context.lengths);
+            self.materials
+                .associate_face_material(file, element, entity);
         }
     }
-    common_sets.push_relations(file, context);
-    types.push_relations(file, context);
-    materials.push_associations(file, context.options, context.owner);
-    for (identity, (container, elements)) in containment {
-        push_containment(
-            file,
-            context.options,
-            context.owner,
-            &identity,
-            container,
-            elements,
-        );
+
+    /// The relationships every table above holds until every element has
+    /// been visited: a type or a material is shared, so it and what relates
+    /// to it are written once here rather than once per element that carries
+    /// it, and an opening's host may be named by an element visited before
+    /// the host itself was.
+    fn finish(self, file: &mut StepFile, context: WriteContext<'_>) {
+        self.common_sets.push_relations(file, context);
+        self.types.push_relations(file, context);
+        self.materials
+            .push_associations(file, context.options, context.owner);
+        if context.options.settings.openings {
+            self.openings.push(file, &self.products_by_id, context);
+        }
+        for (identity, (container, elements)) in self.containment {
+            push_containment(
+                file,
+                context.options,
+                context.owner,
+                &identity,
+                container,
+                elements,
+            );
+        }
+        for (identity, (container, spaces)) in self.decomposition {
+            push_aggregate(
+                file,
+                context.options,
+                context.owner,
+                &format!("spaces:{identity}"),
+                container,
+                spaces,
+            );
+        }
     }
-    for (identity, (container, spaces)) in decomposition {
-        push_aggregate(
-            file,
-            context.options,
-            context.owner,
-            &format!("spaces:{identity}"),
-            container,
-            spaces,
-        );
+}
+
+fn push_elements(
+    file: &mut StepFile,
+    elements: &[BimElement],
+    report: &mut SolidReport,
+    context: WriteContext<'_>,
+    storeys: Storeys<'_>,
+    representation_context: EntityRef,
+    origin_axis: EntityRef,
+) {
+    let pass = PassContext {
+        storeys: &storeys,
+        representation_context,
+        origin_axis,
+    };
+    let mut tables = ElementTables::default();
+    for element in elements {
+        tables.visit(file, element, report, context, pass);
     }
+    tables.finish(file, context);
 }
 
 /// What every writer here needs beside the thing it is writing: this export's
@@ -656,18 +855,18 @@ fn push_space(
     context: WriteContext<'_>,
     placement: EntityRef,
     geometry_context: ElementGeometryContext,
-    report: &mut SolidReport,
-) -> EntityRef {
+    writer: &mut BodyWriter<'_>,
+) -> WrittenProduct {
     let representation = element.geometry.as_ref().and_then(|geometry| {
         push_geometry(
             file,
             geometry,
             geometry_context.representation_context,
             geometry_context.frame,
-            report,
+            writer,
         )
     });
-    file.push(
+    let entity = file.push(
         "IFCSPACE",
         vec![
             global_id(context.options, &format!("element:{}", element.id.0)),
@@ -682,7 +881,11 @@ fn push_space(
             enumeration("NOTDEFINED"),
             omitted(),
         ],
-    )
+    );
+    WrittenProduct {
+        entity,
+        representation,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -791,6 +994,16 @@ fn push_element_placement(
     )
 }
 
+/// A product this pass wrote, and the shape behind it - kept so a later pass
+/// over the same elements, such as [`push_openings`], can place an
+/// `IfcOpeningElement` through the same representation rather than deriving
+/// one of its own.
+#[derive(Clone, Copy)]
+struct WrittenProduct {
+    entity: EntityRef,
+    representation: Option<EntityRef>,
+}
+
 fn push_element(
     file: &mut StepFile,
     element: &BimElement,
@@ -798,8 +1011,8 @@ fn push_element(
     context: WriteContext<'_>,
     placement: EntityRef,
     geometry_context: ElementGeometryContext,
-    report: &mut SolidReport,
-) -> EntityRef {
+    writer: &mut BodyWriter<'_>,
+) -> WrittenProduct {
     let object_type = element.class_name.as_deref().or_else(|| {
         element
             .category
@@ -813,7 +1026,7 @@ fn push_element(
             geometry,
             geometry_context.representation_context,
             geometry_context.frame,
-            report,
+            writer,
         )
     });
     let mut attributes = vec![
@@ -835,7 +1048,50 @@ fn push_element(
     if let Some(predefined_type) = written_as.predefined_type {
         set_predefined_type(IFC4_ELEMENTS, entity, &mut attributes, predefined_type);
     }
-    file.push(entity, attributes)
+    WrittenProduct {
+        entity: file.push(entity, attributes),
+        representation,
+    }
+}
+
+/// What the element is written as, or `None` where it is not written at all.
+///
+/// Two things keep an element out of the file: a category the mapping table
+/// names `Not Exported`, and - unless the setup asks otherwise - a body this
+/// export does not carry. Both are settled before anything is written,
+/// because an element held back afterwards would leave a placement, a
+/// property set and a containment behind it.
+fn write_as<'a>(
+    element: &BimElement,
+    context: WriteContext<'a>,
+    report: &mut SolidReport,
+) -> Option<ResolvedEntity<'a>> {
+    let written_as = resolve_entity(element, context.options.settings.class_mapping())?;
+    if context.options.settings.elements_without_a_body
+        || written_as.name == "IFCSPACE"
+        || carries_a_body(element)
+    {
+        return Some(written_as);
+    }
+    report.count_bodiless();
+    None
+}
+
+/// Whether this export carries a solid for the element.
+///
+/// A decoded boundary representation or an assembly of them is a body; a
+/// swept disk is the pipe it describes. A bounding box is not - it is what is
+/// known about where the element is - and neither is an axis line on its own,
+/// nor no geometry at all.
+fn carries_a_body(element: &BimElement) -> bool {
+    match &element.geometry {
+        Some(BimGeometry::SweptDisk(_)) => true,
+        // A shell the decode read no face of is not a body, complete or not:
+        // what would be written for it is an empty representation.
+        Some(BimGeometry::Brep(brep)) => !brep.faces.is_empty(),
+        Some(BimGeometry::Assembly(bodies)) => bodies.iter().any(|brep| !brep.faces.is_empty()),
+        Some(BimGeometry::AxisLine(_) | BimGeometry::BoundingBox(_)) | None => false,
+    }
 }
 
 /// What an element is written as. The class mapping table decides where it
@@ -993,8 +1249,20 @@ impl TypeLibrary {
         product_entity: &str,
         context: WriteContext<'_>,
     ) -> bool {
-        let Some(type_id) = element.type_id.as_ref() else {
-            return false;
+        // A space names no family type - Revit has none to declare - but
+        // Revit's own export still gives every space its own `IfcSpaceType`,
+        // named after the room rather than shared, and that alone is over a
+        // third of the type-relation count measured against AR S1. Matched
+        // here the same way: the element's own id stands in for a type it
+        // does not have, so each space still reaches exactly one type of its
+        // own.
+        let (type_id, synthetic_name) = match element.type_id.as_ref() {
+            Some(type_id) => (type_id, None),
+            None if product_entity == "IFCSPACE" => (
+                &element.id,
+                element.long_name.as_deref().or(element.name.as_deref()),
+            ),
+            None => return false,
         };
         let Some((entity, table)) = type_entity_for(product_entity) else {
             return false;
@@ -1022,7 +1290,7 @@ impl TypeLibrary {
                 let mut attributes = vec![
                     global_id(context.options, &identity),
                     reference(context.owner),
-                    optional_string(element.type_name.as_deref()),
+                    optional_string(element.type_name.as_deref().or(synthetic_name)),
                     omitted(),
                     omitted(),
                     properties.map_or_else(omitted, |pset| StepValue::List(vec![reference(pset)])),
@@ -1071,12 +1339,126 @@ impl TypeLibrary {
     }
 }
 
+/// Record what an element's product is, so a later element naming it as a
+/// host can find it, and - where the element names a host of its own -
+/// queue it as a candidate for [`PendingOpenings::push`].
+fn track_product(
+    products_by_id: &mut HashMap<String, EntityRef>,
+    openings: &mut PendingOpenings,
+    element: &BimElement,
+    placement: EntityRef,
+    written: WrittenProduct,
+) {
+    products_by_id.insert(element.id.0.clone(), written.entity);
+    if let Some(host_id) = &element.host_id {
+        openings.candidates.push(OpeningCandidate {
+            host_id: host_id.0.clone(),
+            fenestration_id: element.id.0.clone(),
+            fenestration: written.entity,
+            name: element.name.clone(),
+            placement,
+            representation: written.representation,
+        });
+    }
+}
+
+/// A door, a window, or anything else that names a host, waiting on that
+/// host's own product to exist. Elements are written in one pass over the
+/// model, so the host of an element named earlier in it may not have a
+/// product yet - resolved instead once every element has one, in
+/// [`PendingOpenings::push`].
+struct OpeningCandidate {
+    host_id: String,
+    fenestration_id: String,
+    fenestration: EntityRef,
+    name: Option<String>,
+    placement: EntityRef,
+    representation: Option<EntityRef>,
+}
+
+#[derive(Default)]
+struct PendingOpenings {
+    candidates: Vec<OpeningCandidate>,
+}
+
+impl PendingOpenings {
+    /// One `IfcOpeningElement` per candidate whose host wrote a product,
+    /// placed and shaped exactly as the element that fills it. That is not
+    /// what Revit's own export states - it extrudes the fenestration's own
+    /// footprint through the host's thickness, a profile this export does not
+    /// derive - but it is an honest statement of a volume this export has
+    /// already verified, where a guessed one would not be. Related to the
+    /// host by `IfcRelVoidsElement` and to the element by
+    /// `IfcRelFillsElement`.
+    ///
+    /// A host this export did not write a product for - held out of the file
+    /// by the class mapping table, say - leaves its opening out too: a void
+    /// in nothing is not a fact about the model.
+    fn push(
+        self,
+        file: &mut StepFile,
+        products_by_id: &HashMap<String, EntityRef>,
+        context: WriteContext<'_>,
+    ) {
+        for candidate in self.candidates {
+            let Some(&host) = products_by_id.get(&candidate.host_id) else {
+                continue;
+            };
+            let opening = file.push(
+                "IFCOPENINGELEMENT",
+                vec![
+                    global_id(
+                        context.options,
+                        &format!("opening:{}", candidate.fenestration_id),
+                    ),
+                    reference(context.owner),
+                    optional_string(candidate.name.as_deref()),
+                    omitted(),
+                    omitted(),
+                    reference(candidate.placement),
+                    candidate.representation.map_or_else(omitted, reference),
+                    string(&candidate.fenestration_id),
+                    enumeration("OPENING"),
+                ],
+            );
+            file.push(
+                "IFCRELVOIDSELEMENT",
+                vec![
+                    global_id(
+                        context.options,
+                        &format!("voids:{}", candidate.fenestration_id),
+                    ),
+                    reference(context.owner),
+                    omitted(),
+                    omitted(),
+                    reference(host),
+                    reference(opening),
+                ],
+            );
+            file.push(
+                "IFCRELFILLSELEMENT",
+                vec![
+                    global_id(
+                        context.options,
+                        &format!("fills:{}", candidate.fenestration_id),
+                    ),
+                    reference(context.owner),
+                    omitted(),
+                    omitted(),
+                    reference(opening),
+                    reference(candidate.fenestration),
+                ],
+            );
+        }
+    }
+}
+
 fn push_geometry(
     file: &mut StepFile,
     geometry: &BimGeometry,
     representation_context: EntityRef,
     frame: GeometryFrame,
-    report: &mut SolidReport,
+    writer: &mut BodyWriter<'_>,
 ) -> Option<EntityRef> {
     match geometry {
         BimGeometry::AxisLine(line) => {
@@ -1126,11 +1508,317 @@ fn push_geometry(
         BimGeometry::BoundingBox(bounds) => {
             push_bounding_box(file, bounds, representation_context, frame)
         }
-        BimGeometry::Brep(brep) => push_brep(file, brep, representation_context, frame, report),
+        BimGeometry::Brep(brep) => push_brep(file, brep, representation_context, frame, writer),
         BimGeometry::Assembly(parts) => {
-            push_assembly(file, parts, representation_context, frame, report)
+            push_assembly(file, parts, representation_context, frame, writer)
         }
     }
+}
+
+/// The grid a coordinate is fingerprinted on: a nanometre, in the metres
+/// every body is carried in.
+///
+/// Two instances of one symbol do not reach this with bit-identical numbers.
+/// The body arrives in world coordinates, having been carried there through
+/// the instance's own transform, and is carried back into the element's frame
+/// here; a rotation and its inverse leave the last bits of a double
+/// disagreeing. A nanometre is some seven orders of magnitude coarser than
+/// that error on a building-sized coordinate, and some six orders finer than
+/// anything a model distinguishes, so no two bodies that differ agree on it
+/// and no two instances of one body disagree.
+const FINGERPRINT_GRID: f64 = 1e12;
+
+/// One body's fingerprint: everything the writer below would state about it,
+/// in the element's own frame.
+///
+/// `None` where any of it cannot be read - a coordinate in a unit that is not
+/// the model's metre, a frame that states no elevation - which is exactly
+/// where the writer refuses the body too.
+fn brep_fingerprint(brep: &BimBrep, frame: GeometryFrame) -> Option<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    brep.complete.hash(&mut hasher);
+    hash_brep(&mut hasher, brep, frame)?;
+    Some(hasher.finish())
+}
+
+/// The same for the several closed bodies that are one element.
+fn assembly_fingerprint(parts: &[BimBrep], frame: GeometryFrame) -> Option<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    parts.len().hash(&mut hasher);
+    for part in parts {
+        part.complete.hash(&mut hasher);
+        hash_brep(&mut hasher, part, frame)?;
+    }
+    Some(hasher.finish())
+}
+
+fn hash_brep(hasher: &mut impl Hasher, brep: &BimBrep, frame: GeometryFrame) -> Option<()> {
+    brep.faces.len().hash(hasher);
+    for face in &brep.faces {
+        hash_surface(hasher, &face.surface, frame)?;
+        face.loops.len().hash(hasher);
+        for edges in &face.loops {
+            edges.len().hash(hasher);
+            for edge in edges {
+                hash_point(hasher, &edge.start, frame)?;
+                hash_point(hasher, &edge.end, frame)?;
+                hash_curve(hasher, &edge.curve, frame)?;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Every variant is spelled out rather than collapsed, and each states a tag
+/// of its own, so that a surface added to the model cannot quietly fingerprint
+/// the same as one already here: the compiler asks for the new arm.
+fn hash_surface(
+    hasher: &mut impl Hasher,
+    surface: &BimBrepSurface,
+    frame: GeometryFrame,
+) -> Option<()> {
+    match surface {
+        BimBrepSurface::Plane {
+            origin,
+            x_axis,
+            y_axis,
+        } => {
+            0_u8.hash(hasher);
+            hash_point(hasher, origin, frame)?;
+            hash_direction(hasher, *x_axis, frame);
+            hash_direction(hasher, *y_axis, frame);
+        }
+        BimBrepSurface::Cylinder {
+            center,
+            x_axis,
+            y_axis,
+            z_axis,
+            radius,
+        } => {
+            1_u8.hash(hasher);
+            hash_point(hasher, center, frame)?;
+            for axis in [x_axis, y_axis, z_axis] {
+                hash_direction(hasher, *axis, frame);
+            }
+            hash_metres(hasher, radius)?;
+        }
+        BimBrepSurface::Revolution {
+            center,
+            x_axis,
+            y_axis,
+            z_axis,
+            profile,
+        } => {
+            2_u8.hash(hasher);
+            hash_point(hasher, center, frame)?;
+            for axis in [x_axis, y_axis, z_axis] {
+                hash_direction(hasher, *axis, frame);
+            }
+            hash_profile(hasher, profile, frame)?;
+        }
+        BimBrepSurface::Ruled { first, second } => {
+            3_u8.hash(hasher);
+            for ruling in [first, second] {
+                match ruling {
+                    BimBrepRuling::Point(point) => {
+                        0_u8.hash(hasher);
+                        hash_point(hasher, point, frame)?;
+                    }
+                    BimBrepRuling::Curve {
+                        profile,
+                        start,
+                        end,
+                    } => {
+                        1_u8.hash(hasher);
+                        hash_profile(hasher, profile, frame)?;
+                        hash_number(hasher, *start);
+                        hash_number(hasher, *end);
+                    }
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+fn hash_profile(
+    hasher: &mut impl Hasher,
+    profile: &BimBrepProfile,
+    frame: GeometryFrame,
+) -> Option<()> {
+    match profile {
+        BimBrepProfile::Line { origin, direction } => {
+            0_u8.hash(hasher);
+            hash_point(hasher, origin, frame)?;
+            hash_direction(hasher, *direction, frame);
+        }
+        BimBrepProfile::Arc {
+            center,
+            x_axis,
+            y_axis,
+            radius,
+        } => {
+            1_u8.hash(hasher);
+            hash_point(hasher, center, frame)?;
+            hash_direction(hasher, *x_axis, frame);
+            hash_direction(hasher, *y_axis, frame);
+            hash_metres(hasher, radius)?;
+        }
+    }
+    Some(())
+}
+
+fn hash_curve(hasher: &mut impl Hasher, curve: &BimBrepCurve, frame: GeometryFrame) -> Option<()> {
+    match curve {
+        BimBrepCurve::Line => 0_u8.hash(hasher),
+        BimBrepCurve::Arc(arc) => {
+            1_u8.hash(hasher);
+            hash_point(hasher, &arc.center, frame)?;
+            hash_direction(hasher, arc.x_axis, frame);
+            hash_direction(hasher, arc.z_axis, frame);
+            hash_metres(hasher, &arc.radius)?;
+            hash_number(hasher, arc.start_angle);
+            hash_number(hasher, arc.end_angle);
+        }
+        BimBrepCurve::Polyline(points) => {
+            2_u8.hash(hasher);
+            points.len().hash(hasher);
+            for point in points {
+                hash_point(hasher, point, frame)?;
+            }
+        }
+    }
+    Some(())
+}
+
+fn hash_point(hasher: &mut impl Hasher, point: &BimPoint3, frame: GeometryFrame) -> Option<()> {
+    for value in local_coordinates(point, frame)? {
+        hash_number(hasher, value);
+    }
+    Some(())
+}
+
+fn hash_direction(hasher: &mut impl Hasher, direction: [f64; 3], frame: GeometryFrame) {
+    for value in local_direction(direction, frame.placement) {
+        hash_number(hasher, value);
+    }
+}
+
+fn hash_metres(hasher: &mut impl Hasher, number: &BimNumber) -> Option<()> {
+    let metres = number
+        .unit
+        .as_ref()
+        .filter(|unit| unit.id == "autodesk.unit.unit:meters-1.0.0")
+        .map(|_| number.value)?;
+    hash_number(hasher, metres);
+    Some(())
+}
+
+/// A number on the grid above. A value too large for the grid - which no
+/// coordinate of a building is - keeps its own bits instead, so that two
+/// different ones cannot collapse to the same saturated integer.
+fn hash_number(hasher: &mut impl Hasher, value: f64) {
+    let scaled = value * FINGERPRINT_GRID;
+    if scaled.abs() < 9.0e18 {
+        #[allow(clippy::cast_possible_truncation)]
+        // Guarded above: the value is within the range an i64 holds exactly
+        // enough of for a grid this coarse.
+        (scaled.round() as i64).hash(hasher);
+    } else {
+        value.to_bits().hash(hasher);
+    }
+}
+
+/// The bodies written so far, each kept behind the `IfcRepresentationMap`
+/// that places it, and the tally of what the writer made of them.
+///
+/// A family places one symbol's solid over and over - 475 windows, a thousand
+/// balusters - and it is the same body every time: this export writes an
+/// element's geometry in the element's *own* frame, so two instances of one
+/// symbol produce the same coordinates whatever their placement in the
+/// building is. Written out per instance, that repeats every face, every loop
+/// and every oriented edge once per placement, because the topology above an
+/// edge is deliberately not shared between products - see `SHARED_BY_VALUE`
+/// in `lib.rs`, and the reason given beside it.
+///
+/// So each distinct body is written once, wrapped in an
+/// `IfcRepresentationMap`, and every element carrying that body reaches it
+/// through an `IfcMappedItem` - which is what a reader expects of a type's
+/// occurrences, and what Revit's own export does for its families.
+struct BodyWriter<'a> {
+    /// The map each distinct body is reached through, by the fingerprint of
+    /// the body itself. Never iterated, so the file stays deterministic
+    /// whatever order a hash map holds its keys in.
+    ///
+    /// `None` where the setup asks for every element to carry its own body.
+    maps: Option<&'a mut HashMap<u64, EntityRef>>,
+    report: &'a mut SolidReport,
+}
+
+/// One body's shape representation, placed through a map so that the next
+/// element carrying the same body writes no geometry at all.
+///
+/// `fingerprint` is `None` for a body this cannot fingerprint - one stated in
+/// a unit that is not the model's metre, which the writer below will refuse
+/// as well. Such a body is written out and shared with nothing: a body that
+/// might be something else's is never mapped on a guess.
+fn push_mapped_body(
+    file: &mut StepFile,
+    fingerprint: Option<u64>,
+    representation_context: EntityRef,
+    lengths: Lengths,
+    writer: &mut BodyWriter<'_>,
+    write: impl FnOnce(&mut StepFile) -> Option<EntityRef>,
+) -> Option<EntityRef> {
+    let Some(maps) = writer.maps.as_deref_mut() else {
+        // Every element carries its own body: what this wrote before bodies
+        // were shared, and what a reader that cannot follow a mapped item
+        // needs.
+        return write(file);
+    };
+    let known = fingerprint.and_then(|value| maps.get(&value).copied());
+    let map = if let Some(map) = known {
+        writer.report.count_mapped_body();
+        map
+    } else {
+        {
+            let body = write(file)?;
+            // The map's own origin, and the operator's below it. The
+            // element's placement already stands where the element does, and
+            // the body under it is already in that placement's frame, so both
+            // are the identity and neither moves anything.
+            let origin = push_axis(file, lengths, 0.0);
+            let map = file.push(
+                "IFCREPRESENTATIONMAP",
+                vec![reference(origin), reference(body)],
+            );
+            if let Some(value) = fingerprint {
+                maps.insert(value, map);
+            }
+            map
+        }
+    };
+    let local_origin = push_cartesian_point(file, lengths, [0.0, 0.0, 0.0]);
+    let operator = file.push(
+        "IFCCARTESIANTRANSFORMATIONOPERATOR3D",
+        vec![
+            omitted(),
+            omitted(),
+            reference(local_origin),
+            omitted(),
+            omitted(),
+        ],
+    );
+    let item = file.push("IFCMAPPEDITEM", vec![reference(map), reference(operator)]);
+    Some(file.push(
+        "IFCSHAPEREPRESENTATION",
+        vec![
+            reference(representation_context),
+            string("Body"),
+            string("MappedRepresentation"),
+            StepValue::List(vec![reference(item)]),
+        ],
+    ))
 }
 
 /// Count a curved solid whose every curve turns about one axis.
@@ -1226,7 +1914,10 @@ fn prism_of(brep: &BimBrep, frame: GeometryFrame) -> Result<extrusion::Prism, No
 /// next edge's start is this edge's end, and the last closes on the first. A
 /// point stated twice over carries no direction and would put a zero-length
 /// side in the profile, so the repeats go.
-fn polygon_of(edges: &[BimBrepEdge], frame: GeometryFrame) -> Result<extrusion::Polygon, NotAPrism> {
+fn polygon_of(
+    edges: &[BimBrepEdge],
+    frame: GeometryFrame,
+) -> Result<extrusion::Polygon, NotAPrism> {
     let mut polygon = Vec::with_capacity(edges.len());
     for edge in edges {
         if !matches!(edge.curve, BimBrepCurve::Line) {
@@ -1314,11 +2005,7 @@ fn push_extruded_area_solid(
 /// ISO 10303-42 makes a polyline closed by repeating its first point as its
 /// last, which is what `IfcArbitraryClosedProfileDef` requires of the curve it
 /// is given.
-fn push_profile_curve(
-    file: &mut StepFile,
-    lengths: Lengths,
-    boundary: &[[f64; 2]],
-) -> EntityRef {
+fn push_profile_curve(file: &mut StepFile, lengths: Lengths, boundary: &[[f64; 2]]) -> EntityRef {
     let mut points: Vec<StepValue> = boundary
         .iter()
         .map(|point| reference(push_cartesian_point_2d(file, lengths, *point)))
@@ -1383,24 +2070,38 @@ fn push_brep(
     brep: &BimBrep,
     representation_context: EntityRef,
     frame: GeometryFrame,
-    report: &mut SolidReport,
+    writer: &mut BodyWriter<'_>,
 ) -> Option<EntityRef> {
     let read = prism_of(brep, frame);
-    report.saw(read.as_ref().map_err(|refusal| *refusal), brep.faces.len());
-    note_curves(brep, report);
-    let (item, representation_type) = match read {
-        Ok(prism) => (
-            push_extruded_area_solid(file, &prism, frame.lengths),
-            "SweptSolid",
-        ),
-        Err(_) => push_brep_item(file, brep, frame)?,
-    };
-    let body = push_body_representation(
+    // Counted for every element that carries this body, whether or not the
+    // body itself is written again: the tally says what the model holds, not
+    // how many times the file states it.
+    writer
+        .report
+        .saw(read.as_ref().map_err(|refusal| *refusal), brep.faces.len());
+    note_curves(brep, writer.report);
+    let body = push_mapped_body(
         file,
+        brep_fingerprint(brep, frame),
         representation_context,
-        representation_type,
-        vec![item],
-    );
+        frame.lengths,
+        writer,
+        |file| {
+            let (item, representation_type) = match read {
+                Ok(prism) => (
+                    push_extruded_area_solid(file, &prism, frame.lengths),
+                    "SweptSolid",
+                ),
+                Err(_) => push_brep_item(file, brep, frame)?,
+            };
+            Some(push_body_representation(
+                file,
+                representation_context,
+                representation_type,
+                vec![item],
+            ))
+        },
+    )?;
     Some(file.push(
         "IFCPRODUCTDEFINITIONSHAPE",
         vec![omitted(), omitted(), StepValue::List(vec![reference(body)])],
@@ -1421,7 +2122,7 @@ fn push_assembly(
     parts: &[BimBrep],
     representation_context: EntityRef,
     frame: GeometryFrame,
-    report: &mut SolidReport,
+    writer: &mut BodyWriter<'_>,
 ) -> Option<EntityRef> {
     if parts.is_empty() {
         return None;
@@ -1434,31 +2135,49 @@ fn push_assembly(
     let read: Vec<Result<extrusion::Prism, NotAPrism>> =
         parts.iter().map(|part| prism_of(part, frame)).collect();
     for (part, outcome) in parts.iter().zip(&read) {
-        report.saw(outcome.as_ref().map_err(|refusal| *refusal), part.faces.len());
-        note_curves(part, report);
+        writer.report.saw(
+            outcome.as_ref().map_err(|refusal| *refusal),
+            part.faces.len(),
+        );
+        note_curves(part, writer.report);
     }
-    if let Ok(prisms) = read.into_iter().collect::<Result<Vec<_>, _>>() {
-        let items = prisms
-            .iter()
-            .map(|prism| push_extruded_area_solid(file, prism, frame.lengths))
-            .collect();
-        let body = push_body_representation(file, representation_context, "SweptSolid", items);
-        return Some(file.push(
-            "IFCPRODUCTDEFINITIONSHAPE",
-            vec![omitted(), omitted(), StepValue::List(vec![reference(body)])],
-        ));
-    }
-    let mut items = Vec::with_capacity(parts.len());
-    for part in parts {
-        match push_brep_item(file, part, frame) {
-            Some((item, "AdvancedBrep")) => items.push(item),
-            _ => return None,
-        }
-    }
-    if items.is_empty() {
-        return None;
-    }
-    let body = push_body_representation(file, representation_context, "AdvancedBrep", items);
+    let body = push_mapped_body(
+        file,
+        assembly_fingerprint(parts, frame),
+        representation_context,
+        frame.lengths,
+        writer,
+        |file| {
+            if let Ok(prisms) = read.into_iter().collect::<Result<Vec<_>, _>>() {
+                let items = prisms
+                    .iter()
+                    .map(|prism| push_extruded_area_solid(file, prism, frame.lengths))
+                    .collect();
+                return Some(push_body_representation(
+                    file,
+                    representation_context,
+                    "SweptSolid",
+                    items,
+                ));
+            }
+            let mut items = Vec::with_capacity(parts.len());
+            for part in parts {
+                match push_brep_item(file, part, frame) {
+                    Some((item, "AdvancedBrep")) => items.push(item),
+                    _ => return None,
+                }
+            }
+            if items.is_empty() {
+                return None;
+            }
+            Some(push_body_representation(
+                file,
+                representation_context,
+                "AdvancedBrep",
+                items,
+            ))
+        },
+    )?;
     Some(file.push(
         "IFCPRODUCTDEFINITIONSHAPE",
         vec![omitted(), omitted(), StepValue::List(vec![reference(body)])],
@@ -1626,7 +2345,7 @@ fn push_revolved_surface(
         y_axis: *y_axis,
         z_axis: *z_axis,
     };
-    match profile {
+    match &**profile {
         BimBrepProfile::Line { origin, direction } => push_revolved_line_surface(
             file,
             &revolution,
@@ -1721,8 +2440,13 @@ fn push_revolved_line_surface(
         return None;
     }
     let profile_radius = |height: f64| radius + (height - point[2]) * slope;
+    // Three points on the one line, not two. A profile of one edge sends
+    // `ifcopenshell` down a path that revolves it without applying
+    // `Position` to the axis, so a schema-correct axis comes out wrong there;
+    // two edges take the path that sweeps first and places after, which is
+    // the schema's reading. The middle point changes no point of the surface.
     let curve = {
-        let points = ends.map(|height| {
+        let points = [ends[0], f64::midpoint(ends[0], ends[1]), ends[1]].map(|height| {
             push_cartesian_point_2d(file, frame.lengths, [profile_radius(height), height])
         });
         file.push(
@@ -1736,10 +2460,8 @@ fn push_revolved_line_surface(
     );
     // The profile's own plane: `x` along the radius, and therefore `y` along
     // the axis, which is where a surface of revolution requires its axis to
-    // lie. Both the placement and the axis are in the element's coordinates,
-    // not the profile's - measured against `ifcopenshell`, which builds the
-    // cone the profile describes for the one reading and a different surface
-    // for the other.
+    // lie. The placement is in the element's coordinates and the axis in the
+    // placement's: see `push_revolution_axis`.
     let position = push_local_axis(
         file,
         revolution.center,
@@ -1747,7 +2469,7 @@ fn push_revolved_line_surface(
         radial,
         frame,
     )?;
-    let axis = push_axis_placement_1d(file, revolution.center, revolution.z_axis, frame)?;
+    let axis = push_revolution_axis(file, frame.lengths);
     Some(file.push(
         "IFCSURFACEOFREVOLUTION",
         vec![reference(profile), reference(position), reference(axis)],
@@ -1850,20 +2572,43 @@ fn push_revolved_arc_as_revolution(
         "IFCCIRCLE",
         vec![reference(profile_position), frame.lengths.value(radius)],
     );
-    // A full turn, in the radians this file declares its angles in.
-    let trimmed = file.push(
-        "IFCTRIMMEDCURVE",
+    // A full turn, in the radians this file declares its angles in, as two
+    // half turns: one edge would take the path in `ifcopenshell` that leaves
+    // `Position` off the axis - see `push_revolved_line_surface`.
+    let halves = [
+        (0.0, std::f64::consts::PI, "CONTSAMEGRADIENT"),
+        (std::f64::consts::PI, std::f64::consts::TAU, "DISCONTINUOUS"),
+    ]
+    .map(|(start, end, transition)| {
+        let trimmed = file.push(
+            "IFCTRIMMEDCURVE",
+            vec![
+                reference(circle),
+                StepValue::List(vec![parameter_value(start)]),
+                StepValue::List(vec![parameter_value(end)]),
+                StepValue::Boolean(true),
+                enumeration("PARAMETER"),
+            ],
+        );
+        file.push(
+            "IFCCOMPOSITECURVESEGMENT",
+            vec![
+                enumeration(transition),
+                StepValue::Boolean(true),
+                reference(trimmed),
+            ],
+        )
+    });
+    let composite = file.push(
+        "IFCCOMPOSITECURVE",
         vec![
-            reference(circle),
-            StepValue::List(vec![parameter_value(0.0)]),
-            StepValue::List(vec![parameter_value(std::f64::consts::TAU)]),
-            StepValue::Boolean(true),
-            enumeration("PARAMETER"),
+            StepValue::List(halves.into_iter().map(reference).collect()),
+            StepValue::Boolean(false),
         ],
     );
     let profile = file.push(
         "IFCARBITRARYOPENPROFILEDEF",
-        vec![enumeration("CURVE"), omitted(), reference(trimmed)],
+        vec![enumeration("CURVE"), omitted(), reference(composite)],
     );
     let position = push_local_axis(
         file,
@@ -1872,7 +2617,7 @@ fn push_revolved_arc_as_revolution(
         radial,
         frame,
     )?;
-    let axis = push_axis_placement_1d(file, revolution.center, revolution.z_axis, frame)?;
+    let axis = push_revolution_axis(file, frame.lengths);
     Some(file.push(
         "IFCSURFACEOFREVOLUTION",
         vec![reference(profile), reference(position), reference(axis)],
@@ -2065,8 +2810,47 @@ fn push_bounding_box(
     representation_context: EntityRef,
     frame: GeometryFrame,
 ) -> Option<EntityRef> {
-    let min = metric_coordinates(&bounds.min)?;
-    let max = metric_coordinates(&bounds.max)?;
+    // The box arrives in the model's project coordinates, which is the frame
+    // every `BimGeometry` is carried in, and `IfcBoundingBox` states its
+    // corner in the product's own. Reading it as if it were already local is
+    // what put 91 of AR S1's slabs, its roof and its curtain walls at twice
+    // their level elevation: the storey placement added the elevation a
+    // second time under a corner that already carried it.
+    //
+    // An `IfcBoundingBox` has a corner and three lengths along the frame's
+    // axes and cannot be turned, so a frame the box is not square to admits
+    // only the hull of the eight carried corners. That is exact wherever the
+    // frame's axes are the project's, which is every one of the 827 elements
+    // carrying a box in AR S1 - 723 axis-aligned placements and 104 with no
+    // placement at all, and not one turned.
+    let world_min = metric_coordinates(&bounds.min)?;
+    let world_max = metric_coordinates(&bounds.max)?;
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    for corner in 0_u8..8 {
+        let world = [
+            if corner & 1 == 0 {
+                world_min[0]
+            } else {
+                world_max[0]
+            },
+            if corner & 2 == 0 {
+                world_min[1]
+            } else {
+                world_max[1]
+            },
+            if corner & 4 == 0 {
+                world_min[2]
+            } else {
+                world_max[2]
+            },
+        ];
+        let local = frame_coordinates(world, frame)?;
+        for (axis, value) in local.into_iter().enumerate() {
+            min[axis] = min[axis].min(value);
+            max[axis] = max[axis].max(value);
+        }
+    }
     let dimensions = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
     if dimensions
         .into_iter()
@@ -2149,7 +2933,13 @@ fn metric_coordinates(point: &BimPoint3) -> Option<[f64; 3]> {
 }
 
 fn local_coordinates(point: &BimPoint3, frame: GeometryFrame) -> Option<[f64; 3]> {
-    let mut world = metric_coordinates(point)?;
+    frame_coordinates(metric_coordinates(point)?, frame)
+}
+
+/// The same conversion for a point already read out of its `BimPoint3`: what
+/// a box has, whose corners are eight combinations of two carried points
+/// rather than eight carried points.
+fn frame_coordinates(mut world: [f64; 3], frame: GeometryFrame) -> Option<[f64; 3]> {
     if let Some(placement) = frame.placement {
         let delta = subtract(world, placement.origin);
         let local_y = cross(placement.axis, placement.reference_direction);
@@ -2192,29 +2982,24 @@ fn push_cartesian_point_2d(
     file.push("IFCCARTESIANPOINT", vec![lengths.coordinates(coordinates)])
 }
 
-/// An axis with a position but no reference direction: what a surface of
-/// revolution turns about.
-fn push_axis_placement_1d(
-    file: &mut StepFile,
-    origin: &BimPoint3,
-    axis_world: [f64; 3],
-    frame: GeometryFrame,
-) -> Option<EntityRef> {
-    let point = local_coordinates(origin, frame)?;
-    let axis = local_direction(axis_world, frame.placement);
-    if point
-        .into_iter()
-        .chain(axis)
-        .any(|value| !value.is_finite())
-    {
-        return None;
-    }
-    let point_ref = push_cartesian_point(file, frame.lengths, point);
-    let axis_ref = push_direction(file, axis);
-    Some(file.push(
-        "IFCAXIS1PLACEMENT",
-        vec![reference(point_ref), reference(axis_ref)],
-    ))
+/// The axis a surface of revolution turns about, stated where the schema
+/// states it: in the surface's own `Position`, which every writer here builds
+/// with `x` along the radius and `y` along the axis. The profile is swept in
+/// that frame and `Position` then carries the swept surface into the
+/// element's, so the axis is the frame's `y` through its origin whatever the
+/// element's coordinates are.
+///
+/// Written in the element's coordinates instead - which is what this once
+/// did - the two readings agree only while the surface's centre is at the
+/// element's origin and its axis happens to be the element's `y`. Elsewhere
+/// the reference kernel turns the profile about a line displaced by the
+/// centre's own coordinates: on AR S1 an 8 cm anchor became a torus 28 to
+/// 45 m across, and on SMALL the pipe fittings' cones stood 25 to 33 mm off
+/// the faces they bound.
+fn push_revolution_axis(file: &mut StepFile, lengths: Lengths) -> EntityRef {
+    let point = push_cartesian_point(file, lengths, [0.0, 0.0, 0.0]);
+    let axis = push_direction(file, [0.0, 1.0, 0.0]);
+    file.push("IFCAXIS1PLACEMENT", vec![reference(point), reference(axis)])
 }
 
 fn push_cartesian_point(file: &mut StepFile, lengths: Lengths, coordinates: [f64; 3]) -> EntityRef {
@@ -2237,83 +3022,6 @@ fn push_direction(file: &mut StepFile, direction: [f64; 3]) -> EntityRef {
         vec![StepValue::List(
             direction.into_iter().map(StepValue::Real).collect(),
         )],
-    )
-}
-
-/// What has been measured from an element's own exported body.
-///
-/// Not read from the source: Revit computes its quantities when it exports and
-/// stores none of them, and joining every numeric parameter this decode
-/// recovers against every quantity in Revit's own export of AR S1 - as it
-/// stands, in feet turned to millimetres and the other way - found no carrier
-/// for a single one. So they are measured here, from the solid this file
-/// carries, and they describe that solid and nothing else.
-///
-/// Measured against Revit's own `Qto_..BaseQuantities` on the 8 047 closed,
-/// planar-faced solids of AR S1 that both files hold: **7 482 reproduce
-/// Revit's `NetVolume` to within a thousandth**, and 565 do not, of which 558
-/// are walls whose body we export larger than Revit exports its own - a
-/// difference in the body, not in the measurement, and the same difference a
-/// reader would see by looking at the two solids.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct MeasuredQuantities {
-    /// The volume the closed shell encloses, in cubic metres.
-    net_volume: f64,
-    /// The area of every face of it, in square metres.
-    net_surface_area: f64,
-}
-
-/// Measure a body, where it is one this can measure exactly.
-///
-/// Only a closed shell of planar faces bounded by straight edges: a curved
-/// face would have to be tessellated, and a tessellation is an approximation
-/// whose error nothing here bounds. Anything else is left unmeasured rather
-/// than estimated.
-fn measure(geometry: &BimGeometry) -> Option<MeasuredQuantities> {
-    let BimGeometry::Brep(brep) = geometry else {
-        return None;
-    };
-    if !brep.complete || brep.faces.is_empty() {
-        return None;
-    }
-    // Six times the signed volume and twice the area, so the division happens
-    // once at the end.
-    let mut six_volume = 0.0_f64;
-    let mut two_area = 0.0_f64;
-    for face in &brep.faces {
-        if !matches!(face.surface, BimBrepSurface::Plane { .. }) {
-            return None;
-        }
-        for loop_edges in &face.loops {
-            let mut corners = Vec::with_capacity(loop_edges.len());
-            for edge in loop_edges {
-                if !matches!(edge.curve, BimBrepCurve::Line) {
-                    return None;
-                }
-                corners.push(metric_coordinates(&edge.start)?);
-            }
-            // The divergence theorem over the face, fan-triangulated from its
-            // first corner. A hole is wound against the loop it is in, so its
-            // triangles take themselves back out of both sums.
-            let Some((origin, rest)) = corners.split_first() else {
-                continue;
-            };
-            for pair in rest.windows(2) {
-                let first = subtract(pair[0], *origin);
-                let second = subtract(pair[1], *origin);
-                let normal = cross(first, second);
-                six_volume += dot(*origin, normal);
-                two_area += dot(normal, normal).sqrt();
-            }
-        }
-    }
-    let net_volume = six_volume.abs() / 6.0;
-    let net_surface_area = two_area / 2.0;
-    (net_volume.is_finite() && net_surface_area.is_finite() && net_volume > 0.0).then_some(
-        MeasuredQuantities {
-            net_volume,
-            net_surface_area,
-        },
     )
 }
 
@@ -2355,6 +3063,125 @@ fn base_quantity_set(entity: &str) -> Option<(&'static str, &'static [&'static s
         .map(|(_, set, quantities)| (*set, *quantities))
 }
 
+/// What one measured quantity is: the entity it is written as, and the value
+/// in the unit that entity's measure is written in.
+enum Quantity {
+    /// A length, written in the file's own length unit.
+    Length(f64),
+    /// An area, in square metres, which is what the file declares whatever its
+    /// lengths are in.
+    Area(f64),
+    /// A volume, in cubic metres, for the same reason.
+    Volume(f64),
+}
+
+/// Every quantity this can measure for an element written as `entity`, named
+/// as that entity's own template names it.
+///
+/// The names are not interchangeable between entities: a wall's side is
+/// `NetSideArea` and a slab's face is `NetArea`, a column's `Length` runs
+/// upright where a beam's runs along it. What is written is the intersection
+/// of this list with the template's, so a name the template does not define
+/// is never invented for an entity that has no room for it.
+fn measured_quantities(entity: &str, measured: &Measured) -> Vec<(&'static str, Quantity)> {
+    let Measured {
+        net_volume,
+        net_surface_area,
+        length,
+        width,
+        height,
+        side_area,
+        plan_area,
+        upright_area,
+        plan_perimeter,
+        pierced,
+    } = *measured;
+    // A gross quantity, which this can state only for a body nothing was cut
+    // out of - there it is the same number as the net one. See [`Measured`].
+    let gross = |value: f64| (!pierced).then_some(value);
+    match entity {
+        // A wall is measured across its own sides: the face pair carrying the
+        // most area is the wall, and everything else follows from it.
+        //
+        // Against Revit's own export of AR S1, joined on the Revit element
+        // id, of the 7 517 walls both files hold and this measures:
+        // `Length` 7 272, `Height` 7 332, `GrossFootprintArea` 5 938 of 6 084
+        // and `NetSideArea` 6 937 reproduce Revit's number to within a
+        // thousandth. Where they differ it is the body that differs - the
+        // 558 walls this export writes larger than Revit writes its own - not
+        // the measurement.
+        "IFCWALL" | "IFCWALLSTANDARDCASE" | "IFCCURTAINWALL" => vec![
+            ("Length", Quantity::Length(length)),
+            ("Width", Quantity::Length(width)),
+            ("Height", Quantity::Length(height)),
+            ("GrossFootprintArea", Quantity::Area(length * width)),
+            ("NetFootprintArea", Quantity::Area(plan_area)),
+            ("NetSideArea", Quantity::Area(side_area)),
+            ("NetVolume", Quantity::Volume(net_volume)),
+        ]
+        .into_iter()
+        .chain(gross(side_area).map(|area| ("GrossSideArea", Quantity::Area(area))))
+        .chain(gross(net_volume).map(|volume| ("GrossVolume", Quantity::Volume(volume))))
+        .collect(),
+        // A slab lies down: its thickness is what it stands in, and its face
+        // is what it covers. `Perimeter` is the boundary of that face, which
+        // reproduces Revit's on 437 of the 440 slabs both files measure.
+        //
+        // No `GrossVolume`: Revit's is not this body's volume even where
+        // nothing was cut out of the slab, agreeing on 60 of 427, so whatever
+        // it means it is not what is measured here.
+        "IFCSLAB" | "IFCROOF" | "IFCCOVERING" => vec![
+            ("Width", Quantity::Length(height)),
+            ("Perimeter", Quantity::Length(plan_perimeter)),
+            ("NetArea", Quantity::Area(plan_area)),
+            ("NetVolume", Quantity::Volume(net_volume)),
+        ]
+        .into_iter()
+        .chain(gross(plan_area).map(|area| ("GrossArea", Quantity::Area(area))))
+        .collect(),
+        // A column stands: its length is its height, and the section it cuts
+        // is what it shows in plan. Every one of the 56 columns both files
+        // measure agrees with Revit on all five.
+        "IFCCOLUMN" | "IFCPILE" => vec![
+            ("Length", Quantity::Length(height)),
+            ("CrossSectionArea", Quantity::Area(plan_area)),
+            ("OuterSurfaceArea", Quantity::Area(upright_area)),
+            ("NetVolume", Quantity::Volume(net_volume)),
+        ]
+        .into_iter()
+        .chain(gross(net_volume).map(|volume| ("GrossVolume", Quantity::Volume(volume))))
+        .collect(),
+        // A member or a beam is measured as a body and nothing more: its
+        // length runs whichever way its profile was swept, which this does
+        // not read, and Revit's `CrossSectionArea` is that profile's area
+        // rather than anything a bounding extent recovers.
+        "IFCBEAM" | "IFCMEMBER" => vec![("NetVolume", Quantity::Volume(net_volume))]
+            .into_iter()
+            .chain(gross(net_volume).map(|volume| ("GrossVolume", Quantity::Volume(volume))))
+            .collect(),
+        // A door, a window and the opening they fill are measured by Revit
+        // from the family's own width and height, which are not the extents
+        // of the body this file carries - a window panel's body is not its
+        // hole. Nothing of the sort is written rather than the bounding box's
+        // numbers, which agree with Revit's on none of the 185 windows both
+        // files hold.
+        "IFCDOOR" | "IFCWINDOW" | "IFCOPENINGELEMENT" => {
+            vec![("Volume", Quantity::Volume(net_volume))]
+        }
+        // Everything else is measured as a body and nothing more: nothing
+        // here knows which way it runs.
+        _ => vec![
+            ("NetSurfaceArea", Quantity::Area(net_surface_area)),
+            ("TotalSurfaceArea", Quantity::Area(net_surface_area)),
+            ("NetVolume", Quantity::Volume(net_volume)),
+        ]
+        .into_iter()
+        .chain(gross(net_surface_area).map(|area| ("GrossSurfaceArea", Quantity::Area(area))))
+        .chain(gross(net_volume).map(|volume| ("GrossVolume", Quantity::Volume(volume))))
+        .collect(),
+    }
+}
+
 /// Write what has been measured from `element`'s body, as the quantity set the
 /// entity's own template defines. Nothing is written where the body cannot be
 /// measured exactly, or where the set has no name for what was measured.
@@ -2369,12 +3196,14 @@ fn push_quantities(
         return;
     };
     let mut quantities = Vec::new();
+    let mut written = Vec::new();
     // The build-up's own total, written in the file's length unit because
     // `Width` is an `IfcQuantityLength` and every length in the file is in
     // that unit. It is not measured from the body: the layer table states it,
     // which is what the quantity means. See [`layer_set_thickness`].
     if allowed.contains(&"Width") {
         if let Some(thickness) = layer_set_thickness(element) {
+            written.push("Width");
             quantities.push(reference(file.push(
                 "IFCQUANTITYLENGTH",
                 vec![
@@ -2387,30 +3216,32 @@ fn push_quantities(
             )));
         }
     }
-    let measured = element.geometry.as_ref().and_then(measure);
-    if let Some(measured) = measured {
-        if allowed.contains(&"NetVolume") {
+    if let Some(measured) = element.geometry.as_ref().and_then(quantities::measure) {
+        for (name, quantity) in measured_quantities(product_entity, &measured) {
+            if !allowed.contains(&name) || written.contains(&name) {
+                continue;
+            }
+            let (entity, value) = match quantity {
+                Quantity::Length(metres) => ("IFCQUANTITYLENGTH", context.lengths.value(metres)),
+                Quantity::Area(square_metres) => {
+                    ("IFCQUANTITYAREA", StepValue::Real(square_metres))
+                }
+                Quantity::Volume(cubic_metres) => {
+                    ("IFCQUANTITYVOLUME", StepValue::Real(cubic_metres))
+                }
+            };
+            // A quantity that measured to nothing is not a measurement of
+            // this body; it is what a body this cannot read looks like.
+            let StepValue::Real(number) = value else {
+                continue;
+            };
+            if !number.is_finite() || number <= 0.0 {
+                continue;
+            }
+            written.push(name);
             quantities.push(reference(file.push(
-                "IFCQUANTITYVOLUME",
-                vec![
-                    string("NetVolume"),
-                    omitted(),
-                    omitted(),
-                    StepValue::Real(measured.net_volume),
-                    omitted(),
-                ],
-            )));
-        }
-        if allowed.contains(&"NetSurfaceArea") {
-            quantities.push(reference(file.push(
-                "IFCQUANTITYAREA",
-                vec![
-                    string("NetSurfaceArea"),
-                    omitted(),
-                    omitted(),
-                    StepValue::Real(measured.net_surface_area),
-                    omitted(),
-                ],
+                entity,
+                vec![string(name), omitted(), omitted(), value, omitted()],
             )));
         }
     }
@@ -2556,11 +3387,16 @@ impl CommonPropertySets {
 #[derive(Default)]
 struct MaterialLibrary {
     /// `IfcMaterial` by the material's identity, so a material used by many
-    /// layers is written once.
+    /// layers - or named by many faces - is written once.
     materials: BTreeMap<String, EntityRef>,
     /// `IfcMaterialLayerSet` by the set's identity, with the products carrying
     /// it. `BTreeMap` rather than a hash so the output stays deterministic.
     layer_sets: BTreeMap<String, (EntityRef, Vec<EntityRef>)>,
+    /// An `IfcMaterial` by its own identity, with the products whose faces
+    /// name it and nothing else - a door, a window, anything with no layered
+    /// build-up of its own. Kept apart from `layer_sets`: the entity here is
+    /// the material itself, not a set wrapping it.
+    single_materials: BTreeMap<String, (EntityRef, Vec<EntityRef>)>,
 }
 
 impl MaterialLibrary {
@@ -2615,25 +3451,124 @@ impl MaterialLibrary {
         entry.1.push(product);
     }
 
-    /// One `IfcRelAssociatesMaterial` per distinct build-up.
+    /// Record that `product`'s own faces name one material and no build-up -
+    /// an element `associate` above already gave a layer set never reaches
+    /// here, since a build-up is the more complete statement where the
+    /// source gives both. Silent where the faces disagree: a product whose
+    /// faces name two different materials is a real multi-material body this
+    /// export does not yet state, and a guess at one of the two would be a
+    /// wrong material rather than a missing one.
+    fn associate_face_material(
+        &mut self,
+        file: &mut StepFile,
+        element: &BimElement,
+        product: EntityRef,
+    ) {
+        if element
+            .material_layers
+            .as_ref()
+            .is_some_and(|set| !set.layers.is_empty())
+        {
+            return;
+        }
+        let Some(faces) = element_faces(element) else {
+            return;
+        };
+        // Every material identified before any of them is written: writing
+        // the first as it is seen would leave a lone `IFCMATERIAL` behind for
+        // a product this then refuses to relate, once a second, disagreeing
+        // face turns up.
+        let mut identities = faces
+            .iter()
+            .filter_map(|face| face.material.as_deref().and_then(material_identity));
+        let Some(identity) = identities.next() else {
+            return;
+        };
+        if identities.any(|other| other != identity) {
+            return;
+        }
+        let material = faces
+            .iter()
+            .find_map(|face| face.material.as_deref())
+            .expect("at least one face carried a material to reach this point");
+        let Some((identity, entity)) = material_entity(file, &mut self.materials, material) else {
+            return;
+        };
+        self.single_materials
+            .entry(identity)
+            .or_insert_with(|| (entity, Vec::new()))
+            .1
+            .push(product);
+    }
+
+    /// One `IfcRelAssociatesMaterial` per distinct build-up or single
+    /// material.
     fn push_associations(self, file: &mut StepFile, options: &MetadataOptions, owner: EntityRef) {
-        for (identity, (layer_set, products)) in self.layer_sets {
+        let relations = self
+            .layer_sets
+            .into_iter()
+            .chain(self.single_materials)
+            .map(|(identity, (entity, products))| {
+                (format!("material-relation:{identity}"), entity, products)
+            });
+        for (identity, entity, products) in relations {
             if products.is_empty() {
                 continue;
             }
             file.push(
                 "IFCRELASSOCIATESMATERIAL",
                 vec![
-                    global_id(options, &format!("material-relation:{identity}")),
+                    global_id(options, &identity),
                     reference(owner),
                     omitted(),
                     omitted(),
                     StepValue::List(products.into_iter().map(reference).collect()),
-                    reference(layer_set),
+                    reference(entity),
                 ],
             );
         }
     }
+}
+
+/// Every face of `element`'s own geometry - one body's, or every member's of
+/// an assembly - or `None` where it carries no boundary representation at
+/// all.
+fn element_faces(element: &BimElement) -> Option<Vec<&BimBrepFace>> {
+    Some(match &element.geometry {
+        Some(BimGeometry::Brep(brep)) => brep.faces.iter().collect(),
+        Some(BimGeometry::Assembly(parts)) => parts.iter().flat_map(|brep| &brep.faces).collect(),
+        _ => return None,
+    })
+}
+
+/// The identity `material_entity` would key its cache by, computed without
+/// touching the file - so a caller can tell whether several materials agree
+/// *before* committing any of them to an entity. `None` where the material
+/// carries no name: `IfcMaterial.Name` is not an optional attribute, and a
+/// name this file could not resolve - the `MaterialElem` a face names is not
+/// among the elements this file recovered - is not one to invent.
+fn material_identity(material: &BimMaterial) -> Option<String> {
+    let name = material.name.as_deref()?;
+    Some(material.id.as_ref().map_or_else(
+        || format!("name:{name}"),
+        |id| format!("id:{}", external_id(id)),
+    ))
+}
+
+/// `IfcMaterial` for `material`, written the first time this identity is
+/// seen and cached in `materials` thereafter, with the identity string
+/// returned alongside so a caller can key its own table by it.
+fn material_entity(
+    file: &mut StepFile,
+    materials: &mut BTreeMap<String, EntityRef>,
+    material: &BimMaterial,
+) -> Option<(String, EntityRef)> {
+    let name = material.name.as_deref()?;
+    let identity = material_identity(material)?;
+    let entity = *materials
+        .entry(identity.clone())
+        .or_insert_with(|| file.push("IFCMATERIAL", vec![string(name), omitted(), omitted()]));
+    Some((identity, entity))
 }
 
 /// One `IfcMaterialLayer`, with its `IfcMaterial` written once per material.
@@ -2658,21 +3593,14 @@ fn push_material_layer(
     {
         return None;
     }
-    let material =
-        layer.material.as_ref().and_then(|material| {
-            let name = material.name.as_deref()?;
-            let identity = material.id.as_ref().map_or_else(
-                || format!("name:{name}"),
-                |id| format!("id:{}", external_id(id)),
-            );
-            Some(*materials.entry(identity).or_insert_with(|| {
-                file.push("IFCMATERIAL", vec![string(name), omitted(), omitted()])
-            }))
-        });
+    let material = layer
+        .material
+        .as_ref()
+        .and_then(|material| material_entity(file, materials, material));
     Some(file.push(
         "IFCMATERIALLAYER",
         vec![
-            material.map_or_else(omitted, reference),
+            material.map_or_else(omitted, |(_, entity)| reference(entity)),
             lengths.value(layer.thickness.value),
             omitted(),
             omitted(),
@@ -2876,6 +3804,28 @@ fn number_value(
         Some("autodesk.unit.unit:kelvin-1.0.0") => Some("IFCTHERMODYNAMICTEMPERATUREMEASURE"),
         Some("autodesk.unit.unit:candelas-1.0.0") => Some("IFCLUMINOUSINTENSITYMEASURE"),
         Some("autodesk.unit.unit:general-1.0.1") => Some("IFCREAL"),
+        // Derived quantities, in the SI units `push_derived_units` declares.
+        // A spec whose storage unit is not SI is deliberately absent: the
+        // catalogue converts an internal value into its spec's storage unit
+        // and no further, and Revit stores a heat transfer coefficient in
+        // British thermal units. Writing that as an SI measure would restate
+        // it as a number it is not, so it keeps the marked label below.
+        Some("autodesk.unit.unit:kilogramsPerMeter-1.0.1") => Some("IFCMASSPERLENGTHMEASURE"),
+        Some("autodesk.unit.unit:kilogramsPerCubicMeter-1.0.1") => Some("IFCMASSDENSITYMEASURE"),
+        Some("autodesk.unit.unit:kilogramsPerSquareMeter-1.0.1") => Some("IFCAREADENSITYMEASURE"),
+        Some("autodesk.unit.unit:squareMeterKelvinsPerWatt-1.0.1") => {
+            Some("IFCTHERMALRESISTANCEMEASURE")
+        }
+        Some("autodesk.unit.unit:metersToTheFourthPower-1.0.1") => {
+            Some("IFCMOMENTOFINERTIAMEASURE")
+        }
+        // Revit's currency spec carries no dimension and no currency name, and
+        // neither does `IfcMonetaryMeasure` without an `IfcMonetaryUnit` to
+        // name one. AR S1's author declared five project parameters with it -
+        // `SP_этаж`, `SP_подъезд`, `SP_квартира` and two more, 16 006 values
+        // on exported products - and a reader of those wants the number the
+        // file states, not a label that has to be parsed back into one.
+        Some("autodesk.unit.unit:currency-1.0.0") => Some("IFCMONETARYMEASURE"),
         _ => None,
     };
     if let Some(measure) = measure {
@@ -3006,7 +3956,16 @@ mod tests {
             project_name: "Test Project".to_owned(),
             site_name: "Site".to_owned(),
             building_name: "Building".to_owned(),
-            settings: ExportSettings::default(),
+            settings: {
+                // These fixtures are about the spatial tree, the units and
+                // the property sets, and most of their elements carry no
+                // body at all. The rule that holds such an element back is
+                // tested where it belongs - see the tests named for it -
+                // rather than by silently emptying every other fixture.
+                let mut settings = ExportSettings::default();
+                settings.elements_without_a_body = true;
+                settings
+            },
         }
     }
 
@@ -3023,6 +3982,7 @@ mod tests {
         let level_id = BimElementId("100".to_owned());
         BimModel {
             source: None,
+            project: None,
             documents: Vec::new(),
             levels: vec![BimLevel {
                 id: level_id.clone(),
@@ -3046,6 +4006,7 @@ mod tests {
                 level_id: Some(level_id),
                 type_id: None,
                 type_name: None,
+                host_id: None,
                 placement: None,
                 geometry: None,
                 properties: vec![BimProperty {
@@ -3079,6 +4040,7 @@ mod tests {
             level_id: Some(BimElementId("100".to_owned())),
             type_id: None,
             type_name: None,
+            host_id: None,
             placement: None,
             geometry: None,
             properties: Vec::new(),
@@ -3149,6 +4111,102 @@ mod tests {
         }
     }
 
+    /// A door names its host wall's id in `host_id`; this writes an
+    /// `IfcOpeningElement` for it, voids the wall with it and fills it with
+    /// the door - the three relationships a clash check reads a doorway from.
+    #[test]
+    fn writes_an_opening_that_voids_the_host_and_is_filled_by_the_element() {
+        let mut model = model();
+        let mut wall = element("10", "SWall", "OST_Walls");
+        wall.element_type = BimElementType::Wall;
+        let mut door = element("11", "FamilyInstance", "OST_Doors");
+        door.element_type = BimElementType::Door;
+        door.host_id = Some(BimElementId("10".to_owned()));
+        model.elements = vec![wall, door];
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(text.matches("=IFCOPENINGELEMENT(").count(), 1);
+        assert_eq!(text.matches("=IFCRELVOIDSELEMENT(").count(), 1);
+        assert_eq!(text.matches("=IFCRELFILLSELEMENT(").count(), 1);
+
+        let entity_number = |needle: &str| -> &str {
+            text.lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle}"))
+                .split('=')
+                .next()
+                .unwrap()
+        };
+        let wall_entity = entity_number("=IFCWALL(");
+        let door_entity = entity_number("=IFCDOOR(");
+        let opening_entity = entity_number("=IFCOPENINGELEMENT(");
+        let voids = text
+            .lines()
+            .find(|line| line.contains("=IFCRELVOIDSELEMENT("))
+            .unwrap();
+        let fills = text
+            .lines()
+            .find(|line| line.contains("=IFCRELFILLSELEMENT("))
+            .unwrap();
+        assert!(
+            voids.contains(&format!("{wall_entity},{opening_entity})")),
+            "{voids}"
+        );
+        assert!(
+            fills.contains(&format!("{opening_entity},{door_entity})")),
+            "{fills}"
+        );
+    }
+
+    /// A door naming a host this export held out of the file - a category the
+    /// class mapping table excludes, say - gets no opening: a void relating
+    /// nothing to a door is not a fact this export can state.
+    #[test]
+    fn an_opening_is_left_out_where_its_host_writes_no_product() {
+        let mut model = model();
+        let mut door = element("11", "FamilyInstance", "OST_Doors");
+        door.element_type = BimElementType::Door;
+        door.host_id = Some(BimElementId("missing".to_owned()));
+        model.elements = vec![door];
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(!text.contains("=IFCOPENINGELEMENT("));
+        assert!(!text.contains("=IFCRELVOIDSELEMENT("));
+        assert!(!text.contains("=IFCRELFILLSELEMENT("));
+    }
+
+    /// `--no-openings` leaves the relationships out entirely, for a caller
+    /// that does not want them.
+    #[test]
+    fn openings_can_be_left_out() {
+        let mut model = model();
+        let mut wall = element("10", "SWall", "OST_Walls");
+        wall.element_type = BimElementType::Wall;
+        let mut door = element("11", "FamilyInstance", "OST_Doors");
+        door.element_type = BimElementType::Door;
+        door.host_id = Some(BimElementId("10".to_owned()));
+        model.elements = vec![wall, door];
+        let mut options = options();
+        options.settings.openings = false;
+
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(!text.contains("=IFCOPENINGELEMENT("));
+        assert!(!text.contains("=IFCRELVOIDSELEMENT("));
+        assert!(!text.contains("=IFCRELFILLSELEMENT("));
+    }
+
     #[test]
     fn writes_one_layer_set_per_build_up_and_relates_every_product_to_it() {
         let mut model = model();
@@ -3204,6 +4262,104 @@ mod tests {
         assert!(!text.contains("=IFCRELASSOCIATESMATERIAL("));
     }
 
+    fn face_material(id: &str, name: &str) -> BimMaterial {
+        BimMaterial {
+            id: Some(BimExternalId {
+                system: "autodesk.revit.elementId".to_owned(),
+                value: id.to_owned(),
+            }),
+            name: Some(name.to_owned()),
+        }
+    }
+
+    /// A door or a window carries no build-up, so `associate` above never
+    /// reaches it - but its own faces agree on one material, and that alone
+    /// is a fact this export can state: one `IfcMaterial`, related straight
+    /// to the product rather than through a layer set nothing here read.
+    #[test]
+    fn writes_a_single_material_where_every_face_of_a_bodyless_product_agrees() {
+        let mut model = model();
+        let mut door = element("10", "FamilyInstance", "OST_Doors");
+        door.element_type = BimElementType::Door;
+        let mut brep = box_brep(true);
+        for face in &mut brep.faces {
+            face.material = Some(Box::new(face_material("42", "Glass")));
+        }
+        door.geometry = Some(BimGeometry::Brep(brep));
+        model.elements.push(door);
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(text.matches("=IFCMATERIAL(").count(), 1);
+        assert!(text.contains("=IFCMATERIAL('Glass',$,$)"), "{text}");
+        assert_eq!(text.matches("=IFCRELASSOCIATESMATERIAL(").count(), 1);
+        assert!(!text.contains("=IFCMATERIALLAYERSET("));
+        let relation = text
+            .lines()
+            .find(|line| line.contains("=IFCRELASSOCIATESMATERIAL("))
+            .unwrap();
+        // Product and material: two references, not the three a layer set's
+        // relation carries an extra one of.
+        assert_eq!(relation.matches('#').count(), 4, "{relation}");
+    }
+
+    /// A product whose faces name two different materials is a real
+    /// multi-material body this export does not yet state - not a hint to
+    /// guess one of the two and call it the product's material.
+    #[test]
+    fn writes_no_material_where_a_bodyless_products_faces_disagree() {
+        let mut model = model();
+        let mut door = element("10", "FamilyInstance", "OST_Doors");
+        door.element_type = BimElementType::Door;
+        let mut brep = box_brep(true);
+        brep.faces[0].material = Some(Box::new(face_material("42", "Glass")));
+        brep.faces[1].material = Some(Box::new(face_material("43", "Aluminium")));
+        door.geometry = Some(BimGeometry::Brep(brep));
+        model.elements.push(door);
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(!text.contains("=IFCMATERIAL("));
+        assert!(!text.contains("=IFCRELASSOCIATESMATERIAL("));
+    }
+
+    /// An element with its own layered build-up states that, not its faces'
+    /// materials: a wall's own layer set is already the more complete
+    /// statement, and a face material beside it would either repeat it or
+    /// contradict it for no reason this export can tell apart.
+    #[test]
+    fn a_products_own_layers_are_preferred_over_its_faces_material() {
+        let mut model = model();
+        let mut wall = element("10", "SWall", "OST_Walls");
+        wall.element_type = BimElementType::Wall;
+        wall.material_layers = Some(BimMaterialLayerSet {
+            source_type_id: None,
+            name: Some("Wall 200".to_owned()),
+            layers: vec![layer("1", 0.2)],
+        });
+        let mut brep = box_brep(true);
+        for face in &mut brep.faces {
+            face.material = Some(Box::new(face_material("42", "Glass")));
+        }
+        wall.geometry = Some(BimGeometry::Brep(brep));
+        model.elements.push(wall);
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(text.matches("=IFCMATERIALLAYERSET(").count(), 1);
+        assert_eq!(text.matches("=IFCRELASSOCIATESMATERIAL(").count(), 1);
+        assert!(!text.contains("'Glass'"), "{text}");
+    }
+
     #[test]
     fn writes_the_metadata_spatial_tree_proxy_and_property() {
         let file = metadata_ifc(&model(), &options()).unwrap();
@@ -3226,6 +4382,75 @@ mod tests {
         assert!(text.contains("=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)"));
         assert!(text.contains("=IFCOWNERHISTORY(#3,#4,$,.ADDED.,1788506400,#3,#4,1788506400)"));
         assert!(text.contains("'\\X2\\042D04420430043600200031\\X0\\'"));
+    }
+
+    /// A number whose spec is a derived quantity is written as that quantity's
+    /// own measure, in the SI unit the assignment declares for it. It used to
+    /// leave as a label with the unit's name in brackets, which a reader has
+    /// to parse back into a number before it can be compared with anything.
+    ///
+    /// The currency spec goes the same way. AR S1's author declared five
+    /// project parameters with it - a storey number among them - and what a
+    /// reader of those wants is the number the file states.
+    #[test]
+    fn a_derived_quantity_is_written_as_its_own_measure() {
+        let mut model = model();
+        for (name, value, unit, unit_name) in [
+            (
+                "SP_этаж",
+                8.0,
+                "autodesk.unit.unit:currency-1.0.0",
+                "Currency",
+            ),
+            (
+                "Mass per Unit Length",
+                12.5,
+                "autodesk.unit.unit:kilogramsPerMeter-1.0.1",
+                "Kilograms per meter",
+            ),
+            (
+                "Thermal Resistance (R)",
+                1.25,
+                "autodesk.unit.unit:squareMeterKelvinsPerWatt-1.0.1",
+                "Square meter kelvins per watt",
+            ),
+            (
+                // Revit stores this one in British thermal units, so the
+                // catalogue converts it no further and it stays marked.
+                "Heat Transfer Coefficient (U)",
+                0.5,
+                "autodesk.unit.unit:britishThermalUnitsPerHourSquareFootDegreeFahrenheit-1.0.1",
+                "BTU per hour square foot degree Fahrenheit",
+            ),
+        ] {
+            model.elements[0].properties.push(BimProperty {
+                id: None,
+                name: name.to_owned(),
+                specification: None,
+                value: BimPropertyValue::Number(BimNumber {
+                    value,
+                    unit: Some(BimUnit::new(unit, unit_name)),
+                }),
+            });
+        }
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("IFCMONETARYMEASURE(8.)"), "currency");
+        assert!(text.contains("IFCMASSPERLENGTHMEASURE(12.5)"));
+        assert!(text.contains("IFCTHERMALRESISTANCEMEASURE(1.25)"));
+        // The unit each of those is read in, declared once in the assignment.
+        assert!(text.contains("=IFCDERIVEDUNIT((#") && text.contains(".MASSPERLENGTHUNIT.,$)"));
+        assert!(text.contains(".THERMALRESISTANCEUNIT.,$)"));
+        assert!(text.contains("=IFCDERIVEDUNITELEMENT(#"));
+        // Not converted, so not restated as a number it is not.
+        assert!(
+            text.contains("'0.5 [BTU per hour square foot degree Fahrenheit]'"),
+            "an imperial storage unit keeps its marked label"
+        );
     }
 
     /// The length unit changes the numbers and states itself; it changes
@@ -3416,6 +4641,52 @@ mod tests {
         assert_eq!(text.matches("=IFCRELDEFINESBYPROPERTIES(").count(), 3);
     }
 
+    /// A space names no family type - Revit has none to declare for a room -
+    /// but Revit's own export of AR S1 still gives every one of its 553 spaces
+    /// its own `IfcSpaceType`, never shared even between two identical rooms.
+    /// Measured against that file: it is over a third of the type-relation
+    /// count, and this export wrote none of it before this behaviour existed.
+    #[test]
+    fn gives_every_space_its_own_type_when_it_declares_none() {
+        let mut model = model();
+        let mut first = model.elements[0].clone();
+        first.element_type = BimElementType::Space;
+        first.category = None;
+        first.name = Some("101".to_owned());
+        first.long_name = Some("Office".to_owned());
+        let mut second = first.clone();
+        second.id = BimElementId("201".to_owned());
+        second.name = Some("102".to_owned());
+        second.long_name = Some("Office".to_owned());
+        model.elements = vec![first, second];
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        // Two spaces, identically named, still get two types: the room's own
+        // identity stands in for the type it has none of.
+        assert_eq!(text.matches("=IFCSPACETYPE(").count(), 2);
+        assert_eq!(text.matches("=IFCRELDEFINESBYTYPE(").count(), 2);
+        let written: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("=IFCSPACETYPE("))
+            .collect();
+        assert_eq!(written.len(), 2);
+        // Named after the room, which is what tells the two apart in a
+        // viewer - `Tag`, not `Name`, is what a shared family type would
+        // otherwise carry there.
+        assert!(
+            written.iter().all(|line| line.contains("'Office'")),
+            "{written:?}"
+        );
+        assert_ne!(
+            written[0], written[1],
+            "two rooms of the same name still write two distinct types"
+        );
+    }
+
     /// The attribute layout, measured against the IFC Revit itself exported
     /// from AR S1: nine `IfcElementType` attributes and then the entity's own.
     /// A wall type ends at `PredefinedType` for ten, a space type adds
@@ -3492,6 +4763,7 @@ mod tests {
                     edge(corners[2], corners[3]),
                     edge(corners[3], corners[0]),
                 ]],
+                material: None,
             }
         };
         let (x, y, z) = (1.0, 2.0, 3.0);
@@ -3548,6 +4820,129 @@ mod tests {
             text.contains("=IFCQUANTITYAREA('NetSurfaceArea',$,$,22.,$)"),
             "twenty-two square metres of surface"
         );
+    }
+
+    /// The rest of the quantity set, from the frame the body itself
+    /// declares: the upright face pair carrying the most area is what the
+    /// element runs across, and its length, height and side area follow.
+    ///
+    /// The fixture is one by two by three metres, so the face pair carrying
+    /// the most area is the two-by-three one; the wall therefore runs two
+    /// metres along, one across and three up.
+    #[test]
+    fn measures_the_whole_quantity_set_in_the_bodys_own_frame() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Wall;
+        model.elements[0].geometry = Some(BimGeometry::Brep(box_brep(true)));
+        let mut options = options();
+        options.settings.property_sets.base_quantities = true;
+
+        let file = metadata_ifc(&model, &options).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        for expected in [
+            "=IFCQUANTITYLENGTH('Length',$,$,2.,$)",
+            "=IFCQUANTITYLENGTH('Width',$,$,1.,$)",
+            "=IFCQUANTITYLENGTH('Height',$,$,3.,$)",
+            "=IFCQUANTITYAREA('GrossFootprintArea',$,$,2.,$)",
+            "=IFCQUANTITYAREA('NetFootprintArea',$,$,2.,$)",
+            "=IFCQUANTITYAREA('NetSideArea',$,$,6.,$)",
+            // Nothing was cut out of this body, so its gross side is its net
+            // side and the gross one can be stated.
+            "=IFCQUANTITYAREA('GrossSideArea',$,$,6.,$)",
+            "=IFCQUANTITYVOLUME('NetVolume',$,$,6.,$)",
+            "=IFCQUANTITYVOLUME('GrossVolume',$,$,6.,$)",
+        ] {
+            assert!(text.contains(expected), "{expected} is missing from {text}");
+        }
+    }
+
+    /// Two elements carrying the same body write that body once and reach it
+    /// through a map apiece; two elements carrying different bodies write
+    /// both. The placement stays the element's own, so the shared body stands
+    /// where each element does.
+    #[test]
+    fn one_body_is_written_once_and_placed_by_every_element_that_has_it() {
+        let mut model = model();
+        let mut second = model.elements[0].clone();
+        second.id = BimElementId("201".to_owned());
+        second.name = Some("Wall 2".to_owned());
+        model.elements.push(second);
+        for element in &mut model.elements {
+            element.geometry = Some(BimGeometry::Brep(box_brep(true)));
+        }
+
+        let (file, report) = metadata_ifc_reported(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(report.mapped_bodies, 1, "the second element maps the first");
+        // The box is recognised as the prism it is, so the shared body is
+        // one swept solid rather than one boundary representation.
+        assert_eq!(text.matches("=IFCEXTRUDEDAREASOLID(").count(), 1);
+        assert_eq!(text.matches("=IFCREPRESENTATIONMAP(").count(), 1);
+        assert_eq!(text.matches("=IFCMAPPEDITEM(").count(), 2);
+        assert_eq!(text.matches("'MappedRepresentation'").count(), 2);
+        // Each element still carries its own placement and its own product.
+        assert_eq!(text.matches("=IFCPRODUCTDEFINITIONSHAPE(").count(), 2);
+
+        // A body of its own is a map of its own.
+        model.elements[1].geometry = Some(BimGeometry::Brep(box_brep(false)));
+        let (file, report) = metadata_ifc_reported(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(report.mapped_bodies, 0);
+        assert_eq!(text.matches("=IFCREPRESENTATIONMAP(").count(), 2);
+    }
+
+    /// An element this export carries no body for is not written at all, and
+    /// the report says how many were held back. A space is exempt: a room is
+    /// a product whether or not a body was read for it.
+    #[test]
+    fn an_element_with_no_body_is_left_out_and_counted() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Wall;
+        model.elements[0].geometry = None;
+        let mut settled = options();
+        settled.settings.elements_without_a_body = false;
+
+        let (file, report) = metadata_ifc_reported(&model, &settled).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("=IFCWALL("));
+        assert_eq!(report.bodiless_elements, 1);
+
+        // A box is what is known about where the element is, not what it is.
+        model.elements[0].geometry = Some(BimGeometry::BoundingBox(BimBoundingBox {
+            min: metres_point([0.0, 0.0, 0.0]),
+            max: metres_point([1.0, 2.0, 3.0]),
+        }));
+        let (file, report) = metadata_ifc_reported(&model, &settled).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        assert!(!String::from_utf8(bytes).unwrap().contains("=IFCWALL("));
+        assert_eq!(report.bodiless_elements, 1);
+
+        // Asked for, it is written as it was before.
+        model.elements[0].geometry = None;
+        let (file, report) = metadata_ifc_reported(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        assert!(String::from_utf8(bytes).unwrap().contains("=IFCWALL("));
+        assert_eq!(report.bodiless_elements, 0);
+
+        // And a room with no body is still a room.
+        model.elements[0].element_type = BimElementType::Space;
+        let (file, report) = metadata_ifc_reported(&model, &settled).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        assert!(String::from_utf8(bytes).unwrap().contains("=IFCSPACE("));
+        assert_eq!(report.bodiless_elements, 0);
     }
 
     /// `Width` is the one base quantity the source states rather than one
@@ -3623,7 +5018,9 @@ mod tests {
 
         // And with the switch off, nothing is measured at all.
         model.elements[0].geometry = Some(BimGeometry::Brep(box_brep(true)));
-        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut unmeasuring = options();
+        unmeasuring.settings.property_sets.base_quantities = false;
+        let file = metadata_ifc(&model, &unmeasuring).unwrap();
         let mut bytes = Vec::new();
         file.write_to(&mut bytes).unwrap();
         let text = String::from_utf8(bytes).unwrap();
@@ -4163,7 +5560,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_verified_local_extents_as_a_box_not_a_body() {
+    fn writes_verified_extents_as_a_box_not_a_body() {
         let mut model = model();
         model.elements[0].element_type = BimElementType::SanitaryTerminal;
         model.elements[0].placement = Some(BimPlacement {
@@ -4174,16 +5571,11 @@ mod tests {
             reference_direction: [1.0, 0.0, 0.0],
             axis: [0.0, 0.0, 1.0],
         });
-        let metres = BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters");
+        // The box is carried in the model's project coordinates, like every
+        // other geometry, and comes out in the product's own frame.
         model.elements[0].geometry = Some(BimGeometry::BoundingBox(BimBoundingBox {
-            min: BimPoint3 {
-                coordinates: [-0.1, -0.2, -0.3],
-                unit: metres.clone(),
-            },
-            max: BimPoint3 {
-                coordinates: [0.1, 0.2, 0.3],
-                unit: metres,
-            },
+            min: metres_point([9.9, 19.8, 29.7]),
+            max: metres_point([10.1, 20.2, 30.3]),
         }));
 
         let file = metadata_ifc(&model, &options()).unwrap();
@@ -4196,6 +5588,29 @@ mod tests {
         assert!(!text.contains("'Body'"));
         assert!(text.contains("(-0.1,-0.2,-0.3)"));
         assert!(text.contains(",0.2,0.4,0.6)"));
+    }
+
+    #[test]
+    fn a_box_takes_its_storey_elevation_off_once() {
+        // An element with no placement of its own hangs off the storey, whose
+        // own placement carries the elevation. A box corner that still holds
+        // that elevation is the elevation twice, which is what put AR S1's
+        // slabs, roof and curtain walls at twice their height.
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Slab;
+        model.elements[0].placement = None;
+        model.elements[0].geometry = Some(BimGeometry::BoundingBox(BimBoundingBox {
+            min: metres_point([1.0, 2.0, 3.048]),
+            max: metres_point([1.2, 2.4, 3.148]),
+        }));
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("=IFCBOUNDINGBOX("));
+        assert!(text.contains("(1.,2.,0.)"));
+        assert!(!text.contains("(1.,2.,3.048)"));
     }
 
     fn metres_point(coordinates: [f64; 3]) -> BimPoint3 {
@@ -4219,14 +5634,14 @@ mod tests {
         let arc = BimBrepEdge {
             start: metres_point([2.0, 0.0, 3.048]),
             end: metres_point([0.0, 2.0, 3.048]),
-            curve: BimBrepCurve::Arc(bim_core::BimBrepArc {
+            curve: BimBrepCurve::Arc(Box::new(bim_core::BimBrepArc {
                 center: metres_point([0.0, 0.0, 3.048]),
                 x_axis: [1.0, 0.0, 0.0],
                 z_axis: [0.0, 0.0, 1.0],
                 radius: metres_number(2.0),
                 start_angle: 0.0,
                 end_angle: std::f64::consts::FRAC_PI_2,
-            }),
+            })),
         };
         let radius_a = BimBrepEdge {
             start: metres_point([0.0, 2.0, 3.048]),
@@ -4246,6 +5661,7 @@ mod tests {
                     y_axis: [0.0, 1.0, 0.0],
                 },
                 loops: vec![vec![arc, radius_a, radius_b]],
+                material: None,
             }],
             complete,
         }
@@ -4309,10 +5725,8 @@ mod tests {
     fn writes_an_assembly_of_boxes_as_sweeps_and_a_mixed_one_as_shells() {
         let mut model = model();
         model.elements[0].element_type = BimElementType::Wall;
-        model.elements[0].geometry = Some(BimGeometry::Assembly(vec![
-            box_brep(true),
-            box_brep(true),
-        ]));
+        model.elements[0].geometry =
+            Some(BimGeometry::Assembly(vec![box_brep(true), box_brep(true)]));
         let file = metadata_ifc(&model, &options()).unwrap();
         let mut bytes = Vec::new();
         file.write_to(&mut bytes).unwrap();
@@ -4367,11 +5781,11 @@ mod tests {
     #[test]
     fn writes_a_sampled_brep_edge_as_an_ifc_polyline() {
         let mut brep = quarter_disc_brep(true);
-        brep.faces[0].loops[0][0].curve = BimBrepCurve::Polyline(vec![
+        brep.faces[0].loops[0][0].curve = BimBrepCurve::Polyline(Box::new([
             metres_point([2.0, 0.0, 3.048]),
             metres_point([1.4, 1.4, 3.048]),
             metres_point([0.0, 2.0, 3.048]),
-        ]);
+        ]));
         let mut model = model();
         model.elements[0].element_type = BimElementType::SanitaryTerminal;
         model.elements[0].geometry = Some(BimGeometry::Brep(brep));
@@ -4432,13 +5846,14 @@ mod tests {
                 x_axis: [1.0, 0.0, 0.0],
                 y_axis: [0.0, 1.0, 0.0],
                 z_axis: [0.0, 0.0, 1.0],
-                profile,
+                profile: Box::new(profile),
             },
             loops: vec![vec![BimBrepEdge {
                 start: metres_point([1.0, 0.0, heights.0]),
                 end: metres_point([1.0, 0.0, heights.1]),
                 curve: BimBrepCurve::Line,
             }]],
+            material: None,
         };
         push_brep_surface(&mut file, &face, test_frame()).expect("the surface was written");
         let mut bytes = Vec::new();
@@ -4468,6 +5883,64 @@ mod tests {
         assert!(text.contains("((0.9,-0.1))"), "{text}");
         assert!(text.contains("((3.1,2.1))"), "{text}");
         // IFC4 has no conical surface at all.
+    }
+
+    #[test]
+    fn states_the_revolution_axis_in_the_surfaces_own_position() {
+        // A cone whose centre is off the element's origin and whose axis is
+        // not the element's `y`: the two conditions under which the element's
+        // coordinates and `Position`'s stop agreeing. The axis must still be
+        // `Position`'s `y` through its origin, and the profile must be two
+        // edges - see `push_revolution_axis`.
+        let mut file = StepFile::new(step_header(&options()));
+        let face = BimBrepFace {
+            surface: BimBrepSurface::Revolution {
+                center: metres_point([5.0, 6.0, 7.0]),
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+                z_axis: [0.0, 0.0, 1.0],
+                profile: Box::new(BimBrepProfile::Line {
+                    origin: metres_point([1.0, 0.0, 0.0]),
+                    direction: [1.0, 0.0, 1.0],
+                }),
+            },
+            loops: vec![vec![BimBrepEdge {
+                start: metres_point([6.0, 6.0, 7.0]),
+                end: metres_point([8.0, 6.0, 9.0]),
+                curve: BimBrepCurve::Line,
+            }]],
+            material: None,
+        };
+        push_brep_surface(&mut file, &face, test_frame()).expect("the surface was written");
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let entities = text
+            .lines()
+            .filter_map(|line| {
+                let (id, body) = line.strip_prefix('#')?.split_once('=')?;
+                Some((format!("#{id}"), body.trim_end_matches(';').to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let arguments = |body: &str, entity: &str| {
+            body.strip_prefix(entity)
+                .and_then(|rest| rest.strip_prefix('('))
+                .and_then(|rest| rest.strip_suffix(')'))
+                .map(|rest| rest.split(',').map(str::to_owned).collect::<Vec<_>>())
+        };
+        let surface = entities
+            .values()
+            .find_map(|body| arguments(body, "IFCSURFACEOFREVOLUTION"))
+            .expect("a surface of revolution");
+        let axis = arguments(&entities[&surface[2]], "IFCAXIS1PLACEMENT").expect("an axis");
+        assert_eq!(entities[&axis[0]], "IFCCARTESIANPOINT((0.,0.,0.))");
+        assert_eq!(entities[&axis[1]], "IFCDIRECTION((0.,1.,0.))");
+        // The placement carries the centre, so the axis need not.
+        assert!(text.contains("=IFCCARTESIANPOINT((5.,6.,7.))"), "{text}");
+        let profile =
+            arguments(&entities[&surface[0]], "IFCARBITRARYOPENPROFILEDEF").expect("a profile");
+        let polyline = entities[&profile[2]].clone();
+        assert_eq!(polyline.matches('#').count(), 3, "{polyline}");
     }
 
     #[test]

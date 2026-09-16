@@ -11,8 +11,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use bim_core::BimProjectIdentity;
 use bim_mesh::MeshOptions;
-use ifc_export::{LengthUnit, MetadataOptions, extrusion::SolidReport, metadata_ifc_reported, uuid_v5};
+use ifc_export::{
+    ExportSettings, LengthUnit, MetadataOptions, extrusion::SolidReport, metadata_ifc_reported,
+    uuid_v5,
+};
 // The whole semantic reconstruction moved into `rvt-import`. Glob-imported
 // because the probe commands below read the same intermediate the pipeline
 // builds, and naming each item here would be a second list to keep in step.
@@ -44,9 +48,11 @@ pub(crate) fn export_json(
     // object per element and one JSON object per stage would arrive on the
     // same stream, and a reader could not tell an element from a stage.
     if progress && output.is_none() {
-        return Err("--progress writes its stages to stdout, where the export goes \
+        return Err(
+            "--progress writes its stages to stdout, where the export goes \
                     without --output; give the export a file"
-            .into());
+                .into(),
+        );
     }
     // The two halves of a JSON export, which scale differently: reading the
     // records is the model's size, writing them is the element count.
@@ -99,6 +105,18 @@ pub(crate) fn export_json(
 /// waiting on an arc in the profile, and one refused for caps in pieces is
 /// waiting on coplanar faces being merged.
 fn report_solids(report: &SolidReport) {
+    if report.mapped_bodies > 0 {
+        println!(
+            "Bodies placed again rather than written twice: {}",
+            report.mapped_bodies
+        );
+    }
+    if report.bodiless_elements > 0 {
+        println!(
+            "Elements left out for carrying no body: {}",
+            report.bodiless_elements
+        );
+    }
     let (solids, faces) = (report.solids(), report.faces());
     if solids == 0 {
         return;
@@ -140,8 +158,11 @@ pub(crate) struct IfcSettingsArguments<'a> {
     pub(crate) no_revit_property_sets: bool,
     pub(crate) no_revit_type_property_sets: bool,
     pub(crate) no_ifc_common_property_sets: bool,
-    pub(crate) base_quantities: bool,
+    pub(crate) no_base_quantities: bool,
+    pub(crate) no_shared_bodies: bool,
+    pub(crate) elements_without_a_body: bool,
     pub(crate) no_types: bool,
+    pub(crate) no_openings: bool,
     pub(crate) class_mapping: Option<&'a Path>,
     pub(crate) write_settings: Option<&'a Path>,
 }
@@ -188,7 +209,7 @@ pub(crate) fn export_scene(
     limit: Option<usize>,
     arguments: &SceneArguments,
     progress: bool,
-    max_bytes: u64,
+    limits: SourceLimits,
 ) -> Result<(), Box<dyn Error>> {
     let output = default_output(paths, output, "rvs")?;
     let options = pack_options(arguments)?;
@@ -203,7 +224,7 @@ pub(crate) fn export_scene(
         &ReadOptions {
             include_unplaced,
             limit,
-            max_bytes,
+            limits,
             chord_tolerance: arguments.chord_tolerance_mm / 1000.0,
         },
         &mut stage,
@@ -250,6 +271,29 @@ pub(crate) fn export_scene(
     Ok(())
 }
 
+/// Fill whatever `settings.project` left unstated from the source's own
+/// project information - a settings file or a flag still wins, since a
+/// caller who names a value asked for that value. Called only after
+/// `--write-settings` has already saved the setup this run was given: that
+/// file is meant to run again on a different source, and baking in the
+/// project this run happened to read would misname the next one's.
+fn fill_project_identity(settings: &mut ExportSettings, identity: Option<&BimProjectIdentity>) {
+    let Some(identity) = identity else {
+        return;
+    };
+    let project = &mut settings.project;
+    project.name = project.name.take().or_else(|| identity.number.clone());
+    project.long_name = project.long_name.take().or_else(|| identity.name.clone());
+    project.building_name = project
+        .building_name
+        .take()
+        .or_else(|| identity.building_name.clone());
+    project.phase = project.phase.take().or_else(|| identity.phase.clone());
+    if project.address_lines.is_empty() {
+        project.address_lines.extend(identity.address.clone());
+    }
+}
+
 // The command's own arguments, one parameter each. They are the flags
 // `rivet export-ifc` declares, and grouping them into a struct here would put
 // a second shape between the parser and this function for nothing.
@@ -262,9 +306,9 @@ pub(crate) fn export_ifc(
     limit: Option<usize>,
     settings_arguments: &IfcSettingsArguments<'_>,
     progress: bool,
-    max_bytes: u64,
+    limits: SourceLimits,
 ) -> Result<(), Box<dyn Error>> {
-    let settings = settings_arguments.resolve()?;
+    let mut settings = settings_arguments.resolve()?;
     if let Some(path) = settings_arguments.write_settings {
         settings.to_json_file(path)?;
     }
@@ -282,11 +326,13 @@ pub(crate) fn export_ifc(
         &ReadOptions {
             include_unplaced,
             limit,
-            max_bytes,
+            limits,
             chord_tolerance: DEFAULT_CHORD_TOLERANCE_MM / 1000.0,
         },
         &mut stage,
     )?;
+
+    fill_project_identity(&mut settings, conversion.model.project.as_ref());
 
     let namespace = if let Some(value) = model_namespace {
         parse_uuid(value)?
@@ -556,4 +602,47 @@ pub(crate) fn civil_date_from_days(days: i64) -> (i64, i64, i64) {
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
     (year, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The decoded project's own identity fills in an unset field; an
+    /// explicit setting - what a `--settings` file or the default already
+    /// gave `name` here - is never overwritten by it.
+    #[test]
+    fn decoded_identity_fills_only_what_settings_left_unstated() {
+        let mut settings = ExportSettings::default();
+        settings.project.name = Some("Explicit Name".to_owned());
+        let identity = BimProjectIdentity {
+            number: Some("PN-1".to_owned()),
+            name: Some("Decoded Long Name".to_owned()),
+            building_name: Some("Building A".to_owned()),
+            address: Some("221B Baker Street".to_owned()),
+            phase: Some("Design".to_owned()),
+        };
+        fill_project_identity(&mut settings, Some(&identity));
+
+        assert_eq!(settings.project.name.as_deref(), Some("Explicit Name"));
+        assert_eq!(
+            settings.project.long_name.as_deref(),
+            Some("Decoded Long Name")
+        );
+        assert_eq!(
+            settings.project.building_name.as_deref(),
+            Some("Building A")
+        );
+        assert_eq!(settings.project.phase.as_deref(), Some("Design"));
+        assert_eq!(settings.project.address_lines, ["221B Baker Street"]);
+    }
+
+    /// No decoded identity at all - an IFC source, or an RVT with no
+    /// `ProjectInfo` record - leaves every setting exactly as it was.
+    #[test]
+    fn no_decoded_identity_leaves_settings_untouched() {
+        let mut settings = ExportSettings::default();
+        fill_project_identity(&mut settings, None);
+        assert_eq!(settings, ExportSettings::default());
+    }
 }

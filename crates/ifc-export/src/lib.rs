@@ -9,6 +9,7 @@ mod class_mapping;
 pub mod extrusion;
 mod ifc4_entities;
 mod metadata;
+mod quantities;
 mod settings;
 
 pub use class_mapping::{ClassMapping, ClassMappingError, Mapped};
@@ -150,6 +151,11 @@ const SHARED_BY_VALUE: &[&str] = &[
     "IFCAXIS2PLACEMENT2D",
     "IFCAXIS2PLACEMENT3D",
     "IFCCARTESIANPOINT",
+    // The identity, which every mapped body is placed by: the element's own
+    // placement is what stands it where it stands, so the operator states
+    // nothing but where the body's own origin is. One per file rather than
+    // one per element that carries a body.
+    "IFCCARTESIANTRANSFORMATIONOPERATOR3D",
     "IFCCIRCLE",
     "IFCCYLINDRICALSURFACE",
     "IFCDIRECTION",

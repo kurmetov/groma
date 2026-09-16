@@ -31,6 +31,9 @@ use upload::{DEFAULT_MAX_UPLOAD_BYTES, Job, Uploads};
 
 /// The viewer page, embedded so the binary needs nothing beside it.
 const VIEWER_HTML: &str = include_str!("../../../web/viewer.html");
+/// The React shell and Anime.js motion layer are bundled separately so the
+/// WebGL reader can stay a small, dependency-free inline program.
+const VIEWER_UI_JS: &str = include_str!("../../../web/viewer-ui.js");
 
 /// Page size a request gets when it asks for none.
 const DEFAULT_LIMIT: usize = 50;
@@ -450,6 +453,32 @@ fn format_label(formats: &[upload::Format]) -> String {
     }
 }
 
+/// Attach the user's single confirmation to every process it starts. The
+/// values are presentation metadata only; paths and process arguments never
+/// use them.
+fn describe_batch(job: &mut Job, id: &str, params: &BTreeMap<String, String>, target: &str) {
+    let clean = |key: &str, fallback: &str| {
+        params
+            .get(key)
+            .map(|value| value.chars().take(160).collect::<String>())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| fallback.to_owned())
+    };
+    job.batch = Some(clean("batch", id));
+    job.batch_label = Some(clean("batch-label", "Conversion"));
+    job.batch_index = params
+        .get("batch-index")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    job.batch_total = params
+        .get("batch-total")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 1_000);
+    job.target = Some(target.to_owned());
+}
+
 /// Receive a model - or a federation of them - and start converting it to a
 /// scene.
 fn serve_upload(
@@ -518,6 +547,7 @@ fn serve_upload(
     } = received;
     let label = format_label(&formats);
     if let Ok(mut held) = job.lock() {
+        describe_batch(&mut held, &id, params, "scene");
         held.source = Some(set.clone().unwrap_or_else(|| name.to_owned()));
         held.format = Some(label.clone());
         held.bytes = bytes;
@@ -541,6 +571,12 @@ fn serve_upload(
         let _guard = running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if job_cancelled(&job) {
+            if let Some(set) = &set {
+                uploads.discard_set(set);
+            }
+            return;
+        }
         match uploads.convert(&sources, &stem, &formats) {
             Ok(child) => upload::follow(
                 child,
@@ -551,8 +587,10 @@ fn serve_upload(
             ),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
-                    held.state = upload::JobState::Failed;
-                    held.error = Some(format!("the converter could not be started: {failure}"));
+                    if !held.is_cancelled() {
+                        held.state = upload::JobState::Failed;
+                        held.error = Some(format!("the converter could not be started: {failure}"));
+                    }
                 }
             }
         }
@@ -612,6 +650,7 @@ fn serve_export_ifc(
         bytes,
     } = received;
     if let Ok(mut held) = job.lock() {
+        describe_batch(&mut held, &id, params, "ifc");
         held.source = Some(set.clone().unwrap_or_else(|| name.to_owned()));
         held.format = Some(format_label(&formats));
         held.bytes = bytes;
@@ -630,6 +669,12 @@ fn serve_export_ifc(
         let _guard = running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if job_cancelled(&job) {
+            if let Some(set) = &set {
+                uploads.discard_set(set);
+            }
+            return;
+        }
         match uploads.export_ifc(&sources, &stem, &settings) {
             Ok(child) => upload::follow(
                 child,
@@ -640,8 +685,10 @@ fn serve_export_ifc(
             ),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
-                    held.state = upload::JobState::Failed;
-                    held.error = Some(format!("the exporter could not be started: {failure}"));
+                    if !held.is_cancelled() {
+                        held.state = upload::JobState::Failed;
+                        held.error = Some(format!("the exporter could not be started: {failure}"));
+                    }
                 }
             }
         }
@@ -722,6 +769,7 @@ fn serve_export_json(
     let job = Arc::new(Mutex::new(Job::new()));
     let source_bytes = std::fs::metadata(&source).map_or(0, |file| file.len());
     if let Ok(mut held) = job.lock() {
+        describe_batch(&mut held, &id, params, "json");
         held.source = Some(name.to_owned());
         held.format = Some(format.extension().to_owned());
         held.bytes = source_bytes;
@@ -738,6 +786,9 @@ fn serve_export_json(
         let _guard = running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if job_cancelled(&job) {
+            return;
+        }
         match uploads.export_json(&source, &stem, full) {
             Ok(child) => upload::follow(
                 child,
@@ -748,8 +799,10 @@ fn serve_export_json(
             ),
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
-                    held.state = upload::JobState::Failed;
-                    held.error = Some(format!("the exporter could not be started: {failure}"));
+                    if !held.is_cancelled() {
+                        held.state = upload::JobState::Failed;
+                        held.error = Some(format!("the exporter could not be started: {failure}"));
+                    }
                 }
             }
         }
@@ -767,6 +820,38 @@ fn job_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis());
     format!("{now:x}-{count}")
+}
+
+fn job_cancelled(job: &Arc<Mutex<Job>>) -> bool {
+    job.lock().map_or_else(
+        |held| held.into_inner().is_cancelled(),
+        |held| held.is_cancelled(),
+    )
+}
+
+fn serve_cancel_job(
+    slot: Option<&ConversionSlot>,
+    id: &str,
+    request: Request,
+) -> std::io::Result<()> {
+    let Some(job) = slot.and_then(|slot| slot.job(id)) else {
+        return request.respond(error(404, "unknown job"));
+    };
+    let (accepted, process) = job
+        .lock()
+        .map_or_else(|mut held| held.get_mut().cancel(), |mut held| held.cancel());
+    if !accepted {
+        return request.respond(error(409, "this job is no longer running"));
+    }
+    if let Some(process) = process {
+        let _ = process
+            .lock()
+            .map_or_else(|mut held| held.get_mut().kill(), |mut held| held.kill());
+    }
+    request.respond(json_response(
+        202,
+        &serde_json::json!({ "job": id, "state": "cancelled" }),
+    ))
 }
 
 /// Answer one scene request, by range where one was asked for.
@@ -906,7 +991,7 @@ fn handle(
     // The viewer and its scenes are answered before the JSON routes: a scene
     // is bytes served by range, not a document, and the page is HTML.
     match route.as_slice() {
-        [] | ["viewer"] => {
+        [] | ["files" | "convert" | "viewer"] => {
             let content_type =
                 Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
                     .expect("static header");
@@ -916,6 +1001,16 @@ fn handle(
                     // The viewer is embedded in this binary. A local server
                     // restart must publish its new UI immediately rather than
                     // leave a browser running a cached copy of the old one.
+                    .with_header(header("Cache-Control", "no-store, max-age=0")),
+            );
+        }
+        ["viewer-ui.js"] => {
+            let content_type =
+                Header::from_bytes(&b"Content-Type"[..], &b"text/javascript; charset=utf-8"[..])
+                    .expect("static header");
+            return request.respond(
+                Response::from_data(VIEWER_UI_JS)
+                    .with_header(content_type)
                     .with_header(header("Cache-Control", "no-store, max-age=0")),
             );
         }
@@ -953,6 +1048,9 @@ fn handle(
         ["jobs"] => {
             let listed = uploads.map(ConversionSlot::listing).unwrap_or_default();
             return request.respond(json_response(200, &serde_json::json!({ "jobs": listed })));
+        }
+        ["jobs", id] if request.method() == &Method::Delete => {
+            return serve_cancel_job(uploads, id, request);
         }
         ["jobs", id] => {
             let answer = uploads.and_then(|slot| slot.job(id)).map(|job| {
@@ -1003,7 +1101,7 @@ fn handle(
                     "/models/{model}/rooms",
                     "/models/{model}/levels",
                     "/models/{model}/documents",
-                    "/ (the viewer and its model library)",
+                    "/ (the workspace: /files, /convert and /viewer)",
                     "/api (this list)",
                     "/scenes",
                     "/scenes/{scene}",
@@ -1013,7 +1111,7 @@ fn handle(
                      federate several: repeat with the same set, mark the last one \
                      complete, and every file held is read as one model",
                     "POST /export-ifc?name=&set=&complete=&length-unit=&no-types=\
-                     &no-revit-property-sets=&no-revit-type-property-sets=\
+                     &no-openings=&no-revit-property-sets=&no-revit-type-property-sets=\
                      &no-ifc-common-property-sets=&base-quantities=&class-mapping=",
                     "POST /export-json?name=&full=",
                     "/exports/{name}.ifc|.jsonl",
@@ -1216,20 +1314,38 @@ mod tests {
         );
     }
 
-    /// The page is one inline script; an odd number of backticks in it means a
-    /// template literal somewhere is unterminated.
+    /// The WebGL engine remains the page's final inline script; an odd number
+    /// of backticks in it means a template literal somewhere is unterminated.
     #[test]
     fn the_viewers_template_literals_are_balanced() {
         let script = VIEWER_HTML
-            .split_once("<script")
+            .rsplit_once("<script")
             .and_then(|(_, rest)| rest.split_once('>'))
             .map(|(_, rest)| rest.split("</script>").next().unwrap_or_default())
-            .expect("the viewer has one inline script");
+            .expect("the viewer has an inline WebGL script");
         let backticks = script.matches('`').count();
         assert_eq!(
             backticks % 2,
             0,
             "the viewer's script has {backticks} backticks, which cannot pair up"
+        );
+    }
+
+    #[test]
+    fn the_react_shell_loads_before_the_webgl_engine() {
+        let bundle = VIEWER_HTML
+            .find("<script src=\"viewer-ui.js\"></script>")
+            .expect("the viewer loads its React bundle");
+        let engine = VIEWER_HTML
+            .find("<script>\n\"use strict\";")
+            .expect("the viewer keeps its WebGL engine inline");
+        assert!(
+            bundle < engine,
+            "React must mount the controls before the engine reads them"
+        );
+        assert!(
+            VIEWER_UI_JS.len() > 100_000,
+            "the embedded UI bundle is unexpectedly empty"
         );
     }
 
@@ -1242,6 +1358,24 @@ mod tests {
         assert_eq!(segments, ["models", "AR_S1", "elements"]);
         assert_eq!(params["level"], "01 Этаж");
         assert_eq!(params["limit"], "5");
+    }
+
+    #[test]
+    fn keeps_jobs_from_one_confirmation_in_one_batch() {
+        let mut job = Job::new();
+        let params = BTreeMap::from([
+            ("batch".to_owned(), "batch-42".to_owned()),
+            ("batch-label".to_owned(), "4 files".to_owned()),
+            ("batch-index".to_owned(), "3".to_owned()),
+            ("batch-total".to_owned(), "4".to_owned()),
+        ]);
+        describe_batch(&mut job, "fallback", &params, "ifc");
+        let json = job.to_json();
+        assert_eq!(json["batch"], "batch-42");
+        assert_eq!(json["batchLabel"], "4 files");
+        assert_eq!(json["batchIndex"], 3);
+        assert_eq!(json["batchTotal"], 4);
+        assert_eq!(json["target"], "ifc");
     }
 
     #[test]
