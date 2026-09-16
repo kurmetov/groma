@@ -712,6 +712,7 @@ impl ElementTables {
                 .shared_bodies
                 .then_some(&mut self.bodies),
             report,
+            used_map: None,
         };
         let written = if spatial {
             push_space(
@@ -734,6 +735,7 @@ impl ElementTables {
             )
         };
         let entity = written.entity;
+        let body_map = writer.used_map;
         track_product(
             &mut self.products_by_id,
             &mut self.openings,
@@ -755,7 +757,7 @@ impl ElementTables {
         let type_carries_properties = context.options.settings.types
             && self
                 .types
-                .associate(file, element, entity, written_as.name, context);
+                .associate(file, element, entity, written_as.name, body_map, context);
         push_property_set(file, element, entity, context, type_carries_properties);
         if context.options.settings.property_sets.ifc_common {
             self.common_sets
@@ -1222,8 +1224,18 @@ fn type_entity_for(entity: &str) -> Option<(&'static str, &'static [Ifc4Entity])
 /// type, and writing them on each of thousands of products repeats them
 /// thousands of times.
 struct TypeEntry {
-    entity: EntityRef,
+    table: &'static [Ifc4Entity],
+    identity: String,
+    name: Option<String>,
+    type_id: String,
+    properties: Option<EntityRef>,
     products: Vec<EntityRef>,
+    /// The `IfcRepresentationMap`s the type's own products were written
+    /// through, in the order first seen. A type is written once its whole
+    /// loop is done - see [`TypeLibrary::push_relations`] - so this is filled
+    /// in as each product is associated and only read once every element has
+    /// been visited.
+    body_maps: Vec<EntityRef>,
     /// Whether the type was written holding its own parameters.
     carries_properties: bool,
 }
@@ -1247,6 +1259,7 @@ impl TypeLibrary {
         element: &BimElement,
         product: EntityRef,
         product_entity: &str,
+        body_map: Option<EntityRef>,
         context: WriteContext<'_>,
     ) -> bool {
         // A space names no family type - Revit has none to declare - but
@@ -1287,27 +1300,30 @@ impl TypeLibrary {
                         )
                     })
                     .flatten();
-                let mut attributes = vec![
-                    global_id(context.options, &identity),
-                    reference(context.owner),
-                    optional_string(element.type_name.as_deref().or(synthetic_name)),
-                    omitted(),
-                    omitted(),
-                    properties.map_or_else(omitted, |pset| StepValue::List(vec![reference(pset)])),
-                    omitted(),
-                    string(&type_id.0),
-                    omitted(),
-                ];
-                attributes.extend(declared_attributes(table, entity));
-                let written = file.push(entity, attributes);
                 entry.insert(TypeEntry {
-                    entity: written,
+                    table,
+                    identity,
+                    name: element
+                        .type_name
+                        .clone()
+                        .or_else(|| synthetic_name.map(str::to_owned)),
+                    type_id: type_id.0.clone(),
+                    properties,
                     products: Vec::new(),
+                    body_maps: Vec::new(),
                     carries_properties: properties.is_some(),
                 })
             }
         };
         entry.products.push(product);
+        // The same body fingerprints to the same map every time - see
+        // `FINGERPRINT_GRID` - so a type only ever collects a second map here
+        // when its instances genuinely disagree on their body.
+        if let Some(map) = body_map {
+            if !entry.body_maps.contains(&map) {
+                entry.body_maps.push(map);
+            }
+        }
         // Type parameters are read from the type record, so every element of
         // one carries the same ones and the set on the type states them all.
         // An element whose parameters are *not* on the type says so, and
@@ -1315,12 +1331,34 @@ impl TypeLibrary {
         entry.carries_properties || element.type_properties.is_empty()
     }
 
-    /// One `IfcRelDefinesByType` per type.
+    /// The type entity itself, held back until now because
+    /// `RepresentationMaps` is only complete once every product of the type
+    /// has been visited - see [`TypeEntry::body_maps`] - followed by one
+    /// `IfcRelDefinesByType` relating every product to it.
     fn push_relations(self, file: &mut StepFile, context: WriteContext<'_>) {
         for ((type_id, entity), entry) in self.types {
             if entry.products.is_empty() {
                 continue;
             }
+            let mut attributes = vec![
+                global_id(context.options, &entry.identity),
+                reference(context.owner),
+                optional_string(entry.name.as_deref()),
+                omitted(),
+                omitted(),
+                entry
+                    .properties
+                    .map_or_else(omitted, |pset| StepValue::List(vec![reference(pset)])),
+                if entry.body_maps.is_empty() {
+                    omitted()
+                } else {
+                    StepValue::List(entry.body_maps.iter().copied().map(reference).collect())
+                },
+                string(&entry.type_id),
+                omitted(),
+            ];
+            attributes.extend(declared_attributes(entry.table, entity));
+            let written = file.push(entity, attributes);
             file.push(
                 "IFCRELDEFINESBYTYPE",
                 vec![
@@ -1332,7 +1370,7 @@ impl TypeLibrary {
                     omitted(),
                     omitted(),
                     StepValue::List(entry.products.into_iter().map(reference).collect()),
-                    reference(entry.entity),
+                    reference(written),
                 ],
             );
         }
@@ -1753,6 +1791,13 @@ struct BodyWriter<'a> {
     /// `None` where the setup asks for every element to carry its own body.
     maps: Option<&'a mut HashMap<u64, EntityRef>>,
     report: &'a mut SolidReport,
+    /// The `IfcRepresentationMap` the body just written was reached through,
+    /// new or reused - read back by the caller once geometry has been
+    /// written, so the element's type can list it under
+    /// `IfcTypeProduct.RepresentationMaps`. `None` where the element wrote no
+    /// mapped body: bodies are not shared, or the geometry is not a body at
+    /// all (a bounding box, an axis line, a swept disk).
+    used_map: Option<EntityRef>,
 }
 
 /// One body's shape representation, placed through a map so that the next
@@ -1798,6 +1843,7 @@ fn push_mapped_body(
             map
         }
     };
+    writer.used_map = Some(map);
     let local_origin = push_cartesian_point(file, lengths, [0.0, 0.0, 0.0]);
     let operator = file.push(
         "IFCCARTESIANTRANSFORMATIONOPERATOR3D",
@@ -4897,6 +4943,64 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(report.mapped_bodies, 0);
         assert_eq!(text.matches("=IFCREPRESENTATIONMAP(").count(), 2);
+    }
+
+    /// Two elements of one type, sharing a body, relate their type to the
+    /// `IfcRepresentationMap` behind it through `RepresentationMaps` - what
+    /// lets a reader recognise many occurrences of one family as one shared
+    /// definition, the way `IfcMappedItem` already lets it recognise one
+    /// occurrence.
+    #[test]
+    fn a_shared_body_reaches_its_type_through_representation_maps() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::Wall;
+        model.elements[0].type_id = Some(BimElementId("900".to_owned()));
+        model.elements[0].type_name = Some("Basic Wall: 200mm".to_owned());
+        model.elements[0].geometry = Some(BimGeometry::Brep(box_brep(true)));
+        let mut second = model.elements[0].clone();
+        second.id = BimElementId("201".to_owned());
+        model.elements.push(second);
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(text.matches("=IFCREPRESENTATIONMAP(").count(), 1);
+        let map_ref = text
+            .lines()
+            .find(|line| line.contains("=IFCREPRESENTATIONMAP("))
+            .and_then(|line| line.split('=').next())
+            .expect("the map's own reference")
+            .to_owned();
+
+        let written = text
+            .lines()
+            .find(|line| line.contains("=IFCWALLTYPE("))
+            .expect("the wall type");
+        assert!(
+            written.contains(&format!("({map_ref})")),
+            "RepresentationMaps should list the shared map {map_ref}: {written}"
+        );
+
+        // A type whose instances write no mapped body at all - shared bodies
+        // turned off - states no `RepresentationMaps` rather than an empty
+        // list: there is no map to point at.
+        let mut unshared = options();
+        unshared.settings.shared_bodies = false;
+        let file = metadata_ifc(&model, &unshared).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("=IFCREPRESENTATIONMAP("));
+        let written = text
+            .lines()
+            .find(|line| line.contains("=IFCWALLTYPE("))
+            .expect("the wall type");
+        // The only references left on the line are the type's own and
+        // `OwnerHistory`: no property set (the fixture states no type
+        // parameter) and no `RepresentationMaps`.
+        assert_eq!(written.matches('#').count(), 2, "{written}");
     }
 
     /// An element this export carries no body for is not written at all, and
