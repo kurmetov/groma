@@ -39,8 +39,9 @@ pub use serial::{
     FLAG_SAMPLE_WORDS, FlagWidthSample, RECORD_LENGTH_TRAILER_BYTES, SerialObject,
     SerialRecordWalk, SerialStop, SerialStreamWalk, SerialString, SerialTraceEntry, SerialWalk,
     descends_from, record_declared_id, record_declared_ids, record_name, record_name_string,
-    walk_object, walk_object_stream, walk_record, walk_record_collecting, walk_record_flag_widths,
-    walk_record_strings, walk_record_traced,
+    walk_object, walk_object_stream, walk_record, walk_record_collecting,
+    walk_record_flag_widths, walk_record_strings, walk_record_traced, walk_top_level_object,
+    walk_top_level_object_traced,
 };
 
 #[derive(Clone, Debug, Default, PartialEq)]

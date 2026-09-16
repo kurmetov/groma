@@ -154,10 +154,22 @@ impl SerialWalk {
     }
 }
 
-/// Walk `body` as an instance of `class_index`.
-#[must_use]
-pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk {
-    let mut reader = Reader {
+/// A fresh [`Reader`] over `body`, with nothing read yet.
+///
+/// `narrow_first_field` selects the one quirk that depends on what kind of
+/// body this is: a `Partitions` member record's first variable-width field is
+/// written two bytes narrower than its declared width (see
+/// [`FIRST_RECORD_IDENTIFIER_BYTES`]), but a flat top-level object - a
+/// `Global/*` stream's own payload, never opened by a record header - has no
+/// such field and every reference in it takes its full declared width from
+/// the first byte on.
+fn new_reader<'a>(
+    schema: &'a Schema,
+    body: &'a [u8],
+    narrow_first_field: bool,
+    trace: bool,
+) -> Reader<'a> {
+    Reader {
         schema,
         body,
         offset: 0,
@@ -169,8 +181,8 @@ pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk
         small_integers: Vec::new(),
         alternate_integers: Vec::new(),
         node_headers: false,
-        record_narrow_pending: true,
-        trace: None,
+        record_narrow_pending: narrow_first_field,
+        trace: trace.then(Vec::new),
         trace_properties: None,
         kept_strings: None,
         string_properties: None,
@@ -180,7 +192,13 @@ pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk
         string_distance: 0,
         node_class: 0,
         flag_samples: None,
-    };
+    }
+}
+
+/// Walk `body` as an instance of `class_index`.
+#[must_use]
+pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk {
+    let mut reader = new_reader(schema, body, true, false);
     let stop = reader.read_class(class_index, 0).err();
     let consumed = reader.offset;
     SerialWalk {
@@ -189,6 +207,45 @@ pub fn walk_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk
         references: reader.references,
         stop,
     }
+}
+
+/// Walk `body` as a flat top-level object - a `Global/*` stream's own
+/// payload - rather than a `Partitions` member record body. See
+/// [`new_reader`] for the one thing that differs from [`walk_object`].
+#[must_use]
+pub fn walk_top_level_object(schema: &Schema, class_index: u16, body: &[u8]) -> SerialWalk {
+    let mut reader = new_reader(schema, body, false, false);
+    let stop = reader.read_class(class_index, 0).err();
+    let consumed = reader.offset;
+    SerialWalk {
+        consumed,
+        remaining: body.len().saturating_sub(consumed),
+        references: reader.references,
+        stop,
+    }
+}
+
+/// Same as [`walk_top_level_object`], keeping every property read, in the
+/// order it was read, with the offset it started at - for diagnosing where a
+/// flat top-level object leaves the declared layout.
+#[must_use]
+pub fn walk_top_level_object_traced(
+    schema: &Schema,
+    class_index: u16,
+    body: &[u8],
+) -> (SerialWalk, Vec<SerialTraceEntry>) {
+    let mut reader = new_reader(schema, body, false, true);
+    let stop = reader.read_class(class_index, 0).err();
+    let consumed = reader.offset;
+    (
+        SerialWalk {
+            consumed,
+            remaining: body.len().saturating_sub(consumed),
+            references: reader.references,
+            stop,
+        },
+        reader.trace.unwrap_or_default(),
+    )
 }
 
 /// Walk `body` as an instance of `class_index` and then keep walking the
@@ -1601,6 +1658,52 @@ mod tests {
             body.extend(value.to_le_bytes());
         }
         body
+    }
+
+    /// Same shape as [`derived_body`], but `Base.m_flags` is written at its
+    /// declared four bytes throughout - what a flat top-level object (a
+    /// `Global/*` stream's own payload) writes, having no record header of
+    /// its own to narrow the first variable-width field.
+    fn top_level_body(node_count: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(7_u32.to_le_bytes()); // Base.m_tag
+        body.extend((-1_i32).to_le_bytes()); // Base.m_id, one inline Identifier
+        body.extend(0x0008_u32.to_le_bytes()); // Base.m_flags, four bytes
+        body.extend(node_count.to_le_bytes());
+        for index in 0..node_count {
+            body.extend((index + 3).to_le_bytes());
+            body.extend(2_081_u16.to_le_bytes());
+        }
+        for value in [-1.0_f64, -2.0, -3.0, 1.0, 2.0, 3.0] {
+            body.extend(value.to_le_bytes());
+        }
+        body
+    }
+
+    /// A flat top-level object has no record header to narrow its first
+    /// variable-width field, so every alternate integer - including the
+    /// first - takes its declared width. Read the same body with
+    /// [`walk_object`], which always claims the narrow reading for the first
+    /// one, and the two extra bytes it wrongly skips desync every reference
+    /// after: the node count is read two bytes into the real `m_flags` word,
+    /// which is not the real count either.
+    #[test]
+    fn a_flat_top_level_object_reads_every_alternate_integer_at_full_width() {
+        let schema = schema();
+        let body = top_level_body(2);
+
+        let top_level_walk = walk_top_level_object(&schema, FIRST_CLASS_INDEX + 2, &body);
+        assert_eq!(top_level_walk.stop, None);
+        assert!(top_level_walk.is_exact(), "{top_level_walk:?}");
+        // 12 header bytes (m_flags at its full four, two more than the narrow
+        // reading), a 4-byte count, two 6-byte references, six f64.
+        assert_eq!(top_level_walk.consumed, 12 + 4 + 12 + 48);
+
+        let record_walk = walk_object(&schema, FIRST_CLASS_INDEX + 2, &body);
+        assert_ne!(
+            record_walk.consumed, top_level_walk.consumed,
+            "the record-body reading of m_flags should desync the rest of this body"
+        );
     }
 
     #[test]
