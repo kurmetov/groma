@@ -4827,6 +4827,42 @@ fn world_brep_surface(
     })
 }
 
+/// How much extent a body needs along every axis, in metres, before it
+/// counts as enclosing a volume rather than collapsing flat.
+///
+/// Well above the noise a rigid transform leaves in a coordinate (see
+/// `FINGERPRINT_GRID` in `ifc-export` for the same order-of-magnitude
+/// argument) and well below any real product's thickness - a door leaf is
+/// tens of millimetres, not tenths.
+const MIN_VOLUME_EXTENT_METRES: f64 = 1.0e-4;
+
+/// Whether `faces` reaches real extent along all three axes, rather than
+/// collapsing flat along one of them.
+///
+/// A topological closure test - every edge two-sided, the face on the other
+/// side one this body itself owns - cannot see this: it reads no coordinate.
+/// A flat plan symbol's front and back faces, drawn at the same elevation
+/// and sharing every edge, close under that test exactly as a real solid
+/// does. This reads every point the faces carry instead.
+fn spans_a_volume(faces: &[BimBrepFace]) -> bool {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    for face in faces {
+        for loop_edges in &face.loops {
+            for edge in loop_edges {
+                for point in [&edge.start, &edge.end] {
+                    for axis in 0..3 {
+                        let value = point.coordinates[axis];
+                        min[axis] = min[axis].min(value);
+                        max[axis] = max[axis].max(value);
+                    }
+                }
+            }
+        }
+    }
+    (0..3).all(|axis| max[axis] - min[axis] > MIN_VOLUME_EXTENT_METRES)
+}
+
 #[must_use]
 fn normalize_brep(
     local: &rvt_model::SymbolBrep,
@@ -4916,25 +4952,40 @@ fn normalize_brep(
             material,
         });
     }
+    // Usually the source topology and the loops being written are two
+    // independent ways to establish closure, and either is enough. A
+    // cut-face pass can make them contradict each other, however: element
+    // 7281744's kept shell is topologically closed while its own loops
+    // leave an edge unmatched, and rebuilding the record lands a different
+    // body on the same box. Only for that measured population does the
+    // face-loop reading become mandatory. The different rebuilt body is
+    // not substituted; it is evidence against this one's closed claim.
+    // Exact, same-winding duplicate faces are omitted only when the
+    // remainder closes independently. In that case the loops actually
+    // written provide the closed-shell claim; the duplicated interior
+    // sheet is not allowed to add a spurious divergence volume. Surfaces
+    // the file declares free are omitted on the same terms, and inside the
+    // solid only: see `SymbolBrep::free_surface_face_indexes`.
+    let topologically_closed = !redundant_faces.is_empty()
+        || local.bounds_a_volume()
+        || (!requires_loop_closure && local.is_closed());
+    // Neither test above reads a coordinate: `GEdge.m_pFace` bookkeeping can
+    // report a body "closed" - every edge two-sided, on the other side a face
+    // this body itself owns - for a flat plan symbol whose front and back
+    // faces coincide at the same elevation, or for a single unbounded face
+    // the decode isolated into a body of its own. Neither encloses anything.
+    // Measured on AR S1: before this gate, splitting a symbol's several
+    // bodies (see `normalize_symbol_geometry`) turned every 2D furniture and
+    // plumbing-fixture symbol Revit's own IFC export carries none of into a
+    // "closed" body IfcOpenShell then failed or accepted as a zero-height
+    // shell - 89 more `IfcFurnishingElement` and all 339
+    // `IfcSanitaryTerminal` this file has none of in `s1_revit.ifc`. Requires
+    // a real 3D extent, not a genuine volume measurement - `ifc-export`'s own
+    // `quantities` module measures that later, from planar-and-straight
+    // bodies only, which this gate does not require.
     Some(BimBrep {
+        complete: topologically_closed && spans_a_volume(&faces),
         faces,
-        // Usually the source topology and the loops being written are two
-        // independent ways to establish closure, and either is enough. A
-        // cut-face pass can make them contradict each other, however: element
-        // 7281744's kept shell is topologically closed while its own loops
-        // leave an edge unmatched, and rebuilding the record lands a different
-        // body on the same box. Only for that measured population does the
-        // face-loop reading become mandatory. The different rebuilt body is
-        // not substituted; it is evidence against this one's closed claim.
-        // Exact, same-winding duplicate faces are omitted only when the
-        // remainder closes independently. In that case the loops actually
-        // written provide the closed-shell claim; the duplicated interior
-        // sheet is not allowed to add a spurious divergence volume. Surfaces
-        // the file declares free are omitted on the same terms, and inside the
-        // solid only: see `SymbolBrep::free_surface_face_indexes`.
-        complete: !redundant_faces.is_empty()
-            || local.bounds_a_volume()
-            || (!requires_loop_closure && local.is_closed()),
     })
 }
 
@@ -6475,6 +6526,47 @@ mod tests {
             ..ExportedElement::default()
         };
         assert!(normalize_symbol_geometry(&symbol, &IDENTITY_TRANSFORM).is_none());
+    }
+
+    /// A flat plan symbol's front and back faces, drawn at the same
+    /// elevation and sharing every edge, close under every topological
+    /// test `SymbolBrep` has - `is_closed`, and `bounds_a_volume`'s own
+    /// endpoint pairing, since each edge really is drawn by exactly two
+    /// faces - while enclosing no volume at all. Measured on AR S1: this is
+    /// exactly the shape of a "(`оборудование_2D`)" plan symbol, and splitting a
+    /// symbol's several bodies (see `normalize_symbol_geometry`) turned every
+    /// one of them into a "closed" body before `spans_a_volume` existed to
+    /// refuse it - 339 `IfcSanitaryTerminal` on AR S1 Revit's own export
+    /// carries none of.
+    #[test]
+    fn a_flat_two_sided_sandwich_does_not_span_a_volume() {
+        let front = square_body([0.0, 0.0, 0.0]);
+        let mut back = square_body([0.0, 0.0, 0.0]);
+        // The same square, wound the other way - a real back face of a
+        // zero-thickness sheet, not a second copy of the front.
+        for face in &mut back.faces {
+            face.loops[0].reverse();
+            for edge in &mut face.loops[0] {
+                std::mem::swap(&mut edge.start, &mut edge.end);
+            }
+        }
+        let sandwich = rvt_model::SymbolBrep {
+            faces: front.faces.into_iter().chain(back.faces).collect(),
+            bodies: vec![rvt_model::BrepBody {
+                node_id: 0,
+                faces: vec![0, 1],
+                edges: 8,
+                one_sided_edges: 0,
+                open_edges: 0,
+            }],
+            ..rvt_model::SymbolBrep::default()
+        };
+        let normalized = normalize_brep(&sandwich, &IDENTITY_TRANSFORM, false)
+            .expect("a readable, if degenerate, body");
+        assert!(
+            !normalized.complete,
+            "a zero-thickness sandwich should not be accepted as a closed solid"
+        );
     }
 
     #[test]
