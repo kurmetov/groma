@@ -854,6 +854,7 @@ fn material_layers(
                 .map(|material| BimMaterial {
                     id: None,
                     name: text(material.attribute(0)),
+                    color: None,
                 }),
             thickness: BimNumber {
                 value: thickness * units.length,

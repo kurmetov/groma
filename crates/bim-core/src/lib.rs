@@ -172,6 +172,19 @@ pub struct BimMaterialLayer {
 pub struct BimMaterial {
     pub id: Option<BimExternalId>,
     pub name: Option<String>,
+    /// The shading colour Revit's own *Shaded* view paints this material
+    /// with - not a photorealistic render appearance, which this does not
+    /// read. `None` where the source named no material record to read one
+    /// from, same as `name`.
+    pub color: Option<BimColor>,
+}
+
+/// An 8-bit sRGB colour, as Revit's own shading colour states it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BimColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]

@@ -36,7 +36,8 @@ pub use parameter::{
     ParameterSets, ParameterSpec, ParameterValue,
 };
 pub use serial::{
-    FLAG_SAMPLE_WORDS, FlagWidthSample, GeoSiteFields, RECORD_LENGTH_TRAILER_BYTES, SerialObject,
+    FLAG_SAMPLE_WORDS, FlagWidthSample, GeoSiteFields, MaterialColorFields,
+    RECORD_LENGTH_TRAILER_BYTES, SerialObject,
     SerialRecordWalk, SerialStop, SerialStreamWalk, SerialString, SerialTraceEntry, SerialWalk,
     descends_from, record_declared_id, record_declared_ids, record_name, record_name_string,
     walk_object, walk_object_stream, walk_record, walk_record_collecting,

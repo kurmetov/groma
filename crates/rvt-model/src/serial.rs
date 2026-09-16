@@ -792,6 +792,44 @@ impl GeoSiteFields {
     }
 }
 
+/// A `MaterialElem`'s shading colour - what Revit's own *Shaded* view paints
+/// a face with, not the photorealistic render appearance `m_appearanceAssetId`
+/// names. Verified against `s1_revit.ifc`'s own `IfcColourRgb`: two distinct
+/// materials on AR S1 match to the fifteenth decimal once each byte is
+/// divided by 255.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaterialColorFields {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl MaterialColorFields {
+    /// Read `Material.m_color` off a `MaterialElem` record body - the field
+    /// is declared on `Material`, reached through `m_pMaterial`'s reference
+    /// and walked as part of the same record's node stream, not a separate
+    /// top-level record of its own.
+    ///
+    /// `None` where the record does not tile exactly, `Material.m_color` was
+    /// not reached, or the record is shorter than the four bytes the field
+    /// declares. The fourth byte is unused - `0x00` on every sample this was
+    /// checked against - and not read.
+    #[must_use]
+    pub fn parse(schema: &Schema, class_index: u16, body: &[u8]) -> Option<Self> {
+        let (walk, trace) = walk_record_traced(schema, class_index, body);
+        walk.stop.is_none().then_some(())?;
+        let entry = trace
+            .iter()
+            .find(|entry| entry.class == "Material" && entry.property == "m_color")?;
+        let bytes = body.get(entry.offset..entry.offset + 3)?;
+        Some(Self {
+            red: bytes[0],
+            green: bytes[1],
+            blue: bytes[2],
+        })
+    }
+}
+
 /// Read `body` as a complete record: the declared properties of `class_index`,
 /// a two-byte stream prefix, one serialized node per reference in the order
 /// the references were read, and a trailing `u32` repeating the body length.
@@ -1811,6 +1849,68 @@ mod tests {
         };
         let short_body = vec![0_u8; 4];
         assert!(GeoSiteFields::parse(&schema, FIRST_CLASS_INDEX, &short_body).is_none());
+    }
+
+    fn material_elem_schema() -> Schema {
+        Schema {
+            classes: vec![
+                class(
+                    FIRST_CLASS_INDEX,
+                    "MaterialElem",
+                    TypeReference::None,
+                    vec![property("m_pMaterial", FieldType::Object, 0x01, 0, None)],
+                ),
+                class(
+                    FIRST_CLASS_INDEX + 1,
+                    "Material",
+                    TypeReference::None,
+                    vec![
+                        property("m_name", FieldType::String, 0x60, 6, None),
+                        property("m_color", FieldType::Integer32Alternate, 0x00, 0, None),
+                    ],
+                ),
+            ],
+            top_level_class_count: 2,
+            property_count: 3,
+            parsed_property_count: 3,
+            consumed_bytes: 0,
+            trailing_bytes: Vec::new(),
+            unresolved_references: Vec::new(),
+            inline_index_mismatches: Vec::new(),
+        }
+    }
+
+    /// `Material` is never its own top-level record - `MaterialElem.m_pMaterial`
+    /// names it as a reference, so its fields are read out of the *referencing*
+    /// record's own node stream, the same way [`a_record_is_its_properties_then_its_nodes_then_its_length`]
+    /// reads a `GElement` node.
+    #[test]
+    fn material_color_fields_reads_the_shading_colour_through_the_material_reference() {
+        let schema = material_elem_schema();
+        let material_class = FIRST_CLASS_INDEX + 1;
+        let mut body = Vec::new();
+        // m_pMaterial: the record's own first (and only) variable-width
+        // field, so its identifier is written narrow.
+        body.extend(5_u16.to_le_bytes());
+        body.extend(material_class.to_le_bytes());
+        // The node stream: Material.m_name (empty), then Material.m_color -
+        // not narrow, since m_pMaterial's reference already claimed that.
+        body.extend(0_u32.to_le_bytes());
+        body.extend([0xba, 0xbf, 0xc5, 0x00]);
+        let length = u32::try_from(body.len() + RECORD_LENGTH_TRAILER_BYTES).unwrap();
+        body.extend(length.to_le_bytes());
+
+        let fields = MaterialColorFields::parse(&schema, FIRST_CLASS_INDEX, &body).unwrap();
+        assert_eq!(fields.red, 0xba);
+        assert_eq!(fields.green, 0xbf);
+        assert_eq!(fields.blue, 0xc5);
+    }
+
+    #[test]
+    fn material_color_fields_refuses_a_record_the_declarations_do_not_tile() {
+        let schema = material_elem_schema();
+        let short_body = vec![0_u8; 2];
+        assert!(MaterialColorFields::parse(&schema, FIRST_CLASS_INDEX, &short_body).is_none());
     }
 
     #[test]

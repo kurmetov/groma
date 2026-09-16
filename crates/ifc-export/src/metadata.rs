@@ -760,6 +760,7 @@ impl ElementTables {
                 .then_some(&mut self.bodies),
             report,
             used_map: None,
+            written_faces: Vec::new(),
         };
         let written = if spatial {
             push_space(
@@ -783,6 +784,7 @@ impl ElementTables {
         };
         let entity = written.entity;
         let body_map = writer.used_map;
+        let written_faces = writer.written_faces;
         track_product(
             &mut self.products_by_id,
             &mut self.openings,
@@ -817,7 +819,7 @@ impl ElementTables {
             self.materials
                 .associate(file, element, entity, context.lengths);
             self.materials
-                .associate_face_material(file, element, entity);
+                .associate_face_material(file, element, entity, &written_faces);
         }
     }
 
@@ -1845,6 +1847,19 @@ struct BodyWriter<'a> {
     /// mapped body: bodies are not shared, or the geometry is not a body at
     /// all (a bounding box, an axis line, a swept disk).
     used_map: Option<EntityRef>,
+    /// The `IfcAdvancedFace`/`IfcFace` each face of the body just written
+    /// became, in the same order [`element_faces`] would read them back in -
+    /// `None` for a face that failed to write. Read back the same way as
+    /// [`Self::used_map`], to style a face whose product's faces disagree on
+    /// material - see [`MaterialLibrary::style_disagreeing_faces`].
+    ///
+    /// Left empty where the body took the swept-solid path: a recognised
+    /// prism writes no per-face entity at all, so there is nothing here to
+    /// style. Also empty for the second and later element sharing one mapped
+    /// body, since [`push_mapped_body`]'s closure - the only place this is
+    /// filled in - does not run again for them; such an element's faces keep
+    /// whatever styling the body's first writer gave them.
+    written_faces: Vec<Option<EntityRef>>,
 }
 
 /// One body's shape representation, placed through a map so that the next
@@ -2117,22 +2132,27 @@ fn push_brep_item(
     file: &mut StepFile,
     brep: &BimBrep,
     frame: GeometryFrame,
-) -> Option<(EntityRef, &'static str)> {
+) -> Option<(EntityRef, &'static str, Vec<Option<EntityRef>>)> {
     if brep.faces.is_empty() {
         return None;
     }
-    let mut faces = Vec::with_capacity(brep.faces.len());
+    // Kept in `brep.faces`' own order, `None` where a face did not write, so
+    // a caller can style a written face by the same index `element_faces`
+    // would read it back at - see `BodyWriter::written_faces`.
+    let mut written = Vec::with_capacity(brep.faces.len());
     // A face this cannot write leaves the shell open instead of discarding
     // the whole body, which is what the incomplete-shell path is for. The
     // closed-solid claim then has to account for it: a shell missing a face
     // the source does declare is not closed, however the face was lost.
     let mut wrote_every_face = true;
     for face in &brep.faces {
-        match push_advanced_face(file, face, frame) {
-            Some(written) => faces.push(written),
-            None => wrote_every_face = false,
+        let face_entity = push_advanced_face(file, face, frame);
+        if face_entity.is_none() {
+            wrote_every_face = false;
         }
+        written.push(face_entity);
     }
+    let faces: Vec<EntityRef> = written.iter().copied().flatten().collect();
     if faces.is_empty() {
         return None;
     }
@@ -2153,7 +2173,7 @@ fn push_brep_item(
             "SurfaceModel",
         )
     };
-    Some((item, representation_type))
+    Some((item, representation_type, written))
 }
 
 /// One body's shape representation: the sweep it is, where it is one, and
@@ -2173,6 +2193,7 @@ fn push_brep(
         .report
         .saw(read.as_ref().map_err(|refusal| *refusal), brep.faces.len());
     note_curves(brep, writer.report);
+    let mut written_faces = Vec::new();
     let body = push_mapped_body(
         file,
         brep_fingerprint(brep, frame),
@@ -2180,12 +2201,15 @@ fn push_brep(
         frame.lengths,
         writer,
         |file| {
-            let (item, representation_type) = match read {
-                Ok(prism) => (
+            let (item, representation_type) = if let Ok(prism) = read {
+                (
                     push_extruded_area_solid(file, &prism, frame.lengths),
                     "SweptSolid",
-                ),
-                Err(_) => push_brep_item(file, brep, frame)?,
+                )
+            } else {
+                let (item, representation_type, faces) = push_brep_item(file, brep, frame)?;
+                written_faces = faces;
+                (item, representation_type)
             };
             Some(push_body_representation(
                 file,
@@ -2195,6 +2219,7 @@ fn push_brep(
             ))
         },
     )?;
+    writer.written_faces = written_faces;
     Some(file.push(
         "IFCPRODUCTDEFINITIONSHAPE",
         vec![omitted(), omitted(), StepValue::List(vec![reference(body)])],
@@ -2234,6 +2259,7 @@ fn push_assembly(
         );
         note_curves(part, writer.report);
     }
+    let mut written_faces = Vec::new();
     let body = push_mapped_body(
         file,
         assembly_fingerprint(parts, frame),
@@ -2255,10 +2281,11 @@ fn push_assembly(
             }
             let mut items = Vec::with_capacity(parts.len());
             for part in parts {
-                match push_brep_item(file, part, frame) {
-                    Some((item, "AdvancedBrep")) => items.push(item),
-                    _ => return None,
-                }
+                let Some((item, "AdvancedBrep", faces)) = push_brep_item(file, part, frame) else {
+                    return None;
+                };
+                written_faces.extend(faces);
+                items.push(item);
             }
             if items.is_empty() {
                 return None;
@@ -2271,6 +2298,7 @@ fn push_assembly(
             ))
         },
     )?;
+    writer.written_faces = written_faces;
     Some(file.push(
         "IFCPRODUCTDEFINITIONSHAPE",
         vec![omitted(), omitted(), StepValue::List(vec![reference(body)])],
@@ -3490,6 +3518,10 @@ struct MaterialLibrary {
     /// build-up of its own. Kept apart from `layer_sets`: the entity here is
     /// the material itself, not a set wrapping it.
     single_materials: BTreeMap<String, (EntityRef, Vec<EntityRef>)>,
+    /// `IfcSurfaceStyle` by the colour it paints, so two faces - of one
+    /// product or of two - that share a colour share the style entity too.
+    /// See [`MaterialLibrary::style_disagreeing_faces`].
+    styles: BTreeMap<(u8, u8, u8), EntityRef>,
 }
 
 impl MaterialLibrary {
@@ -3547,15 +3579,17 @@ impl MaterialLibrary {
     /// Record that `product`'s own faces name one material and no build-up -
     /// an element `associate` above already gave a layer set never reaches
     /// here, since a build-up is the more complete statement where the
-    /// source gives both. Silent where the faces disagree: a product whose
-    /// faces name two different materials is a real multi-material body this
-    /// export does not yet state, and a guess at one of the two would be a
-    /// wrong material rather than a missing one.
+    /// source gives both. Where the faces disagree, no single
+    /// `IfcRelAssociatesMaterial` is honest - a product whose faces name two
+    /// different materials is a real multi-material body this export does
+    /// not state as one material - so `written_faces` is styled face by face
+    /// instead, through [`Self::style_disagreeing_faces`].
     fn associate_face_material(
         &mut self,
         file: &mut StepFile,
         element: &BimElement,
         product: EntityRef,
+        written_faces: &[Option<EntityRef>],
     ) {
         if element
             .material_layers
@@ -3578,6 +3612,7 @@ impl MaterialLibrary {
             return;
         };
         if identities.any(|other| other != identity) {
+            self.style_disagreeing_faces(file, &faces, written_faces);
             return;
         }
         let material = faces
@@ -3592,6 +3627,51 @@ impl MaterialLibrary {
             .or_insert_with(|| (entity, Vec::new()))
             .1
             .push(product);
+    }
+
+    /// Paint each face of a product whose faces disagree on material with an
+    /// `IfcStyledItem` carrying that one face's own colour - a visual
+    /// statement, not the semantic one `IfcRelAssociatesMaterial` makes: two
+    /// faces styled the same colour here are not thereby said to be the same
+    /// material, only to look like it. `IfcSurfaceStyle` is written once per
+    /// distinct colour and shared by every face that colour paints, the same
+    /// way `self.materials` shares one `IfcMaterial` across every face or
+    /// layer that names it.
+    ///
+    /// A face this cannot style - no material, no colour read for that
+    /// material, or no written entity because the body took the swept-solid
+    /// path or shares a body with an element `written_faces` was not filled
+    /// in for - is left unstyled rather than guessed at, the same honesty
+    /// [`Self::associate_face_material`] already keeps for the product as a
+    /// whole.
+    fn style_disagreeing_faces(
+        &mut self,
+        file: &mut StepFile,
+        faces: &[&BimBrepFace],
+        written_faces: &[Option<EntityRef>],
+    ) {
+        for (face, item) in faces.iter().zip(written_faces) {
+            let Some(item) = item else { continue };
+            let Some(color) = face
+                .material
+                .as_deref()
+                .and_then(|material| material.color)
+            else {
+                continue;
+            };
+            let style = *self
+                .styles
+                .entry((color.red, color.green, color.blue))
+                .or_insert_with(|| push_surface_style(file, color));
+            file.push(
+                "IFCSTYLEDITEM",
+                vec![
+                    reference(*item),
+                    StepValue::List(vec![reference(style)]),
+                    omitted(),
+                ],
+            );
+        }
     }
 
     /// One `IfcRelAssociatesMaterial` per distinct build-up or single
@@ -3632,6 +3712,35 @@ fn element_faces(element: &BimElement) -> Option<Vec<&BimBrepFace>> {
         Some(BimGeometry::Assembly(parts)) => parts.iter().flat_map(|brep| &brep.faces).collect(),
         _ => return None,
     })
+}
+
+/// `IfcSurfaceStyle` wrapping one `IfcColourRgb`, shaded rather than
+/// rendered: `IfcSurfaceStyleShading` states only the colour this export
+/// actually read. `IfcSurfaceStyleRendering` would ask for a transparency,
+/// a specular exponent and a reflectance method this export does not have -
+/// Revit's own render appearance, not the shading colour this reads - and
+/// writing plausible defaults for them would be exactly the guess this
+/// codebase does not make.
+fn push_surface_style(file: &mut StepFile, color: bim_core::BimColor) -> EntityRef {
+    let normalised = |channel: u8| StepValue::Real(f64::from(channel) / 255.0);
+    let rgb = file.push(
+        "IFCCOLOURRGB",
+        vec![
+            omitted(),
+            normalised(color.red),
+            normalised(color.green),
+            normalised(color.blue),
+        ],
+    );
+    let shading = file.push("IFCSURFACESTYLESHADING", vec![reference(rgb), omitted()]);
+    file.push(
+        "IFCSURFACESTYLE",
+        vec![
+            omitted(),
+            enumeration("BOTH"),
+            StepValue::List(vec![reference(shading)]),
+        ],
+    )
 }
 
 /// The identity `material_entity` would key its cache by, computed without
@@ -4158,6 +4267,7 @@ mod tests {
                     value: name.to_owned(),
                 }),
                 name: Some(format!("Material {name}")),
+                color: None,
             }),
             thickness: metres(thickness),
             is_core: false,
@@ -4363,6 +4473,18 @@ mod tests {
                 value: id.to_owned(),
             }),
             name: Some(name.to_owned()),
+            color: None,
+        }
+    }
+
+    fn face_material_with_color(id: &str, name: &str, color: (u8, u8, u8)) -> BimMaterial {
+        BimMaterial {
+            color: Some(bim_core::BimColor {
+                red: color.0,
+                green: color.1,
+                blue: color.2,
+            }),
+            ..face_material(id, name)
         }
     }
 
@@ -4421,6 +4543,72 @@ mod tests {
 
         assert!(!text.contains("=IFCMATERIAL("));
         assert!(!text.contains("=IFCRELASSOCIATESMATERIAL("));
+    }
+
+    /// Where the faces disagree, no product-level material is honest - but a
+    /// face this export wrote its own `IfcAdvancedFace` for, and whose
+    /// material carries a colour, is not left bare either: it gets an
+    /// `IfcStyledItem` of its own, and two faces of the same colour share one
+    /// `IfcSurfaceStyle`. `box_brep` recognises as a sweep and writes no
+    /// per-face entity at all, so this uses `quarter_disc_brep` - curved,
+    /// never a prism - twice over, the same shape both instances of
+    /// `writes_a_complete_brep_as_an_advanced_brep` already prove becomes
+    /// real `IfcAdvancedFace`s.
+    #[test]
+    fn styles_each_face_of_a_disagreeing_product_by_its_own_colour() {
+        let mut model = model();
+        model.elements[0].element_type = BimElementType::SanitaryTerminal;
+        let mut brep = quarter_disc_brep(true);
+        brep.faces.push(quarter_disc_brep(true).faces.remove(0));
+        brep.faces[0].material = Some(Box::new(face_material_with_color(
+            "42",
+            "Glass",
+            (0xba, 0xbf, 0xc5),
+        )));
+        brep.faces[1].material = Some(Box::new(face_material_with_color(
+            "43",
+            "Aluminium",
+            (0xba, 0xbf, 0xc5),
+        )));
+        model.elements[0].geometry = Some(BimGeometry::Brep(brep));
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        // Still no product-level material: the two faces disagree.
+        assert!(!text.contains("=IFCMATERIAL("), "{text}");
+        assert!(!text.contains("=IFCRELASSOCIATESMATERIAL("));
+
+        // One shared colour and style, styling two distinct faces.
+        assert_eq!(text.matches("=IFCCOLOURRGB(").count(), 1, "{text}");
+        assert_eq!(text.matches("=IFCSURFACESTYLESHADING(").count(), 1);
+        assert_eq!(text.matches("=IFCSURFACESTYLE(").count(), 1);
+        assert_eq!(text.matches("=IFCSTYLEDITEM(").count(), 2, "{text}");
+        let colour = text
+            .lines()
+            .find(|line| line.contains("=IFCCOLOURRGB("))
+            .expect("one shared colour");
+        // 0xba, 0xbf, 0xc5 over 255, close enough that the writer's own
+        // shortest-round-trip rounding cannot land elsewhere.
+        assert!(colour.contains("0.7294117"), "{colour}");
+        assert!(colour.contains("0.7490196"), "{colour}");
+        assert!(colour.contains("0.7725490"), "{colour}");
+        let advanced_faces: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("=IFCADVANCEDFACE("))
+            .collect();
+        assert_eq!(advanced_faces.len(), 2, "{advanced_faces:?}");
+        for face in advanced_faces {
+            let face_ref = face.split('=').next().unwrap();
+            assert!(
+                text.lines().any(|line| {
+                    line.contains("=IFCSTYLEDITEM(") && line.contains(&format!("({face_ref},"))
+                }),
+                "no IfcStyledItem styles {face_ref}: {text}"
+            );
+        }
     }
 
     /// An element with its own layered build-up states that, not its faces'

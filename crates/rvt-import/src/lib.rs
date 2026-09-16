@@ -22,8 +22,9 @@ use bim_core::{
     BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
     BimBrepRuling, BimBrepSurface, BimCategory, BimElement, BimElementId, BimElementType,
     BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimMaterial, BimMaterialLayer,
-    BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3, BimProjectIdentity,
-    BimProperty, BimPropertyValue, BimSiteLocation, BimSource, BimSweptDisk, BimUnit,
+    BimColor, BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3,
+    BimProjectIdentity, BimProperty, BimPropertyValue, BimSiteLocation, BimSource, BimSweptDisk,
+    BimUnit,
 };
 use revit_catalog::Catalog;
 use rvt_container::{
@@ -680,6 +681,8 @@ pub struct ExportedElement {
     /// A `GeoSite`'s own latitude, longitude and elevation. See
     /// [`rvt_model::GeoSiteFields`] for why a project can carry more than one.
     pub geo_site: Option<rvt_model::GeoSiteFields>,
+    /// A `MaterialElem`'s shading colour. See [`rvt_model::MaterialColorFields`].
+    pub material_color: Option<rvt_model::MaterialColorFields>,
     /// First readable string in the body, with how it was located.
     pub name: Option<(String, &'static str)>,
     pub parameters: Vec<rvt_model::Parameter>,
@@ -1030,6 +1033,7 @@ pub fn recover_elements(
     let level_class_index = schema_class_index(schema.as_ref(), "Level");
     let plane_class_index = schema_class_index(schema.as_ref(), "Plane");
     let geo_site_class_index = schema_class_index(schema.as_ref(), "GeoSite");
+    let material_elem_class_index = schema_class_index(schema.as_ref(), "MaterialElem");
     let pipe_curve_class_index = schema_class_index(schema.as_ref(), "RbsPipeCurve");
     let family_instance_class_index = schema_class_index(schema.as_ref(), "FamilyInstance");
     let curve_driver_class_index = schema_class_index(schema.as_ref(), "RbsCurveDriver");
@@ -1075,6 +1079,7 @@ pub fn recover_elements(
         level_class_index,
         plane_class_index,
         geo_site_class_index,
+        material_elem_class_index,
         pipe_curve_class_index,
         family_instance_class_index,
         curve_driver_class_index,
@@ -1210,6 +1215,7 @@ pub fn recover_elements(
                             fields,
                             elevation_feet,
                             geo_site,
+                            material_color,
                             pipe_line_candidate,
                             fitting_center_line_candidate,
                             parameter_spec,
@@ -1313,6 +1319,9 @@ pub fn recover_elements(
                         if let Some(geo_site) = geo_site {
                             entry.geo_site = Some(geo_site);
                         }
+                        if let Some(material_color) = material_color {
+                            entry.material_color = Some(material_color);
+                        }
                         if Some(header.class_index) == context.pipe_curve_class_index
                             && context.curve_driver_class_index.is_some()
                         {
@@ -1371,6 +1380,7 @@ struct RecordContext<'a> {
     level_class_index: Option<u16>,
     plane_class_index: Option<u16>,
     geo_site_class_index: Option<u16>,
+    material_elem_class_index: Option<u16>,
     pipe_curve_class_index: Option<u16>,
     family_instance_class_index: Option<u16>,
     curve_driver_class_index: Option<u16>,
@@ -1456,6 +1466,7 @@ struct ElementDecode {
     fields: Option<ElementFieldsDecode>,
     elevation_feet: Option<f64>,
     geo_site: Option<rvt_model::GeoSiteFields>,
+    material_color: Option<rvt_model::MaterialColorFields>,
     pipe_line_candidate: Option<PipeLineGeometryFields>,
     fitting_center_line_candidate: Option<FittingCenterLineFields>,
     parameter_spec: Option<String>,
@@ -1734,6 +1745,13 @@ fn decode_element(context: &RecordContext<'_>, header: RecordHeader, body: &[u8]
                 context
                     .schema
                     .and_then(|schema| GeoSiteFields::parse(schema, header.class_index, body))
+            })
+            .flatten(),
+        material_color: (Some(header.class_index) == context.material_elem_class_index)
+            .then(|| {
+                context.schema.and_then(|schema| {
+                    rvt_model::MaterialColorFields::parse(schema, header.class_index, body)
+                })
             })
             .flatten(),
         pipe_line_candidate: (Some(header.class_index) == context.pipe_curve_class_index)
@@ -4031,16 +4049,24 @@ fn normalize_material_layers(
         .iter()
         .enumerate()
         .map(|(index, layer)| BimMaterialLayer {
-            material: layer.material_id.map(|id| BimMaterial {
-                id: Some(BimExternalId {
-                    system: "autodesk.revit.elementId".to_owned(),
-                    value: id.to_string(),
-                }),
-                name: u32::try_from(id)
-                    .ok()
-                    .and_then(|id| elements.get(&id))
-                    .and_then(|material| material.name.as_ref())
-                    .map(|(name, _)| name.clone()),
+            material: layer.material_id.map(|id| {
+                let source = u32::try_from(id).ok().and_then(|id| elements.get(&id));
+                BimMaterial {
+                    id: Some(BimExternalId {
+                        system: "autodesk.revit.elementId".to_owned(),
+                        value: id.to_string(),
+                    }),
+                    name: source
+                        .and_then(|material| material.name.as_ref())
+                        .map(|(name, _)| name.clone()),
+                    color: source.and_then(|material| material.material_color).map(
+                        |fields| BimColor {
+                            red: fields.red,
+                            green: fields.green,
+                            blue: fields.blue,
+                        },
+                    ),
+                }
             }),
             thickness: BimNumber {
                 value: revit_catalog::internal_feet_to_metres(layer.width_feet).unwrap_or(f64::NAN),
@@ -4392,26 +4418,30 @@ fn drawn_as_its_own_product(
         })
 }
 
-/// Fill in the name of every face material [`normalize_brep`] left with only
-/// an identity, now that `elements` is in scope to read it from - the same
-/// `MaterialElem` a compound layer's own material names, so
-/// `normalize_material_layers` is not repeated here, only its lookup.
+/// Fill in the name and shading colour of every face material
+/// [`normalize_brep`] left with only an identity, now that `elements` is in
+/// scope to read them from - the same `MaterialElem` a compound layer's own
+/// material names, so `normalize_material_layers` is not repeated here, only
+/// its lookup.
 fn resolve_face_materials(
     geometry: BimGeometry,
     elements: &BTreeMap<u32, ExportedElement>,
 ) -> BimGeometry {
-    let name_of = |id: &str| {
-        id.parse::<u32>()
-            .ok()
-            .and_then(|id| elements.get(&id))
-            .and_then(|material| material.name.as_ref())
-            .map(|(name, _)| name.clone())
-    };
+    let source_of = |id: &str| id.parse::<u32>().ok().and_then(|id| elements.get(&id));
     let resolve_brep = |mut brep: BimBrep| {
         for face in &mut brep.faces {
             if let Some(material) = &mut face.material {
-                if let Some(id) = material.id.as_ref().map(|id| id.value.clone()) {
-                    material.name = name_of(&id);
+                if let Some(source) = material
+                    .id
+                    .as_ref()
+                    .and_then(|id| source_of(&id.value))
+                {
+                    material.name = source.name.as_ref().map(|(name, _)| name.clone());
+                    material.color = source.material_color.map(|fields| BimColor {
+                        red: fields.red,
+                        green: fields.green,
+                        blue: fields.blue,
+                    });
                 }
             }
         }
@@ -4831,6 +4861,7 @@ fn normalize_brep(
                     value: id.to_string(),
                 }),
                 name: None,
+                color: None,
             })
         });
         faces.push(BimBrepFace {
@@ -6995,8 +7026,8 @@ mod tests {
 
     /// `GFace.m_renderStyleId` names a `MaterialElem` the same way a compound
     /// layer's own material does; `resolve_face_materials` reads that
-    /// element's name once the element table is in scope, the same lookup
-    /// `normalize_material_layers` already trusts.
+    /// element's name and shading colour once the element table is in
+    /// scope, the same lookup `normalize_material_layers` already trusts.
     #[test]
     fn resolve_face_materials_names_a_face_from_its_render_style_id() {
         let face = BimBrepFace {
@@ -7015,12 +7046,18 @@ mod tests {
                     value: "42".to_owned(),
                 }),
                 name: None,
+                color: None,
             })),
         };
         let elements = BTreeMap::from([(
             42,
             ExportedElement {
                 name: Some(("Glass".to_owned(), "declared")),
+                material_color: Some(rvt_model::MaterialColorFields {
+                    red: 0xba,
+                    green: 0xbf,
+                    blue: 0xc5,
+                }),
                 ..ExportedElement::default()
             },
         )]);
@@ -7045,6 +7082,14 @@ mod tests {
             })
         );
         assert_eq!(material.name.as_deref(), Some("Glass"));
+        assert_eq!(
+            material.color,
+            Some(BimColor {
+                red: 0xba,
+                green: 0xbf,
+                blue: 0xc5
+            })
+        );
     }
 
     /// A `render_style_id` naming nothing this file recovered - a linked
@@ -7068,6 +7113,7 @@ mod tests {
                     value: "999".to_owned(),
                 }),
                 name: None,
+                color: None,
             })),
         };
 
