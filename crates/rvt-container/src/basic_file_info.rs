@@ -7,6 +7,18 @@ pub struct BasicFileInfo {
     pub format_version: u32,
     /// Revit release year, only when a known layout yields an exact value.
     pub revit_version: Option<u16>,
+    /// `Unique Document GUID`, which identifies this save of the document.
+    ///
+    /// Read out of the labelled text block rather than off an offset, so the
+    /// name is Revit's own rather than this project's reading of one. Held
+    /// hyphenated and lower-case exactly as the stream states it.
+    pub document_guid: Option<String>,
+    /// `Unique Document Increments`: how many times the document has been
+    /// saved. It orders two saves of one model, which a GUID cannot.
+    pub document_increments: Option<u32>,
+    /// `Worksharing`, observed as `Central` or `Local`. Part of the identity
+    /// picture because a local copy and its central are different files.
+    pub worksharing: Option<String>,
 }
 
 impl BasicFileInfo {
@@ -34,11 +46,76 @@ impl BasicFileInfo {
             _ => None,
         };
 
+        // Every one of these comes out of the labelled block by name. A
+        // layout that does not carry the block leaves them `None` rather
+        // than falling back to an offset that would have to be guessed at.
         Ok(Self {
             format_version,
             revit_version,
+            document_guid: labelled_field(data, "Unique Document GUID")
+                .filter(|value| is_hyphenated_guid(value))
+                .map(|value| value.to_ascii_lowercase()),
+            document_increments: labelled_field(data, "Unique Document Increments")
+                .and_then(|value| value.parse().ok()),
+            worksharing: labelled_field(data, "Worksharing"),
         })
     }
+}
+
+/// The value of one `Label: value` line of `BasicFileInfo`'s labelled block.
+///
+/// The block is UTF-16LE text among binary fields and is *not* aligned to the
+/// stream: on the measured corpus its code units sit at odd byte offsets. So
+/// the label is searched for as bytes at whatever alignment it occurs, and
+/// the value read from the same one.
+///
+/// The match has to begin a line, which is what keeps one label from being
+/// answered by another: `Central model's episode GUID corresponding to the
+/// last reload latest` states a GUID too, and a path could name anything.
+fn labelled_field(data: &[u8], label: &str) -> Option<String> {
+    let needle: Vec<u8> = format!("{label}: ")
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let at = data
+        .windows(needle.len())
+        .enumerate()
+        .find(|(start, window)| *window == needle.as_slice() && starts_a_line(data, *start))
+        .map(|(start, _)| start)?;
+    let value = data[at + needle.len()..]
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .take_while(|&unit| unit != u16::from(b'\r') && unit != u16::from(b'\n') && unit != 0)
+        .collect::<Vec<_>>();
+    let value = char::decode_utf16(value)
+        .collect::<core::result::Result<String, _>>()
+        .ok()?;
+    let value = value.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Whether a match begins a line of the block rather than sitting inside one.
+///
+/// The break before it is a CR/LF pair, and because the block's own alignment
+/// need not be the stream's, that pair may be read either way round - which
+/// is why this looks for the bytes and not for a decoded `'\n'`.
+fn starts_a_line(data: &[u8], start: usize) -> bool {
+    start == 0
+        || data[start.saturating_sub(2)..start]
+            .iter()
+            .any(|&byte| byte == b'\r' || byte == b'\n')
+}
+
+/// `8-4-4-4-12` hexadecimal, which is the only form the stream states a GUID
+/// in. Checked rather than trusted, so a field this does not understand is
+/// dropped instead of travelling on as an identity.
+fn is_hyphenated_guid(value: &str) -> bool {
+    let groups: Vec<&str> = value.split('-').collect();
+    groups.len() == 5
+        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|group| group.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn parse_v10_version(data: &[u8]) -> Option<u16> {
@@ -141,5 +218,84 @@ mod tests {
         data.extend("2026".bytes());
         let info = BasicFileInfo::parse(&data).unwrap();
         assert_eq!(info.revit_version, None);
+    }
+
+    /// A stream carrying the labelled block the way the corpus does: UTF-16LE
+    /// text whose code units are at *odd* byte offsets, because `pad` bytes
+    /// of binary precede it, and whose first line is itself preceded by a
+    /// break - in the file that break is what separates the block from the
+    /// binary field ahead of it.
+    fn with_labelled_block(pad: usize, lines: &[&str]) -> Vec<u8> {
+        let mut data = 14_u32.to_le_bytes().to_vec();
+        data.resize(4 + pad, 0);
+        for unit in format!("\r\n{}", lines.join("\r\n")).encode_utf16() {
+            data.extend(unit.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn reads_the_document_identity_from_the_labelled_block() {
+        for pad in [0, 1] {
+            let data = with_labelled_block(
+                pad,
+                &[
+                    "Worksharing: Central",
+                    "Central Model Path: \\\\server\\a.rvt",
+                    "Unique Document GUID: 11E41A02-892f-4b12-ba15-42a8028ff452",
+                    "Unique Document Increments: 773",
+                    "Model Identity: face0000-1223-3344-4455-555666666333",
+                ],
+            );
+            let info = BasicFileInfo::parse(&data).unwrap();
+            assert_eq!(
+                info.document_guid.as_deref(),
+                Some("11e41a02-892f-4b12-ba15-42a8028ff452"),
+                "the block is found at either alignment, and the GUID lower-cased (pad {pad})"
+            );
+            assert_eq!(info.document_increments, Some(773));
+            assert_eq!(info.worksharing.as_deref(), Some("Central"));
+        }
+    }
+
+    #[test]
+    fn does_not_let_another_label_answer_for_the_document_guid() {
+        // This line states a GUID and ends in words that contain neither
+        // label, but a substring search over the block would still have to
+        // step past it; the same block without the real label must yield
+        // nothing rather than this value.
+        let data = with_labelled_block(
+            1,
+            &[
+                "Central model's episode GUID corresponding to the last reload latest: \
+                 11e41a02-892f-4b12-ba15-42a8028ff452",
+                "Last Save Path: \\\\server\\Unique Document GUID: 0badf00d-0000-0000-0000-000000000000",
+            ],
+        );
+        let info = BasicFileInfo::parse(&data).unwrap();
+        assert_eq!(
+            info.document_guid, None,
+            "a label has to begin its own line to be that label"
+        );
+    }
+
+    #[test]
+    fn drops_a_document_guid_that_is_not_one() {
+        let data = with_labelled_block(1, &["Unique Document GUID: not-a-guid"]);
+        assert_eq!(BasicFileInfo::parse(&data).unwrap().document_guid, None);
+    }
+
+    #[test]
+    fn states_no_identity_where_the_block_is_absent() {
+        let mut data = 14_u32.to_le_bytes().to_vec();
+        data.extend([4, 0, 0, 0]);
+        for unit in "2023".encode_utf16() {
+            data.extend(unit.to_le_bytes());
+        }
+        let info = BasicFileInfo::parse(&data).unwrap();
+        assert_eq!(info.revit_version, Some(2023));
+        assert_eq!(info.document_guid, None);
+        assert_eq!(info.document_increments, None);
+        assert_eq!(info.worksharing, None);
     }
 }

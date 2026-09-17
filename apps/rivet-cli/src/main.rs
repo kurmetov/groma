@@ -70,6 +70,12 @@ struct Cli {
 enum Command {
     /// Show a concise container and release summary.
     Info { file: PathBuf },
+    /// Say which file, and which save of it, each of these is, and which of
+    /// them are the same document.
+    ///
+    /// Reads an RVT's own identity, and the identity an IFC this converter
+    /// wrote states about the RVT behind it, so the two can be compared.
+    DocumentId { files: Vec<PathBuf> },
     /// List every physical stream and its size.
     Streams { file: PathBuf },
     /// Copy one raw stream to stdout or a file.
@@ -613,6 +619,10 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Info { file } => info(&file),
+        Command::DocumentId { files } => {
+            document_ids(&files);
+            Ok(())
+        }
         Command::Streams { file } => streams(&file),
         Command::DumpStream {
             file,
@@ -921,6 +931,7 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             max_member_bytes,
         } => inspect(&file, streams_only, max_member_bytes),
         Command::Info { .. }
+        | Command::DocumentId { .. }
         | Command::Streams { .. }
         | Command::DumpStream { .. }
         | Command::Partitions { .. } => unreachable!("handled by run"),

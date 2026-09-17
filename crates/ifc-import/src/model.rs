@@ -10,9 +10,9 @@
 use std::collections::{HashMap, HashSet};
 
 use bim_core::{
-    BimCategory, BimElement, BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel,
-    BimMaterial, BimMaterialLayer, BimMaterialLayerSet, BimModel, BimNumber, BimPlacement,
-    BimProperty, BimPropertyValue, BimRelation, BimSource, BimUnit,
+    BimCategory, BimDocumentIdentity, BimElement, BimElementId, BimElementType, BimExternalId,
+    BimGeometry, BimLevel, BimMaterial, BimMaterialLayer, BimMaterialLayerSet, BimModel, BimNumber,
+    BimPlacement, BimProperty, BimPropertyValue, BimRelation, BimSource, BimUnit,
 };
 
 use crate::curve::Sampler;
@@ -198,6 +198,7 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
             // not as project identity - nothing here reads `Name`/`LongName`
             // back into one.
             project: None,
+            document_identity: document_identity(parsed, &index, units),
             site: None,
             documents: Vec::new(),
             elements,
@@ -423,6 +424,50 @@ fn source(parsed: &Parsed) -> Option<BimSource> {
         application,
         release: parsed.schema.clone(),
     })
+}
+
+/// Which file, and which save of it, an IFC states it was made from.
+///
+/// This reads back the `Rivet Source Document` set this project's own
+/// exporter writes on `IfcProject`. It is what lets the question "is this IFC
+/// the file I already have?" be put to the IFC rather than to a file name:
+/// nothing else in an exported IFC survives a rename, and an element's
+/// `GlobalId` identifies an element rather than a document.
+///
+/// `None` for any other IFC, which is most of them - an IFC that says nothing
+/// about its source is not made to say something.
+fn document_identity(parsed: &Parsed, index: &Index, units: Units) -> Option<BimDocumentIdentity> {
+    let (project, _) = *parsed.of_type("IFCPROJECT").first()?;
+    let stated = properties(parsed, index, project, units);
+    let text = |name: &str| {
+        stated
+            .iter()
+            .find(|property| {
+                property.name == name
+                    && property.id.as_ref().is_some_and(|id| {
+                        id.value == BimDocumentIdentity::IFC_PROPERTY_SET
+                            || id.value.starts_with(&format!(
+                                "{}: ",
+                                BimDocumentIdentity::IFC_PROPERTY_SET
+                            ))
+                    })
+            })
+            .and_then(|property| match &property.value {
+                BimPropertyValue::Text(value) => Some(value.clone()),
+                BimPropertyValue::Integer(value) => Some(value.to_string()),
+                _ => None,
+            })
+    };
+    let identity = BimDocumentIdentity {
+        document_guid: text(BimDocumentIdentity::IFC_DOCUMENT_GUID),
+        increment: text(BimDocumentIdentity::IFC_INCREMENT).and_then(|value| value.parse().ok()),
+        creation_guid: text(BimDocumentIdentity::IFC_CREATION_GUID),
+        detach_guid: text(BimDocumentIdentity::IFC_DETACH_GUID),
+        worksharing: text(BimDocumentIdentity::IFC_WORKSHARING),
+    };
+    // The GUID is the identity; the rest only qualifies it. A set without one
+    // is some other set that happens to share a property name.
+    identity.document_guid.is_some().then_some(identity)
 }
 
 /// Add up what each product was read as, in file order.
@@ -977,6 +1022,65 @@ mod tests {
             found.iter().filter(|(kind, _, _)| kind == "bounds").count(),
             1,
             "the repeated boundary was not collapsed: {found:?}"
+        );
+    }
+
+    /// An `IfcProject` carrying the source-document set this project's own
+    /// exporter writes, and beside it a set that shares a property name so
+    /// that the read has to look at which set a value came from.
+    const SOURCED: &str = "ISO-10303-21;\n\
+        HEADER;\n\
+        FILE_SCHEMA(('IFC4'));\n\
+        ENDSEC;\n\
+        DATA;\n\
+        #1=IFCPROJECT('project',$,'Number',$,$,$,$,$,$);\n\
+        #2=IFCPROPERTYSINGLEVALUE('DocumentGuid',$,IFCLABEL('11e41a02-892f-4b12-ba15-42a8028ff452'),$);\n\
+        #3=IFCPROPERTYSINGLEVALUE('DocumentIncrement',$,IFCINTEGER(773),$);\n\
+        #4=IFCPROPERTYSINGLEVALUE('CreationGuid',$,IFCLABEL('3f0befca-10b5-414a-ab7a-9b96f8c4a616'),$);\n\
+        #5=IFCPROPERTYSINGLEVALUE('DetachGuid',$,IFCLABEL('be18304c-03bf-4e5d-a6dd-bffa7798c29e'),$);\n\
+        #6=IFCPROPERTYSINGLEVALUE('Worksharing',$,IFCLABEL('Central'),$);\n\
+        #7=IFCPROPERTYSET('set',$,'Rivet Source Document',$,(#2,#3,#4,#5,#6));\n\
+        #8=IFCRELDEFINESBYPROPERTIES('rel',$,$,$,(#1),#7);\n\
+        #9=IFCPROPERTYSINGLEVALUE('DocumentGuid',$,IFCLABEL('00000000-0000-0000-0000-000000000000'),$);\n\
+        #10=IFCPROPERTYSET('other',$,'Something Else',$,(#9));\n\
+        #11=IFCRELDEFINESBYPROPERTIES('rel2',$,$,$,(#1),#10);\n\
+        ENDSEC;\n\
+        END-ISO-10303-21;\n";
+
+    #[test]
+    fn reads_back_the_source_document_this_exporter_states() {
+        let parsed = parse(SOURCED.as_bytes()).unwrap();
+        let identity = convert(&parsed, &Options::default())
+            .model
+            .document_identity
+            .expect("the project states a source document");
+        assert_eq!(
+            identity.document_guid.as_deref(),
+            Some("11e41a02-892f-4b12-ba15-42a8028ff452"),
+            "a set that only shares a property name must not answer for this"
+        );
+        assert_eq!(identity.increment, Some(773));
+        assert_eq!(
+            identity.creation_guid.as_deref(),
+            Some("3f0befca-10b5-414a-ab7a-9b96f8c4a616")
+        );
+        assert_eq!(
+            identity.detach_guid.as_deref(),
+            Some("be18304c-03bf-4e5d-a6dd-bffa7798c29e")
+        );
+        assert_eq!(identity.worksharing.as_deref(), Some("Central"));
+    }
+
+    #[test]
+    fn states_no_source_document_where_the_file_does_not() {
+        // Which is every IFC but this converter's own, so it has to be
+        // `None` rather than anything derived from what is there.
+        let parsed = parse(RELATED.as_bytes()).unwrap();
+        assert_eq!(
+            convert(&parsed, &Options::default())
+                .model
+                .document_identity,
+            None
         );
     }
 

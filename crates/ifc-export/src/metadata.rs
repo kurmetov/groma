@@ -8,9 +8,9 @@ use std::{
 use bim_convert::{ifc_entity_name, resolved_element_type};
 use bim_core::{
     BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile, BimBrepRuling,
-    BimBrepSurface, BimElement, BimElementId, BimExternalId, BimGeometry, BimLevel, BimLineSegment,
-    BimMaterial, BimMaterialLayer, BimModel, BimNumber, BimPlacement, BimPoint3, BimProperty,
-    BimPropertyValue,
+    BimBrepSurface, BimDocumentIdentity, BimElement, BimElementId, BimExternalId, BimGeometry,
+    BimLevel, BimLineSegment, BimMaterial, BimMaterialLayer, BimModel, BimNumber, BimPlacement,
+    BimPoint3, BimProperty, BimPropertyValue,
 };
 
 use crate::{
@@ -125,7 +125,7 @@ pub fn metadata_ifc_reported(
     validate_model(model)?;
     let mut report = SolidReport::default();
     let lengths = Lengths::new(options.settings.length_unit);
-    let mut file = StepFile::new(step_header(options));
+    let mut file = StepFile::new(step_header(options, model));
     let ownership = push_ownership(&mut file, options.creation_time);
     let context = push_context(&mut file, lengths);
     let units = push_units(&mut file, options.settings.length_unit);
@@ -150,6 +150,17 @@ pub fn metadata_ifc_reported(
         ],
     );
     let building = push_building(&mut file, options, ownership, building_placement);
+    push_source_documents(
+        &mut file,
+        model,
+        WriteContext {
+            options,
+            owner: ownership,
+            lengths,
+            space_boundaries: &model.space_boundaries,
+        },
+        project,
+    );
     push_aggregate(
         &mut file,
         options,
@@ -246,7 +257,7 @@ fn validate_model(model: &BimModel) -> Result<(), MetadataError> {
 /// What wrote this file, named the same way everywhere it is named.
 const PREPROCESSOR: &str = concat!("Rivet ", env!("CARGO_PKG_VERSION"));
 
-fn step_header(options: &MetadataOptions) -> StepHeader {
+fn step_header(options: &MetadataOptions, model: &BimModel) -> StepHeader {
     StepHeader {
         description: vec![
             format!(
@@ -263,7 +274,19 @@ fn step_header(options: &MetadataOptions) -> StepHeader {
                 "Converter [{PREPROCESSOR}: converted from an Autodesk Revit model, \
                  not exported by Revit]"
             ),
-        ],
+        ]
+        .into_iter()
+        // The same identity the `Rivet Source Document` set states, said
+        // again where it costs the reader nothing to reach: a pipeline
+        // asking "have I converted this file already?" answers it from the
+        // first few hundred bytes of the file instead of parsing all of it.
+        // A bracketed entry beside `ViewDefinition` is how IFC's own header
+        // carries this kind of statement.
+        .chain(model.documents.iter().filter_map(|document| {
+            let guid = document.identity.as_ref()?.document_guid.as_ref()?;
+            Some(format!("SourceDocument [{guid}]"))
+        }))
+        .collect(),
         file_name: options.file_name.clone(),
         timestamp: options.timestamp.clone(),
         authors: vec!["Rivet".to_owned()],
@@ -456,6 +479,111 @@ fn push_project(
             reference(units),
         ],
     )
+}
+
+/// State which file, and which save of it, this export was made from, as a
+/// property set on `IfcProject`.
+///
+/// Without this an exported IFC says nothing about its source that survives
+/// being renamed or copied: the header's `FILE_NAME` is the output path, and
+/// every `GlobalId` identifies an element rather than the document. With it,
+/// a reader holding two IFCs can tell whether they came from the same file -
+/// which is the question a pipeline that must not convert one model twice is
+/// actually asking.
+///
+/// One set per source document, so a federated export states each of its
+/// files rather than picking one of them to speak for the rest. A document
+/// whose format says nothing about its own identity contributes no set, which
+/// is not the same as a set full of blanks.
+fn push_source_documents(
+    file: &mut StepFile,
+    model: &BimModel,
+    context: WriteContext<'_>,
+    project: EntityRef,
+) {
+    for (position, document) in model.documents.iter().enumerate() {
+        // Without the GUID the set would answer nothing it exists to answer,
+        // and a set of blanks beside a file name reads like an identity
+        // without being one.
+        let Some(identity) = document
+            .identity
+            .as_ref()
+            .filter(|identity| identity.document_guid.is_some())
+        else {
+            continue;
+        };
+        let properties = source_document_properties(&document.name, identity);
+        // The set is named for the document in a federated export, where
+        // several of them hang off the one project and the name is all a
+        // reader has to tell them apart.
+        let name = if model.documents.len() > 1 {
+            format!(
+                "{}: {}",
+                BimDocumentIdentity::IFC_PROPERTY_SET,
+                document.id.0
+            )
+        } else {
+            BimDocumentIdentity::IFC_PROPERTY_SET.to_owned()
+        };
+        push_named_property_set(
+            file,
+            &properties,
+            project,
+            context,
+            &name,
+            &format!("source-document:{position}"),
+            &format!("source-document-relation:{position}"),
+        );
+    }
+}
+
+/// What the set states, in the order it reads best: the identity first, then
+/// the lineage that groups it, then the file it arrived as.
+fn source_document_properties(
+    name: &str,
+    identity: &bim_core::BimDocumentIdentity,
+) -> Vec<BimProperty> {
+    let text = |name: &str, value: Option<&String>| {
+        value.map(|value| BimProperty {
+            id: None,
+            name: name.to_owned(),
+            specification: None,
+            value: BimPropertyValue::Text(value.clone()),
+        })
+    };
+    [
+        text(
+            BimDocumentIdentity::IFC_DOCUMENT_GUID,
+            identity.document_guid.as_ref(),
+        ),
+        identity.increment.map(|increment| BimProperty {
+            id: None,
+            name: BimDocumentIdentity::IFC_INCREMENT.to_owned(),
+            specification: None,
+            value: BimPropertyValue::Integer(i64::from(increment)),
+        }),
+        text(
+            BimDocumentIdentity::IFC_CREATION_GUID,
+            identity.creation_guid.as_ref(),
+        ),
+        text(
+            BimDocumentIdentity::IFC_DETACH_GUID,
+            identity.detach_guid.as_ref(),
+        ),
+        text(
+            BimDocumentIdentity::IFC_WORKSHARING,
+            identity.worksharing.as_ref(),
+        ),
+        Some(BimProperty {
+            id: None,
+            name: BimDocumentIdentity::IFC_FILE_NAME.to_owned(),
+            specification: None,
+            value: BimPropertyValue::Text(name.to_owned()),
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn push_site(
@@ -4314,6 +4442,7 @@ mod tests {
         BimModel {
             source: None,
             project: None,
+            document_identity: None,
             site: None,
             documents: Vec::new(),
             levels: vec![BimLevel {
@@ -4945,6 +5074,100 @@ mod tests {
         assert!(text.contains("=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.)"));
         assert!(text.contains("=IFCOWNERHISTORY(#3,#4,$,.ADDED.,1788506400,#3,#4,1788506400)"));
         assert!(text.contains("'\\X2\\042D04420430043600200031\\X0\\'"));
+    }
+
+    /// The model with the two source files a federated conversion states,
+    /// one of which knows its own identity and one of which does not.
+    fn model_with_documents() -> BimModel {
+        let mut model = model();
+        model.documents = vec![
+            bim_core::BimDocument {
+                id: bim_core::BimDocumentId("first".to_owned()),
+                name: "first.rvt".to_owned(),
+                kind: "rvt".to_owned(),
+                source: None,
+                identity: Some(bim_core::BimDocumentIdentity {
+                    document_guid: Some("11e41a02-892f-4b12-ba15-42a8028ff452".to_owned()),
+                    increment: Some(773),
+                    creation_guid: Some("3f0befca-10b5-414a-ab7a-9b96f8c4a616".to_owned()),
+                    detach_guid: Some("be18304c-03bf-4e5d-a6dd-bffa7798c29e".to_owned()),
+                    worksharing: Some("Central".to_owned()),
+                }),
+                elements: 1,
+            },
+            bim_core::BimDocument {
+                id: bim_core::BimDocumentId("second".to_owned()),
+                name: "second.ifc".to_owned(),
+                kind: "ifc".to_owned(),
+                source: None,
+                identity: None,
+                elements: 0,
+            },
+        ];
+        model
+    }
+
+    #[test]
+    fn states_which_file_and_which_save_of_it_the_export_was_made_from() {
+        let file = metadata_ifc(&model_with_documents(), &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        // In the header, so the question is answerable from the head of the
+        // file rather than by parsing all of it.
+        assert!(
+            text.contains("'SourceDocument [11e41a02-892f-4b12-ba15-42a8028ff452]'"),
+            "the header states no source document: {}",
+            text.lines().nth(2).unwrap_or_default()
+        );
+        // And on the project, with what qualifies it.
+        for stated in [
+            "IFCPROPERTYSINGLEVALUE('DocumentGuid',$,IFCLABEL('11e41a02-892f-4b12-ba15-42a8028ff452'),$)",
+            "IFCPROPERTYSINGLEVALUE('DocumentIncrement',$,IFCINTEGER(773),$)",
+            "IFCPROPERTYSINGLEVALUE('CreationGuid',$,IFCLABEL('3f0befca-10b5-414a-ab7a-9b96f8c4a616'),$)",
+            "IFCPROPERTYSINGLEVALUE('DetachGuid',$,IFCLABEL('be18304c-03bf-4e5d-a6dd-bffa7798c29e'),$)",
+            "IFCPROPERTYSINGLEVALUE('Worksharing',$,IFCLABEL('Central'),$)",
+            "IFCPROPERTYSINGLEVALUE('SourceFileName',$,IFCLABEL('first.rvt'),$)",
+        ] {
+            assert!(text.contains(stated), "missing {stated}");
+        }
+        // Two documents, so each set says which of them it speaks for; the
+        // one stating no identity contributes nothing rather than a set of
+        // blanks that reads like one.
+        assert_eq!(
+            text.matches("'Rivet Source Document: first'").count(),
+            1,
+            "the set is not named for its document"
+        );
+        assert!(!text.contains("second.ifc"));
+        assert_eq!(text.matches("SourceDocument [").count(), 1);
+    }
+
+    #[test]
+    fn states_no_source_document_where_the_model_names_no_file() {
+        let file = metadata_ifc(&model(), &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("SourceDocument ["));
+        assert!(!text.contains("Rivet Source Document"));
+    }
+
+    /// One source file, so the set carries the plain name: what a reader of a
+    /// single-file export looks for, and what the importer reads back.
+    #[test]
+    fn one_source_file_states_the_set_under_its_plain_name() {
+        let mut model = model_with_documents();
+        model.documents.truncate(1);
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(&format!(
+            "'{}',$,(",
+            bim_core::BimDocumentIdentity::IFC_PROPERTY_SET
+        )));
     }
 
     /// A number whose spec is a derived quantity is written as that quantity's
@@ -6518,7 +6741,7 @@ mod tests {
     /// other surface here ignores. World coordinates throughout: no storey
     /// elevation, no placement.
     fn revolved_surface_text(profile: BimBrepProfile, heights: (f64, f64)) -> String {
-        let mut file = StepFile::new(step_header(&options()));
+        let mut file = StepFile::new(step_header(&options(), &model()));
         let face = BimBrepFace {
             surface: BimBrepSurface::Revolution {
                 center: metres_point([0.0, 0.0, 0.0]),
@@ -6571,7 +6794,7 @@ mod tests {
         // coordinates and `Position`'s stop agreeing. The axis must still be
         // `Position`'s `y` through its origin, and the profile must be two
         // edges - see `push_revolution_axis`.
-        let mut file = StepFile::new(step_header(&options()));
+        let mut file = StepFile::new(step_header(&options(), &model()));
         let face = BimBrepFace {
             surface: BimBrepSurface::Revolution {
                 center: metres_point([5.0, 6.0, 7.0]),

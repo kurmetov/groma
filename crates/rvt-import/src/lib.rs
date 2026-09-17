@@ -20,10 +20,11 @@
 use bim_convert::element_type_for_source;
 use bim_core::{
     BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
-    BimBrepRuling, BimBrepSurface, BimCategory, BimColor, BimElement, BimElementId, BimElementType,
-    BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimMaterial, BimMaterialLayer,
-    BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3, BimProjectIdentity,
-    BimProperty, BimPropertyValue, BimSiteLocation, BimSource, BimSweptDisk, BimUnit,
+    BimBrepRuling, BimBrepSurface, BimCategory, BimColor, BimDocumentIdentity, BimElement,
+    BimElementId, BimElementType, BimExternalId, BimGeometry, BimLevel, BimLineSegment,
+    BimMaterial, BimMaterialLayer, BimMaterialLayerSet, BimModel, BimNumber, BimPlacement,
+    BimPoint3, BimProjectIdentity, BimProperty, BimPropertyValue, BimSiteLocation, BimSource,
+    BimSweptDisk, BimUnit,
 };
 use revit_catalog::Catalog;
 use rvt_container::{
@@ -1443,6 +1444,7 @@ pub fn recover_elements(
         parameter_specs,
         elements,
         authored_unique_ids: authored_unique_ids(&container)?,
+        document_identity: document_identity(&container)?,
     })
 }
 
@@ -2305,6 +2307,8 @@ pub struct RecoveredElements {
     /// Each element's own Revit `UniqueId`, where the file carries the episode
     /// it was created in. See [`authored_unique_ids`].
     pub authored_unique_ids: BTreeMap<u32, [u8; 16]>,
+    /// Which file, and which save of it, this is. See [`document_identity`].
+    pub document_identity: Option<BimDocumentIdentity>,
 }
 
 #[must_use]
@@ -2824,6 +2828,7 @@ pub fn metadata_model(
                 release: recovered.release.map(|release| release.to_string()),
             }),
             project: project_identity(recovered),
+            document_identity: recovered.document_identity.clone(),
             site: site_location(recovered),
             documents: Vec::new(),
             elements,
@@ -5201,6 +5206,80 @@ fn schema_retry_error(raw: &str, stripped: &str) -> io::Error {
     )
 }
 
+/// Which file, and which save of it, this container is.
+///
+/// Two streams state the same identity and both are read, because they are
+/// the two halves of one answer. `BasicFileInfo` names its fields in plain
+/// text - `Unique Document GUID`, `Unique Document Increments` - so nothing
+/// about them has to be inferred, and it is also where the save counter
+/// lives. `Global/History` carries the same GUID structurally, as the newest
+/// episode, and the five document-level GUIDs beside it that no labelled
+/// field states.
+///
+/// Where both name the GUID they are required to agree: on the 74-file corpus
+/// they do, 74 out of 74. A file where they did not would be one this does
+/// not understand, and it states no identity at all rather than picking a
+/// side - an identity that is wrong is worse here than one that is missing,
+/// since the whole point of it is to decide whether two files are the same.
+///
+/// `None` where neither stream states a GUID.
+///
+/// # Errors
+///
+/// Fails where a stream is present but its framing does not decode.
+pub fn document_identity(
+    container: &RvtContainer,
+) -> Result<Option<BimDocumentIdentity>, Box<dyn Error>> {
+    let labelled = read_basic_file_info(container)?;
+    let history = decode_global_stream(container, "Global/History")?;
+    let episodes = history
+        .as_deref()
+        .and_then(rvt_model::EpisodeTable::parse)
+        .and_then(|episodes| episodes.newest())
+        .map(format_guid);
+    let guids = history.as_deref().and_then(rvt_model::DocumentGuids::parse);
+    let stated = labelled
+        .as_ref()
+        .and_then(|info| info.document_guid.clone());
+    let document_guid = match (stated, episodes) {
+        (Some(stated), Some(episode)) if stated != episode => None,
+        (stated, episode) => stated.or(episode),
+    };
+    if document_guid.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(BimDocumentIdentity {
+        document_guid,
+        increment: labelled.as_ref().and_then(|info| info.document_increments),
+        // A nil GUID is a field the document leaves unset, not a lineage.
+        creation_guid: guids.and_then(|guids| optional_guid(guids.creation)),
+        detach_guid: guids.and_then(|guids| optional_guid(guids.detach)),
+        worksharing: labelled.and_then(|info| info.worksharing),
+    }))
+}
+
+/// A GUID the way `BasicFileInfo` states one, so the two sources can be
+/// compared as text and either can fill the field.
+fn format_guid(bytes: [u8; 16]) -> String {
+    let hex = bytes.iter().fold(String::new(), |mut text, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(text, "{byte:02x}");
+        text
+    });
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+fn optional_guid(bytes: [u8; 16]) -> Option<String> {
+    (bytes != [0; 16]).then(|| format_guid(bytes))
+}
+
 /// The file's `BasicFileInfo`, or `None` where it has none.
 ///
 /// # Errors
@@ -5791,6 +5870,7 @@ mod tests {
             parameter_specs: BTreeMap::new(),
             elements,
             authored_unique_ids: BTreeMap::new(),
+            document_identity: None,
         };
         let (model, ..) = metadata_model(&recovered, false, None);
         let selected = model
@@ -5843,6 +5923,7 @@ mod tests {
             parameter_specs: BTreeMap::new(),
             elements,
             authored_unique_ids: BTreeMap::new(),
+            document_identity: None,
         };
         let (model, counts) = metadata_model(&recovered, false, None);
         let names = model.elements[0]
@@ -5936,6 +6017,7 @@ mod tests {
             parameter_specs: BTreeMap::new(),
             elements,
             authored_unique_ids: BTreeMap::new(),
+            document_identity: None,
         };
         let is_model_element = |element: &ExportedElement| element.class_index == Some(13);
         let (levels, canonical) = building_storeys(&recovered, &is_model_element);
@@ -6037,6 +6119,7 @@ mod tests {
             parameter_specs: BTreeMap::new(),
             elements,
             authored_unique_ids: BTreeMap::new(),
+            document_identity: None,
         };
 
         let identity = project_identity(&recovered).expect("a ProjectInfo record");
@@ -6062,6 +6145,7 @@ mod tests {
             parameter_specs: BTreeMap::new(),
             elements: BTreeMap::new(),
             authored_unique_ids: BTreeMap::new(),
+            document_identity: None,
         };
         assert!(project_identity(&recovered).is_none());
     }
@@ -6102,6 +6186,7 @@ mod tests {
             parameter_specs: BTreeMap::new(),
             elements,
             authored_unique_ids: BTreeMap::new(),
+            document_identity: None,
         };
         let site = site_location(&recovered).expect("every record agrees");
         assert!((site.latitude_degrees - 42.414_863_586_425_76).abs() < 1e-9);
@@ -6147,6 +6232,7 @@ mod tests {
             parameter_specs: BTreeMap::new(),
             elements,
             authored_unique_ids: BTreeMap::new(),
+            document_identity: None,
         };
         assert!(site_location(&recovered).is_none());
     }
@@ -6165,6 +6251,7 @@ mod tests {
             parameter_specs: BTreeMap::new(),
             elements: BTreeMap::new(),
             authored_unique_ids: BTreeMap::new(),
+            document_identity: None,
         };
         assert!(site_location(&recovered).is_none());
     }

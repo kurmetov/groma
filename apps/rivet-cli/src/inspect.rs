@@ -6,8 +6,8 @@ use std::{
     error::Error,
     fmt::Write as _,
     fs::File,
-    io::{self, Write},
-    path::Path,
+    io::{self, Read as _, Write},
+    path::{Path, PathBuf},
 };
 
 use revit_catalog::Catalog;
@@ -28,6 +28,167 @@ use rvt_import::{
     partition_paths, read_basic_file_info, read_schema,
 };
 
+/// Leading bytes of an IFC read to find the identity its header states.
+///
+/// The header is the first thing in an ISO 10303-21 file and ends at
+/// `ENDSEC;`, so this is a generous bound on it rather than a guess: a
+/// `FILE_DESCRIPTION` naming a long view definition, a converter and several
+/// source documents still fits, and reading this much of a 700 MB export
+/// costs nothing.
+const IFC_HEADER_BYTES: usize = 64 * 1024;
+
+/// Which file, and which save of it, each of these is - and which of them are
+/// the same file.
+///
+/// This is the question a pipeline asks before converting: an RVT states its
+/// own identity, and an IFC this converter wrote states the identity of the
+/// RVT it came from, so the two can be compared. Files are grouped by that
+/// identity, which is what makes a duplicate visible rather than merely
+/// reported.
+///
+/// Nothing here fails as a whole: an unreadable file is one line of the
+/// report, so the scan always has an answer about the files it could read.
+pub(crate) fn document_ids(paths: &[PathBuf]) {
+    let mut by_guid: BTreeMap<String, Vec<&PathBuf>> = BTreeMap::new();
+    let mut unidentified = Vec::new();
+    for path in paths {
+        // One unreadable file does not stop the scan. The question being
+        // asked is about the set - which of these are the same document -
+        // and answering it for 73 of 74 files beats answering it for none.
+        let read = read_document_identity(path);
+        println!("{}", path.display());
+        let (format, identity) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                println!("  Unreadable: {error}");
+                unidentified.push(path);
+                println!();
+                continue;
+            }
+        };
+        println!(
+            "  Format: {}",
+            format.map_or("unrecognized", bim_convert::Format::label)
+        );
+        if let Some(identity) = identity {
+            let guid = identity.document_guid.clone().unwrap_or_default();
+            print_identity("  ", &identity);
+            by_guid.entry(guid).or_default().push(path);
+        } else {
+            // Said plainly, because "no identity" and "a new file" are
+            // different answers and only the file can tell them apart.
+            println!("  Document GUID: none stated");
+            unidentified.push(path);
+        }
+        println!();
+    }
+    let duplicates: Vec<_> = by_guid
+        .iter()
+        .filter(|(_, files)| files.len() > 1)
+        .collect();
+    if duplicates.is_empty() {
+        println!(
+            "Distinct documents: {} of {} files, no duplicates",
+            by_guid.len(),
+            paths.len() - unidentified.len()
+        );
+    } else {
+        println!("Duplicates, by document GUID:");
+        for (guid, files) in duplicates {
+            println!("  {guid}");
+            for file in files {
+                println!("    {}", file.display());
+            }
+        }
+    }
+    if !unidentified.is_empty() {
+        println!(
+            "Stating no identity: {} file(s) - an RVT too old to carry one, or an \
+             IFC this converter did not write",
+            unidentified.len()
+        );
+    }
+}
+
+/// What one file is, and the identity it states, from whichever of the two
+/// readers its format calls for.
+type StatedIdentity = (
+    Option<bim_convert::Format>,
+    Option<bim_core::BimDocumentIdentity>,
+);
+
+fn read_document_identity(path: &Path) -> Result<StatedIdentity, Box<dyn Error>> {
+    let format = bim_convert::Format::sniff_file(path)?;
+    let identity = match format {
+        Some(bim_convert::Format::Rvt) => {
+            rvt_import::document_identity(&RvtContainer::open(path)?)?
+        }
+        Some(bim_convert::Format::Ifc) => ifc_header_identity(path)?,
+        _ => None,
+    };
+    Ok((format, identity))
+}
+
+fn print_identity(indent: &str, identity: &bim_core::BimDocumentIdentity) {
+    println!(
+        "{indent}Document GUID: {}",
+        identity.document_guid.as_deref().unwrap_or("none stated")
+    );
+    if let Some(increment) = identity.increment {
+        println!("{indent}Save number: {increment}");
+    }
+    if let Some(worksharing) = identity.worksharing.as_deref() {
+        println!("{indent}Worksharing: {worksharing}");
+    }
+    // Named as lineage where they are printed, too: these group the saves of
+    // one model and are shared by unrelated files, so nothing should compare
+    // them to decide two files are the same.
+    if let Some(creation) = identity.creation_guid.as_deref() {
+        println!("{indent}Template lineage: {creation}");
+    }
+    if let Some(detach) = identity.detach_guid.as_deref() {
+        println!("{indent}Central lineage: {detach}");
+    }
+}
+
+/// The identity an IFC's own header states, read without parsing the file.
+///
+/// The exporter writes it into `FILE_DESCRIPTION` precisely so that this
+/// question needs the head of the file and not the whole of it. The property
+/// set on `IfcProject` carries the same GUID and more beside it; reading that
+/// is a conversion, which is what `export-json` does.
+fn ifc_header_identity(
+    path: &Path,
+) -> Result<Option<bim_core::BimDocumentIdentity>, Box<dyn Error>> {
+    let mut head = vec![0_u8; IFC_HEADER_BYTES];
+    let read = {
+        let mut file = File::open(path)?;
+        let mut filled = 0;
+        loop {
+            match file.read(&mut head[filled..])? {
+                0 => break filled,
+                count => filled += count,
+            }
+            if filled == head.len() {
+                break filled;
+            }
+        }
+    };
+    let head = String::from_utf8_lossy(&head[..read]);
+    let header = head.split("ENDSEC;").next().unwrap_or(&head);
+    let Some(guid) = header
+        .split("SourceDocument [")
+        .skip(1)
+        .find_map(|rest| rest.split(']').next())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(bim_core::BimDocumentIdentity {
+        document_guid: Some(guid.to_owned()),
+        ..bim_core::BimDocumentIdentity::default()
+    }))
+}
+
 pub(crate) fn info(path: &Path) -> Result<(), Box<dyn Error>> {
     let container = RvtContainer::open(path)?;
     let basic_info = read_basic_file_info(&container)?;
@@ -41,6 +202,9 @@ pub(crate) fn info(path: &Path) -> Result<(), Box<dyn Error>> {
             .and_then(|info| info.revit_version)
             .map_or_else(|| "unknown".to_owned(), |year| year.to_string())
     );
+    if let Some(identity) = rvt_import::document_identity(&container)? {
+        print_identity("", &identity);
+    }
     println!("Streams: {}", container.streams().len());
     println!("Partitions: {}", container.partition_count());
     println!();

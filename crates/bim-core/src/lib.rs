@@ -19,6 +19,12 @@ pub struct BimModel {
     /// `None` for a federated model, because several files name several
     /// projects and none of them is *the* project of the assembled whole.
     pub project: Option<BimProjectIdentity>,
+    /// Which file, and which save of it, this model was read from.
+    ///
+    /// The shorthand for a model read from one file, same as [`Self::source`]:
+    /// `None` for a federated model, which states one of these per file in
+    /// [`BimDocument::identity`] instead.
+    pub document_identity: Option<BimDocumentIdentity>,
     /// Where the project sits, when the file states one location and every
     /// record of it agrees. `None` for a federated model, same reasoning as
     /// [`Self::project`]; also `None` for a single file whose named
@@ -70,6 +76,70 @@ pub struct BimProjectIdentity {
     pub address: Option<String>,
     /// `PROJECT_STATUS`, written as `IfcProject.Phase`.
     pub phase: Option<String>,
+}
+
+/// Which file, and which save of it, a model was read from.
+///
+/// This answers a question the rest of the model cannot: given an exported
+/// IFC, is it this source file, and has it already been converted? An element
+/// identity says which element, and a project identity says which project -
+/// several files belong to one project, and one file has many saves.
+///
+/// Every field is stated by the source or left `None`. Nothing here is
+/// computed from the file's bytes: a hash would answer "the same bytes",
+/// which a re-save with no edits already breaks, and these are what the
+/// document says about itself.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BimDocumentIdentity {
+    /// The identity of this save of the document, hyphenated and lower-case.
+    ///
+    /// Revit's own `Unique Document GUID`, which changes with every save. It
+    /// is the field to compare when the question is whether two exports came
+    /// from the same file: measured over a 74-file corpus, two files sharing
+    /// it and two files being byte-identical are the same 9 pairs out of
+    /// 2701.
+    pub document_guid: Option<String>,
+    /// How many times the document has been saved, which orders two saves of
+    /// one model where the GUIDs only tell them apart.
+    pub increment: Option<u32>,
+    /// The lineage the document was created in - a template, typically shared
+    /// by every model in an office. Never an identity: 74 corpus files state
+    /// 19 of these. Kept for grouping, and named so that nothing mistakes it
+    /// for [`Self::document_guid`].
+    pub creation_guid: Option<String>,
+    /// The lineage of the central model this one was detached from, shared by
+    /// everything detached from the same one. Not an identity either - 61
+    /// values over those 74 files - but it is what stays put across the saves
+    /// of one model.
+    pub detach_guid: Option<String>,
+    /// Whether the file is a central model or a local copy of one, where the
+    /// source says. A local copy and its central are different files.
+    pub worksharing: Option<String>,
+}
+
+impl BimDocumentIdentity {
+    /// The `IfcPropertySet` an exporter states this under, on `IfcProject`.
+    ///
+    /// IFC has no attribute for "which file was this made from", so a writer
+    /// and a reader of one have to agree on a spelling. These are that
+    /// agreement, kept here rather than in either of them, because an
+    /// exported file outlives the session that wrote it: changing one of
+    /// these strings orphans every IFC already written under the old one.
+    pub const IFC_PROPERTY_SET: &'static str = "Rivet Source Document";
+    /// [`Self::document_guid`], the property that identifies the save.
+    pub const IFC_DOCUMENT_GUID: &'static str = "DocumentGuid";
+    /// [`Self::increment`], which orders two saves of one model.
+    pub const IFC_INCREMENT: &'static str = "DocumentIncrement";
+    /// [`Self::creation_guid`]. Lineage, not identity.
+    pub const IFC_CREATION_GUID: &'static str = "CreationGuid";
+    /// [`Self::detach_guid`]. Lineage, not identity.
+    pub const IFC_DETACH_GUID: &'static str = "DetachGuid";
+    /// [`Self::worksharing`].
+    pub const IFC_WORKSHARING: &'static str = "Worksharing";
+    /// The source file's own name, which the identity itself does not carry:
+    /// a name is not an identity, and is written beside one so that a person
+    /// reading the set recognises the file.
+    pub const IFC_FILE_NAME: &'static str = "SourceFileName";
 }
 
 /// Where a project's `Manage > Location` places it.
@@ -855,6 +925,10 @@ pub struct BimDocument {
     /// The source format's short tag, such as `rvt` or `ifc`.
     pub kind: String,
     pub source: Option<BimSource>,
+    /// Which file, and which save of it, this is - as the file states it,
+    /// not as it was named or where it was found. `None` for a format that
+    /// says nothing about its own identity.
+    pub identity: Option<BimDocumentIdentity>,
     /// Elements this document contributed.
     pub elements: usize,
 }
@@ -949,6 +1023,7 @@ pub fn federate(sources: Vec<(BimDocument, BimModel)>) -> (BimModel, BimFederati
         if !qualify {
             out.source = model.source.clone();
             out.project = model.project.clone();
+            out.document_identity.clone_from(&model.document_identity);
             out.site = model.site;
         }
         out.elements.append(&mut model.elements);
@@ -1313,6 +1388,7 @@ mod tests {
                 ..BimProjectIdentity::default()
             }),
             site: None,
+            document_identity: Some(identity(id)),
             documents: Vec::new(),
             elements: vec![element(id, at)],
             levels: vec![BimLevel {
@@ -1335,7 +1411,17 @@ mod tests {
             name: format!("{id}.ifc"),
             kind: "ifc".to_owned(),
             source: None,
+            identity: Some(identity(id)),
             elements: 0,
+        }
+    }
+
+    /// An identity distinct per file, so a federated model can be checked for
+    /// keeping each file's own rather than one of them for all.
+    fn identity(id: &str) -> BimDocumentIdentity {
+        BimDocumentIdentity {
+            document_guid: Some(format!("guid-of-{id}")),
+            ..BimDocumentIdentity::default()
         }
     }
 
@@ -1367,8 +1453,34 @@ mod tests {
                 ..BimProjectIdentity::default()
             })
         );
+        assert_eq!(
+            federated.document_identity,
+            Some(identity("1234")),
+            "which file this was read from survives being federated with itself"
+        );
         assert_eq!(report.collisions, 0);
         assert!(report.disjoint.is_empty());
+    }
+
+    #[test]
+    fn several_sources_state_one_identity_each_and_none_for_the_whole() {
+        let (federated, _) = federate(vec![
+            (document("a"), model("1234", [0.0; 3])),
+            (document("b"), model("1234", [0.0; 3])),
+        ]);
+
+        // No file is *the* file a federated model came from, so the
+        // shorthand answers for none of them - and a reader asking which
+        // files these are gets all of them rather than one picked out.
+        assert_eq!(federated.document_identity, None);
+        assert_eq!(
+            federated
+                .documents
+                .iter()
+                .map(|document| document.identity.clone())
+                .collect::<Vec<_>>(),
+            vec![Some(identity("a")), Some(identity("b"))]
+        );
     }
 
     #[test]

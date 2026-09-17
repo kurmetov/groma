@@ -582,6 +582,9 @@ pub(crate) fn read_sources(
             name: source.name.clone(),
             kind: source.format.source_kind().to_owned(),
             source: source.model.source.clone(),
+            // The reader's own shorthand for the one file it read, moved to
+            // where a federated model keeps one per file.
+            identity: source.model.document_identity.clone(),
             // `federate` fills this from the model it is handed.
             elements: 0,
         };

@@ -23,7 +23,7 @@ pub use geometry::{
     FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds, GElementGraphFields,
     GElementNodeReference, GInstanceTransformFields, PipeLineGeometryFields, RvtPoint3,
 };
-pub use history::EpisodeTable;
+pub use history::{DocumentGuids, EpisodeTable};
 pub use member::{
     ELEMENT_HEADER_ID_BLOCK_BYTES, ELEMENT_ID_SEARCH_WINDOW_BYTES, ELEMENT_PRE_ID_WORD_BYTES,
     ELEMENT_TAIL_BYTES, ElementAnchor, ElementFields, ElementHeaderFields,
