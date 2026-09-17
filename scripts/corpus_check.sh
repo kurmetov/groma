@@ -2,7 +2,7 @@
 # Measure the reference corpus and compare against the accepted baseline in
 # tests/baseline/corpus_metrics.tsv, failing on any movement the wrong way.
 #
-# This is the check the project's working notes requires before and after any change to
+# This is the check to run before and after any change to
 # the record walk. It replaces diffing two sweeps by eye: a class that is bought
 # by selling another now fails instead of needing to be spotted.
 #

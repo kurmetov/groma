@@ -2,8 +2,8 @@
 //! Semantic reconstruction: a Revit file's records read into
 //! [`bim_core::BimModel`].
 //!
-//! This is the stage `BRIEF.md` rule 10 names between RVT serialization
-//! decoding and the exporters. It used to live inside the `rivet` binary,
+//! This is the stage between RVT serialization decoding and the exporters.
+//! It used to live inside the `rivet` binary,
 //! which is why adding a second source format meant editing the CLI; IFC
 //! reading was already a crate of its own and this is now its peer.
 //!

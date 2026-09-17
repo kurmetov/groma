@@ -1,8 +1,8 @@
 //! The corpus regression gate.
 //!
 //! Every decode rule in this project is justified by a measurement over the
-//! reference corpus, and the project's working notes requires those measurements to be
-//! taken before and after any change to the record walk - a change can buy one
+//! reference corpus, and those measurements have to be taken before and after
+//! any change to the record walk - a change can buy one
 //! class by selling another, and nothing else catches that. Until now that
 //! comparison was a human diffing two TSV files by eye, which means a
 //! regression is caught only if someone remembers to look.
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Classes always measured, whether or not they are among a file's most
-/// numerous. the project's working notes calls these out: `GElement` is the number
+/// numerous. These three are always worth stating: `GElement` is the number
 /// geometry depends on, and the two family classes carry the element/type link.
 const ALWAYS_MEASURED: [&str; 3] = ["GElement", "FamilySymbol", "FamilyInstance"];
 

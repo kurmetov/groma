@@ -722,7 +722,7 @@ Two defects fell out, both now fixed with tests:
   `payload[record.body_offset()..record.end()]` raw, and a record may be
   continued into the following member, so a declared end past this payload is
   an expected condition. `MemberRecord::body_in` now returns the guarded slice
-  and all four call sites go through it. This is the `BRIEF.md` rule about
+  and all four call sites go through it. This is the project's rule against
   `unwrap()` in parser code, in the form of an index.
 - **`ifcopenshell.validate --rules` failed `IfcPropertySet.UniquePropertyNames`
   on 54 of AR S1's 189 098 property sets.** Distinct Revit built-ins share a
@@ -946,8 +946,8 @@ published enumeration. They stay `param_-1001101`, which is rule 12 working.
 its name) and a `ROOM_NAME`, and 553 of them carry the project's own schedule
 parameters - `Number`, `SP_назначение`, `SP_количество_комнат`, `SP_этаж`,
 `SP_подъезд`, `SP_тип_помещения` and four area parameters. That is the data
-behind "what equipment belongs to room 204", which `BRIEF.md` names as a target
-query.
+behind "what equipment belongs to room 204", one of the queries this project
+set out to answer.
 
 They are already complete in the JSON. What they never reach is the IFC: a
 `RoomElem` declares no category, is not a building-element class and has no

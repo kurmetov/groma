@@ -28,8 +28,8 @@ RIVET_CORPUS=/path/to/models scripts/corpus_check.sh
 Without `RIVET_CORPUS` the test skips, so `cargo test --workspace` stays fast
 and CI - which has no corpus - still runs everything it can.
 
-Run it before and after any change to the record walk. the project's working notes
-explains why: a change there can buy one class by selling another, and the
+Run it before and after any change to the record walk. The reason: a change
+there can buy one class by selling another, and the
 per-class table is the only thing that shows both halves.
 
 When a change moves a number legitimately, re-accept it with `--write` and

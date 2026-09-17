@@ -214,8 +214,9 @@ pub(crate) struct SourceModel {
 /// These are deliberately not flattened into shared counters. "Products whose
 /// representation held nothing this reads" and "faces the tessellator could
 /// not read" are different facts about different stages, and a single number
-/// covering both would say neither - which is what rules 8 and 12 of
-/// `BRIEF.md` forbid. Generic code carries this and prints it through the
+/// covering both would say neither, and this project does not publish a number
+/// that states neither of its measurements. Generic code carries this and
+/// prints it through the
 /// `report_*` methods below; it never interprets it.
 pub(crate) enum SourceDetail {
     Rvt(Box<RvtDetail>),
