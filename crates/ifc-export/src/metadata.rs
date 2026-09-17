@@ -373,6 +373,7 @@ fn push_axis(file: &mut StepFile, lengths: Lengths, elevation: f64) -> EntityRef
     )
 }
 
+
 fn push_units(file: &mut StepFile, length_unit: LengthUnit) -> EntityRef {
     let mut units = Vec::new();
     for (unit_type, prefix, name) in [
@@ -830,6 +831,7 @@ struct ElementTables {
     // [`BodyWriter`].
     bodies: HashMap<u64, EntityRef>,
     common_sets: CommonPropertySets,
+    classifications: ClassificationLibrary,
     containment: BTreeMap<String, (EntityRef, Vec<EntityRef>)>,
     // A space is part of the spatial structure, so its storey decomposes it
     // rather than containing it. Kept apart from containment so the two
@@ -948,6 +950,7 @@ impl ElementTables {
         if context.options.settings.property_sets.base_quantities {
             push_quantities(file, element, entity, written_as.name, context);
         }
+        self.classifications.associate(file, element, entity);
         if !spatial {
             self.materials
                 .associate(file, element, entity, context.lengths);
@@ -969,6 +972,7 @@ impl ElementTables {
         if context.options.settings.openings {
             self.openings.push(file, &self.products_by_id, context);
         }
+        self.classifications.push_associations(file, context);
         push_space_boundaries(
             file,
             &self.products_by_id,
@@ -3655,6 +3659,145 @@ fn common_property_set(entity: &str) -> Option<&'static str> {
         .map(|(_, pset)| *pset)
 }
 
+/// Revit's `Assembly Code`, the parameter a type carries a Uniformat code in.
+const UNIFORMAT_CODE_PARAMETER: &str = "-1002500";
+
+/// Revit's `Assembly Description`, the caption beside that code.
+const UNIFORMAT_DESCRIPTION_PARAMETER: &str = "-1002501";
+
+/// The system a built-in Revit parameter's identifier is stated in.
+const BUILT_IN_PARAMETER_SYSTEM: &str = "autodesk.revit.builtInParameter";
+
+/// The value of one built-in Revit parameter, as text, preferring the
+/// element's own over the one its type carries: a family that declares the
+/// parameter per instance overrides the type's, and one that does not leaves
+/// the element's empty, in which case the type's is what holds.
+///
+/// Trimmed, because a code read from the file arrives with the line ending the
+/// user's own edit left in it - `03.10.07\r\n` - which is trailing whitespace
+/// in the value rather than part of the code.
+fn built_in_parameter_text<'a>(element: &'a BimElement, id: &str) -> Option<&'a str> {
+    [&element.properties, &element.type_properties]
+        .into_iter()
+        .flatten()
+        .filter(|property| {
+            property.id.as_ref().is_some_and(|external| {
+                external.system == BUILT_IN_PARAMETER_SYSTEM && external.value == id
+            })
+        })
+        .find_map(|property| match &property.value {
+            BimPropertyValue::Text(text) => Some(text.trim()).filter(|text| !text.is_empty()),
+            _ => None,
+        })
+}
+
+/// The classification codes written so far, and the products carrying each.
+///
+/// Revit keeps a type's classification in `Assembly Code`, a parameter holding
+/// a code from its own assembly-code table, and states it in IFC as an
+/// `IfcClassificationReference` under one `IfcClassification`. That the table
+/// here is Uniformat is not an assumption about what the codes mean: joined to
+/// Revit's own export of AR S1 on the element id, the codes this reads are the
+/// same codes, on the same elements - 3 262 walls, 446 slabs and 7 plates
+/// against Revit's 3 266, 447 and 7 - and Revit names the classification they
+/// belong to `Uniformat`, CSI's 1998 edition. So the source is joined, not
+/// guessed, and an element whose type carries no code carries no reference
+/// rather than an empty one.
+///
+/// Only an element's own code is written. An opening inherits nothing: Revit
+/// classifies 2 062 of AR S1's openings, and not one of them is a void an
+/// element fills - they are the penetrations cut by pipes and beams, carrying
+/// the code of whatever cuts them, which is a different fact from the code of
+/// the wall they pass through. Giving a doorway its wall's code would agree
+/// with Revit on 14 openings and contradict it on 189.
+#[derive(Default)]
+struct ClassificationLibrary {
+    /// The `IfcClassification` every reference belongs to, written the first
+    /// time any element turns out to carry a code.
+    source: Option<EntityRef>,
+    /// `IfcClassificationReference` by code, with the products carrying it.
+    /// `BTreeMap` rather than a hash so the output stays deterministic.
+    references: BTreeMap<String, (EntityRef, Vec<EntityRef>)>,
+}
+
+impl ClassificationLibrary {
+    /// Record that `product` is classified by its type's `Assembly Code`,
+    /// writing the reference the first time that code is seen.
+    fn associate(&mut self, file: &mut StepFile, element: &BimElement, product: EntityRef) {
+        let Some(code) = built_in_parameter_text(element, UNIFORMAT_CODE_PARAMETER) else {
+            return;
+        };
+        let title = built_in_parameter_text(element, UNIFORMAT_DESCRIPTION_PARAMETER);
+        self.reference(file, code, title).push(product);
+    }
+
+    /// The products carrying one code, writing the code's reference - and the
+    /// classification it belongs to - the first time it is asked for.
+    fn reference(
+        &mut self,
+        file: &mut StepFile,
+        code: &str,
+        title: Option<&str>,
+    ) -> &mut Vec<EntityRef> {
+        let source = *self.source.get_or_insert_with(|| {
+            file.push(
+                "IFCCLASSIFICATION",
+                vec![
+                    string("CSI (Construction Specifications Institute)"),
+                    string("1998"),
+                    omitted(),
+                    string("Uniformat"),
+                    string("UniFormat Classification"),
+                    string(UNIFORMAT_LOCATION),
+                    omitted(),
+                ],
+            )
+        });
+        &mut self
+            .references
+            .entry(code.to_owned())
+            .or_insert_with(|| {
+                let entity = file.push(
+                    "IFCCLASSIFICATIONREFERENCE",
+                    vec![
+                        string(UNIFORMAT_LOCATION),
+                        string(code),
+                        optional_string(title),
+                        reference(source),
+                        omitted(),
+                        omitted(),
+                    ],
+                );
+                (entity, Vec::new())
+            })
+            .1
+    }
+
+    /// One `IfcRelAssociatesClassification` per distinct code.
+    fn push_associations(self, file: &mut StepFile, context: WriteContext<'_>) {
+        for (code, (entity, products)) in self.references {
+            if products.is_empty() {
+                continue;
+            }
+            file.push(
+                "IFCRELASSOCIATESCLASSIFICATION",
+                vec![
+                    global_id(context.options, &format!("classification:{code}")),
+                    reference(context.owner),
+                    omitted(),
+                    omitted(),
+                    StepValue::List(products.into_iter().map(reference).collect()),
+                    reference(entity),
+                ],
+            );
+        }
+    }
+}
+
+/// Where the classification the codes belong to is published, as Revit's own
+/// export states it.
+const UNIFORMAT_LOCATION: &str = "https://www.csiresources.org/standards/uniformat";
+
 /// The IFC common property sets written so far, and the products carrying each.
 ///
 /// The only property in them is `Reference`, which holds the element's type
@@ -6233,6 +6376,98 @@ mod tests {
         assert!(!text.contains("=IFCRELDEFINESBYTYPE("));
         assert!(text.contains("'Rivet Type Properties'"));
         assert_eq!(text.matches("=IFCRELDEFINESBYPROPERTIES(").count(), 2);
+    }
+
+    #[test]
+    fn classifies_an_element_by_the_assembly_code_its_type_carries() {
+        let mut model = model();
+        let mut element = model.elements[0].clone();
+        element.element_type = BimElementType::Wall;
+        element.type_properties = vec![
+            BimProperty {
+                id: Some(BimExternalId {
+                    system: BUILT_IN_PARAMETER_SYSTEM.to_owned(),
+                    value: UNIFORMAT_CODE_PARAMETER.to_owned(),
+                }),
+                name: "Assembly Code".to_owned(),
+                specification: None,
+                // The line ending a user's own edit leaves in the value.
+                value: BimPropertyValue::Text("03.10.01\r\n".to_owned()),
+            },
+            BimProperty {
+                id: Some(BimExternalId {
+                    system: BUILT_IN_PARAMETER_SYSTEM.to_owned(),
+                    value: UNIFORMAT_DESCRIPTION_PARAMETER.to_owned(),
+                }),
+                name: "Assembly Description".to_owned(),
+                specification: None,
+                value: BimPropertyValue::Text("Полы".to_owned()),
+            },
+        ];
+        let mut other = element.clone();
+        other.id = BimElementId("201".to_owned());
+        model.elements = vec![element, other];
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        // One classification and one reference, however many elements carry
+        // the code, and one relationship naming both of them.
+        assert_eq!(text.matches("=IFCCLASSIFICATION(").count(), 1);
+        assert_eq!(text.matches("=IFCCLASSIFICATIONREFERENCE(").count(), 1);
+        assert_eq!(text.matches("=IFCRELASSOCIATESCLASSIFICATION(").count(), 1);
+        assert!(text.contains("'Uniformat'"));
+        // The code is the trimmed value, and the description names it.
+        let reference = text
+            .lines()
+            .find(|line| line.contains("=IFCCLASSIFICATIONREFERENCE("))
+            .unwrap();
+        assert!(reference.contains("'03.10.01'"), "{reference}");
+        // The description is there, and neither it nor the code kept the
+        // line ending - `000D000A` is what an encoded `\r\n` reads as.
+        assert!(reference.contains("041F043E043B044B"), "{reference}");
+        assert!(!reference.contains("000D000A"), "{reference}");
+        let relation = text
+            .lines()
+            .find(|line| line.contains("=IFCRELASSOCIATESCLASSIFICATION("))
+            .unwrap();
+        assert_eq!(relation.matches('#').count(), 5, "{relation}");
+    }
+
+    #[test]
+    fn classifies_nothing_where_no_assembly_code_was_read() {
+        let file = metadata_ifc(&model(), &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(!text.contains("=IFCCLASSIFICATION("));
+        assert!(!text.contains("=IFCRELASSOCIATESCLASSIFICATION("));
+    }
+
+    #[test]
+    fn an_empty_assembly_code_classifies_nothing() {
+        let mut model = model();
+        let mut element = model.elements[0].clone();
+        element.type_properties = vec![BimProperty {
+            id: Some(BimExternalId {
+                system: BUILT_IN_PARAMETER_SYSTEM.to_owned(),
+                value: UNIFORMAT_CODE_PARAMETER.to_owned(),
+            }),
+            name: "Assembly Code".to_owned(),
+            specification: None,
+            value: BimPropertyValue::Text("  \r\n".to_owned()),
+        }];
+        model.elements = vec![element];
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(!text.contains("=IFCCLASSIFICATIONREFERENCE("));
     }
 
     #[test]
