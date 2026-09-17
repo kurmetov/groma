@@ -1,9 +1,9 @@
 # Rivet
 
 Rivet is an early-stage, Linux-native, read-only ingestion engine for building
-models. It reads Autodesk Revit `.rvt` files and IFC (ISO 10303-21), converts
-between them, and needs neither Revit, Windows, Wine, Autodesk Platform
-Services, nor ODA BimRv.
+models. It reads Autodesk Revit `.rvt` files - release 2023, and no other - and
+IFC (ISO 10303-21), converts between them, and needs neither Revit, Windows,
+Wine, Autodesk Platform Services, nor ODA BimRv.
 
 The source format is read from a file's own leading bytes, so `export-scene`
 and `export-ifc` take either an `.rvt` or an `.ifc` without being told which.
@@ -19,6 +19,29 @@ per-member descriptor and the length-prefixed record array inside partition
 members, including records that continue across member boundaries, resolves
 each record's element identifier and schema class, and can run aggregate, schema-backed partition probes without loading
 complete partitions into memory.
+
+## Supported Revit releases
+
+Rivet reads **Revit 2023 files, and only those**. That is the single release the
+decode has been measured on: every model behind
+[`tests/baseline/corpus_metrics.tsv`](tests/baseline/corpus_metrics.tsv), every
+`Partitions/*` framing claim in [`docs/format-notes.md`](docs/format-notes.md),
+and the built-in parameter and category tables in `revit-catalog` are 2023.
+
+A file from another release is not rejected, and the layers that read the file's
+own declarations do work on it: the container, `BasicFileInfo` - which reads the
+release year from a 2026 file today - and the `Formats/Latest` class inventory,
+which was decoded from a 2026 file with no trailing bytes and no unresolved
+class. What is missing is everything keyed to a release. `Catalog::for_release`
+answers for 2023 and returns nothing for anything else, so on another release
+built-in parameter names, their units, and every category-driven IFC
+classification fall away, leaving only the handful of mappings made from class
+names. The record framing inside `Partitions/*` has never been measured on
+another release at all.
+
+Nothing warns you about any of this. Treat a non-2023 file as unverified rather
+than unsupported-but-probably-fine: it may well convert, and no output states
+which parts of it were read by a table that does not apply.
 
 ## Build
 
@@ -573,7 +596,8 @@ evidence.
 
 ## Status
 
-Rivet is experimental. It recovers the object graph's records, identifiers,
+Rivet is experimental, and at 0.9 it supports exactly one Revit release: 2023.
+It recovers the object graph's records, identifiers,
 classes, selected fields, level elevations, names, and schema-bound parameter
 sets, plus independently checked straight-pipe bodies, straight fitting axes
 and boundary representations. On the reference model 56.4% of the products

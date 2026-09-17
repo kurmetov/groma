@@ -66,18 +66,18 @@ checksum = "d92bec98840b8f03a5ff5413de5293bfcd8bf96467cf5452609f939ec6f5de16"
 
 [[package]]
 name = "bim-convert"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bim-core",
 ]
 
 [[package]]
 name = "bim-core"
-version = "0.1.0"
+version = "0.9.0"
 
 [[package]]
 name = "bim-mesh"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bim-core",
 ]
@@ -270,7 +270,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "ifc-export"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bim-convert",
  "bim-core",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "ifc-import"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bim-core",
  "bim-mesh",
@@ -405,11 +405,11 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "revit-catalog"
-version = "0.1.0"
+version = "0.9.0"
 
 [[package]]
 name = "rivet-api"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bim-convert",
  "clap",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "rivet-cli"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bim-convert",
  "bim-core",
@@ -463,7 +463,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rvt-container"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "cfb",
  "flate2",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "rvt-import"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bim-convert",
  "bim-core",
@@ -485,18 +485,18 @@ dependencies = [
 
 [[package]]
 name = "rvt-model"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "rvt-schema",
 ]
 
 [[package]]
 name = "rvt-schema"
-version = "0.1.0"
+version = "0.9.0"
 
 [[package]]
 name = "scene-pack"
-version = "0.1.0"
+version = "0.9.0"
 dependencies = [
  "bim-convert",
  "bim-core",
