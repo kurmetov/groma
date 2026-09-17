@@ -401,6 +401,7 @@ mod tests {
         BimElement {
             id: BimElementId(id.to_owned()),
             document: None,
+            authored_uuid: None,
             element_type: BimElementType::Wall,
             class_name: Some("SWall".to_owned()),
             name: Some(format!("Wall {id}")),

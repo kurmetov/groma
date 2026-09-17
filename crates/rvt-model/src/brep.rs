@@ -79,8 +79,7 @@ impl BrepClassIndexes {
     /// resolved.
     #[must_use]
     pub fn is_edge_loop(&self, class_index: u16) -> bool {
-        class_index == self.edge_loop
-            || self.edge_loop_with_chain_envelopes == Some(class_index)
+        class_index == self.edge_loop || self.edge_loop_with_chain_envelopes == Some(class_index)
     }
 }
 
@@ -2948,7 +2947,11 @@ mod tests {
         // one of these, among them the top and the bottom of 87 floors, each
         // of which left a slab with only its sides and no closed body at all.
         let plain = assemble(&square_with_a_hole(0), &classes(), &[]);
-        let derived = assemble(&with_chain_envelopes(square_with_a_hole(0)), &classes(), &[]);
+        let derived = assemble(
+            &with_chain_envelopes(square_with_a_hole(0)),
+            &classes(),
+            &[],
+        );
         assert!(
             derived.excluded_faces.is_empty(),
             "{:?}",

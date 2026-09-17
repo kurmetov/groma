@@ -40,6 +40,94 @@ use rvt_import::{
     recover_elements, schema_class_index, schema_class_is_a, tally_class_geometry,
 };
 
+/// Walk one flat `Global/*` stream as a top-level object of a named class,
+/// and report where each declared property was read from.
+///
+/// A `Global/*` payload is not a `Partitions` member record: it has no record
+/// header, so nothing narrows its first variable-width field, which is what
+/// [`rvt_model::walk_top_level_object`] exists for. Some of these streams open
+/// with a two-byte class-index tag before the object's own fields
+/// (`Global/PartitionTable` does, `Global/History` does not), so `--skip`
+/// takes it off.
+///
+/// `--output` writes the decoded payload, which is what lets a value be read
+/// back at an offset this prints.
+pub(crate) fn global_object(
+    path: &Path,
+    stream: &str,
+    class_name: Option<&str>,
+    skip: usize,
+    rows: usize,
+    hex: usize,
+    output: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let container = RvtContainer::open(path)?;
+    let raw = container.read_stream_with_limit("Formats/Latest", DEFAULT_DECODE_LIMIT as u64)?;
+    let (_, schema, _) = decode_schema_stream(&raw)?;
+    let class = class_name
+        .map(|class_name| {
+            schema.class_by_name(class_name).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "schema class not found: {}",
+                        escape_terminal_text(class_name)
+                    ),
+                )
+            })
+        })
+        .transpose()?;
+
+    let stored = container.read_stream_with_limit(stream, DEFAULT_DECODE_LIMIT as u64)?;
+    let prepared = if stored.len() >= rvt_container::REVIT_STORED_PAGE_BYTES {
+        rvt_container::strip_revit_page_checksums(&stored)
+    } else {
+        stored.clone()
+    };
+    let decoded = rvt_container::decode_known_framing(&prepared, DEFAULT_DECODE_LIMIT)?;
+    let payload = decoded.payload.get(skip..).unwrap_or_default();
+
+    println!("Stream: {} ({} stored bytes)", stream, stored.len());
+    println!("Framing: {:?}", decoded.framing);
+    println!("Decoded: {} bytes", decoded.payload.len());
+
+    if let Some(class) = class {
+        println!(
+            "Walking {} of them as {} [{}]",
+            payload.len(),
+            class.name,
+            class.index
+        );
+        let (walk, trace) = rvt_model::walk_top_level_object_traced(&schema, class.index, payload);
+        println!(
+            "Consumed: {}, left over: {}, stop: {:?}",
+            walk.consumed, walk.remaining, walk.stop
+        );
+        println!("Properties read (offset +width  class.property):");
+        for entry in trace.iter().take(rows) {
+            println!(
+                "  {:8} +{:<5} {}.{}",
+                entry.offset, entry.consumed, entry.class, entry.property
+            );
+        }
+        if trace.len() > rows {
+            println!("  ... {} more", trace.len() - rows);
+        }
+    }
+    if hex > 0 {
+        let mut head = String::with_capacity(hex * 2);
+        for byte in payload.iter().take(hex) {
+            let _ = write!(head, "{byte:02x}");
+        }
+        println!("Head: {head}");
+    }
+    if let Some(output) = output {
+        std::fs::write(output, &decoded.payload)?;
+        println!("Wrote the decoded payload to {}", output.display());
+    }
+    Ok(())
+}
+
 pub(crate) fn partition_id_probe(path: &Path) -> Result<(), Box<dyn Error>> {
     let container = RvtContainer::open(path)?;
     let element_ids = elem_table_ids(&container)?.ok_or_else(|| {

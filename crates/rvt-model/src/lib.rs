@@ -4,6 +4,7 @@ mod brep;
 mod compound;
 mod elem_table;
 mod geometry;
+mod history;
 mod member;
 mod parameter;
 mod serial;
@@ -17,13 +18,12 @@ pub use compound::{
     COMPOUND_STRUCTURE_CLASS_NAME, COMPOUND_STRUCTURE_LAYER_CLASS_NAME, CompoundLayer,
     CompoundStructure, CompoundStructureClassIndexes, HOST_OBJECT_ATTRIBUTES_CLASS_NAME,
 };
-pub use elem_table::{
-    ElemTable, ElemTableError, ElemTableHeader, ElemTableLayout, ElemTableRecord, RecordFraming,
-};
+pub use elem_table::{ElemTable, ElemTableError, ElemTableRecord};
 pub use geometry::{
     FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds, GElementGraphFields,
     GElementNodeReference, GInstanceTransformFields, PipeLineGeometryFields, RvtPoint3,
 };
+pub use history::EpisodeTable;
 pub use member::{
     ELEMENT_HEADER_ID_BLOCK_BYTES, ELEMENT_ID_SEARCH_WINDOW_BYTES, ELEMENT_PRE_ID_WORD_BYTES,
     ELEMENT_TAIL_BYTES, ElementAnchor, ElementFields, ElementHeaderFields,
@@ -31,18 +31,17 @@ pub use member::{
     MemberRecordError, MemberRecords, MemberWalk, RecordHeader, RecordLayout, RecordString,
 };
 pub use parameter::{
-    FamilyParameterClassIndexes, read_family_parameters, read_record_parameters,
-    AUTODESK_SPEC_PREFIX, MAX_PARAMETERS_PER_SET, Parameter, ParameterSetClassIndexes,
-    ParameterSets, ParameterSpec, ParameterValue,
+    AUTODESK_SPEC_PREFIX, FamilyParameterClassIndexes, MAX_PARAMETERS_PER_SET, Parameter,
+    ParameterSetClassIndexes, ParameterSets, ParameterSpec, ParameterValue, read_family_parameters,
+    read_record_parameters,
 };
 pub use serial::{
     FLAG_SAMPLE_WORDS, FlagWidthSample, GeoSiteFields, MaterialColorFields,
-    RECORD_LENGTH_TRAILER_BYTES, SerialObject,
-    SerialRecordWalk, SerialStop, SerialStreamWalk, SerialString, SerialTraceEntry, SerialWalk,
-    descends_from, record_declared_id, record_declared_ids, record_name, record_name_string,
-    walk_object, walk_object_stream, walk_record, walk_record_collecting,
-    walk_record_flag_widths, walk_record_strings, walk_record_traced, walk_top_level_object,
-    walk_top_level_object_traced,
+    RECORD_LENGTH_TRAILER_BYTES, SerialObject, SerialRecordWalk, SerialStop, SerialStreamWalk,
+    SerialString, SerialTraceEntry, SerialWalk, descends_from, record_declared_id,
+    record_declared_ids, record_name, record_name_string, walk_object, walk_object_stream,
+    walk_record, walk_record_collecting, walk_record_flag_widths, walk_record_strings,
+    walk_record_traced, walk_top_level_object, walk_top_level_object_traced,
 };
 
 #[derive(Clone, Debug, Default, PartialEq)]

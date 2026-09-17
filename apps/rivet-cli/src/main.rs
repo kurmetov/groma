@@ -113,6 +113,30 @@ enum Command {
         #[arg(long)]
         records: bool,
     },
+    /// Walk a flat `Global/*` stream as a top-level object of one class.
+    Global {
+        file: PathBuf,
+        /// Stream name, for example `Global/History`.
+        stream: String,
+        /// Exact schema class the payload is an instance of. Left out, the
+        /// stream is only decoded, which is what `--output` needs.
+        #[arg(long)]
+        class: Option<String>,
+        /// Bytes to take off the front before the object's own fields begin -
+        /// some of these streams open with a two-byte class-index tag.
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        /// Print this many of the properties read.
+        #[arg(long, default_value_t = 40)]
+        rows: usize,
+        /// Print this many leading payload bytes as hex.
+        #[arg(long, default_value_t = 0)]
+        hex: usize,
+        /// Write the decoded payload here, so a value can be read back at an
+        /// offset this reports.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
     /// Probe whether partition-member first words correlate with element IDs.
     PartitionIdProbe { file: PathBuf },
     /// Count schema-index/zero prefixes inside decoded partition members.
@@ -626,6 +650,23 @@ fn run_model_command(command: Command) -> Result<(), Box<dyn Error>> {
             property,
         } => schema(&file, class.as_deref(), property.as_deref()),
         Command::ElemTable { file, records } => elem_table(&file, records),
+        Command::Global {
+            file,
+            stream,
+            class,
+            skip,
+            rows,
+            hex,
+            output,
+        } => global_object(
+            &file,
+            &stream,
+            class.as_deref(),
+            skip,
+            rows,
+            hex,
+            output.as_deref(),
+        ),
         Command::PartitionIdProbe { file } => partition_id_probe(&file),
         Command::SchemaPrefixProbe { file, class } => schema_prefix_probe(&file, &class),
         Command::MarkerEnvelopes {

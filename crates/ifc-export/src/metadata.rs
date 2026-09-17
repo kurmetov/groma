@@ -135,7 +135,13 @@ pub fn metadata_ifc_reported(
         "IFCLOCALPLACEMENT",
         vec![StepValue::Omitted, StepValue::Reference(origin_axis)],
     );
-    let site = push_site(&mut file, options, ownership, site_placement, model.site.as_ref());
+    let site = push_site(
+        &mut file,
+        options,
+        ownership,
+        site_placement,
+        model.site.as_ref(),
+    );
     let building_placement = file.push(
         "IFCLOCALPLACEMENT",
         vec![
@@ -459,9 +465,8 @@ fn push_site(
     placement: EntityRef,
     site: Option<&bim_core::BimSiteLocation>,
 ) -> EntityRef {
-    let (ref_latitude, ref_longitude, ref_elevation) = site.map_or(
-        (omitted(), omitted(), omitted()),
-        |site| {
+    let (ref_latitude, ref_longitude, ref_elevation) =
+        site.map_or((omitted(), omitted(), omitted()), |site| {
             (
                 compound_plane_angle(site.latitude_degrees),
                 compound_plane_angle(site.longitude_degrees),
@@ -469,8 +474,7 @@ fn push_site(
                     .as_ref()
                     .map_or_else(omitted, |elevation| StepValue::Real(elevation.value)),
             )
-        },
-    );
+        });
     file.push(
         "IFCSITE",
         vec![
@@ -928,7 +932,7 @@ fn push_space(
     let entity = file.push(
         "IFCSPACE",
         vec![
-            global_id(context.options, &format!("element:{}", element.id.0)),
+            element_global_id(context.options, element),
             reference(context.owner),
             string(element.name.as_deref().unwrap_or(&element.id.0)),
             omitted(),
@@ -1089,7 +1093,7 @@ fn push_element(
         )
     });
     let mut attributes = vec![
-        global_id(context.options, &format!("element:{}", element.id.0)),
+        element_global_id(context.options, element),
         reference(context.owner),
         string(element.name.as_deref().unwrap_or(&element.id.0)),
         omitted(),
@@ -1640,7 +1644,11 @@ fn push_space_boundary_surface(
     let outer = push_profile_curve(file, world.lengths, &polygon);
     let curve_bounded_plane = file.push(
         "IFCCURVEBOUNDEDPLANE",
-        vec![reference(plane), reference(outer), StepValue::List(Vec::new())],
+        vec![
+            reference(plane),
+            reference(outer),
+            StepValue::List(Vec::new()),
+        ],
     );
     Some(file.push(
         "IFCCONNECTIONSURFACEGEOMETRY",
@@ -3760,11 +3768,7 @@ impl MaterialLibrary {
     ) {
         for (face, item) in faces.iter().zip(written_faces) {
             let Some(item) = item else { continue };
-            let Some(color) = face
-                .material
-                .as_deref()
-                .and_then(|material| material.color)
-            else {
+            let Some(color) = face.material.as_deref().and_then(|material| material.color) else {
                 continue;
             };
             let style = *self
@@ -4206,6 +4210,23 @@ fn global_id(options: &MetadataOptions, identity: &str) -> StepValue {
     string(IfcGuid::from_namespace_and_name(options.model_namespace, identity.as_bytes()).as_str())
 }
 
+/// The `GlobalId` of the element itself: the identity its own source authored
+/// where it has one, and otherwise one derived from the model namespace.
+///
+/// A Revit element's `UniqueId` is what Revit's own IFC export writes here, so
+/// carrying it through is what lets a converted model be joined to Revit's by
+/// `GlobalId` rather than only by the element id in `Tag`. Every other entity
+/// this exporter writes about the element - its opening, its property sets,
+/// its quantities, the relationships around it - keeps the derived identity,
+/// because those are this exporter's own entities and the source names none
+/// of them.
+fn element_global_id(options: &MetadataOptions, element: &BimElement) -> StepValue {
+    element.authored_uuid.map_or_else(
+        || global_id(options, &format!("element:{}", element.id.0)),
+        |uuid| string(IfcGuid::from_uuid_bytes(uuid).as_str()),
+    )
+}
+
 fn external_id(id: &BimExternalId) -> String {
     format!("{}:{}", id.system, id.value)
 }
@@ -4306,6 +4327,7 @@ mod tests {
             elements: vec![BimElement {
                 id: BimElementId("200".to_owned()),
                 document: None,
+                authored_uuid: None,
                 element_type: BimElementType::Unknown,
                 class_name: Some("Wall".to_owned()),
                 name: Some("Wall 1".to_owned()),
@@ -4341,6 +4363,7 @@ mod tests {
         BimElement {
             id: BimElementId(id.to_owned()),
             document: None,
+            authored_uuid: None,
             element_type: BimElementType::Unknown,
             class_name: Some(class_name.to_owned()),
             name: Some(format!("Element {id}")),
@@ -4422,6 +4445,63 @@ mod tests {
                 + 1;
             assert_eq!(arguments, attributes, "{line}");
         }
+    }
+
+    /// An element the source gave an identity of its own is written under it,
+    /// so a converted model and the source's own export name it the same way.
+    /// Everything this exporter writes *about* that element keeps the derived
+    /// identity, because the source names none of those entities.
+    #[test]
+    fn writes_the_identity_the_source_authored_where_there_is_one() {
+        let mut model = model();
+        let mut authored = element("10", "SWall", "OST_Walls");
+        authored.element_type = BimElementType::Wall;
+        authored.authored_uuid = Some([
+            0x3d, 0x7b, 0x2a, 0x01, 0x11, 0x22, 0x43, 0x33, 0xa4, 0x55, 0xb6, 0x66, 0xc7, 0x77,
+            0xd8, 0x88,
+        ]);
+        let mut derived = element("11", "SWall", "OST_Walls");
+        derived.element_type = BimElementType::Wall;
+        model.elements.push(authored);
+        model.elements.push(derived);
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        let expected = IfcGuid::from_uuid_bytes([
+            0x3d, 0x7b, 0x2a, 0x01, 0x11, 0x22, 0x43, 0x33, 0xa4, 0x55, 0xb6, 0x66, 0xc7, 0x77,
+            0xd8, 0x88,
+        ]);
+        let walls: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("=IFCWALL("))
+            .collect();
+        assert_eq!(walls.len(), 2, "{walls:?}");
+        assert!(
+            walls[0].contains(&format!("'{expected}'")),
+            "the authored identity is the wall's own GlobalId: {}",
+            walls[0]
+        );
+        assert!(
+            !walls[1].contains(&format!("'{expected}'")),
+            "an element with none keeps a derived identity: {}",
+            walls[1]
+        );
+        let derived_for_the_authored_one =
+            IfcGuid::from_namespace_and_name(options().model_namespace, b"element:10");
+        assert!(
+            !text.contains(&format!("=IFCWALL('{derived_for_the_authored_one}'")),
+            "the derived identity is not written for it as well"
+        );
+        assert!(
+            text.contains(&format!(
+                "'{}'",
+                IfcGuid::from_namespace_and_name(options().model_namespace, b"quantities:10")
+            )) || !text.contains("IFCELEMENTQUANTITY"),
+            "entities about the element keep the derived scheme"
+        );
     }
 
     /// A door names its host wall's id in `host_id`; this writes an
@@ -4529,7 +4609,12 @@ mod tests {
         }));
         model.elements = vec![space, wall];
         model.space_boundaries = bim_core::compute_space_boundaries(&model.elements);
-        assert_eq!(model.space_boundaries.len(), 1, "{:?}", model.space_boundaries);
+        assert_eq!(
+            model.space_boundaries.len(),
+            1,
+            "{:?}",
+            model.space_boundaries
+        );
 
         let file = metadata_ifc(&model, &options()).unwrap();
         let mut bytes = Vec::new();
@@ -5639,7 +5724,10 @@ mod tests {
             longitude_degrees: -1.243_687_973_267_624_5 * (180.0 / std::f64::consts::PI),
             elevation: Some(BimNumber {
                 value: 0.0,
-                unit: Some(bim_core::BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters")),
+                unit: Some(bim_core::BimUnit::new(
+                    "autodesk.unit.unit:meters-1.0.0",
+                    "Meters",
+                )),
             }),
         });
 

@@ -14,7 +14,7 @@ use revit_catalog::Catalog;
 use rvt_container::{DEFAULT_DECODE_LIMIT, PartitionReadOptions, RvtContainer, StreamFraming};
 use rvt_model::{
     ELEMENT_TAIL_BYTES, ElementAnchor, ElementFields, ElementHeaderFields, MemberWalk,
-    ParameterSets, ParameterValue, RecordFraming, RecordHeader, RecordLayout,
+    ParameterSets, ParameterValue, RecordHeader, RecordLayout,
 };
 use rvt_schema::{Schema, TypeReference};
 // The whole semantic reconstruction moved into `rvt-import`. Glob-imported
@@ -358,35 +358,34 @@ pub(crate) fn elem_table(path: &Path, show_records: bool) -> Result<(), Box<dyn 
     println!("Checksum-page trailers stripped: {stripped_page_checksums}");
     println!("Framing prefix bytes: {}", decoded.prefix.len());
     println!("Decoded bytes: {}", decoded.payload.len());
-    println!("Declared elements: {}", table.header.element_count);
-    println!("Declared records: {}", table.header.record_count);
-    let framing = match table.layout.framing {
-        RecordFraming::Implicit => "implicit".to_owned(),
-        RecordFraming::Explicit { marker_bytes } => {
-            format!("explicit-{marker_bytes}-byte-marker")
-        }
-    };
-    println!("Record framing: {framing}");
-    println!("Record start: {}", table.layout.start);
-    println!("Record stride: {}", table.layout.stride);
-    println!("Marker offset: {}", table.layout.marker_offset);
-    println!("Records matching marker: {}", table.marker_match_count());
+    println!("Object class index: {}", table.class_index);
+    println!("Declared records: {}", table.declared_records);
     println!("Parsed records: {}", table.records.len());
-    println!("Unique primary IDs: {}", table.unique_primary_id_count());
+    println!("Unique element IDs: {}", table.unique_id_count());
     println!(
-        "Primary/secondary mismatches: {}",
-        table.primary_secondary_mismatch_count()
+        "Copied in from another document: {}",
+        table.copied_in_count()
     );
     println!("Preserved header bytes: {}", table.leading_bytes().len());
     println!("Preserved trailing bytes: {}", table.trailing_bytes().len());
 
     if show_records {
         println!();
-        println!("Record inventory:");
+        println!(
+            "Record inventory (offset, id, original, creation, last change, \
+             last user change, partition, owner):"
+        );
         for (index, record) in table.records.iter().enumerate() {
             println!(
-                "{index}\toffset={}\tprimary={}\tsecondary={}",
-                record.offset, record.id_primary, record.id_secondary
+                "{index}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                record.offset,
+                record.id,
+                record.original_id,
+                record.creation_episode,
+                record.last_modification_episode,
+                record.last_user_modification_episode,
+                record.partition_id,
+                record.owning_element_id
             );
         }
     }

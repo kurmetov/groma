@@ -126,6 +126,12 @@ pub struct BimElement {
     /// where the model was read from a single file and the question does not
     /// arise.
     pub document: Option<BimDocumentId>,
+    /// The stable identity the source model itself authored for this element,
+    /// as 16 UUID bytes in network order - Revit's `UniqueId`. An exporter
+    /// writes it where a format has somewhere to put it, so a converted model
+    /// and the source's own export name the same element the same way. `None`
+    /// where the source states none, and an exporter then derives one.
+    pub authored_uuid: Option<[u8; 16]>,
 }
 
 /// A layered build-up, in order from one face to the other. The order is the
@@ -881,6 +887,9 @@ pub struct BimFederationReport {
     /// the collisions qualification prevented; zero means qualification
     /// changed nothing but the spelling of every identifier.
     pub collisions: usize,
+    /// Elements whose authored identity more than one document claimed, and
+    /// which therefore lost it. See [`federate`].
+    pub authored_identity_collisions: usize,
     /// Pairs of documents whose stated geometry does not overlap at all.
     ///
     /// This is the only coordinate check made, and it is a report rather than
@@ -951,6 +960,29 @@ pub fn federate(sources: Vec<(BimDocument, BimModel)>) -> (BimModel, BimFederati
 
     report.elements = out.elements.len();
     report.collisions = claimed.values().filter(|count| **count > 1).count();
+    // An authored identity is the source's own, and two sources can state the
+    // same one: a model linked into two others carries its elements, and their
+    // `UniqueId`s, into both. An identifier is qualified by its document to
+    // keep those apart, but an authored UUID cannot be - so where one is not
+    // unique across the federation, nobody gets it and the exporter derives an
+    // identity for each instead. IFC requires a `GlobalId` to be unique, and a
+    // duplicate is worse than a derived identity.
+    let mut authored: std::collections::BTreeMap<[u8; 16], usize> =
+        std::collections::BTreeMap::new();
+    for element in &out.elements {
+        if let Some(uuid) = element.authored_uuid {
+            *authored.entry(uuid).or_default() += 1;
+        }
+    }
+    for element in &mut out.elements {
+        if element
+            .authored_uuid
+            .is_some_and(|uuid| authored.get(&uuid).is_some_and(|count| *count > 1))
+        {
+            element.authored_uuid = None;
+            report.authored_identity_collisions += 1;
+        }
+    }
     for (left_index, (left, left_extent)) in extents.iter().enumerate() {
         for (right, right_extent) in &extents[left_index + 1..] {
             if let (Some(left_extent), Some(right_extent)) = (left_extent, right_extent) {
@@ -1240,6 +1272,7 @@ mod tests {
         BimElement {
             id: BimElementId(id.to_owned()),
             document: None,
+            authored_uuid: None,
             element_type: BimElementType::Wall,
             class_name: None,
             name: None,
@@ -1379,6 +1412,36 @@ mod tests {
         assert!(report.disjoint.is_empty());
         // There is no one application behind a federated model.
         assert!(federated.source.is_none());
+    }
+
+    /// An authored identity cannot be qualified by its document the way an
+    /// identifier can - it is a UUID the source states - so where two
+    /// documents state the same one, neither element keeps it. A duplicate
+    /// `GlobalId` is not valid IFC; a derived identity is.
+    #[test]
+    fn an_authored_identity_two_documents_both_state_is_given_up() {
+        let shared = [7_u8; 16];
+        let mut left = model("1234", [0.0; 3]);
+        left.elements[0].authored_uuid = Some(shared);
+        let mut right = model("5678", [0.5, 0.0, 0.0]);
+        right.elements[0].authored_uuid = Some(shared);
+        let mut alone = model("9999", [1.0, 0.0, 0.0]);
+        alone.elements[0].authored_uuid = Some([9_u8; 16]);
+
+        let (federated, report) = federate(vec![
+            (document("a"), left),
+            (document("b"), right),
+            (document("c"), alone),
+        ]);
+
+        assert_eq!(report.authored_identity_collisions, 2);
+        assert_eq!(federated.elements[0].authored_uuid, None);
+        assert_eq!(federated.elements[1].authored_uuid, None);
+        assert_eq!(
+            federated.elements[2].authored_uuid,
+            Some([9_u8; 16]),
+            "the one nothing else claimed keeps it"
+        );
     }
 
     #[test]

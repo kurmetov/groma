@@ -1,92 +1,127 @@
+//! `Global/ElemTable`: every element the document holds, and when each was
+//! created and last changed.
+//!
+//! The layout is the schema's own. `ElemTable` declares
+//! `m_elemArr: [ElemRec]`, and `ElemRec` declares `m_id: ElementId`,
+//! `m_history: ElementHistory`, `m_partitionId: PartitionId` and
+//! `m_OwningElementId: ElementId`, where `ElementHistory` is
+//! `m_originalElementId` plus three `EpisodeId`s - creation, last
+//! modification, last user modification. Every one of those is a four-byte
+//! identifier, so a record is 28 bytes with nothing variable in it, and the
+//! payload is a two-byte class-index tag, a four-byte count, and the array.
+//!
+//! Verified by walking the stream against those declarations with
+//! `rivet global FILE Global/ElemTable --class ElemTable --skip 2`, which
+//! consumes all but the trailing 8 bytes on all 28 project files available -
+//! the four corpus files and the 24 AR/KJ models beside them.
+//!
+//! This replaces a heuristic that scanned for a run of `0xff` bytes and read
+//! the record array from there. That marker is real - it is
+//! `m_OwningElementId` on an element nothing owns - but it sits at the *end*
+//! of a record, so the scan started the array 24 bytes late and read every
+//! field one slot over. It also read the leading class-index tag as a
+//! `u16` element count (1370, `ElemTable`'s own class index, reported as
+//! "declared elements") and the low half of the record count as the count
+//! itself (2847 of 265 503 on AR S1).
+
 use std::{collections::BTreeSet, fmt};
 
-const COMMON_HEADER_BYTES: usize = 16;
-const MARKER_SCAN_BYTES: usize = 512;
-const FAMILY_RECORD_START: usize = 0x30;
-const FAMILY_RECORD_STRIDE: usize = 12;
-const EXPLICIT_MARKERS_TO_VALIDATE: usize = 8;
+/// The two-byte class tag, then the four-byte count.
+const HEADER_BYTES: usize = 6;
+/// `m_id`, `m_originalElementId`, three `EpisodeId`s, `m_partitionId`,
+/// `m_OwningElementId`.
+const RECORD_BYTES: usize = 28;
+/// How many of a declared count may be missing from the payload before the
+/// parse is treated as a layout failure rather than a truncated table.
+const RECORD_SHORTFALL_TOLERANCE: usize = 0;
 
-/// Counts declared by the decoded `Global/ElemTable` header.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ElemTableHeader {
-    pub element_count: u16,
-    pub record_count: u16,
-}
-
-/// How records are delimited in the decoded table.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RecordFraming {
-    /// Observed in public family-file samples.
-    Implicit,
-    /// A sentinel field repeats inside every project-file record.
-    Explicit { marker_bytes: usize },
-}
-
-/// Physical record layout recovered without assigning BIM semantics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ElemTableLayout {
-    pub start: usize,
-    pub stride: usize,
-    pub marker_offset: usize,
-    pub framing: RecordFraming,
-}
-
-/// One record in the decoded table.
+/// One `ElemRec`, field for field.
+///
+/// The three episodes are `EpisodeId.m_id` values. They index
+/// [`crate::EpisodeTable`] from its *end* - see
+/// [`crate::EpisodeTable::position_of`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ElemTableRecord {
     pub offset: usize,
-    /// Candidate element identifier, as observed in public project corpora.
-    pub id_primary: u32,
-    /// Repeated/correlated identifier field; its full semantics remain unknown.
-    pub id_secondary: u32,
+    pub id: u32,
+    /// `ElementHistory.m_originalElementId` - the same value as `id` on an
+    /// element this document authored.
+    pub original_id: u32,
+    pub creation_episode: i32,
+    pub last_modification_episode: i32,
+    pub last_user_modification_episode: i32,
+    pub partition_id: i32,
+    /// `-1` where nothing owns the element, which is most of them.
+    pub owning_element_id: i32,
 }
 
 /// Loss-preserving parse of `Global/ElemTable`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ElemTable {
-    pub header: ElemTableHeader,
-    pub layout: ElemTableLayout,
+    /// The payload's leading two bytes: the schema class index of the object
+    /// it holds, which is `ElemTable`'s own.
+    pub class_index: u16,
+    /// The count the payload declares, before any of it is read.
+    pub declared_records: u32,
     pub records: Vec<ElemTableRecord>,
     decoded: Vec<u8>,
     records_end: usize,
 }
 
 impl ElemTable {
-    /// Parse a decoded `Global/ElemTable` using only corpus-backed layouts.
-    ///
-    /// The parser validates an initial run of explicit layout markers. Corpus
-    /// evidence shows the same field can take non-sentinel values later, so it
-    /// is not treated as a delimiter for every record. A declared record count
-    /// larger than the available complete record array is preserved as a
-    /// visible count mismatch instead of being silently repaired.
+    /// Parse a decoded `Global/ElemTable`.
     ///
     /// # Errors
     ///
-    /// Returns an error for a short header, an unsupported layout, overflow,
-    /// or a broken marker inside the recoverable record array.
+    /// Returns an error for a payload too short to hold the header, for a
+    /// count that overflows, and for a count the payload cannot hold - the
+    /// last of which is what a layout this does not understand looks like,
+    /// and is reported rather than repaired.
     pub fn parse(decoded: &[u8]) -> Result<Self, ElemTableError> {
-        if decoded.len() < COMMON_HEADER_BYTES {
+        if decoded.len() < HEADER_BYTES {
             return Err(ElemTableError::HeaderTooShort {
                 actual: decoded.len(),
             });
         }
+        let class_index = read_u16(decoded, 0);
+        let declared_records = read_u32(decoded, 2);
+        let declared = usize::try_from(declared_records)
+            .ok()
+            .ok_or(ElemTableError::RecordSpanOverflow)?;
+        let span = declared
+            .checked_mul(RECORD_BYTES)
+            .and_then(|span| span.checked_add(HEADER_BYTES))
+            .ok_or(ElemTableError::RecordSpanOverflow)?;
+        let available = decoded.len().saturating_sub(HEADER_BYTES) / RECORD_BYTES;
+        if declared.saturating_sub(available) > RECORD_SHORTFALL_TOLERANCE {
+            return Err(ElemTableError::RecordsDoNotFit {
+                declared,
+                available,
+            });
+        }
 
-        let header = ElemTableHeader {
-            element_count: read_u16(decoded, 0),
-            record_count: read_u16(decoded, 2),
-        };
-        let layout = detect_layout(decoded, usize::from(header.record_count))?;
-        let records = parse_records(decoded, header.record_count, layout)?;
-        let records_end = records
-            .last()
-            .map_or(layout.start, |record| record.offset + layout.stride);
+        let records = (0..declared.min(available))
+            .map(|index| {
+                let offset = HEADER_BYTES + index * RECORD_BYTES;
+                ElemTableRecord {
+                    offset,
+                    id: read_u32(decoded, offset),
+                    original_id: read_u32(decoded, offset + 4),
+                    creation_episode: read_i32(decoded, offset + 8),
+                    last_modification_episode: read_i32(decoded, offset + 12),
+                    last_user_modification_episode: read_i32(decoded, offset + 16),
+                    partition_id: read_i32(decoded, offset + 20),
+                    owning_element_id: read_i32(decoded, offset + 24),
+                }
+            })
+            .collect::<Vec<_>>();
 
         Ok(Self {
-            header,
-            layout,
+            class_index,
+            declared_records,
             records,
             decoded: decoded.to_vec(),
-            records_end,
+            records_end: span.min(decoded.len()),
         })
     }
 
@@ -97,9 +132,11 @@ impl ElemTable {
 
     #[must_use]
     pub fn leading_bytes(&self) -> &[u8] {
-        &self.decoded[..self.layout.start]
+        &self.decoded[..HEADER_BYTES.min(self.decoded.len())]
     }
 
+    /// What follows the record array: the graveyard records and whatever the
+    /// declarations after them hold, kept rather than discarded.
     #[must_use]
     pub fn trailing_bytes(&self) -> &[u8] {
         &self.decoded[self.records_end..]
@@ -107,40 +144,25 @@ impl ElemTable {
 
     #[must_use]
     pub fn record_bytes(&self, record: &ElemTableRecord) -> &[u8] {
-        &self.decoded[record.offset..record.offset + self.layout.stride]
+        &self.decoded[record.offset..record.offset + RECORD_BYTES]
     }
 
     #[must_use]
-    pub fn unique_primary_id_count(&self) -> usize {
+    pub fn unique_id_count(&self) -> usize {
         self.records
             .iter()
-            .map(|record| record.id_primary)
+            .map(|record| record.id)
             .collect::<BTreeSet<_>>()
             .len()
     }
 
+    /// Records whose `m_originalElementId` is not their own id: an element
+    /// this document did not author, copied in from somewhere that did.
     #[must_use]
-    pub fn primary_secondary_mismatch_count(&self) -> usize {
+    pub fn copied_in_count(&self) -> usize {
         self.records
             .iter()
-            .filter(|record| record.id_primary != record.id_secondary)
-            .count()
-    }
-
-    /// Count records whose layout-marker field currently holds all `0xff`.
-    #[must_use]
-    pub fn marker_match_count(&self) -> usize {
-        let RecordFraming::Explicit { marker_bytes } = self.layout.framing else {
-            return 0;
-        };
-        self.records
-            .iter()
-            .filter(|record| {
-                let marker = record.offset + self.layout.marker_offset;
-                self.decoded[marker..marker + marker_bytes]
-                    .iter()
-                    .all(|byte| *byte == 0xff)
-            })
+            .filter(|record| record.id != record.original_id)
             .count()
     }
 }
@@ -148,8 +170,8 @@ impl ElemTable {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ElemTableError {
     HeaderTooShort { actual: usize },
-    UnsupportedLayout,
     RecordSpanOverflow,
+    RecordsDoNotFit { declared: usize, available: usize },
 }
 
 impl fmt::Display for ElemTableError {
@@ -157,142 +179,23 @@ impl fmt::Display for ElemTableError {
         match self {
             Self::HeaderTooShort { actual } => write!(
                 formatter,
-                "Global/ElemTable header needs at least {COMMON_HEADER_BYTES} bytes, got {actual}"
-            ),
-            Self::UnsupportedLayout => formatter.write_str(
-                "Global/ElemTable does not match a verified 12-, 28-, or 40-byte record layout",
+                "Global/ElemTable header needs at least {HEADER_BYTES} bytes, got {actual}"
             ),
             Self::RecordSpanOverflow => {
                 formatter.write_str("Global/ElemTable record span overflows address space")
             }
+            Self::RecordsDoNotFit {
+                declared,
+                available,
+            } => write!(
+                formatter,
+                "Global/ElemTable declares {declared} records and the payload holds {available}"
+            ),
         }
     }
 }
 
 impl std::error::Error for ElemTableError {}
-
-fn detect_layout(
-    decoded: &[u8],
-    declared_records: usize,
-) -> Result<ElemTableLayout, ElemTableError> {
-    if let Some(layout) = detect_explicit_layout(decoded, declared_records, 8, 40) {
-        return Ok(layout);
-    }
-    if let Some(layout) = detect_explicit_layout(decoded, declared_records, 4, 28) {
-        return Ok(layout);
-    }
-
-    let minimum_end = FAMILY_RECORD_START
-        .checked_add(
-            declared_records
-                .checked_mul(FAMILY_RECORD_STRIDE)
-                .ok_or(ElemTableError::RecordSpanOverflow)?,
-        )
-        .ok_or(ElemTableError::RecordSpanOverflow)?;
-    if decoded.len() >= minimum_end && !has_ff_marker(decoded) {
-        return Ok(ElemTableLayout {
-            start: FAMILY_RECORD_START,
-            stride: FAMILY_RECORD_STRIDE,
-            marker_offset: 0,
-            framing: RecordFraming::Implicit,
-        });
-    }
-
-    Err(ElemTableError::UnsupportedLayout)
-}
-
-fn detect_explicit_layout(
-    decoded: &[u8],
-    declared_records: usize,
-    marker_bytes: usize,
-    stride: usize,
-) -> Option<ElemTableLayout> {
-    let first_marker = find_marker(decoded, marker_bytes)?;
-    let candidate_offsets: &[usize] = if marker_bytes == 8 { &[4, 0] } else { &[0] };
-
-    for &marker_offset in candidate_offsets {
-        let Some(start) = first_marker.checked_sub(marker_offset) else {
-            continue;
-        };
-        if start % 2 != 0 {
-            continue;
-        }
-        let available = decoded.len().saturating_sub(start) / stride;
-        let records_to_validate = declared_records
-            .min(available)
-            .min(EXPLICIT_MARKERS_TO_VALIDATE);
-        if records_to_validate == 0 {
-            continue;
-        }
-        let all_markers_match = (0..records_to_validate).all(|record| {
-            let marker = start + record * stride + marker_offset;
-            decoded
-                .get(marker..marker + marker_bytes)
-                .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0xff))
-        });
-        if all_markers_match {
-            return Some(ElemTableLayout {
-                start,
-                stride,
-                marker_offset,
-                framing: RecordFraming::Explicit { marker_bytes },
-            });
-        }
-    }
-    None
-}
-
-fn find_marker(decoded: &[u8], marker_bytes: usize) -> Option<usize> {
-    let end = decoded.len().min(MARKER_SCAN_BYTES);
-    decoded
-        .get(COMMON_HEADER_BYTES..end)?
-        .windows(marker_bytes)
-        .position(|window| window.iter().all(|byte| *byte == 0xff))
-        .map(|relative| COMMON_HEADER_BYTES + relative)
-}
-
-fn has_ff_marker(decoded: &[u8]) -> bool {
-    find_marker(decoded, 4).is_some()
-}
-
-fn parse_records(
-    decoded: &[u8],
-    declared_count: u16,
-    layout: ElemTableLayout,
-) -> Result<Vec<ElemTableRecord>, ElemTableError> {
-    let available_records = decoded.len().saturating_sub(layout.start) / layout.stride;
-    let count = usize::from(declared_count).min(available_records);
-    let mut records = Vec::with_capacity(count);
-
-    for index in 0..count {
-        let offset = layout
-            .start
-            .checked_add(
-                index
-                    .checked_mul(layout.stride)
-                    .ok_or(ElemTableError::RecordSpanOverflow)?,
-            )
-            .ok_or(ElemTableError::RecordSpanOverflow)?;
-        let (id_primary_offset, id_secondary_offset) = match layout.framing {
-            RecordFraming::Implicit => (offset, offset + 4),
-            RecordFraming::Explicit { marker_bytes } => {
-                let marker = offset + layout.marker_offset;
-                if layout.stride == 40 {
-                    (offset + 16, offset + 36)
-                } else {
-                    let body = marker + marker_bytes;
-                    (body, body + 4)
-                }
-            }
-        };
-        records.push(ElemTableRecord {
-            offset,
-            id_primary: read_u32(decoded, id_primary_offset),
-            id_secondary: read_u32(decoded, id_secondary_offset),
-        });
-    }
-    Ok(records)
-}
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
@@ -307,109 +210,81 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
+#[allow(clippy::cast_possible_wrap)] // An identifier field, read as declared.
+fn read_i32(bytes: &[u8], offset: usize) -> i32 {
+    read_u32(bytes, offset) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn explicit_2023_fixture(declared: u16, complete: usize, tail: usize) -> Vec<u8> {
-        let mut bytes = vec![0; 0x1e + complete * 28 + tail];
-        bytes[..2].copy_from_slice(&declared.to_le_bytes());
-        bytes[2..4].copy_from_slice(&declared.to_le_bytes());
-        for index in 0..complete {
-            let offset = 0x1e + index * 28;
-            bytes[offset..offset + 4].fill(0xff);
-            let id = u32::try_from(index + 1).unwrap();
-            bytes[offset + 4..offset + 8].copy_from_slice(&id.to_le_bytes());
-            bytes[offset + 8..offset + 12].copy_from_slice(&id.to_le_bytes());
+    /// One table: a class tag, a count, and `records.len()` records of the
+    /// declared shape, with `tail` bytes of anything after them.
+    fn fixture(declared: u32, records: &[[i32; 7]], tail: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1370_u16.to_le_bytes());
+        bytes.extend_from_slice(&declared.to_le_bytes());
+        for record in records {
+            for field in record {
+                bytes.extend_from_slice(&field.to_le_bytes());
+            }
         }
+        bytes.extend(std::iter::repeat_n(0_u8, tail));
         bytes
     }
 
     #[test]
-    fn parses_explicit_2023_records_and_preserves_tail() {
-        let bytes = explicit_2023_fixture(3, 3, 7);
-        let table = ElemTable::parse(&bytes).unwrap();
-
-        assert_eq!(table.layout.start, 0x1e);
-        assert_eq!(table.layout.stride, 28);
-        assert_eq!(table.records.len(), 3);
-        assert_eq!(table.records[2].id_primary, 3);
-        assert_eq!(table.trailing_bytes().len(), 7);
-        assert_eq!(table.record_bytes(&table.records[0]).len(), 28);
-    }
-
-    #[test]
-    fn reports_declared_record_shortfall_without_guessing_a_record() {
-        let bytes = explicit_2023_fixture(4, 3, 5);
-        let table = ElemTable::parse(&bytes).unwrap();
-        assert_eq!(table.header.record_count, 4);
-        assert_eq!(table.records.len(), 3);
-        assert_eq!(table.trailing_bytes().len(), 5);
-    }
-
-    #[test]
-    fn recovers_2024_record_origin_before_marker() {
-        let mut bytes = vec![0; 0x1e + 3 * 40];
-        bytes[..2].copy_from_slice(&3_u16.to_le_bytes());
-        bytes[2..4].copy_from_slice(&3_u16.to_le_bytes());
-        for index in 0..3 {
-            let offset = 0x1e + index * 40;
-            bytes[offset + 4..offset + 12].fill(0xff);
-            let id = u32::try_from(index + 1).unwrap();
-            bytes[offset + 16..offset + 20].copy_from_slice(&id.to_le_bytes());
-            bytes[offset + 36..offset + 40].copy_from_slice(&id.to_le_bytes());
-        }
-
-        let table = ElemTable::parse(&bytes).unwrap();
-        assert_eq!(table.layout.start, 0x1e);
-        assert_eq!(table.layout.marker_offset, 4);
-        assert_eq!(table.layout.stride, 40);
-        assert_eq!(table.records.len(), 3);
-        assert!(table.trailing_bytes().is_empty());
-    }
-
-    #[test]
-    fn parses_implicit_family_records() {
-        let mut bytes = vec![0; FAMILY_RECORD_START + 2 * FAMILY_RECORD_STRIDE];
-        bytes[..2].copy_from_slice(&2_u16.to_le_bytes());
-        bytes[2..4].copy_from_slice(&2_u16.to_le_bytes());
-        bytes[FAMILY_RECORD_START..FAMILY_RECORD_START + 4].copy_from_slice(&7_u32.to_le_bytes());
-        bytes[FAMILY_RECORD_START + 4..FAMILY_RECORD_START + 8]
-            .copy_from_slice(&7_u32.to_le_bytes());
-
-        let table = ElemTable::parse(&bytes).unwrap();
-        assert_eq!(table.layout.framing, RecordFraming::Implicit);
+    fn reads_every_declared_field_of_a_record() {
+        let table = ElemTable::parse(&fixture(
+            2,
+            &[[7, 7, 1072, 2007, 2007, 13, -1], [9, 4, 0, 438, 438, 2, 7]],
+            8,
+        ))
+        .unwrap();
+        assert_eq!(table.class_index, 1370);
+        assert_eq!(table.declared_records, 2);
         assert_eq!(table.records.len(), 2);
-        assert_eq!(table.records[0].id_primary, 7);
+        assert_eq!(
+            table.records[0],
+            ElemTableRecord {
+                offset: 6,
+                id: 7,
+                original_id: 7,
+                creation_episode: 1072,
+                last_modification_episode: 2007,
+                last_user_modification_episode: 2007,
+                partition_id: 13,
+                owning_element_id: -1,
+            }
+        );
+        assert_eq!(table.records[1].id, 9);
+        assert_eq!(table.records[1].owning_element_id, 7);
+        assert_eq!(table.trailing_bytes().len(), 8, "the tail is preserved");
+        assert_eq!(table.unique_id_count(), 2);
+        assert_eq!(table.copied_in_count(), 1, "record 1 was copied in");
     }
 
     #[test]
-    fn rejects_unknown_layout() {
-        let bytes = vec![0; COMMON_HEADER_BYTES];
+    fn refuses_a_count_the_payload_cannot_hold() {
+        // What a layout this does not understand looks like: the count reads
+        // as something the array could not possibly hold. Saying so is the
+        // point - the heuristic this replaced would have found a `0xff` run
+        // somewhere and read a table out of the middle of the bytes.
         assert_eq!(
-            ElemTable::parse(&bytes),
-            Err(ElemTableError::UnsupportedLayout)
+            ElemTable::parse(&fixture(4, &[[1, 1, 0, 0, 0, 0, -1]], 0)),
+            Err(ElemTableError::RecordsDoNotFit {
+                declared: 4,
+                available: 1,
+            })
         );
     }
 
     #[test]
-    fn counts_unique_and_mismatched_ids() {
-        let mut bytes = explicit_2023_fixture(2, 2, 0);
-        bytes[0x1e + 28 + 4..0x1e + 28 + 8].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[0x1e + 28 + 8..0x1e + 28 + 12].copy_from_slice(&9_u32.to_le_bytes());
-        let table = ElemTable::parse(&bytes).unwrap();
-        assert_eq!(table.unique_primary_id_count(), 1);
-        assert_eq!(table.primary_secondary_mismatch_count(), 1);
-    }
-
-    #[test]
-    fn later_non_sentinel_values_do_not_break_a_detected_layout() {
-        let mut bytes = explicit_2023_fixture(10, 10, 0);
-        let ninth_marker = 0x1e + 8 * 28;
-        bytes[ninth_marker..ninth_marker + 4].copy_from_slice(&17_u32.to_le_bytes());
-
-        let table = ElemTable::parse(&bytes).unwrap();
-        assert_eq!(table.records.len(), 10);
-        assert_eq!(table.marker_match_count(), 9);
+    fn refuses_a_payload_too_short_for_the_header() {
+        assert_eq!(
+            ElemTable::parse(&[0x5a, 0x05, 0x01]),
+            Err(ElemTableError::HeaderTooShort { actual: 3 })
+        );
     }
 }

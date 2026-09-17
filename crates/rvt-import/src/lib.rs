@@ -20,11 +20,10 @@
 use bim_convert::element_type_for_source;
 use bim_core::{
     BimBoundingBox, BimBrep, BimBrepArc, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile,
-    BimBrepRuling, BimBrepSurface, BimCategory, BimElement, BimElementId, BimElementType,
+    BimBrepRuling, BimBrepSurface, BimCategory, BimColor, BimElement, BimElementId, BimElementType,
     BimExternalId, BimGeometry, BimLevel, BimLineSegment, BimMaterial, BimMaterialLayer,
-    BimColor, BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3,
-    BimProjectIdentity, BimProperty, BimPropertyValue, BimSiteLocation, BimSource, BimSweptDisk,
-    BimUnit,
+    BimMaterialLayerSet, BimModel, BimNumber, BimPlacement, BimPoint3, BimProjectIdentity,
+    BimProperty, BimPropertyValue, BimSiteLocation, BimSource, BimSweptDisk, BimUnit,
 };
 use revit_catalog::Catalog;
 use rvt_container::{
@@ -34,7 +33,7 @@ use rvt_container::{
 use rvt_model::{
     ELEMENT_TAIL_BYTES, ElemTable, ElementFields, ElementHeaderFields,
     FamilyInstancePlacementFields, FittingCenterLineFields, GElementBounds, GElementGraphFields,
-    GeoSiteFields, GInstanceTransformFields, LevelFields, MemberWalk, ParameterSetClassIndexes,
+    GInstanceTransformFields, GeoSiteFields, LevelFields, MemberWalk, ParameterSetClassIndexes,
     ParameterSets, ParameterSpec, ParameterValue, PipeLineGeometryFields, RecordHeader,
     RecordLayout, RecordString, RvtPoint3,
 };
@@ -140,10 +139,80 @@ pub fn elem_table_ids(container: &RvtContainer) -> Result<Option<BTreeSet<u32>>,
         table
             .records
             .iter()
-            .flat_map(|record| [record.id_primary, record.id_secondary])
+            .flat_map(|record| [record.id, record.original_id])
             .filter(|id| *id != 0 && *id != u32::MAX)
             .collect(),
     ))
+}
+
+/// One `Global/*` stream's decoded payload, or `None` where the container has
+/// no such stream.
+///
+/// # Errors
+///
+/// Fails where the stream is present but its framing does not decode.
+pub fn decode_global_stream(
+    container: &RvtContainer,
+    name: &str,
+) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    if container.stream(name).is_none() {
+        return Ok(None);
+    }
+    let raw = container.read_stream_with_limit(name, DEFAULT_DECODE_LIMIT as u64)?;
+    let prepared = if raw.len() >= REVIT_STORED_PAGE_BYTES {
+        strip_revit_page_checksums(&raw)
+    } else {
+        raw
+    };
+    Ok(Some(
+        decode_known_framing(&prepared, DEFAULT_DECODE_LIMIT)?.payload,
+    ))
+}
+
+/// Every element's own Revit `UniqueId`, in network byte order, keyed by
+/// element id.
+///
+/// This is the identity Revit's own IFC export writes as an element's
+/// `GlobalId`, so recovering it is what lets a converted model be joined to
+/// Revit's by GUID rather than only by the element id in `Tag`. It is built
+/// from two streams: `Global/ElemTable` gives each element the episode it was
+/// created in, and `Global/History` gives that episode's GUID, which the
+/// element's id is exclusive-ORed into. See
+/// [`rvt_model::EpisodeTable::element_unique_id`].
+///
+/// An element whose creation episode the history does not carry is left out
+/// rather than given a guessed identity - 673 of AR S1's 11 738 products.
+/// A container missing either stream yields an empty map, which is not an
+/// error: the exporter falls back to its own deterministic identity.
+///
+/// # Errors
+///
+/// Fails where a stream is present but its framing does not decode.
+pub fn authored_unique_ids(
+    container: &RvtContainer,
+) -> Result<BTreeMap<u32, [u8; 16]>, Box<dyn Error>> {
+    let (Some(history), Some(table)) = (
+        decode_global_stream(container, "Global/History")?,
+        decode_global_stream(container, "Global/ElemTable")?,
+    ) else {
+        return Ok(BTreeMap::new());
+    };
+    let (Some(episodes), Ok(table)) = (
+        rvt_model::EpisodeTable::parse(&history),
+        ElemTable::parse(&table),
+    ) else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(table
+        .records
+        .iter()
+        .filter_map(|record| {
+            Some((
+                record.id,
+                episodes.element_unique_id(record.creation_episode, record.id)?,
+            ))
+        })
+        .collect())
 }
 
 /// Visit every member that carries a usable descriptor, in partition order,
@@ -1373,6 +1442,7 @@ pub fn recover_elements(
         parameter_names,
         parameter_specs,
         elements,
+        authored_unique_ids: authored_unique_ids(&container)?,
     })
 }
 
@@ -2232,6 +2302,9 @@ pub struct RecoveredElements {
     pub parameter_names: BTreeMap<i32, String>,
     pub parameter_specs: BTreeMap<i32, String>,
     pub elements: BTreeMap<u32, ExportedElement>,
+    /// Each element's own Revit `UniqueId`, where the file carries the episode
+    /// it was created in. See [`authored_unique_ids`].
+    pub authored_unique_ids: BTreeMap<u32, [u8; 16]>,
 }
 
 #[must_use]
@@ -2713,6 +2786,7 @@ pub fn metadata_model(
                 .level_id
                 .as_ref()
                 .and_then(|level_id| canonical_level.get(level_id).cloned());
+            normalized.authored_uuid = recovered.authored_unique_ids.get(id).copied();
             let mut properties = trusted_source_properties(&normalized);
             // A parameter nothing names is not written into the model. See
             // `placeholder_parameter_name`: the reader recovered a value and
@@ -3507,8 +3581,7 @@ pub fn geometry_statistics(
             )
     };
     for element in elements.values() {
-        statistics.bodies_requiring_loop_closure +=
-            usize::from(element.brep_requires_loop_closure);
+        statistics.bodies_requiring_loop_closure += usize::from(element.brep_requires_loop_closure);
         statistics.bodies_with_redundant_duplicate_faces += usize::from(
             element
                 .brep
@@ -3553,9 +3626,7 @@ pub fn geometry_statistics(
                 if element.verified_symbol_bounds.is_some() {
                     statistics.instances_whose_bounds_match_the_symbol += 1;
                     statistics.instances_whose_symbol_body_is_flat += usize::from(
-                        symbol.is_some_and(|symbol| {
-                            symbol.brep.as_ref().is_some_and(body_is_flat)
-                        }),
+                        symbol.is_some_and(|symbol| symbol.brep.as_ref().is_some_and(body_is_flat)),
                     );
                 }
                 let symbol_category = symbol.and_then(|symbol| symbol.category);
@@ -3805,10 +3876,7 @@ pub fn brep_class_indexes(schema: Option<&Schema>) -> Option<rvt_model::BrepClas
         edge_loop: schema_class_index(schema, "EdgeLoop")?,
         // The one class derived from `EdgeLoop`, and optional because a file
         // whose schema does not declare it must still read every other loop.
-        edge_loop_with_chain_envelopes: schema_class_index(
-            schema,
-            "EdgeLoopWithChainEnvelopes",
-        ),
+        edge_loop_with_chain_envelopes: schema_class_index(schema, "EdgeLoopWithChainEnvelopes"),
         edge: schema_class_index(schema, "Edge")?,
         plane: schema_class_index(schema, "Plane")?,
         cyl_surf: schema_class_index(schema, "CylSurf")?,
@@ -3974,6 +4042,10 @@ pub fn normalize_element(
         // A reader states one file; `bim_core::federate` names the document
         // when several are assembled.
         document: None,
+        // Read from two `Global/*` streams rather than from the element's own
+        // record, so it is attached where those are in scope - see
+        // `authored_unique_ids`.
+        authored_uuid: None,
         element_type,
         class_name,
         name,
@@ -4079,13 +4151,13 @@ fn normalize_material_layers(
                     name: source
                         .and_then(|material| material.name.as_ref())
                         .map(|(name, _)| name.clone()),
-                    color: source.and_then(|material| material.material_color).map(
-                        |fields| BimColor {
+                    color: source
+                        .and_then(|material| material.material_color)
+                        .map(|fields| BimColor {
                             red: fields.red,
                             green: fields.green,
                             blue: fields.blue,
-                        },
-                    ),
+                        }),
                 }
             }),
             thickness: BimNumber {
@@ -4330,12 +4402,8 @@ fn nested_assembly(
         if !agrees(min, max) {
             return Err(NestedRefusal::HullDisagreed);
         }
-        let brep = normalize_brep(
-            own,
-            &IDENTITY_TRANSFORM,
-            element.brep_requires_loop_closure,
-        )
-        .ok_or(NestedRefusal::MemberNotConverted)?;
+        let brep = normalize_brep(own, &IDENTITY_TRANSFORM, element.brep_requires_loop_closure)
+            .ok_or(NestedRefusal::MemberNotConverted)?;
         if !brep.complete {
             return Err(NestedRefusal::OwnBodyUnusable);
         }
@@ -4451,11 +4519,7 @@ fn resolve_face_materials(
     let resolve_brep = |mut brep: BimBrep| {
         for face in &mut brep.faces {
             if let Some(material) = &mut face.material {
-                if let Some(source) = material
-                    .id
-                    .as_ref()
-                    .and_then(|id| source_of(&id.value))
-                {
+                if let Some(source) = material.id.as_ref().and_then(|id| source_of(&id.value)) {
                     material.name = source.name.as_ref().map(|(name, _)| name.clone());
                     material.color = source.material_color.map(|fields| BimColor {
                         red: fields.red,
@@ -4574,9 +4638,10 @@ fn normalize_geometry(
         }
     }
     let symbol = element.verified_symbol_bounds?;
-    if let (Some(symbol_element), Some(transform)) =
-        (elements.get(&symbol.symbol_element_id), element.ginstance_transform)
-    {
+    if let (Some(symbol_element), Some(transform)) = (
+        elements.get(&symbol.symbol_element_id),
+        element.ginstance_transform,
+    ) {
         // Only a body whose every face resolved is emitted. An incomplete one
         // is schema-valid as an open `IfcShellBasedSurfaceModel`, and for a
         // handful of records it geometrizes, but at corpus scale it does not:
@@ -4926,11 +4991,9 @@ fn normalize_brep(
                         start_angle: arc.start_angle,
                         end_angle: arc.end_angle,
                     })),
-                    rvt_model::BrepCurve::Polyline(points) => {
-                        BimBrepCurve::Polyline(
-                            normalize_brep_points(points, &world_point)?.into_boxed_slice(),
-                        )
-                    }
+                    rvt_model::BrepCurve::Polyline(points) => BimBrepCurve::Polyline(
+                        normalize_brep_points(points, &world_point)?.into_boxed_slice(),
+                    ),
                 };
                 edges.push(BimBrepEdge {
                     start: world_point(edge.start)?,
@@ -5727,6 +5790,7 @@ mod tests {
             parameter_names: BTreeMap::new(),
             parameter_specs: BTreeMap::new(),
             elements,
+            authored_unique_ids: BTreeMap::new(),
         };
         let (model, ..) = metadata_model(&recovered, false, None);
         let selected = model
@@ -5778,6 +5842,7 @@ mod tests {
             parameter_names: BTreeMap::new(),
             parameter_specs: BTreeMap::new(),
             elements,
+            authored_unique_ids: BTreeMap::new(),
         };
         let (model, counts) = metadata_model(&recovered, false, None);
         let names = model.elements[0]
@@ -5870,6 +5935,7 @@ mod tests {
             parameter_names: BTreeMap::new(),
             parameter_specs: BTreeMap::new(),
             elements,
+            authored_unique_ids: BTreeMap::new(),
         };
         let is_model_element = |element: &ExportedElement| element.class_index == Some(13);
         let (levels, canonical) = building_storeys(&recovered, &is_model_element);
@@ -5970,6 +6036,7 @@ mod tests {
             parameter_names: BTreeMap::new(),
             parameter_specs: BTreeMap::new(),
             elements,
+            authored_unique_ids: BTreeMap::new(),
         };
 
         let identity = project_identity(&recovered).expect("a ProjectInfo record");
@@ -5994,6 +6061,7 @@ mod tests {
             parameter_names: BTreeMap::new(),
             parameter_specs: BTreeMap::new(),
             elements: BTreeMap::new(),
+            authored_unique_ids: BTreeMap::new(),
         };
         assert!(project_identity(&recovered).is_none());
     }
@@ -6033,6 +6101,7 @@ mod tests {
             parameter_names: BTreeMap::new(),
             parameter_specs: BTreeMap::new(),
             elements,
+            authored_unique_ids: BTreeMap::new(),
         };
         let site = site_location(&recovered).expect("every record agrees");
         assert!((site.latitude_degrees - 42.414_863_586_425_76).abs() < 1e-9);
@@ -6077,6 +6146,7 @@ mod tests {
             parameter_names: BTreeMap::new(),
             parameter_specs: BTreeMap::new(),
             elements,
+            authored_unique_ids: BTreeMap::new(),
         };
         assert!(site_location(&recovered).is_none());
     }
@@ -6094,6 +6164,7 @@ mod tests {
             parameter_names: BTreeMap::new(),
             parameter_specs: BTreeMap::new(),
             elements: BTreeMap::new(),
+            authored_unique_ids: BTreeMap::new(),
         };
         assert!(site_location(&recovered).is_none());
     }
@@ -6397,9 +6468,7 @@ mod tests {
     /// fixture has none of to read - a cube has twelve edges and closes, so
     /// that is what is asserted directly.
     fn closed_box_faces(origin: [f64; 3]) -> Vec<rvt_model::BrepFace> {
-        let point = |dx: f64, dy: f64, dz: f64| {
-            [origin[0] + dx, origin[1] + dy, origin[2] + dz]
-        };
+        let point = |dx: f64, dy: f64, dz: f64| [origin[0] + dx, origin[1] + dy, origin[2] + dz];
         let edge = |from: [f64; 3], to: [f64; 3]| rvt_model::BrepEdge {
             start: from,
             end: to,
@@ -6420,12 +6489,42 @@ mod tests {
             material_id: None,
         };
         vec![
-            quad([point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0), point(1.0, 1.0, 0.0), point(0.0, 1.0, 0.0)]),
-            quad([point(0.0, 0.0, 1.0), point(0.0, 1.0, 1.0), point(1.0, 1.0, 1.0), point(1.0, 0.0, 1.0)]),
-            quad([point(0.0, 0.0, 0.0), point(0.0, 1.0, 0.0), point(0.0, 1.0, 1.0), point(0.0, 0.0, 1.0)]),
-            quad([point(1.0, 0.0, 0.0), point(1.0, 0.0, 1.0), point(1.0, 1.0, 1.0), point(1.0, 1.0, 0.0)]),
-            quad([point(0.0, 0.0, 0.0), point(0.0, 0.0, 1.0), point(1.0, 0.0, 1.0), point(1.0, 0.0, 0.0)]),
-            quad([point(0.0, 1.0, 0.0), point(1.0, 1.0, 0.0), point(1.0, 1.0, 1.0), point(0.0, 1.0, 1.0)]),
+            quad([
+                point(0.0, 0.0, 0.0),
+                point(1.0, 0.0, 0.0),
+                point(1.0, 1.0, 0.0),
+                point(0.0, 1.0, 0.0),
+            ]),
+            quad([
+                point(0.0, 0.0, 1.0),
+                point(0.0, 1.0, 1.0),
+                point(1.0, 1.0, 1.0),
+                point(1.0, 0.0, 1.0),
+            ]),
+            quad([
+                point(0.0, 0.0, 0.0),
+                point(0.0, 1.0, 0.0),
+                point(0.0, 1.0, 1.0),
+                point(0.0, 0.0, 1.0),
+            ]),
+            quad([
+                point(1.0, 0.0, 0.0),
+                point(1.0, 0.0, 1.0),
+                point(1.0, 1.0, 1.0),
+                point(1.0, 1.0, 0.0),
+            ]),
+            quad([
+                point(0.0, 0.0, 0.0),
+                point(0.0, 0.0, 1.0),
+                point(1.0, 0.0, 1.0),
+                point(1.0, 0.0, 0.0),
+            ]),
+            quad([
+                point(0.0, 1.0, 0.0),
+                point(1.0, 1.0, 0.0),
+                point(1.0, 1.0, 1.0),
+                point(0.0, 1.0, 1.0),
+            ]),
         ]
     }
 
@@ -7180,8 +7279,8 @@ mod tests {
         assert!(body.is_closed());
         assert!(!body.bounds_a_volume());
 
-        let normalized = normalize_brep(&body, &IDENTITY_TRANSFORM, true)
-            .expect("finite planar body");
+        let normalized =
+            normalize_brep(&body, &IDENTITY_TRANSFORM, true).expect("finite planar body");
         assert!(!normalized.complete);
     }
 

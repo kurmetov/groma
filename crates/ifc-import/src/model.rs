@@ -147,6 +147,11 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
                 id: element_id,
                 // One file per reader; `bim_core::federate` names the document.
                 document: None,
+                // An `IfcRoot.GlobalId` is exactly this, and decoding one back
+                // would let a re-export keep it. Left unread until something
+                // needs it: doing it silently would change the identity every
+                // IFC-sourced element is written under today.
+                authored_uuid: None,
                 element_type: element_type(&entity.type_name),
                 class_name: Some(entity.type_name.as_str().to_owned()),
                 name: text(entity.attribute(2)),

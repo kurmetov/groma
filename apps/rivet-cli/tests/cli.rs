@@ -134,27 +134,33 @@ fn elem_table_fixture() -> Vec<u8> {
     stored
 }
 
+/// A `Global/ElemTable` payload in the shape the declarations give it: the
+/// object's own class index, the record count, and one 28-byte `ElemRec`
+/// each - `m_id`, `m_originalElementId`, three `EpisodeId`s, `m_partitionId`
+/// and `m_OwningElementId`.
 fn decoded_elem_table_fixture(tail_bytes: usize) -> Vec<u8> {
-    let record_count = 10_u16;
-    let mut decoded = vec![0; 0x1e + usize::from(record_count) * 28 + tail_bytes];
-    decoded[..2].copy_from_slice(&9_u16.to_le_bytes());
-    decoded[2..4].copy_from_slice(&record_count.to_le_bytes());
-    for index in 0..usize::from(record_count) {
-        let offset = 0x1e + index * 28;
-        if index < 8 {
-            decoded[offset..offset + 4].fill(0xff);
-        }
+    let record_count = 10_u32;
+    let records = usize::try_from(record_count).unwrap();
+    let mut decoded = vec![0; ELEM_TABLE_HEADER_BYTES + records * 28 + tail_bytes];
+    decoded[..2].copy_from_slice(&1370_u16.to_le_bytes());
+    decoded[2..6].copy_from_slice(&record_count.to_le_bytes());
+    for index in 0..records {
+        let offset = ELEM_TABLE_HEADER_BYTES + index * 28;
         let id = u32::try_from(index + 1).unwrap();
+        decoded[offset..offset + 4].copy_from_slice(&id.to_le_bytes());
         decoded[offset + 4..offset + 8].copy_from_slice(&id.to_le_bytes());
-        decoded[offset + 8..offset + 12].copy_from_slice(&id.to_le_bytes());
+        decoded[offset + 24..offset + 28].copy_from_slice(&(-1_i32).to_le_bytes());
     }
 
     decoded
 }
 
+/// The class-index tag and the record count that open the payload.
+const ELEM_TABLE_HEADER_BYTES: usize = 6;
+
 fn checksum_paged_elem_table_fixture() -> Vec<u8> {
     let mut decoded = decoded_elem_table_fixture(90_000);
-    let tail_start = 0x1e + 10 * 28;
+    let tail_start = ELEM_TABLE_HEADER_BYTES + 10 * 28;
     let mut state = 0x6d2b_79f5_u32;
     for byte in &mut decoded[tail_start..] {
         state ^= state << 13;
@@ -341,9 +347,9 @@ fn elem_table_reports_layout_without_listing_ids_by_default() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Framing: truncated gzip at byte 8"));
     assert!(stdout.contains("Declared records: 10"));
-    assert!(stdout.contains("Record framing: explicit-4-byte-marker"));
-    assert!(stdout.contains("Records matching marker: 8"));
+    assert!(stdout.contains("Object class index: 1370"));
     assert!(stdout.contains("Parsed records: 10"));
+    assert!(stdout.contains("Unique element IDs: 10"));
     assert!(stdout.contains("Preserved trailing bytes: 3"));
     assert!(!stdout.contains("Record inventory:"));
 }
