@@ -2,6 +2,7 @@
 
 pub mod work;
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -32,6 +33,12 @@ pub struct BimModel {
     pub elements: Vec<BimElement>,
     pub levels: Vec<BimLevel>,
     pub relations: Vec<BimRelation>,
+    /// A space's own face, matched against the one real element whose own
+    /// face coincides with it. Empty until [`compute_space_boundaries`] is
+    /// run over [`Self::elements`] - it is not filled in automatically,
+    /// since it is a real geometric computation and not every caller needs
+    /// it paid for.
+    pub space_boundaries: Vec<BimSpaceBoundary>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -557,6 +564,270 @@ pub struct BimRelation {
     pub target: BimElementId,
 }
 
+/// One face of a space's own closed body, matched against the one real
+/// element whose own face coincides with it - what `IfcRelSpaceBoundary`
+/// states in IFC.
+///
+/// Written only where a match was found: a face this reader could not match
+/// to a real element is left out rather than stated as a virtual boundary it
+/// has no evidence for. See [`compute_space_boundaries`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct BimSpaceBoundary {
+    pub space_id: BimElementId,
+    pub element_id: BimElementId,
+    /// The space's own face's plane, verbatim - in the model's project
+    /// frame, the same frame every `BimGeometry::Brep` is already carried
+    /// in before an exporter places it relative to a storey.
+    pub origin: BimPoint3,
+    pub x_axis: [f64; 3],
+    pub y_axis: [f64; 3],
+    /// The face's outer boundary, closed (first point not repeated), in the
+    /// same frame as `origin`.
+    pub boundary: Vec<BimPoint3>,
+}
+
+/// How close two candidate faces' planes have to agree, in metres, to call
+/// them the same surface. Real modelled geometry that genuinely touches
+/// agrees to a small fraction of a millimetre; this leaves room for the
+/// arithmetic without accepting two surfaces that merely sit close.
+const SPACE_BOUNDARY_PLANE_TOLERANCE_METRES: f64 = 0.005;
+/// How nearly opposite two coincident faces' outward normals have to point.
+/// Two solids meeting at a shared boundary always face away from each
+/// other there, so this should be almost exactly -1; the margin is for the
+/// arithmetic, not for a judgement about what counts as facing away.
+const SPACE_BOUNDARY_NORMAL_ALIGNMENT: f64 = 0.999;
+/// Side of the grid cell candidate faces are bucketed into before the
+/// per-face test, in metres - a few times a typical room's own extent, so a
+/// room's own cell and its neighbours hold every wall that could plausibly
+/// bound it without scanning the whole model.
+const SPACE_BOUNDARY_GRID_METRES: f64 = 5.0;
+
+/// One straight-edged planar face, reduced to what matching a space
+/// boundary needs: its plane, its own outer polygon, and the 3D box that
+/// polygon spans - the last for the coarse spatial filter below.
+struct PlanarFace<'a> {
+    element_id: &'a BimElementId,
+    origin: [f64; 3],
+    x_axis: [f64; 3],
+    y_axis: [f64; 3],
+    normal: [f64; 3],
+    /// The face's own outer loop, as the plain coordinates
+    /// [`compute_space_boundaries`] does its arithmetic in.
+    polygon: Vec<[f64; 3]>,
+    min: [f64; 3],
+    max: [f64; 3],
+}
+
+fn subtract3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn normalize3(a: [f64; 3]) -> Option<[f64; 3]> {
+    let length = dot3(a, a).sqrt();
+    (length > 0.0).then(|| [a[0] / length, a[1] / length, a[2] / length])
+}
+
+/// The straight-line outer boundary of one face, in plain coordinates - or
+/// `None` for a face this cannot read one from: a surface that is not a
+/// plane, a boundary with a curved edge, or one with too few points to be a
+/// polygon at all. A space boundary is only ever stated from geometry this
+/// exactly, never approximated from a curve.
+fn planar_face<'a>(element_id: &'a BimElementId, face: &BimBrepFace) -> Option<PlanarFace<'a>> {
+    let BimBrepSurface::Plane {
+        origin,
+        x_axis,
+        y_axis,
+    } = &face.surface
+    else {
+        return None;
+    };
+    let normal = normalize3(cross3(*x_axis, *y_axis))?;
+    let outer = face.loops.first()?;
+    if outer.len() < 3 {
+        return None;
+    }
+    let mut polygon = Vec::with_capacity(outer.len());
+    for edge in outer {
+        if !matches!(edge.curve, BimBrepCurve::Line) {
+            return None;
+        }
+        polygon.push(edge.start.coordinates);
+    }
+    let mut min = polygon[0];
+    let mut max = polygon[0];
+    for point in &polygon[1..] {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(point[axis]);
+            max[axis] = max[axis].max(point[axis]);
+        }
+    }
+    Some(PlanarFace {
+        element_id,
+        origin: origin.coordinates,
+        x_axis: *x_axis,
+        y_axis: *y_axis,
+        normal,
+        polygon,
+        min,
+        max,
+    })
+}
+
+/// The grid cell one point falls into, at [`SPACE_BOUNDARY_GRID_METRES`].
+fn grid_cell(point: [f64; 3]) -> [i32; 3] {
+    #[allow(clippy::cast_possible_truncation)]
+    // A building's coordinates are nowhere near i32's range at this cell
+    // size.
+    point.map(|value| (value / SPACE_BOUNDARY_GRID_METRES).floor() as i32)
+}
+
+/// Whether `face` sits close enough to `candidate`'s own plane, facing away
+/// from it, to be considered the same physical surface.
+fn coincides(face: &PlanarFace<'_>, candidate: &PlanarFace<'_>) -> bool {
+    if dot3(face.normal, candidate.normal) > -SPACE_BOUNDARY_NORMAL_ALIGNMENT {
+        return false;
+    }
+    let offset = dot3(subtract3(candidate.origin, face.origin), face.normal);
+    offset.abs() <= SPACE_BOUNDARY_PLANE_TOLERANCE_METRES
+}
+
+/// Whether the two faces' own polygons genuinely overlap once projected
+/// into `face`'s own 2D frame, rather than merely sharing a plane - two
+/// walls end to end share a plane at their butt joint without either one
+/// bounding what lies past it.
+///
+/// The extent of each polygon in that frame is compared rather than the
+/// polygons themselves: exact polygon intersection would tell an L-shaped
+/// room's short leg from a wall that only borders its long one, which this
+/// cannot, but every overlap this accepts is a real one - it only risks
+/// accepting a boundary too generously, never inventing a plane that is not
+/// there.
+fn overlaps_in_plane(face: &PlanarFace<'_>, candidate: &PlanarFace<'_>) -> bool {
+    let project = |point: [f64; 3]| {
+        let local = subtract3(point, face.origin);
+        (dot3(local, face.x_axis), dot3(local, face.y_axis))
+    };
+    let extent = |polygon: &[[f64; 3]]| {
+        let mut min = (f64::INFINITY, f64::INFINITY);
+        let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for point in polygon {
+            let (u, v) = project(*point);
+            min = (min.0.min(u), min.1.min(v));
+            max = (max.0.max(u), max.1.max(v));
+        }
+        (min, max)
+    };
+    let (a_min, a_max) = extent(&face.polygon);
+    let (b_min, b_max) = extent(&candidate.polygon);
+    a_min.0 <= b_max.0 && b_min.0 <= a_max.0 && a_min.1 <= b_max.1 && b_min.1 <= a_max.1
+}
+
+/// Every grid cell a face's own `[min, max]` extent touches - so a face
+/// larger than one cell is still found from any of them, in either
+/// direction: the same function buckets a candidate's own cells on the way
+/// in and a space face's cells on the way out.
+fn grid_cells(min: [f64; 3], max: [f64; 3]) -> impl Iterator<Item = [i32; 3]> {
+    let low = grid_cell(min);
+    let high = grid_cell(max);
+    (low[0]..=high[0]).flat_map(move |x| {
+        (low[1]..=high[1]).flat_map(move |y| (low[2]..=high[2]).map(move |z| [x, y, z]))
+    })
+}
+
+/// Match every space's own closed body against the real elements around it,
+/// one face at a time - what `IfcRelSpaceBoundary` states in IFC.
+///
+/// A face this reader cannot match to a real element - a curved boundary,
+/// an unrecognised surface, or one genuinely bordering nothing modelled -
+/// is left out rather than guessed at: every entry this returns names a
+/// real element whose own face was found to coincide, never a virtual
+/// boundary inferred from its absence.
+///
+/// Elements are bucketed into a coarse grid before the precise per-face
+/// test, so a space is only ever compared against the elements actually
+/// near it rather than the whole model. A face is registered under every
+/// cell its own extent touches rather than one corner, so a wall or slab
+/// larger than one cell is still found from whichever end of it a space
+/// actually borders.
+#[must_use]
+pub fn compute_space_boundaries(elements: &[BimElement]) -> Vec<BimSpaceBoundary> {
+    let mut faces = Vec::new();
+    for element in elements {
+        if element.element_type.is_spatial() {
+            continue;
+        }
+        let Some(BimGeometry::Brep(brep)) = &element.geometry else {
+            continue;
+        };
+        for face in &brep.faces {
+            if let Some(planar) = planar_face(&element.id, face) {
+                faces.push(planar);
+            }
+        }
+    }
+    let mut grid: HashMap<[i32; 3], Vec<usize>> = HashMap::new();
+    for (index, face) in faces.iter().enumerate() {
+        for cell in grid_cells(face.min, face.max) {
+            grid.entry(cell).or_default().push(index);
+        }
+    }
+
+    let mut boundaries = Vec::new();
+    for space in elements {
+        if !space.element_type.is_spatial() {
+            continue;
+        }
+        let Some(BimGeometry::Brep(brep)) = &space.geometry else {
+            continue;
+        };
+        for face in &brep.faces {
+            let Some(space_face) = planar_face(&space.id, face) else {
+                continue;
+            };
+            let matched = grid_cells(space_face.min, space_face.max)
+                .filter_map(|cell| grid.get(&cell))
+                .flatten()
+                .map(|&index| &faces[index])
+                .find(|candidate| {
+                    coincides(&space_face, candidate) && overlaps_in_plane(&space_face, candidate)
+                });
+            if let Some(matched) = matched {
+                boundaries.push(BimSpaceBoundary {
+                    space_id: space.id.clone(),
+                    element_id: matched.element_id.clone(),
+                    origin: BimPoint3 {
+                        coordinates: space_face.origin,
+                        unit: BimUnit::metres(),
+                    },
+                    x_axis: space_face.x_axis,
+                    y_axis: space_face.y_axis,
+                    boundary: space_face
+                        .polygon
+                        .iter()
+                        .map(|point| BimPoint3 {
+                            coordinates: *point,
+                            unit: BimUnit::metres(),
+                        })
+                        .collect(),
+                });
+            }
+        }
+    }
+    boundaries
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BimLevel {
     pub id: BimElementId,
@@ -674,6 +945,7 @@ pub fn federate(sources: Vec<(BimDocument, BimModel)>) -> (BimModel, BimFederati
         out.elements.append(&mut model.elements);
         out.levels.append(&mut model.levels);
         out.relations.append(&mut model.relations);
+        out.space_boundaries.append(&mut model.space_boundaries);
         out.documents.push(document);
     }
 
@@ -800,6 +1072,10 @@ impl BimModel {
             relation.source = relation.source.qualified(document);
             relation.target = relation.target.qualified(document);
         }
+        for boundary in &mut self.space_boundaries {
+            boundary.space_id = boundary.space_id.qualified(document);
+            boundary.element_id = boundary.element_id.qualified(document);
+        }
     }
 }
 
@@ -829,6 +1105,133 @@ mod tests {
             coordinates,
             unit: BimUnit::metres(),
         }
+    }
+
+    /// One planar, straight-edged face: the plane `origin`/`x_axis`/`y_axis`
+    /// declare, bounded by `polygon` - closed, first point not repeated.
+    fn planar_face(
+        origin: [f64; 3],
+        x_axis: [f64; 3],
+        y_axis: [f64; 3],
+        polygon: &[[f64; 3]],
+    ) -> BimBrepFace {
+        let edges = (0..polygon.len())
+            .map(|index| BimBrepEdge {
+                start: point(polygon[index]),
+                end: point(polygon[(index + 1) % polygon.len()]),
+                curve: BimBrepCurve::Line,
+            })
+            .collect();
+        BimBrepFace {
+            surface: BimBrepSurface::Plane {
+                origin: point(origin),
+                x_axis,
+                y_axis,
+            },
+            loops: vec![edges],
+            material: None,
+        }
+    }
+
+    fn space_with_faces(id: &str, faces: Vec<BimBrepFace>) -> BimElement {
+        BimElement {
+            geometry: Some(BimGeometry::Brep(BimBrep {
+                faces,
+                complete: false,
+            })),
+            ..element(id, [0.0, 0.0, 0.0])
+        }
+    }
+
+    fn boundary_element_with_faces(id: &str, faces: Vec<BimBrepFace>) -> BimElement {
+        BimElement {
+            element_type: BimElementType::Wall,
+            geometry: Some(BimGeometry::Brep(BimBrep {
+                faces,
+                complete: false,
+            })),
+            ..element(id, [0.0, 0.0, 0.0])
+        }
+    }
+
+    /// A room's own face at the plane `x = 3`, its outward normal `+X`
+    /// (matching a room whose interior sits at `x < 3`), spanning the same
+    /// 4x3 m rectangle two of the fixtures below share.
+    fn room_facing_wall() -> BimBrepFace {
+        planar_face(
+            [3.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            &[
+                [3.0, 0.0, 0.0],
+                [3.0, 4.0, 0.0],
+                [3.0, 4.0, 3.0],
+                [3.0, 0.0, 3.0],
+            ],
+        )
+    }
+
+    #[test]
+    fn a_room_matches_the_one_wall_face_that_coincides_with_its_own() {
+        let mut space = space_with_faces("room", vec![room_facing_wall()]);
+        space.element_type = BimElementType::Space;
+
+        // The wall's own interior face, at the same plane, facing back into
+        // the room - `-X`, anti-parallel to the room's `+X` - and spanning
+        // the same rectangle. A real wall's own body carries more faces than
+        // this one, but only this face is what a boundary match needs.
+        let wall = boundary_element_with_faces(
+            "wall",
+            vec![planar_face(
+                [3.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                &[
+                    [3.0, 0.0, 0.0],
+                    [3.0, 0.0, 3.0],
+                    [3.0, 4.0, 3.0],
+                    [3.0, 4.0, 0.0],
+                ],
+            )],
+        );
+
+        let elements = vec![space, wall];
+        let boundaries = compute_space_boundaries(&elements);
+        assert_eq!(boundaries.len(), 1, "{boundaries:?}");
+        assert_eq!(boundaries[0].space_id, BimElementId("room".to_owned()));
+        assert_eq!(boundaries[0].element_id, BimElementId("wall".to_owned()));
+        assert_eq!(boundaries[0].boundary.len(), 4);
+    }
+
+    #[test]
+    fn a_room_face_finds_no_match_without_a_real_coincident_face() {
+        let mut space = space_with_faces("room", vec![room_facing_wall()]);
+        space.element_type = BimElementType::Space;
+
+        // Same plane and orientation, but nowhere near the room's own
+        // rectangle in that plane - a wall this room does not actually
+        // border, however far its infinite plane would extend.
+        let distant = boundary_element_with_faces(
+            "distant_wall",
+            vec![planar_face(
+                [3.0, 100.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0],
+                &[
+                    [3.0, 100.0, 0.0],
+                    [3.0, 100.0, 3.0],
+                    [3.0, 104.0, 3.0],
+                    [3.0, 104.0, 0.0],
+                ],
+            )],
+        );
+        // Same plane and extent, but facing the same way as the room's own
+        // face rather than away from it - not a real coincident boundary,
+        // whatever else agrees.
+        let same_facing = boundary_element_with_faces("same_facing", vec![room_facing_wall()]);
+
+        let elements = vec![space, distant, same_facing];
+        assert!(compute_space_boundaries(&elements).is_empty());
     }
 
     /// One element with an identifier, a level, a type and a reference, so
@@ -889,6 +1292,7 @@ mod tests {
                 source: BimElementId("level".to_owned()),
                 target: BimElementId(id.to_owned()),
             }],
+            space_boundaries: Vec::new(),
         }
     }
 

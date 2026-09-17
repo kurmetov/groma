@@ -2740,8 +2740,9 @@ pub fn metadata_model(
             normalized.properties = properties;
             normalized
         })
-        .collect();
+        .collect::<Vec<_>>();
 
+    let space_boundaries = bim_core::compute_space_boundaries(&elements);
     (
         BimModel {
             source: Some(BimSource {
@@ -2754,6 +2755,7 @@ pub fn metadata_model(
             elements,
             levels,
             relations: Vec::new(),
+            space_boundaries,
         },
         counts,
     )

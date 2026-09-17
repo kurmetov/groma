@@ -198,6 +198,7 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
             elements,
             levels,
             relations: relations(&index, &kept),
+            space_boundaries: Vec::new(),
         },
         read,
     }

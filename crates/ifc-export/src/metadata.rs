@@ -192,6 +192,7 @@ pub fn metadata_ifc_reported(
             options,
             owner: ownership,
             lengths,
+            space_boundaries: &model.space_boundaries,
         },
         Storeys {
             entities: &storeys,
@@ -836,6 +837,12 @@ impl ElementTables {
         if context.options.settings.openings {
             self.openings.push(file, &self.products_by_id, context);
         }
+        push_space_boundaries(
+            file,
+            &self.products_by_id,
+            context.space_boundaries,
+            context,
+        );
         for (identity, (container, elements)) in self.containment {
             push_containment(
                 file,
@@ -889,6 +896,7 @@ struct WriteContext<'a> {
     options: &'a MetadataOptions,
     owner: EntityRef,
     lengths: Lengths,
+    space_boundaries: &'a [bim_core::BimSpaceBoundary],
 }
 
 /// Write one `IfcSpace`. It is a spatial structure element, not an element:
@@ -1538,6 +1546,106 @@ impl PendingOpenings {
             );
         }
     }
+}
+
+/// One `IfcRelSpaceBoundary` per [`bim_core::BimSpaceBoundary`], with a real
+/// `IfcConnectionSurfaceGeometry` built from the space's own matched face -
+/// never a guessed one. A boundary whose space or element did not itself
+/// reach the file - held back by the class mapping table, say - is left out
+/// along with it, the same discipline [`PendingOpenings::push`] already
+/// keeps for a fenestration's host.
+///
+/// Always written `PHYSICAL`/`NOTDEFINED`: every entry here names a real,
+/// matched element, so it is never the `VIRTUAL` case IFC reserves for a
+/// boundary with none, and nothing this reader computes yet distinguishes
+/// an internal partition from an external envelope.
+fn push_space_boundaries(
+    file: &mut StepFile,
+    products_by_id: &HashMap<String, EntityRef>,
+    boundaries: &[bim_core::BimSpaceBoundary],
+    context: WriteContext<'_>,
+) {
+    // A world-frame reading: `IfcConnectionGeometry` carries no placement of
+    // its own to be relative to, unlike a product's `ObjectPlacement`, so
+    // this states the surface in the same absolute project coordinates
+    // `BimSpaceBoundary` is already carried in - `storey_elevation: 0.0` and
+    // no placement is what makes `push_local_axis`'s own frame conversion an
+    // identity.
+    let world = GeometryFrame {
+        lengths: context.lengths,
+        storey_elevation: 0.0,
+        placement: None,
+    };
+    for (index, boundary) in boundaries.iter().enumerate() {
+        let (Some(&space), Some(&element)) = (
+            products_by_id.get(&boundary.space_id.0),
+            products_by_id.get(&boundary.element_id.0),
+        ) else {
+            continue;
+        };
+        let Some(geometry) = push_space_boundary_surface(file, boundary, world) else {
+            continue;
+        };
+        file.push(
+            "IFCRELSPACEBOUNDARY",
+            vec![
+                // Indexed rather than keyed on the (space, element) pair
+                // alone: a room can border one wall along more than one of
+                // its own faces - two separate faces meeting a wall that
+                // wraps an outside corner, say - and each is a boundary of
+                // its own, not a duplicate of the other.
+                global_id(
+                    context.options,
+                    &format!(
+                        "space-boundary:{}:{}:{index}",
+                        boundary.space_id.0, boundary.element_id.0
+                    ),
+                ),
+                reference(context.owner),
+                omitted(),
+                omitted(),
+                reference(space),
+                reference(element),
+                reference(geometry),
+                enumeration("PHYSICAL"),
+                enumeration("NOTDEFINED"),
+            ],
+        );
+    }
+}
+
+/// `IfcConnectionSurfaceGeometry` wrapping an `IfcCurveBoundedPlane`: the
+/// space's own matched face, exactly - its plane, and its boundary polygon
+/// projected into that plane's own two-dimensional frame, the same
+/// projection [`push_profile_curve`]'s callers already use for a swept
+/// solid's profile.
+fn push_space_boundary_surface(
+    file: &mut StepFile,
+    boundary: &bim_core::BimSpaceBoundary,
+    world: GeometryFrame,
+) -> Option<EntityRef> {
+    let origin = metric_coordinates(&boundary.origin)?;
+    let normal = cross(boundary.x_axis, boundary.y_axis);
+    let axis = push_local_axis(file, &boundary.origin, normal, boundary.x_axis, world)?;
+    let plane = file.push("IFCPLANE", vec![reference(axis)]);
+    let mut polygon = Vec::with_capacity(boundary.boundary.len());
+    for point in &boundary.boundary {
+        let world_point = metric_coordinates(point)?;
+        let delta = subtract(world_point, origin);
+        polygon.push([dot(delta, boundary.x_axis), dot(delta, boundary.y_axis)]);
+    }
+    if polygon.len() < 3 {
+        return None;
+    }
+    let outer = push_profile_curve(file, world.lengths, &polygon);
+    let curve_bounded_plane = file.push(
+        "IFCCURVEBOUNDEDPLANE",
+        vec![reference(plane), reference(outer), StepValue::List(Vec::new())],
+    );
+    Some(file.push(
+        "IFCCONNECTIONSURFACEGEOMETRY",
+        vec![reference(curve_bounded_plane), omitted()],
+    ))
 }
 
 fn push_geometry(
@@ -4225,6 +4333,7 @@ mod tests {
                 material_layers: None,
             }],
             relations: Vec::new(),
+            space_boundaries: Vec::new(),
         }
     }
 
@@ -4363,6 +4472,93 @@ mod tests {
         assert!(
             fills.contains(&format!("{opening_entity},{door_entity})")),
             "{fills}"
+        );
+    }
+
+    /// A space's own face and a wall's own face that coincide - the same
+    /// plane, facing away from each other, the same extent - become an
+    /// `IfcRelSpaceBoundary` naming the real wall, with a real
+    /// `IfcConnectionSurfaceGeometry`/`IfcCurveBoundedPlane` built from the
+    /// space's own matched polygon rather than a guessed one.
+    #[test]
+    fn writes_a_real_space_boundary_from_a_coincident_face() {
+        let plane = |x: f64, x_axis: [f64; 3], y_axis: [f64; 3]| BimBrepFace {
+            surface: BimBrepSurface::Plane {
+                origin: metres_point([x, 0.0, 0.0]),
+                x_axis,
+                y_axis,
+            },
+            loops: vec![vec![
+                BimBrepEdge {
+                    start: metres_point([x, 0.0, 0.0]),
+                    end: metres_point([x, 4.0, 0.0]),
+                    curve: BimBrepCurve::Line,
+                },
+                BimBrepEdge {
+                    start: metres_point([x, 4.0, 0.0]),
+                    end: metres_point([x, 4.0, 3.0]),
+                    curve: BimBrepCurve::Line,
+                },
+                BimBrepEdge {
+                    start: metres_point([x, 4.0, 3.0]),
+                    end: metres_point([x, 0.0, 3.0]),
+                    curve: BimBrepCurve::Line,
+                },
+                BimBrepEdge {
+                    start: metres_point([x, 0.0, 3.0]),
+                    end: metres_point([x, 0.0, 0.0]),
+                    curve: BimBrepCurve::Line,
+                },
+            ]],
+            material: None,
+        };
+        let mut model = model();
+        let mut space = element("20", "RoomElem", "OST_Rooms");
+        space.element_type = BimElementType::Space;
+        // Outward normal +X: cross([0,1,0],[0,0,1]) = [1,0,0].
+        space.geometry = Some(BimGeometry::Brep(BimBrep {
+            faces: vec![plane(3.0, [0.0, 1.0, 0.0], [0.0, 0.0, 1.0])],
+            complete: false,
+        }));
+        let mut wall = element("21", "SWall", "OST_Walls");
+        wall.element_type = BimElementType::Wall;
+        // Outward normal -X: cross([0,0,1],[0,1,0]) = [-1,0,0].
+        wall.geometry = Some(BimGeometry::Brep(BimBrep {
+            faces: vec![plane(3.0, [0.0, 0.0, 1.0], [0.0, 1.0, 0.0])],
+            complete: false,
+        }));
+        model.elements = vec![space, wall];
+        model.space_boundaries = bim_core::compute_space_boundaries(&model.elements);
+        assert_eq!(model.space_boundaries.len(), 1, "{:?}", model.space_boundaries);
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(text.matches("=IFCRELSPACEBOUNDARY(").count(), 1, "{text}");
+        assert_eq!(text.matches("=IFCCONNECTIONSURFACEGEOMETRY(").count(), 1);
+        assert_eq!(text.matches("=IFCCURVEBOUNDEDPLANE(").count(), 1);
+
+        let entity_number = |needle: &str| -> &str {
+            text.lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle}"))
+                .split('=')
+                .next()
+                .unwrap()
+        };
+        let space_entity = entity_number("=IFCSPACE(");
+        let wall_entity = entity_number("=IFCWALL(");
+        let relation = text
+            .lines()
+            .find(|line| line.contains("=IFCRELSPACEBOUNDARY("))
+            .unwrap();
+        assert!(
+            relation.contains(&format!(",{space_entity},{wall_entity},"))
+                && relation.contains(".PHYSICAL.")
+                && relation.contains(".NOTDEFINED."),
+            "{relation}"
         );
     }
 
