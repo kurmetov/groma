@@ -46,6 +46,15 @@ const MAX_FACE_LOOPS: usize = 256;
 pub struct BrepClassIndexes {
     pub face: u16,
     pub edge_loop: u16,
+    /// `EdgeLoopWithChainEnvelopes`, the one class the schema derives from
+    /// `EdgeLoop`. It is a loop like any other here: everything a loop is read
+    /// by is declared by `GEdgeLoop` two classes above it, and the single
+    /// property it adds (`m_chainsWithEnvelopes`) comes after all of them, so
+    /// `m_nextLoop` and `m_pFace` sit where an `EdgeLoop`'s do. A face naming
+    /// one used to resolve to nothing at all - see [`Self::is_edge_loop`].
+    ///
+    /// `None` where the file's schema does not declare the class.
+    pub edge_loop_with_chain_envelopes: Option<u16>,
     pub edge: u16,
     pub plane: u16,
     pub cyl_surf: u16,
@@ -59,6 +68,20 @@ pub struct BrepClassIndexes {
     /// is left unread rather than approximated.
     pub g_line: u16,
     pub g_arc: u16,
+}
+
+impl BrepClassIndexes {
+    /// Whether a node of this class is an edge loop: `EdgeLoop` itself, or
+    /// the one class derived from it. Measured on AR S1, where 840 faces -
+    /// among them the top and the bottom of 87 floors Revit exports and this
+    /// reader did not - name a loop of the derived class and were excluded as
+    /// "referenced loop is missing" while every other face of the same record
+    /// resolved.
+    #[must_use]
+    pub fn is_edge_loop(&self, class_index: u16) -> bool {
+        class_index == self.edge_loop
+            || self.edge_loop_with_chain_envelopes == Some(class_index)
+    }
 }
 
 /// One symbol's boundary representation, in the symbol's own local
@@ -817,7 +840,7 @@ pub fn assemble(
     let by_id: HashMap<u32, &SerialObject> = objects
         .iter()
         .filter(|object| {
-            object.class_index == classes.edge_loop || object.class_index == classes.edge
+            classes.is_edge_loop(object.class_index) || object.class_index == classes.edge
         })
         .map(|object| (object.object_id, object))
         .collect();
@@ -1977,7 +2000,7 @@ fn assemble_face(
     let loop_object = *by_id
         .get(&first_loop.object_id)
         .ok_or("referenced loop is missing")?;
-    if loop_object.class_index != classes.edge_loop {
+    if !classes.is_edge_loop(loop_object.class_index) {
         return Err("loop reference does not name an EdgeLoop");
     }
     let loop_edges = walk_loop(face.object_id, loop_object, by_id, classes, edges)?;
@@ -2012,7 +2035,7 @@ fn assemble_face(
             stopped = Some("next loop in the chain is missing");
             break;
         };
-        if next_object.class_index != classes.edge_loop {
+        if !classes.is_edge_loop(next_object.class_index) {
             stopped = Some("next loop in the chain does not name an EdgeLoop");
             break;
         }
@@ -2189,7 +2212,17 @@ fn walk_loop(
     classes: &BrepClassIndexes,
     edges: &HashMap<u32, Result<ResolvedEdge, EdgeFailure>>,
 ) -> Result<BrepLoop, &'static str> {
-    if loop_object.identifiers.len() != 3 {
+    // `GEdgeLoop` declares `m_pFace`, `m_next` and `m_prev` as identifiers and
+    // every loop class writes them first. `EdgeLoop` declares nothing after
+    // them, so three is all it can carry. `EdgeLoopWithChainEnvelopes` appends
+    // `m_chainsWithEnvelopes`, one `EdgeChainWithEnvelope` per chain, each
+    // contributing the single identifier it declares (`m_pStartEdge`) - AR S1's
+    // floors write `[pFace, next, prev, chain, chain]`, and the loop is read
+    // through the same first three either way.
+    let three_declared = loop_object.identifiers.len() >= 3;
+    let exactly_what_the_class_declares =
+        loop_object.class_index != classes.edge_loop || loop_object.identifiers.len() == 3;
+    if !(three_declared && exactly_what_the_class_declares) {
         return Err("loop does not declare pFace/next/prev");
     }
     let [loop_face, first_edge, _last_edge] = [
@@ -2344,6 +2377,7 @@ mod tests {
     const EDGE: u16 = 1300;
     const PLANE: u16 = 565;
     const CYL_SURF: u16 = 1039;
+    const EDGE_LOOP_WITH_CHAIN_ENVELOPES: u16 = 1314;
     const CONE_SURF: u16 = 815;
     const SURF_REV: u16 = 3986;
     const RULED_SURF: u16 = 3587;
@@ -2354,6 +2388,7 @@ mod tests {
         BrepClassIndexes {
             face: FACE,
             edge_loop: EDGE_LOOP,
+            edge_loop_with_chain_envelopes: Some(EDGE_LOOP_WITH_CHAIN_ENVELOPES),
             edge: EDGE,
             plane: PLANE,
             cyl_surf: CYL_SURF,
@@ -2885,6 +2920,65 @@ mod tests {
         assert_eq!(brep.holes.edges_accounted, 1);
         assert_eq!(brep.holes.first_loop_accounted, 0);
         assert_eq!(brep.holes.edges_short, 0);
+    }
+
+    /// Rewrite every loop of a fixture as the class derived from `EdgeLoop`,
+    /// exactly as AR S1's floors write it: the same three identifiers
+    /// `GEdgeLoop` declares, then one per `EdgeChainWithEnvelope` the loop
+    /// carries. The face's reference names the derived class too.
+    fn with_chain_envelopes(objects: Vec<SerialObject>) -> Vec<SerialObject> {
+        objects
+            .into_iter()
+            .map(|mut object| {
+                if object.class_index == EDGE_LOOP {
+                    object.class_index = EDGE_LOOP_WITH_CHAIN_ENVELOPES;
+                    let chain = object.identifiers[1];
+                    object.identifiers.push(chain);
+                } else if object.class_index == FACE {
+                    object.references[0].class_index = EDGE_LOOP_WITH_CHAIN_ENVELOPES;
+                }
+                object
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reads_a_loop_written_as_the_class_derived_from_edge_loop() {
+        // AR S1 excluded 840 faces as "referenced loop is missing" for naming
+        // one of these, among them the top and the bottom of 87 floors, each
+        // of which left a slab with only its sides and no closed body at all.
+        let plain = assemble(&square_with_a_hole(0), &classes(), &[]);
+        let derived = assemble(&with_chain_envelopes(square_with_a_hole(0)), &classes(), &[]);
+        assert!(
+            derived.excluded_faces.is_empty(),
+            "{:?}",
+            derived.excluded_faces
+        );
+        assert_eq!(derived.faces, plain.faces, "read as the same face");
+    }
+
+    #[test]
+    fn refuses_a_plain_edge_loop_carrying_more_than_the_three_it_declares() {
+        // The reading above is licensed by the derived class declaring a
+        // property after `GEdgeLoop`'s three. An `EdgeLoop` declares none, so
+        // a fourth identifier on one is a walk that went wrong, not a chain.
+        let objects: Vec<SerialObject> = square_with_a_hole(0)
+            .into_iter()
+            .map(|mut object| {
+                if object.class_index == EDGE_LOOP {
+                    object.identifiers.push(object.identifiers[1]);
+                }
+                object
+            })
+            .collect();
+        let brep = assemble(&objects, &classes(), &[]);
+        assert_eq!(
+            brep.excluded_faces
+                .iter()
+                .map(|exclusion| exclusion.reason)
+                .collect::<Vec<_>>(),
+            vec!["loop does not declare pFace/next/prev"]
+        );
     }
 
     #[test]

@@ -3803,6 +3803,12 @@ pub fn brep_class_indexes(schema: Option<&Schema>) -> Option<rvt_model::BrepClas
     Some(rvt_model::BrepClassIndexes {
         face: schema_class_index(schema, "Face")?,
         edge_loop: schema_class_index(schema, "EdgeLoop")?,
+        // The one class derived from `EdgeLoop`, and optional because a file
+        // whose schema does not declare it must still read every other loop.
+        edge_loop_with_chain_envelopes: schema_class_index(
+            schema,
+            "EdgeLoopWithChainEnvelopes",
+        ),
         edge: schema_class_index(schema, "Edge")?,
         plane: schema_class_index(schema, "Plane")?,
         cyl_surf: schema_class_index(schema, "CylSurf")?,
@@ -6765,6 +6771,9 @@ mod tests {
         rvt_model::BrepClassIndexes {
             face: FIXTURE_FACE,
             edge_loop: FIXTURE_EDGE_LOOP,
+            // No fixture here writes the derived loop class; `rvt-model`'s own
+            // tests cover it.
+            edge_loop_with_chain_envelopes: None,
             edge: FIXTURE_EDGE,
             plane: FIXTURE_PLANE,
             // Nothing in these fixtures is curved, and a class index no

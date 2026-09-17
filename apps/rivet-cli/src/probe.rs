@@ -3713,6 +3713,8 @@ pub(crate) fn report_boundary_topology(
                 | "GEllipse"
                 | "Face"
                 | "Edge"
+                | "EdgeLoop"
+                | "EdgeLoopWithChainEnvelopes"
                 | "InstanceInfo"
                 | "GInstance"
                 | "Geometry"
