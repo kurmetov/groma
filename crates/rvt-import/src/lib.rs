@@ -1261,7 +1261,7 @@ pub fn recover_elements(
                                 requires_loop_closure,
                                 placement_box,
                             } = read;
-                            if keep_body(&brep, placed, entry) {
+                            if keep_body(placed, entry) {
                                 let body = record.body_in(&member.payload);
                                 entry.brep_placement_box = placement_box;
                                 entry.brep_box_residuals = BodyBoxResiduals {
@@ -3220,14 +3220,23 @@ impl BodyBoxResiduals {
 }
 
 /// Whether a newly decoded body should replace the one its id already holds.
-/// A placed body wins over an unplaced one and the larger of two placed bodies
-/// wins; among unplaced bodies the last still wins, which is what every id did
+///
+/// A placed body wins over an unplaced one, and between two placed bodies the
+/// later record wins - the same rule, for the same reason, as
+/// [`fold_type_element_id`]: a duplicate record of one element in an earlier
+/// partition is a state the model has moved on from, and everything else the
+/// element carries is already read from the latest record. Keeping the larger
+/// of the two instead, which this did before, mixed one record's body with
+/// another's box: AR S1's wall 5 405 889 is 2.8 m tall in `Partitions/755`,
+/// which is the height its own box and `s1_revit.ifc` both state, and 4.0 m
+/// tall in `Partitions/541`, whose body was the one kept.
+///
+/// Among unplaced bodies the last still wins, which is what every id did
 /// before the two could be told apart.
 #[must_use]
-fn keep_body(brep: &rvt_model::SymbolBrep, placed: bool, kept: &ExportedElement) -> bool {
+fn keep_body(placed: bool, kept: &ExportedElement) -> bool {
     match (placed, kept.brep_is_placed) {
-        (true | false, false) => true,
-        (true, true) => brep.faces.len() > kept.brep.as_ref().map_or(0, |kept| kept.faces.len()),
+        (true | false, false) | (true, true) => true,
         (false, true) => false,
     }
 }
@@ -7647,24 +7656,22 @@ mod tests {
     fn a_placed_body_outranks_the_one_its_id_already_holds() {
         let mut kept = ExportedElement::default();
         // Nothing held yet: anything is an improvement.
-        assert!(keep_body(&square_body([0.0, 0.0, 0.0]), false, &kept));
+        assert!(keep_body(false, &kept));
         kept.brep = Some(square_body([0.0, 0.0, 0.0]));
 
         // An unplaced body still replaces an unplaced one, which is what every
         // id did before the two could be told apart.
-        assert!(keep_body(&square_body([1.0, 0.0, 0.0]), false, &kept));
+        assert!(keep_body(false, &kept));
         // A placed one takes it over.
-        assert!(keep_body(&square_body([1.0, 0.0, 0.0]), true, &kept));
+        assert!(keep_body(true, &kept));
 
         kept.brep_is_placed = true;
-        // Held placed body wins over an unplaced newcomer, whatever its size.
-        assert!(!keep_body(&square_body([1.0, 0.0, 0.0]), false, &kept));
-        // Between two placed bodies the larger one wins.
-        assert!(!keep_body(&square_body([1.0, 0.0, 0.0]), true, &kept));
-        let mut larger = square_body([1.0, 0.0, 0.0]);
-        let mut second_face = square_body([1.0, 0.0, 1.0]);
-        larger.faces.append(&mut second_face.faces);
-        assert!(keep_body(&larger, true, &kept));
+        // A held placed body wins over an unplaced newcomer.
+        assert!(!keep_body(false, &kept));
+        // Between two placed bodies the later record wins, however large the
+        // one already held: an earlier partition's copy is a state the model
+        // has moved on from.
+        assert!(keep_body(true, &kept));
     }
 
     #[test]

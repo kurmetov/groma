@@ -561,7 +561,49 @@ fn write_body_extent_json(
         }
         write!(writer, "]")?;
     }
-    Ok(())
+    write_declared_bodies_json(writer, brep)
+}
+
+/// The bodies the record declares, one entry each: a record is not one body,
+/// and which of them the export kept is the whole question wherever the
+/// assembled extent disagrees with the record's own box.
+fn write_declared_bodies_json(
+    writer: &mut impl Write,
+    brep: &rvt_model::SymbolBrep,
+) -> io::Result<()> {
+    if brep.bodies.len() < 2 {
+        return Ok(());
+    }
+    write!(writer, ",\"declared_bodies\":[")?;
+    for (index, body) in brep.bodies.iter().enumerate() {
+        let separator = if index > 0 { "," } else { "" };
+        write!(
+            writer,
+            "{separator}{{\"node\":{},\"faces\":{},\"closes\":{}",
+            body.node_id,
+            body.faces.len(),
+            body.is_closed()
+        )?;
+        if let Some((min, max)) = brep
+            .body(index)
+            .as_ref()
+            .and_then(rvt_import::body_extent_feet)
+        {
+            for (key, corner) in [("min", min), ("max", max)] {
+                write!(writer, ",\"{key}_meters\":[")?;
+                for (axis, feet) in corner.into_iter().enumerate() {
+                    let separator = if axis > 0 { "," } else { "" };
+                    match revit_catalog::internal_feet_to_metres(feet) {
+                        Some(metres) => write!(writer, "{separator}{}", json_number(metres))?,
+                        None => write!(writer, "{separator}null")?,
+                    }
+                }
+                write!(writer, "]")?;
+            }
+        }
+        write!(writer, "}}")?;
+    }
+    write!(writer, "]")
 }
 
 pub(crate) fn write_body_json(

@@ -3537,11 +3537,12 @@ fn measured_quantities(entity: &str, measured: &Measured) -> Vec<(&'static str, 
         //
         // Against Revit's own export of AR S1, joined on the Revit element
         // id, of the 7 517 walls both files hold and this measures:
-        // `Length` 7 272, `Height` 7 332, `GrossFootprintArea` 5 938 of 6 084
-        // and `NetSideArea` 6 937 reproduce Revit's number to within a
-        // thousandth. Where they differ it is the body that differs - the
-        // 558 walls this export writes larger than Revit writes its own - not
-        // the measurement.
+        // `Length` 7 476, `Height` 7 508 of 7 515, `Width` all 7 515,
+        // `GrossFootprintArea` 6 056 of 6 084, `NetSideArea` 7 510 of 7 515
+        // and `NetVolume` 7 479 reproduce Revit's number to within a
+        // thousandth. Where they differ it is the body that differs, not the
+        // measurement - see `keep_body`, which is what most of the walls that
+        // used to differ were.
         "IFCWALL" | "IFCWALLSTANDARDCASE" | "IFCCURTAINWALL" => vec![
             ("Length", Quantity::Length(length)),
             ("Width", Quantity::Length(width)),
