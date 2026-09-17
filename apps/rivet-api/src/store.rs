@@ -677,6 +677,12 @@ mod tests {
         std::fs::write(&path, lines.join("\n")).unwrap();
         let (model, skipped) = Model::load(test, &path).unwrap();
         assert_eq!(skipped, 0);
+        // `load` has read the whole file, so nothing needs it after this. Both
+        // removals run while other tests of this process may still hold files
+        // here: the directory only goes when the last of them has taken its
+        // own away, and fails harmlessly until then rather than being retried.
+        std::fs::remove_file(&path).unwrap();
+        drop(std::fs::remove_dir(&directory));
         model
     }
 
