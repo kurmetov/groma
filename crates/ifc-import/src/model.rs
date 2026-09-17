@@ -200,6 +200,9 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
             project: None,
             document_identity: document_identity(parsed, &index, units),
             site: None,
+            // An imported IFC's own coordinates are already the ones it was
+            // written in, so there is no second frame to state.
+            site_placement: None,
             documents: Vec::new(),
             elements,
             levels,

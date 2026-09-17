@@ -773,6 +773,11 @@ pub struct ExportedElement {
     /// A `GeoSite`'s own latitude, longitude and elevation. See
     /// [`rvt_model::GeoSiteFields`] for why a project can carry more than one.
     pub geo_site: Option<rvt_model::GeoSiteFields>,
+    /// Which named location the project is placed by, from the single record
+    /// that declares it. See [`rvt_model::ActiveGeoLocationFields`].
+    pub active_geo_location: Option<rvt_model::ActiveGeoLocationFields>,
+    /// A `GeoLocation`'s own frame, relative to the project's coordinates.
+    pub geo_location_placement: Option<GInstanceTransformFields>,
     /// A `MaterialElem`'s shading colour. See [`rvt_model::MaterialColorFields`].
     pub material_color: Option<rvt_model::MaterialColorFields>,
     /// First readable string in the body, with how it was located.
@@ -1125,6 +1130,11 @@ pub fn recover_elements(
     let level_class_index = schema_class_index(schema.as_ref(), "Level");
     let plane_class_index = schema_class_index(schema.as_ref(), "Plane");
     let geo_site_class_index = schema_class_index(schema.as_ref(), "GeoSite");
+    // Where the project stands in shared coordinates: one record says which
+    // named location is active, and the location itself carries the frame.
+    let active_geo_location_class_index =
+        schema_class_index(schema.as_ref(), "ActiveGeoLocationTrackingElement");
+    let geo_location_class_index = schema_class_index(schema.as_ref(), "GeoLocation");
     let material_elem_class_index = schema_class_index(schema.as_ref(), "MaterialElem");
     let pipe_curve_class_index = schema_class_index(schema.as_ref(), "RbsPipeCurve");
     let family_instance_class_index = schema_class_index(schema.as_ref(), "FamilyInstance");
@@ -1171,6 +1181,8 @@ pub fn recover_elements(
         level_class_index,
         plane_class_index,
         geo_site_class_index,
+        active_geo_location_class_index,
+        geo_location_class_index,
         material_elem_class_index,
         pipe_curve_class_index,
         family_instance_class_index,
@@ -1307,6 +1319,8 @@ pub fn recover_elements(
                             fields,
                             elevation_feet,
                             geo_site,
+                            active_geo_location,
+                            geo_location_placement,
                             material_color,
                             pipe_line_candidate,
                             fitting_center_line_candidate,
@@ -1401,6 +1415,12 @@ pub fn recover_elements(
                         if let Some(geo_site) = geo_site {
                             entry.geo_site = Some(geo_site);
                         }
+                        if let Some(active) = active_geo_location {
+                            entry.active_geo_location = Some(active);
+                        }
+                        if let Some(placement) = geo_location_placement {
+                            entry.geo_location_placement = Some(placement);
+                        }
                         if let Some(material_color) = material_color {
                             entry.material_color = Some(material_color);
                         }
@@ -1464,6 +1484,8 @@ struct RecordContext<'a> {
     level_class_index: Option<u16>,
     plane_class_index: Option<u16>,
     geo_site_class_index: Option<u16>,
+    active_geo_location_class_index: Option<u16>,
+    geo_location_class_index: Option<u16>,
     material_elem_class_index: Option<u16>,
     pipe_curve_class_index: Option<u16>,
     family_instance_class_index: Option<u16>,
@@ -1550,6 +1572,12 @@ struct ElementDecode {
     fields: Option<ElementFieldsDecode>,
     elevation_feet: Option<f64>,
     geo_site: Option<rvt_model::GeoSiteFields>,
+    /// Which named location the project is placed by, from the one record
+    /// that declares it. See [`rvt_model::ActiveGeoLocationFields`].
+    active_geo_location: Option<rvt_model::ActiveGeoLocationFields>,
+    /// The transform a `GeoLocation` carries: the frame that location's
+    /// coordinates stand in, relative to the project's own.
+    geo_location_placement: Option<GInstanceTransformFields>,
     material_color: Option<rvt_model::MaterialColorFields>,
     pipe_line_candidate: Option<PipeLineGeometryFields>,
     fitting_center_line_candidate: Option<FittingCenterLineFields>,
@@ -1758,6 +1786,24 @@ fn decode_element_fields(
 
 /// Read an element-class record's body: the parameters, name and identifiers
 /// its declarations state, and the readings its fixed tail locates.
+/// The frame a `GeoLocation` record carries, off the `InstInfoBase` in its own
+/// node stream - the same declaration a family instance's placement is read
+/// from, rather than a scan for twelve doubles. `None` for any other class.
+fn read_geo_location_placement(
+    context: &RecordContext<'_>,
+    header: RecordHeader,
+    body: &[u8],
+) -> Option<GInstanceTransformFields> {
+    (Some(header.class_index) == context.geo_location_class_index).then_some(())?;
+    let schema = context.schema?;
+    let base = context.inst_info_base_class_index?;
+    let (_walk, objects) = rvt_model::walk_record_collecting(schema, header.class_index, body);
+    objects
+        .iter()
+        .filter(|object| schema_class_is_a(schema, object.class_index, base))
+        .find_map(GInstanceTransformFields::from_instance_info)
+}
+
 fn decode_element(context: &RecordContext<'_>, header: RecordHeader, body: &[u8]) -> ElementDecode {
     // The declarations name the four parameter sets outright, so they are read
     // from the walk rather than searched for, and without waiting on the
@@ -1831,6 +1877,19 @@ fn decode_element(context: &RecordContext<'_>, header: RecordHeader, body: &[u8]
                     .and_then(|schema| GeoSiteFields::parse(schema, header.class_index, body))
             })
             .flatten(),
+        active_geo_location: (Some(header.class_index)
+            == context.active_geo_location_class_index)
+            .then(|| {
+                context.schema.and_then(|schema| {
+                    rvt_model::ActiveGeoLocationFields::parse(schema, header.class_index, body)
+                })
+            })
+            .flatten(),
+        // A `GeoLocation` is an `Instance`, so where it stands is the `m_Trf`
+        // of the `InstInfoBase` in its own node stream - read exactly the way
+        // a family instance's placement is, off the declaration rather than
+        // by scanning for twelve doubles.
+        geo_location_placement: read_geo_location_placement(context, header, body),
         material_color: (Some(header.class_index) == context.material_elem_class_index)
             .then(|| {
                 context.schema.and_then(|schema| {
@@ -2407,6 +2466,45 @@ fn project_identity(recovered: &RecoveredElements) -> Option<BimProjectIdentity>
     })
 }
 
+/// The frame the project is shared in, read off the location the file itself
+/// declares active.
+///
+/// Revit's *Manage > Coordinates* keeps one `GeoLocation` per named location
+/// and each carries the transform between that location's coordinates and the
+/// project's own, so which one is in force decides the answer.
+/// `ActiveGeoLocationTrackingElement` states it outright - no agreement rule
+/// like [`site_location`]'s is needed here, because nothing is being guessed
+/// between records.
+///
+/// `None` where the file declares no active location, the location carries no
+/// readable transform, or the transform is the identity - a project sitting at
+/// its own origin is not placed anywhere, and saying so with an identity
+/// placement would only add an entity that states nothing.
+///
+/// Verified against Revit's own export of AR S1: the active location is
+/// `Внутренний`, its frame is `(30.8708, 16.3119, -0.275)` metres turned
+/// `-88.52°`, and inverting it gives `IfcSite`'s placement in `s1_revit.ifc`
+/// to the last digit Revit wrote - `(-17102.79, 30439.81, 275)` millimetres
+/// with `RefDirection (0.025794452427383818, -0.99966726775661263, 0)`.
+// Exact comparison, on purpose: an identity frame here is not a frame that
+// came out near identity, it is the one Revit writes for a project that was
+// never placed - literal zeroes and ones, put there by the application rather
+// than arrived at by arithmetic.
+#[allow(clippy::float_cmp)]
+fn site_placement(recovered: &RecoveredElements) -> Option<BimPlacement> {
+    let active = recovered
+        .elements
+        .values()
+        .filter(|element| !element.moribund)
+        .find_map(|element| element.active_geo_location)?;
+    let location = recovered.elements.get(&active.active_id)?;
+    let placement = normalize_placement(location.geo_location_placement)?;
+    let identity = placement.origin.coordinates == [0.0; 3]
+        && placement.reference_direction == [1.0, 0.0, 0.0]
+        && placement.axis == [0.0, 0.0, 1.0];
+    (!identity).then_some(placement)
+}
+
 /// Where the project sits, read off every `GeoSite` record the file carries.
 ///
 /// A project can keep more than one named location (`Manage > Location` does
@@ -2830,6 +2928,7 @@ pub fn metadata_model(
             project: project_identity(recovered),
             document_identity: recovered.document_identity.clone(),
             site: site_location(recovered),
+            site_placement: site_placement(recovered),
             documents: Vec::new(),
             elements,
             levels,
@@ -6192,6 +6291,116 @@ mod tests {
         assert!((site.latitude_degrees - 42.414_863_586_425_76).abs() < 1e-9);
         assert!((site.longitude_degrees - -71.258_071_899_414_03).abs() < 1e-9);
         assert_eq!(site.elevation.map(|value| value.value), Some(0.0));
+    }
+
+    /// The two `GeoLocation` records AR S1 carries, and the tracking element
+    /// that says which of them is in force. The values are that file's own:
+    /// `Внутренний`'s frame, which `s1_revit.ifc`'s `IfcSite` placement is
+    /// the inverse of.
+    fn geo_location_elements() -> BTreeMap<u32, ExportedElement> {
+        let frame = |basis, origin| {
+            Some(GInstanceTransformFields {
+                offset: 134,
+                basis,
+                origin: rvt_model::RvtPoint3 {
+                    coordinates_feet: origin,
+                },
+                symbol_element_id: None,
+            })
+        };
+        let mut elements = BTreeMap::new();
+        elements.insert(
+            1366,
+            ExportedElement {
+                active_geo_location: Some(rvt_model::ActiveGeoLocationFields {
+                    active_id: 1368,
+                    project_id: 1371,
+                }),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            1368,
+            ExportedElement {
+                geo_location_placement: frame(
+                    [
+                        [0.025_794_452_427_383_475, 0.999_667_267_756_612_7, 0.0],
+                        [-0.999_667_267_756_612_7, 0.025_794_452_427_383_475, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    [
+                        101.282_288_650_673_27,
+                        53.516_806_742_184_244,
+                        -0.902_230_971_128_607_2,
+                    ],
+                ),
+                ..ExportedElement::default()
+            },
+        );
+        elements.insert(
+            1371,
+            ExportedElement {
+                geo_location_placement: frame(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [0.0; 3],
+                ),
+                ..ExportedElement::default()
+            },
+        );
+        elements
+    }
+
+    fn recovered_with(elements: BTreeMap<u32, ExportedElement>) -> RecoveredElements {
+        RecoveredElements {
+            release: None,
+            catalog: None,
+            parameter_values_schema_bound: false,
+            schema: None,
+            partition_paths: Vec::new(),
+            parameter_names: BTreeMap::new(),
+            parameter_specs: BTreeMap::new(),
+            elements,
+            authored_unique_ids: BTreeMap::new(),
+            document_identity: None,
+        }
+    }
+
+    #[test]
+    fn site_placement_follows_the_location_the_file_declares_active() {
+        let placement =
+            site_placement(&recovered_with(geo_location_elements())).expect("an active location");
+        for (actual, expected) in placement
+            .origin
+            .coordinates
+            .into_iter()
+            .zip([30.870_841_580_725_212, 16.311_922_695_017_76, -0.275])
+        {
+            assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+        }
+        assert!((placement.reference_direction[1] - 0.999_667_267_756_612_7).abs() < 1e-12);
+        for (actual, expected) in placement.axis.into_iter().zip([0.0, 0.0, 1.0]) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
+
+    /// A project that was never placed states an identity location, and an
+    /// identity placement says nothing an absent one does not.
+    #[test]
+    fn site_placement_refuses_an_identity_location() {
+        let mut elements = geo_location_elements();
+        elements.get_mut(&1366).unwrap().active_geo_location =
+            Some(rvt_model::ActiveGeoLocationFields {
+                active_id: 1371,
+                project_id: 1371,
+            });
+        assert!(site_placement(&recovered_with(elements)).is_none());
+    }
+
+    #[test]
+    fn site_placement_is_none_without_a_tracking_element() {
+        let mut elements = geo_location_elements();
+        elements.remove(&1366);
+        assert!(site_placement(&recovered_with(elements)).is_none());
     }
 
     /// Two named locations whose coordinates genuinely differ - a project

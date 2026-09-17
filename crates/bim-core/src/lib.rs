@@ -31,6 +31,17 @@ pub struct BimModel {
     /// locations disagree - see [`BimSiteLocation`] for why that is refused
     /// rather than guessed at.
     pub site: Option<BimSiteLocation>,
+    /// The frame the model is shared in, stated in the model's own
+    /// coordinates: where its origin sits and how its axes are turned, as the
+    /// source's active named location declares them.
+    ///
+    /// Every coordinate in [`Self::elements`] is in the model's own frame and
+    /// stays that way. This says how to get from that frame to the one the
+    /// project is shared under, which is what lets an exported file land on
+    /// the same ground as another export of the same site. `None` where the
+    /// source states no such location, or states an identity one - a project
+    /// that was never placed.
+    pub site_placement: Option<BimPlacement>,
     /// The source files this model was assembled from, one entry per file.
     ///
     /// Empty for a model a reader produced directly; [`federate`] fills it,
@@ -1025,6 +1036,10 @@ pub fn federate(sources: Vec<(BimDocument, BimModel)>) -> (BimModel, BimFederati
             out.project = model.project.clone();
             out.document_identity.clone_from(&model.document_identity);
             out.site = model.site;
+            // A federated model has no single frame to be shared in - each
+            // file states its own - so this, like the fields above it, is the
+            // single-source shorthand and stays unset for a federation.
+            out.site_placement.clone_from(&model.site_placement);
         }
         out.elements.append(&mut model.elements);
         out.levels.append(&mut model.levels);
@@ -1388,6 +1403,7 @@ mod tests {
                 ..BimProjectIdentity::default()
             }),
             site: None,
+            site_placement: None,
             document_identity: Some(identity(id)),
             documents: Vec::new(),
             elements: vec![element(id, at)],

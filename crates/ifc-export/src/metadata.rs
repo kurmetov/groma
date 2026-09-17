@@ -131,9 +131,10 @@ pub fn metadata_ifc_reported(
     let units = push_units(&mut file, options.settings.length_unit);
     let project = push_project(&mut file, options, ownership, context, units);
     let origin_axis = push_axis(&mut file, lengths, 0.0);
+    let site_axis = push_site_axis(&mut file, lengths, model.site_placement.as_ref());
     let site_placement = file.push(
         "IFCLOCALPLACEMENT",
-        vec![StepValue::Omitted, StepValue::Reference(origin_axis)],
+        vec![StepValue::Omitted, StepValue::Reference(site_axis)],
     );
     let site = push_site(
         &mut file,
@@ -373,6 +374,68 @@ fn push_axis(file: &mut StepFile, lengths: Lengths, elevation: f64) -> EntityRef
     )
 }
 
+/// The site's own placement: the model's coordinates carried into the frame
+/// the project is shared in.
+///
+/// [`bim_core::BimModel::site_placement`] states where the model's origin sits
+/// in its own coordinates, which is the frame read out of the source. What the
+/// file needs is the other direction - every product below the site is written
+/// in the model's coordinates, and the site is what takes them to the ground
+/// the project is shared on - so this writes that frame's inverse: a rotation
+/// transposed, and an origin turned through it and negated.
+///
+/// Identical in form to what Revit's own export writes, and identical in
+/// value: on AR S1 this reproduces `s1_revit.ifc`'s `IfcSite` placement to
+/// every digit Revit wrote.
+fn push_site_axis(
+    file: &mut StepFile,
+    lengths: Lengths,
+    placement: Option<&bim_core::BimPlacement>,
+) -> EntityRef {
+    let Some(placement) = placement else {
+        return push_axis(file, lengths, 0.0);
+    };
+    // The frame's three axes, as rows. The second is the one the source did
+    // not have to state: a right-handed frame's Y is its Z crossed with its X.
+    let reference_direction = placement.reference_direction;
+    let axis = placement.axis;
+    let rows = [reference_direction, cross(axis, reference_direction), axis];
+    // The inverse of a rigid frame: the rotation transposed, and the origin
+    // turned through it and negated.
+    let origin = placement.origin.coordinates;
+    let turned = rows.map(|row| -dot(row, origin));
+    let point = file.push("IFCCARTESIANPOINT", vec![lengths.coordinates(turned)]);
+    // The transpose's own columns, which is what `Axis` and `RefDirection`
+    // state: the site's local Z and X as the shared frame sees them.
+    let column = |index: usize| unit([rows[0][index], rows[1][index], rows[2][index]]);
+    let mut direction = |vector: [f64; 3]| {
+        file.push(
+            "IFCDIRECTION",
+            vec![StepValue::List(
+                vector.into_iter().map(StepValue::Real).collect(),
+            )],
+        )
+    };
+    let local_z = direction(column(2));
+    let local_x = direction(column(0));
+    file.push(
+        "IFCAXIS2PLACEMENT3D",
+        vec![reference(point), reference(local_z), reference(local_x)],
+    )
+}
+
+/// A direction as a unit vector. The basis a rigid frame was read from is
+/// orthonormal by construction, but two decoded doubles multiplied together
+/// land a part in 10^16 off 1, and a direction written as `0.9999999999999998`
+/// says the same thing less clearly than `1.`.
+fn unit(vector: [f64; 3]) -> [f64; 3] {
+    let length = dot(vector, vector).sqrt();
+    if length > 0.0 {
+        vector.map(|value| value / length)
+    } else {
+        vector
+    }
+}
 
 fn push_units(file: &mut StepFile, length_unit: LengthUnit) -> EntityRef {
     let mut units = Vec::new();
@@ -4587,6 +4650,7 @@ mod tests {
             project: None,
             document_identity: None,
             site: None,
+            site_placement: None,
             documents: Vec::new(),
             levels: vec![BimLevel {
                 id: level_id.clone(),
@@ -6434,6 +6498,93 @@ mod tests {
             .find(|line| line.contains("=IFCRELASSOCIATESCLASSIFICATION("))
             .unwrap();
         assert_eq!(relation.matches('#').count(), 5, "{relation}");
+    }
+
+    /// AR S1's own frame, and the `IfcSite` placement Revit's export of it
+    /// states: the one is the inverse of the other, and this checks that the
+    /// writer produces Revit's numbers rather than merely something rigid.
+    #[test]
+    fn the_site_carries_the_inverse_of_the_frame_the_model_is_shared_in() {
+        let mut model = model();
+        model.site_placement = Some(bim_core::BimPlacement {
+            origin: BimPoint3 {
+                coordinates: [30.870_841_580_725_212, 16.311_922_695_017_76, -0.275],
+                unit: BimUnit::new("autodesk.unit.unit:meters-1.0.0", "Meters"),
+            },
+            reference_direction: [0.025_794_452_427_383_475, 0.999_667_267_756_612_7, 0.0],
+            axis: [0.0, 0.0, 1.0],
+        });
+
+        let file = metadata_ifc(&model, &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        let site = text
+            .lines()
+            .find(|line| line.contains("=IFCSITE("))
+            .unwrap();
+        let placement = entity(&text, &reference_in(site, 5));
+        let line = entity(&text, &reference_in(&placement, 1));
+        let point = entity(&text, &reference_in(&line, 0));
+        let direction = entity(&text, &reference_in(&line, 2));
+        // Metres here, millimetres in `s1_revit.ifc`: the same numbers.
+        assert!(point.contains("-17.1027916469"), "{point}");
+        assert!(point.contains("30.4398127424"), "{point}");
+        assert!(point.contains("0.275"), "{point}");
+        assert!(direction.contains("0.0257944524274"), "{direction}");
+        assert!(direction.contains("-0.999667267757"), "{direction}");
+    }
+
+    /// The entity line `#n=...` for a reference like `#n`.
+    fn entity(text: &str, reference: &str) -> String {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{reference}=")))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// The `#n` in attribute `index` of an entity line.
+    fn reference_in(line: &str, index: usize) -> String {
+        let body = line.split_once('(').unwrap().1;
+        let mut depth = 0_i32;
+        let mut current = String::new();
+        let mut fields = Vec::new();
+        for character in body.chars() {
+            match character {
+                '(' => {
+                    depth += 1;
+                    current.push(character);
+                }
+                ')' if depth == 0 => break,
+                ')' => {
+                    depth -= 1;
+                    current.push(character);
+                }
+                ',' if depth == 0 => fields.push(std::mem::take(&mut current)),
+                _ => current.push(character),
+            }
+        }
+        fields.push(current);
+        fields[index].trim().to_owned()
+    }
+
+    #[test]
+    fn a_model_shared_in_its_own_frame_leaves_the_site_at_the_origin() {
+        let file = metadata_ifc(&model(), &options()).unwrap();
+        let mut bytes = Vec::new();
+        file.write_to(&mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        let site = text
+            .lines()
+            .find(|line| line.contains("=IFCSITE("))
+            .unwrap();
+        let placement = entity(&text, &reference_in(site, 5));
+        let axis = entity(&text, &reference_in(&placement, 1));
+        // No direction of its own: the axis placement is the origin one every
+        // other unturned frame in the file uses.
+        assert!(axis.ends_with(",$,$);"), "{axis}");
     }
 
     #[test]

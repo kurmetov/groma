@@ -539,6 +539,31 @@ pub(crate) fn write_decoded_sections_json(
 /// placed, and only when a verified route reached it. This is the decode
 /// itself, so a body that is incomplete, unplaced or attached to nothing is
 /// still visible here rather than silently absent.
+/// The body's own extent, which is what says which frame it was written in. A
+/// residual alone cannot: a body 70 mm off its record's box and a body in a
+/// symbol's local frame both read as "not placed", and only the extent tells
+/// them apart.
+fn write_body_extent_json(
+    writer: &mut impl Write,
+    brep: &rvt_model::SymbolBrep,
+) -> io::Result<()> {
+    let Some((min, max)) = rvt_import::body_extent_feet(brep) else {
+        return Ok(());
+    };
+    for (key, corner) in [("min", min), ("max", max)] {
+        write!(writer, ",\"body_{key}_meters\":[")?;
+        for (index, feet) in corner.into_iter().enumerate() {
+            let separator = if index > 0 { "," } else { "" };
+            match revit_catalog::internal_feet_to_metres(feet) {
+                Some(metres) => write!(writer, "{separator}{}", json_number(metres))?,
+                None => write!(writer, "{separator}null")?,
+            }
+        }
+        write!(writer, "]")?;
+    }
+    Ok(())
+}
+
 pub(crate) fn write_body_json(
     writer: &mut impl Write,
     element: &ExportedElement,
@@ -607,6 +632,7 @@ pub(crate) fn write_body_json(
         }
         write!(writer, "]")?;
     }
+    write_body_extent_json(writer, brep)?;
     let residuals = element.brep_box_residuals;
     for (key, residual) in [
         ("exact", residuals.exact),

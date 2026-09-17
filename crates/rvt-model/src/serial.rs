@@ -792,6 +792,50 @@ impl GeoSiteFields {
     }
 }
 
+/// Which named location of the several a project can carry is the active one.
+///
+/// Revit's *Manage > Coordinates* keeps one `GeoLocation` per named location -
+/// `Внутренний`/`Internal` and `Проект`/`Project` on AR S1 - and each is an
+/// `Instance` carrying the transform between that location's coordinates and
+/// the project's own. Which one is in force is not something to guess from
+/// the records: `ActiveGeoLocationTrackingElement` declares it, and this reads
+/// exactly that declaration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveGeoLocationFields {
+    /// The `GeoLocation` element the project is currently placed by - Revit's
+    /// own `Document.ActiveProjectLocation`.
+    pub active_id: u32,
+    /// The location named `Project`, which is the identity one. Read beside
+    /// the active one because the two being the same element is what says a
+    /// project is not placed in shared coordinates at all.
+    pub project_id: u32,
+}
+
+impl ActiveGeoLocationFields {
+    /// Read `m_activeGeoLocationId` and `m_projectGeoLocationId` off an
+    /// `ActiveGeoLocationTrackingElement` record, by declaration.
+    ///
+    /// `None` where the record does not tile exactly against the schema,
+    /// either property is not declared, or either names nothing.
+    #[must_use]
+    pub fn parse(schema: &Schema, class_index: u16, body: &[u8]) -> Option<Self> {
+        let (walk, trace) = walk_record_traced(schema, class_index, body);
+        walk.stop.is_none().then_some(())?;
+        let read = |property: &str| {
+            let entry = trace.iter().find(|entry| {
+                entry.class == "ActiveGeoLocationTrackingElement" && entry.property == property
+            })?;
+            let bytes: [u8; 4] = body.get(entry.offset..entry.offset + 4)?.try_into().ok()?;
+            let id = i32::from_le_bytes(bytes);
+            u32::try_from(id).ok().filter(|id| *id > 0)
+        };
+        Some(Self {
+            active_id: read("m_activeGeoLocationId")?,
+            project_id: read("m_projectGeoLocationId")?,
+        })
+    }
+}
+
 /// A `MaterialElem`'s shading colour - what Revit's own *Shaded* view paints
 /// a face with, not the photorealistic render appearance `m_appearanceAssetId`
 /// names. Verified against `s1_revit.ifc`'s own `IfcColourRgb`: two distinct
@@ -1849,6 +1893,51 @@ mod tests {
         };
         let short_body = vec![0_u8; 4];
         assert!(GeoSiteFields::parse(&schema, FIRST_CLASS_INDEX, &short_body).is_none());
+    }
+
+    fn active_geo_location_schema() -> Schema {
+        Schema {
+            classes: vec![class(
+                FIRST_CLASS_INDEX,
+                "ActiveGeoLocationTrackingElement",
+                TypeReference::None,
+                vec![
+                    property("m_activeGeoLocationId", FieldType::Integer32, 0x00, 0, None),
+                    property("m_projectGeoLocationId", FieldType::Integer32, 0x00, 0, None),
+                ],
+            )],
+            top_level_class_count: 1,
+            property_count: 2,
+            parsed_property_count: 2,
+            consumed_bytes: 0,
+            trailing_bytes: Vec::new(),
+            unresolved_references: Vec::new(),
+            inline_index_mismatches: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn active_geo_location_reads_both_declared_identifiers() {
+        let schema = active_geo_location_schema();
+        let mut body = Vec::new();
+        body.extend(1368_i32.to_le_bytes());
+        body.extend(1371_i32.to_le_bytes());
+        body.extend(0_u32.to_le_bytes()); // length trailer, unchecked here
+
+        let fields = ActiveGeoLocationFields::parse(&schema, FIRST_CLASS_INDEX, &body).unwrap();
+        assert_eq!(fields.active_id, 1368);
+        assert_eq!(fields.project_id, 1371);
+    }
+
+    #[test]
+    fn active_geo_location_refuses_a_record_naming_nothing() {
+        let schema = active_geo_location_schema();
+        let mut body = Vec::new();
+        body.extend((-1_i32).to_le_bytes());
+        body.extend(1371_i32.to_le_bytes());
+        body.extend(0_u32.to_le_bytes());
+
+        assert!(ActiveGeoLocationFields::parse(&schema, FIRST_CLASS_INDEX, &body).is_none());
     }
 
     fn material_elem_schema() -> Schema {
