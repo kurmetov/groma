@@ -1,8 +1,8 @@
 # Rivet
 
 Rivet is an early-stage, Linux-native, read-only ingestion engine for building
-models. It reads Autodesk Revit `.rvt` files - release 2023, and no other - and
-IFC (ISO 10303-21), converts between them, and needs neither Revit, Windows,
+models. It reads Autodesk Revit `.rvt` files - releases 2023 and 2026, on the
+evidence set out below - and IFC (ISO 10303-21), converts between them, and needs neither Revit, Windows,
 Wine, Autodesk Platform Services, nor ODA BimRv.
 
 The source format is read from a file's own leading bytes, so `export-scene`
@@ -22,26 +22,45 @@ complete partitions into memory.
 
 ## Supported Revit releases
 
-Rivet reads **Revit 2023 files, and only those**. That is the single release the
-decode has been measured on: every model behind
-[`tests/baseline/corpus_metrics.tsv`](tests/baseline/corpus_metrics.tsv), every
-`Partitions/*` framing claim in [`docs/format-notes.md`](docs/format-notes.md),
-and the built-in parameter and category tables in `revit-catalog` are 2023.
+Rivet carries identifier tables for **Revit 2023 and Revit 2026**, and for no
+other release. `Catalog::for_release` answers for those two and returns nothing
+for anything else, so a file from 2024 or 2025 is read without built-in
+parameter names, without their units, and without any category-driven IFC
+classification, leaving only the handful of mappings made from class names.
+`rivet info` states which of the two applies to a file, `export-scene` and
+`export-ifc` say so when neither does, `export-json --full` writes it as
+`parameter_catalog`, and a converted scene carries the same answer into the
+viewer, which marks a model read without a catalog.
 
-A file from another release is not rejected, and the layers that read the file's
-own declarations do work on it: the container, `BasicFileInfo` - which reads the
-release year from a 2026 file today - and the `Formats/Latest` class inventory,
-which was decoded from a 2026 file with no trailing bytes and no unresolved
-class. What is missing is everything keyed to a release. `Catalog::for_release`
-answers for 2023 and returns nothing for anything else, so on another release
-built-in parameter names, their units, and every category-driven IFC
-classification fall away, leaving only the handful of mappings made from class
-names. The record framing inside `Partitions/*` has never been measured on
-another release at all.
+The two releases do not stand on the same evidence, and it is worth being
+precise about the difference.
 
-Nothing warns you about any of this. Treat a non-2023 file as unverified rather
-than unsupported-but-probably-fine: it may well convert, and no output states
-which parts of it were read by a table that does not apply.
+**2023 is the measured release.** Every model behind
+[`tests/baseline/corpus_metrics.tsv`](tests/baseline/corpus_metrics.tsv) and
+every `Partitions/*` framing claim in
+[`docs/format-notes.md`](docs/format-notes.md) is 2023.
+
+**2026 is catalogued but not measured.** Its `BuiltInParameter` and
+`BuiltInCategory` tables are generated from Autodesk's own published 2026
+enumerations - 3,699 parameter and 1,212 category codes, against 3,439 and
+1,189 for 2023 - so on a 2026 file every built-in code those tables carry is
+named by the release that wrote it. That matters beyond the new codes: 2026
+renames twelve parameters and one category that 2023 spells differently,
+`UNIFORMAT_CODE` becoming `ASSEMBLY_CODE` among them, and reading either
+release's file through the other's table would quietly mislabel them. What has
+*not* been measured is the rest of a 2026 read: the layers that read a file's
+own declarations work - the container, `BasicFileInfo`, and the `Formats/Latest`
+class inventory, which was decoded from a 2026 file with no trailing bytes and
+no unresolved class - but the record framing inside `Partitions/*` has never
+been measured on a 2026 model, because no 2026 file has reached the reference
+corpus. Treat a 2026 conversion as unverified until it has.
+
+The Forge spec table is deliberately not release-keyed. A spec is named by a
+fully qualified `ForgeTypeId` that the file itself states, and that identity is
+version-insensitive by Autodesk's own convention, so `autodesk.spec.aec:length`
+means metres whichever release wrote it. An identifier the table does not carry
+resolves to nothing and its value reaches an exporter unconverted and marked,
+so a newer release's additions cost coverage rather than correctness.
 
 ## Build
 
@@ -267,7 +286,8 @@ record belonging to one identifier, with its category and family reference when
 the element's header record carries them. `bodies` prints record payloads of one
 class as hex for field analysis. `export-json` writes one JSON object per
 element with its class, name, category code, level, phase, level elevation,
-parameter values, Revit 2023 built-in names, model-defined parameter specs,
+parameter values, the built-in names its own release publishes,
+model-defined parameter specs,
 known canonical-unit conversions, deletion/lock flags, and the byte location
 it came from. Independently bounds-verified straight pipes additionally carry
 a metric swept-disk axis and radius; owner-verified, single-line pipe-fitting
@@ -596,8 +616,9 @@ evidence.
 
 ## Status
 
-Rivet is experimental, and at 0.9 it supports exactly one Revit release: 2023.
-It recovers the object graph's records, identifiers,
+Rivet is experimental, and at 0.9 it carries identifier tables for two Revit
+releases, 2023 and 2026, of which only 2023 has been measured against real
+models. It recovers the object graph's records, identifiers,
 classes, selected fields, level elevations, names, and schema-bound parameter
 sets, plus independently checked straight-pipe bodies, straight fitting axes
 and boundary representations. On the reference model 56.4% of the products

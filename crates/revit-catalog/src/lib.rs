@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
 mod built_in_categories_2023;
+mod built_in_categories_2026;
 mod built_in_parameter_specifications;
 mod built_in_parameters_2023;
-mod specifications_2023;
+mod built_in_parameters_2026;
+mod specifications;
 
 /// Metres in one Revit internal length unit (one international foot).
 pub const METRES_PER_INTERNAL_FOOT: f64 = 0.3048;
@@ -54,20 +56,52 @@ impl Specification {
     }
 }
 
+/// Every Revit release this crate carries identifier tables for, newest last.
+///
+/// A release is only listed once its tables are generated from that release's
+/// own published enumerations. Nothing here is inferred from a neighbouring
+/// release: the codes are largely shared, but 2026 renames twelve parameters
+/// and one category that 2023 states differently, and adds 267 parameter and
+/// 23 category codes 2023 never had.
+pub const RELEASES: &[u16] = &[2023, 2026];
+
 /// Versioned external catalog. Unsupported releases deliberately return no
 /// names instead of silently applying a table from another Revit version.
+///
+/// The tables a release answers from are chosen once, by the only constructor,
+/// and carried on the value. So there is no arm that could quietly fall back
+/// to another release's names: a release with no tables has no `Catalog`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Catalog {
     release: u16,
+    parameters: &'static [BuiltInParameter],
+    categories: &'static [BuiltInCategory],
 }
 
 impl Catalog {
     #[must_use]
     pub const fn for_release(release: u16) -> Option<Self> {
         match release {
-            2023 => Some(Self { release }),
+            2023 => Some(Self {
+                release,
+                parameters: built_in_parameters_2023::VALUES,
+                categories: built_in_categories_2023::VALUES,
+            }),
+            2026 => Some(Self {
+                release,
+                parameters: built_in_parameters_2026::VALUES,
+                categories: built_in_categories_2026::VALUES,
+            }),
             _ => None,
         }
+    }
+
+    /// Whether a Revit release has identifier tables here, without building
+    /// one. `BasicFileInfo` reads the release off any file, and a caller that
+    /// only wants to say whether the read is a catalogued one asks this.
+    #[must_use]
+    pub const fn supports_release(release: u16) -> bool {
+        Self::for_release(release).is_some()
     }
 
     #[must_use]
@@ -77,20 +111,18 @@ impl Catalog {
 
     #[must_use]
     pub fn built_in_parameter(self, code: i32) -> Option<&'static BuiltInParameter> {
-        debug_assert_eq!(self.release, 2023);
         if code == -1 {
             return None;
         }
-        find_by_code(built_in_parameters_2023::VALUES, code, |entry| entry.code)
+        find_by_code(self.parameters, code, |entry| entry.code)
     }
 
     #[must_use]
     pub fn built_in_category(self, code: i32) -> Option<&'static BuiltInCategory> {
-        debug_assert_eq!(self.release, 2023);
         if code == -1 {
             return None;
         }
-        find_by_code(built_in_categories_2023::VALUES, code, |entry| entry.code)
+        find_by_code(self.categories, code, |entry| entry.code)
     }
 
     /// The Forge spec a built-in parameter's stored double is measured in,
@@ -98,9 +130,13 @@ impl Catalog {
     /// parameter takes its spec from Revit's own definition of it - so this
     /// is the only way one of them reaches an exporter as a quantity rather
     /// than as a raw internal number.
+    ///
+    /// It is not release-keyed. Every code it claims is published by each
+    /// release in [`RELEASES`] under the same enum name, which the tests
+    /// check: a code whose name moved would be a different parameter, and
+    /// would have to be keyed by release like the names are.
     #[must_use]
     pub fn built_in_parameter_specification(self, code: i32) -> Option<&'static str> {
-        debug_assert_eq!(self.release, 2023);
         find_by_code(built_in_parameter_specifications::VALUES, code, |entry| {
             entry.0
         })
@@ -109,14 +145,22 @@ impl Catalog {
 
     /// Resolve a Forge spec while ignoring only its semantic-version suffix,
     /// matching `ForgeTypeId`'s version-insensitive identity convention.
+    ///
+    /// The spec table is the one part of the catalog that is not release-keyed,
+    /// and deliberately: a spec is named by a fully qualified `ForgeTypeId`
+    /// that the file itself states, and that identity is version-insensitive by
+    /// Autodesk's own convention, which is what `forge_type_key` implements. So
+    /// `autodesk.spec.aec:length` means metres whichever release wrote it. An
+    /// identifier the table does not carry resolves to nothing, and its value
+    /// reaches an exporter unconverted and marked, so a newer release's
+    /// additions cost coverage rather than correctness.
     #[must_use]
     pub fn specification(self, type_id: &str) -> Option<&'static Specification> {
-        debug_assert_eq!(self.release, 2023);
         let key = forge_type_key(type_id);
-        specifications_2023::VALUES
+        specifications::VALUES
             .binary_search_by_key(&key, |entry| entry.key)
             .ok()
-            .map(|index| &specifications_2023::VALUES[index])
+            .map(|index| &specifications::VALUES[index])
             .or_else(|| {
                 // Autodesk spells this one spec two ways and files carry both:
                 // `measurable` in the 1.0.0 the 231 MB architectural model
@@ -126,12 +170,12 @@ impl Catalog {
                 // generated file is not edited, so the alias lives here.
                 (forge_type_key(type_id) == "autodesk.spec.measurable:currency")
                     .then(|| {
-                        specifications_2023::VALUES
+                        specifications::VALUES
                             .binary_search_by_key(&"autodesk.spec.measurabLe:currency", |entry| {
                                 entry.key
                             })
                             .ok()
-                            .map(|index| &specifications_2023::VALUES[index])
+                            .map(|index| &specifications::VALUES[index])
                     })
                     .flatten()
             })
@@ -169,11 +213,119 @@ fn forge_type_key(type_id: &str) -> &str {
 mod tests {
     use super::*;
 
-    const CATALOG: Catalog = Catalog { release: 2023 };
+    const CATALOG: Catalog = match Catalog::for_release(2023) {
+        Some(catalog) => catalog,
+        None => panic!("2023 is a listed release"),
+    };
+
+    fn catalogs() -> impl Iterator<Item = Catalog> {
+        RELEASES
+            .iter()
+            .map(|release| Catalog::for_release(*release).expect("a listed release has tables"))
+    }
 
     #[test]
     fn rejects_an_unsupported_release() {
-        assert_eq!(Catalog::for_release(2026), None);
+        // 2024 and 2025 are real releases whose enumerations have never been
+        // generated here, and a file from one must not borrow 2023's or 2026's.
+        for release in [2018, 2022, 2024, 2025, 2027] {
+            assert_eq!(Catalog::for_release(release), None);
+            assert!(!Catalog::supports_release(release));
+        }
+        for release in RELEASES {
+            assert!(Catalog::supports_release(*release));
+            assert_eq!(
+                Catalog::for_release(*release).map(Catalog::release),
+                Some(*release)
+            );
+        }
+    }
+
+    #[test]
+    fn every_release_answers_the_codes_its_own_tables_state() {
+        for catalog in catalogs() {
+            let release = catalog.release();
+            assert!(
+                catalog.parameters.len() > 3_000,
+                "{release} carries too few parameters"
+            );
+            assert!(
+                catalog.categories.len() > 1_000,
+                "{release} carries too few categories"
+            );
+            for (index, entry) in catalog.parameters.iter().enumerate() {
+                assert!(
+                    index == 0 || catalog.parameters[index - 1].code < entry.code,
+                    "{release} parameter codes must ascend for the binary search"
+                );
+                assert!(!entry.enum_name.is_empty() && !entry.display_name.is_empty());
+            }
+            for (index, entry) in catalog.categories.iter().enumerate() {
+                assert!(
+                    index == 0 || catalog.categories[index - 1].code < entry.code,
+                    "{release} category codes must ascend for the binary search"
+                );
+                assert!(!entry.enum_name.is_empty());
+            }
+            assert_eq!(
+                catalog.built_in_parameter(-1_001_203).unwrap().enum_name,
+                "ALL_MODEL_MARK"
+            );
+            assert_eq!(
+                catalog.built_in_category(-2_000_011).unwrap().enum_name,
+                "OST_Walls"
+            );
+            assert!(catalog.built_in_parameter(-1).is_none());
+            assert!(catalog.built_in_category(-1).is_none());
+        }
+    }
+
+    #[test]
+    fn a_release_keeps_the_names_its_own_release_publishes() {
+        let catalog_2023 = Catalog::for_release(2023).unwrap();
+        let catalog_2026 = Catalog::for_release(2026).unwrap();
+        let parameter = |catalog: Catalog, code| {
+            catalog
+                .built_in_parameter(code)
+                .map(|parameter| parameter.enum_name)
+        };
+        let category = |catalog: Catalog, code| {
+            catalog
+                .built_in_category(code)
+                .map(|category| category.enum_name)
+        };
+
+        // `UNIFORMAT_CODE` became `ASSEMBLY_CODE` and the rebar hooks became
+        // terminations. One code, two names, and each release states its own -
+        // which is the whole reason the tables are keyed by release.
+        assert_eq!(parameter(catalog_2023, -1_002_500), Some("UNIFORMAT_CODE"));
+        assert_eq!(parameter(catalog_2026, -1_002_500), Some("ASSEMBLY_CODE"));
+        assert_eq!(
+            parameter(catalog_2023, -1_155_205),
+            Some("REBAR_HOOK_ROTATION_AT_START")
+        );
+        assert_eq!(
+            parameter(catalog_2026, -1_155_205),
+            Some("REBAR_TERMINATION_ROTATION_AT_START")
+        );
+
+        // A category and a parameter 2026 adds. 2023 must answer neither
+        // rather than reach for the nearest code it does carry.
+        assert_eq!(category(catalog_2026, -2_001_105), Some("OST_WallLayers"));
+        assert_eq!(category(catalog_2023, -2_001_105), None);
+        assert_eq!(
+            parameter(catalog_2026, -1_180_441),
+            Some("REBAR_SHAPE_NAME")
+        );
+        assert_eq!(parameter(catalog_2023, -1_180_441), None);
+
+        // And one 2023 states that 2026 retired, which is the same rule the
+        // other way: 2026 answers nothing for it.
+        assert_eq!(
+            parameter(catalog_2023, -1_005_400),
+            Some("VIEW_DESIGN_OPTIONS_CONFIG")
+        );
+        assert_eq!(parameter(catalog_2026, -1_005_400), None);
     }
 
     #[test]
@@ -275,13 +427,32 @@ mod tests {
             assert!(*code > previous, "codes must ascend for the binary search");
             previous = *code;
             assert!(
-                CATALOG.built_in_parameter(*code).is_some(),
-                "{code} names no published parameter"
-            );
-            assert!(
                 CATALOG.specification(type_id).is_some(),
                 "{type_id} names no published spec"
             );
+            // The table is shared across releases, so every release has to
+            // publish the code, and publish it under one name. A code whose
+            // name moved would be a different parameter measured in whatever
+            // the row happens to say.
+            let mut names = catalogs().map(|catalog| {
+                (
+                    catalog.release(),
+                    catalog
+                        .built_in_parameter(*code)
+                        .map(|parameter| parameter.enum_name),
+                )
+            });
+            let (first_release, first_name) = names.next().expect("at least one release");
+            assert!(
+                first_name.is_some(),
+                "{code} names no parameter published by {first_release}"
+            );
+            for (release, name) in names {
+                assert_eq!(
+                    name, first_name,
+                    "{code} is not one parameter across {first_release} and {release}"
+                );
+            }
         }
     }
 

@@ -1065,7 +1065,7 @@ pub(super) static VALUES: &[BuiltInCategory] = &[
     },
     BuiltInCategory {
         code: -2008152,
-        enum_name: "OST_ElectricalInternalCircuits",
+        enum_name: "OST_ElectricalInternalCircuits_Obsolete",
     },
     BuiltInCategory {
         code: -2008151,
@@ -2676,6 +2676,18 @@ pub(super) static VALUES: &[BuiltInCategory] = &[
         enum_name: "OST_MechanicalEquipment",
     },
     BuiltInCategory {
+        code: -2001125,
+        enum_name: "OST_MEPSystemZoneColorFill",
+    },
+    BuiltInCategory {
+        code: -2001124,
+        enum_name: "OST_ViewPosition",
+    },
+    BuiltInCategory {
+        code: -2001122,
+        enum_name: "OST_Subdivision",
+    },
+    BuiltInCategory {
         code: -2001121,
         enum_name: "OST_LightingFixtureSource",
     },
@@ -2684,8 +2696,88 @@ pub(super) static VALUES: &[BuiltInCategory] = &[
         enum_name: "OST_LightingFixtures",
     },
     BuiltInCategory {
+        code: -2001119,
+        enum_name: "OST_Cable",
+    },
+    BuiltInCategory {
+        code: -2001118,
+        enum_name: "OST_PanelSchedules",
+    },
+    BuiltInCategory {
+        code: -2001117,
+        enum_name: "OST_RebarCrankType",
+    },
+    BuiltInCategory {
+        code: -2001116,
+        enum_name: "OST_DuctAnalyticalSegmentTags",
+    },
+    BuiltInCategory {
+        code: -2001115,
+        enum_name: "OST_DuctAnalyticalSegments",
+    },
+    BuiltInCategory {
+        code: -2001114,
+        enum_name: "OST_PipeAnalyticalSegmentTags",
+    },
+    BuiltInCategory {
+        code: -2001113,
+        enum_name: "OST_PipeAnalyticalSegments",
+    },
+    BuiltInCategory {
+        code: -2001112,
+        enum_name: "OST_SheetCollections",
+    },
+    BuiltInCategory {
+        code: -2001111,
+        enum_name: "OST_DuctFlowDirectionSymbols_Obsolete",
+    },
+    BuiltInCategory {
+        code: -2001110,
+        enum_name: "OST_PipeFlowDirectionSymbols_Obsolete",
+    },
+    BuiltInCategory {
+        code: -2001109,
+        enum_name: "OST_RebarSpliceType",
+    },
+    BuiltInCategory {
+        code: -2001108,
+        enum_name: "OST_RebarSpliceLines",
+    },
+    BuiltInCategory {
+        code: -2001107,
+        enum_name: "OST_DataExchanges",
+    },
+    BuiltInCategory {
+        code: -2001106,
+        enum_name: "OST_FloorLayers",
+    },
+    BuiltInCategory {
+        code: -2001105,
+        enum_name: "OST_WallLayers",
+    },
+    BuiltInCategory {
+        code: -2001104,
+        enum_name: "OST_RebarBendingDetails",
+    },
+    BuiltInCategory {
+        code: -2001103,
+        enum_name: "OST_ToposolidLinkTags",
+    },
+    BuiltInCategory {
+        code: -2001102,
+        enum_name: "OST_ElectricalConnectorTags",
+    },
+    BuiltInCategory {
+        code: -2001101,
+        enum_name: "OST_ElectricalConnector",
+    },
+    BuiltInCategory {
         code: -2001100,
         enum_name: "OST_FurnitureSystems",
+    },
+    BuiltInCategory {
+        code: -2001099,
+        enum_name: "OST_ElectricalLoadCase",
     },
     BuiltInCategory {
         code: -2001098,

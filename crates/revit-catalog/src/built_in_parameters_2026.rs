@@ -4,6 +4,621 @@ use crate::BuiltInParameter;
 
 pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
+        code: -1612357,
+        enum_name: "ALLOW_MULTIPLE_SELECTION",
+        display_name: "Allow Multiple Selection",
+    },
+    BuiltInParameter {
+        code: -1612354,
+        enum_name: "ELLIPSE_MODIFICATION_KEEPS_RATIO",
+        display_name: "Keep Ratio",
+    },
+    BuiltInParameter {
+        code: -1523514,
+        enum_name: "PROJECTION_TYPE",
+        display_name: "Projection Type",
+    },
+    BuiltInParameter {
+        code: -1180442,
+        enum_name: "BENDING_DETAIL_TYPE_ANGULAR_DIMENSIONS_FOR_CRANKS_ENABLED",
+        display_name: "Crank Angles",
+    },
+    BuiltInParameter {
+        code: -1180441,
+        enum_name: "REBAR_SHAPE_NAME",
+        display_name: "Shape Name",
+    },
+    BuiltInParameter {
+        code: -1180440,
+        enum_name: "REBAR_SHAPE_CRANK_END_RATIO",
+        display_name: "End Crank Slope 1:",
+    },
+    BuiltInParameter {
+        code: -1180439,
+        enum_name: "REBAR_SHAPE_CRANK_START_RATIO",
+        display_name: "Start Crank Slope 1:",
+    },
+    BuiltInParameter {
+        code: -1180438,
+        enum_name: "REBAR_CRANK_LENGTH_OVERRIDE",
+        display_name: "Override Crank Lengths",
+    },
+    BuiltInParameter {
+        code: -1180437,
+        enum_name: "REBAR_TYPE_AT_END",
+        display_name: "End of Bar",
+    },
+    BuiltInParameter {
+        code: -1180436,
+        enum_name: "REBAR_TYPE_AT_START",
+        display_name: "Start of Bar",
+    },
+    BuiltInParameter {
+        code: -1180435,
+        enum_name: "REBAR_SHAPE_TYPE_AT_END",
+        display_name: "Type At End",
+    },
+    BuiltInParameter {
+        code: -1180434,
+        enum_name: "REBAR_SHAPE_TYPE_AT_START",
+        display_name: "Type At Start",
+    },
+    BuiltInParameter {
+        code: -1180433,
+        enum_name: "REBAR_CRANK_AT_END_TYPE",
+        display_name: "Crank at End",
+    },
+    BuiltInParameter {
+        code: -1180432,
+        enum_name: "REBAR_CRANK_AT_START_TYPE",
+        display_name: "Crank at Start",
+    },
+    BuiltInParameter {
+        code: -1180431,
+        enum_name: "REBAR_SHAPE_CRANK_END_LENGTH",
+        display_name: "End Crank Length",
+    },
+    BuiltInParameter {
+        code: -1180430,
+        enum_name: "REBAR_SHAPE_CRANK_END_ANGLED_LENGTH",
+        display_name: "End Crank Angled Length",
+    },
+    BuiltInParameter {
+        code: -1180429,
+        enum_name: "REBAR_SHAPE_CRANK_END_STRAIGHT_LENGTH",
+        display_name: "End Crank Straight Length",
+    },
+    BuiltInParameter {
+        code: -1180428,
+        enum_name: "REBAR_SHAPE_CRANK_END_OFFSET",
+        display_name: "End Crank Offset",
+    },
+    BuiltInParameter {
+        code: -1180426,
+        enum_name: "REBAR_SHAPE_CRANK_START_LENGTH",
+        display_name: "Start Crank Length",
+    },
+    BuiltInParameter {
+        code: -1180425,
+        enum_name: "REBAR_SHAPE_CRANK_START_ANGLED_LENGTH",
+        display_name: "Start Crank Angled Length",
+    },
+    BuiltInParameter {
+        code: -1180424,
+        enum_name: "REBAR_SHAPE_CRANK_START_STRAIGHT_LENGTH",
+        display_name: "Start Crank Straight Length",
+    },
+    BuiltInParameter {
+        code: -1180423,
+        enum_name: "REBAR_SHAPE_CRANK_START_OFFSET",
+        display_name: "Start Crank Offset",
+    },
+    BuiltInParameter {
+        code: -1180421,
+        enum_name: "ANALYTICAL_NODE_CAN_BE_HOSTED",
+        display_name: "Can Be Hosted",
+    },
+    BuiltInParameter {
+        code: -1180420,
+        enum_name: "ANALYTICAL_NODE_TYPE",
+        display_name: "Node Type",
+    },
+    BuiltInParameter {
+        code: -1180418,
+        enum_name: "REBAR_CRANK_RATIO",
+        display_name: "Crank Slope 1:",
+    },
+    BuiltInParameter {
+        code: -1180417,
+        enum_name: "REBAR_CRANK_OFFSET_MULTIPLIER",
+        display_name: "Crank Offset Multiplier",
+    },
+    BuiltInParameter {
+        code: -1180416,
+        enum_name: "REBAR_CRANK_LENGTH_MULTIPLIER",
+        display_name: "Length Multiplier",
+    },
+    BuiltInParameter {
+        code: -1180415,
+        enum_name: "REBAR_STAGGERED_SET",
+        display_name: "Staggered Set",
+    },
+    BuiltInParameter {
+        code: -1180414,
+        enum_name: "REBAR_MAXIMUM_NUMBER",
+        display_name: "Maximum Rebar Number",
+    },
+    BuiltInParameter {
+        code: -1180413,
+        enum_name: "REBAR_MINIMUM_NUMBER",
+        display_name: "Minimum Rebar Number",
+    },
+    BuiltInParameter {
+        code: -1180412,
+        enum_name: "REBAR_SPLICE_SHIFT_BARS",
+        display_name: "Shift Bars",
+    },
+    BuiltInParameter {
+        code: -1180411,
+        enum_name: "REBAR_SPLICE_STAGGER_LENGTH_MULTIPLIER",
+        display_name: "Stagger Length Multiplier",
+    },
+    BuiltInParameter {
+        code: -1180410,
+        enum_name: "REBAR_STAGGER_OFFSET_AT_END",
+        display_name: "Offset At End",
+    },
+    BuiltInParameter {
+        code: -1180409,
+        enum_name: "REBAR_STAGGER_OFFSET_AT_START",
+        display_name: "Offset At Start",
+    },
+    BuiltInParameter {
+        code: -1180408,
+        enum_name: "SPLICE_TYPE_AT_END",
+        display_name: "Splice at End",
+    },
+    BuiltInParameter {
+        code: -1180407,
+        enum_name: "SPLICE_TYPE_AT_START",
+        display_name: "Splice at Start",
+    },
+    BuiltInParameter {
+        code: -1180406,
+        enum_name: "SPLICE_LAP_LENGTH_AT_END",
+        display_name: "Lap Length at End",
+    },
+    BuiltInParameter {
+        code: -1180405,
+        enum_name: "SPLICE_LAP_LENGTH_AT_START",
+        display_name: "Lap Length at Start",
+    },
+    BuiltInParameter {
+        code: -1180404,
+        enum_name: "SPLICE_BY_RULES_RUNOUT",
+        display_name: "Runout",
+    },
+    BuiltInParameter {
+        code: -1180403,
+        enum_name: "SPLICE_BY_RULES_MIN_LENGTH",
+        display_name: "Minimum bar length",
+    },
+    BuiltInParameter {
+        code: -1180402,
+        enum_name: "SPLICE_BY_RULES_MAX_LENGTH",
+        display_name: "Maximum bar length",
+    },
+    BuiltInParameter {
+        code: -1180401,
+        enum_name: "REBAR_SPLICE_SPLICE_LINE_POSITION",
+        display_name: "Splice Position",
+    },
+    BuiltInParameter {
+        code: -1180400,
+        enum_name: "REBAR_SPLICE_LAP_LENGTH_MULTIPLIER",
+        display_name: "Lap Length Multiplier",
+    },
+    BuiltInParameter {
+        code: -1180319,
+        enum_name: "STEEL_ELEM_SINGLE_PART_MARK",
+        display_name: "Single Part Mark",
+    },
+    BuiltInParameter {
+        code: -1180318,
+        enum_name: "STEEL_ELEM_MARK",
+        display_name: "Assembly Mark",
+    },
+    BuiltInParameter {
+        code: -1180317,
+        enum_name: "BENDINGDETAIL_POSITION",
+        display_name: "Bending Detail Position",
+    },
+    BuiltInParameter {
+        code: -1180310,
+        enum_name: "TAG_HEAD_ALIGNMENT",
+        display_name: "Tag Alignment",
+    },
+    BuiltInParameter {
+        code: -1180309,
+        enum_name: "REBAR_BAR_SPLICE_LENGTHS",
+        display_name: "Splice Lengths",
+    },
+    BuiltInParameter {
+        code: -1180308,
+        enum_name: "EXCAVATION_VOLUME_ON_TOPOSOLID",
+        display_name: "Excavation Volume on Toposolid",
+    },
+    BuiltInParameter {
+        code: -1180307,
+        enum_name: "TOTAL_EXCAVATION_VOLUME",
+        display_name: "Total Excavation Volume",
+    },
+    BuiltInParameter {
+        code: -1180306,
+        enum_name: "EXCAVATION_VOLUME",
+        display_name: "Excavation Volume",
+    },
+    BuiltInParameter {
+        code: -1180305,
+        enum_name: "EXCAVATION_ELEMENT_FAMILY_AND_TYPE",
+        display_name: "Element Family and Type",
+    },
+    BuiltInParameter {
+        code: -1180304,
+        enum_name: "EXCAVATION_ELEMENT_ID",
+        display_name: "Element Id",
+    },
+    BuiltInParameter {
+        code: -1180303,
+        enum_name: "INDIVIDUAL_EXCAVATION_VOLUME",
+        display_name: "Individual Excavation Volume",
+    },
+    BuiltInParameter {
+        code: -1180302,
+        enum_name: "TAG_HEAD_POSITION",
+        display_name: "Tag Position",
+    },
+    BuiltInParameter {
+        code: -1180301,
+        enum_name: "REBAR_CONSTRAINTS_STATUS",
+        display_name: "Rebar Constraint Status",
+    },
+    BuiltInParameter {
+        code: -1180201,
+        enum_name: "TOPOSOLID_FACES_LOCATION",
+        display_name: "Picked Faces Location",
+    },
+    BuiltInParameter {
+        code: -1180200,
+        enum_name: "FAMILY_USING_MULTIPLE",
+        display_name: "Multiple Join",
+    },
+    BuiltInParameter {
+        code: -1180000,
+        enum_name: "USING_MULTIPLE",
+        display_name: "Multiple Join",
+    },
+    BuiltInParameter {
+        code: -1166006,
+        enum_name: "PLACEMENT_TOP",
+        display_name: "Top",
+    },
+    BuiltInParameter {
+        code: -1166005,
+        enum_name: "PLACEMENT_RIGHT",
+        display_name: "Right",
+    },
+    BuiltInParameter {
+        code: -1166004,
+        enum_name: "PLACEMENT_BOTTOM",
+        display_name: "Bottom",
+    },
+    BuiltInParameter {
+        code: -1166003,
+        enum_name: "PLACEMENT_LEFT",
+        display_name: "Left",
+    },
+    BuiltInParameter {
+        code: -1166002,
+        enum_name: "PLACEMENT_CENTER_Y",
+        display_name: "Center Y",
+    },
+    BuiltInParameter {
+        code: -1166001,
+        enum_name: "PLACEMENT_CENTER_X",
+        display_name: "Center X",
+    },
+    BuiltInParameter {
+        code: -1166000,
+        enum_name: "PLACEMENT_PARAMS_SHOW",
+        display_name: "Enable Position Parameters",
+    },
+    BuiltInParameter {
+        code: -1155401,
+        enum_name: "EXCHANGE_ENTITY_ID",
+        display_name: "Exchange Entity ID",
+    },
+    BuiltInParameter {
+        code: -1155400,
+        enum_name: "EXCHANGE_ID",
+        display_name: "Exchange ID",
+    },
+    BuiltInParameter {
+        code: -1155322,
+        enum_name: "SHEET_SCALE_OVERRIDE",
+        display_name: "Scale Override (Multiple Values)",
+    },
+    BuiltInParameter {
+        code: -1155321,
+        enum_name: "TAG_ORIENTATION_BEHAVIOR",
+        display_name: "Tag Orientation",
+    },
+    BuiltInParameter {
+        code: -1155320,
+        enum_name: "FAMILY_NESTING_BEHAVIOR",
+        display_name: "Family Nesting Behavior",
+    },
+    BuiltInParameter {
+        code: -1155318,
+        enum_name: "BENDING_DETAIL_TYPE_SCHEMATIC_HEIGHT",
+        display_name: "Height",
+    },
+    BuiltInParameter {
+        code: -1155317,
+        enum_name: "BENDING_DETAIL_TYPE_SCHEMATIC_WIDTH",
+        display_name: "Width",
+    },
+    BuiltInParameter {
+        code: -1155315,
+        enum_name: "BENDING_DETAIL_TYPE_TAG_TYPE_ID",
+        display_name: "Tag Type",
+    },
+    BuiltInParameter {
+        code: -1155314,
+        enum_name: "BLEND_DEPTH_PARAM",
+        display_name: "Depth",
+    },
+    BuiltInParameter {
+        code: -1155313,
+        enum_name: "BENDING_DETAIL_DETAIL_LEVEL",
+        display_name: "Detail Level",
+    },
+    BuiltInParameter {
+        code: -1155312,
+        enum_name: "BENDING_DETAIL_ANGULAR_DIMENSION_TEXT_POSITION",
+        display_name: "Angle Text Position",
+    },
+    BuiltInParameter {
+        code: -1155311,
+        enum_name: "BENDING_DETAIL_SEGMENT_LENGTH_DIMENSION_TEXT_POSITION",
+        display_name: "Dimension Text Position",
+    },
+    BuiltInParameter {
+        code: -1155310,
+        enum_name: "BENDING_DETAIL_SEGMENT_REPRESENTATION",
+        display_name: "Representation",
+    },
+    BuiltInParameter {
+        code: -1155309,
+        enum_name: "BENDING_DETAIL_VARYING_REBAR_DIMENSION",
+        display_name: "Varying Rebar Set Dimensions",
+    },
+    BuiltInParameter {
+        code: -1155308,
+        enum_name: "BENDING_DETAIL_REPRESENTATION_FOR_3D_BARS",
+        display_name: "View for 3D Shape",
+    },
+    BuiltInParameter {
+        code: -1155307,
+        enum_name: "BENDING_DETAIL_TYPE_ANGULAR_DIMENSIONS_MEASUREMENT",
+        display_name: "Angle Measurement",
+    },
+    BuiltInParameter {
+        code: -1155306,
+        enum_name: "BENDING_DETAIL_TYPE_ANGULAR_DIMENSIONS_FOR_HOOKS_ENABLED",
+        display_name: "Hook Angles",
+    },
+    BuiltInParameter {
+        code: -1155305,
+        enum_name: "BENDING_DETAIL_TYPE_BEND_DIAMETER_DIMENSIONS_FOR_HOOKS_ENABLED",
+        display_name: "Hook Bends",
+    },
+    BuiltInParameter {
+        code: -1155304,
+        enum_name: "BENDING_DETAIL_TYPE_BEND_DIAMETER_DIMENSIONS_FOR_SEGMENTS_ENABLED",
+        display_name: "Segment Bends",
+    },
+    BuiltInParameter {
+        code: -1155302,
+        enum_name: "BENDING_DETAIL_TYPE_SHOW_BAR_BENDING_USING",
+        display_name: "Dimension Type",
+    },
+    BuiltInParameter {
+        code: -1155301,
+        enum_name: "BENDING_DETAIL_TYPE_DIAMETER_DIMENSION_TYPE_ID",
+        display_name: "Diameter Dimension Style",
+    },
+    BuiltInParameter {
+        code: -1155300,
+        enum_name: "BENDING_DETAIL_TYPE_RADIAL_DIMENSION_TYPE_ID",
+        display_name: "Radial Dimension Style",
+    },
+    BuiltInParameter {
+        code: -1155299,
+        enum_name: "BENDING_DETAIL_TYPE_BEND_DIAMETER_DIMENSIONS_ENABLED",
+        display_name: "Bend Diameter Dimensions",
+    },
+    BuiltInParameter {
+        code: -1155298,
+        enum_name: "BENDING_DETAIL_TYPE_ANGULAR_DIMENSION_OFFSET",
+        display_name: "Angular Dimension Offset",
+    },
+    BuiltInParameter {
+        code: -1155297,
+        enum_name: "BENDING_DETAIL_TYPE_SHOW_ANGULAR_DIMENSIONS_FOR",
+        display_name: "Show for Angles",
+    },
+    BuiltInParameter {
+        code: -1155296,
+        enum_name: "BENDING_DETAIL_TYPE_ANGULAR_DIMENSION_TYPE_ID",
+        display_name: "Angular Dimension Style",
+    },
+    BuiltInParameter {
+        code: -1155295,
+        enum_name: "BENDING_DETAIL_TYPE_ANGULAR_DIMENSIONS_ENABLED",
+        display_name: "Angular Dimensions",
+    },
+    BuiltInParameter {
+        code: -1155294,
+        enum_name: "BENDING_DETAIL_TYPE_ORTHOGONAL_AND_OVERALL_DIMESIONS_ENABLED",
+        display_name: "Other Dimensions",
+    },
+    BuiltInParameter {
+        code: -1155293,
+        enum_name: "BENDING_DETAIL_TYPE_SEGMENT_LENGTH_DIMENSIONS_FOR_HOOKS_ENABLED",
+        display_name: "Hook Lengths",
+    },
+    BuiltInParameter {
+        code: -1155292,
+        enum_name: "BENDING_DETAIL_TYPE_SEGMENT_LENGTH_DIMENSIONS_OFFSET",
+        display_name: "Dimension Offset",
+    },
+    BuiltInParameter {
+        code: -1155291,
+        enum_name: "BENDING_DETAIL_TYPE_SEGMENT_LENGTHS_DISPLAY_OPTION",
+        display_name: "Straight Segment Lengths",
+    },
+    BuiltInParameter {
+        code: -1155290,
+        enum_name: "BENDING_DETAIL_TYPE_SEGMENT_LENGTHS_FOR_ARCS_DISPLAY_OPTION",
+        display_name: "Arc Segment Lengths",
+    },
+    BuiltInParameter {
+        code: -1155289,
+        enum_name: "BENDING_DETAIL_TYPE_SEGMENT_LENGTH_DIMENSION_TYPE_ID",
+        display_name: "Linear Dimension Style",
+    },
+    BuiltInParameter {
+        code: -1155288,
+        enum_name: "BENDING_DETAIL_TYPE_SEGMENT_LENGTH_DIMENSIONS_ENABLED",
+        display_name: "Segment Length Dimensions",
+    },
+    BuiltInParameter {
+        code: -1155285,
+        enum_name: "SSE_POINT_OFFSET_FROM_SNAPS",
+        display_name: "Offset from Snaps",
+    },
+    BuiltInParameter {
+        code: -1155284,
+        enum_name: "LOAD_IS_CONSTRAINED_ON_HOST",
+        display_name: "Is constrained on host",
+    },
+    BuiltInParameter {
+        code: -1155283,
+        enum_name: "REBAR_ALIGNMENT_OPTIONS",
+        display_name: "Bar Alignment",
+    },
+    BuiltInParameter {
+        code: -1155282,
+        enum_name: "SCHEDULE_ROW_HEIGHT_INPUT",
+        display_name: "Row Height",
+    },
+    BuiltInParameter {
+        code: -1155281,
+        enum_name: "SCHEDULE_RESIZE_ROWS",
+        display_name: "Resize Rows",
+    },
+    BuiltInParameter {
+        code: -1155280,
+        enum_name: "SCHEDULE_ROTATION_ON_SHEET",
+        display_name: "Rotation on Sheet",
+    },
+    BuiltInParameter {
+        code: -1155279,
+        enum_name: "LAYER_ELEM_SCHEDULE_FAMILY",
+        display_name: "Family",
+    },
+    BuiltInParameter {
+        code: -1155278,
+        enum_name: "LAYER_ELEM_IS_VARIABLE",
+        display_name: "Is Variable",
+    },
+    BuiltInParameter {
+        code: -1155277,
+        enum_name: "LAYER_ELEM_IS_STRUCTURAL_MATERIAL",
+        display_name: "Is Structural Material",
+    },
+    BuiltInParameter {
+        code: -1155276,
+        enum_name: "LAYER_ELEM_IS_CORE_LAYER",
+        display_name: "Is Core Layer",
+    },
+    BuiltInParameter {
+        code: -1155275,
+        enum_name: "LAYER_ELEM_COMPOUND_ELEM_TYPE",
+        display_name: "Compound Element Type",
+    },
+    BuiltInParameter {
+        code: -1155274,
+        enum_name: "LAYER_ELEM_COMPOUND_ELEM_FAMILY",
+        display_name: "Compound Element Family",
+    },
+    BuiltInParameter {
+        code: -1155273,
+        enum_name: "SSE_POINT_ELEVATION_BASE_TYPE",
+        display_name: "Elevation Base Type",
+    },
+    BuiltInParameter {
+        code: -1155272,
+        enum_name: "SSE_POINT_ELEVATION",
+        display_name: "Elevation",
+    },
+    BuiltInParameter {
+        code: -1155271,
+        enum_name: "SSE_POINT_OFFSET_FROM_SURFACE",
+        display_name: "Offset from Surface",
+    },
+    BuiltInParameter {
+        code: -1155270,
+        enum_name: "SSE_POINT_BASETYPE_ENUM",
+        display_name: "Point Base Type",
+    },
+    BuiltInParameter {
+        code: -1155269,
+        enum_name: "TOPOSOLID_CONTOUR_SUBCATEGORY_ID",
+        display_name: "Subcategory",
+    },
+    BuiltInParameter {
+        code: -1155268,
+        enum_name: "TOPOSOLID_CONTOUR_DISPLAY_SETTINGS_ID_PARAM",
+        display_name: "Contour Display",
+    },
+    BuiltInParameter {
+        code: -1155267,
+        enum_name: "TOPOSOLID_SUBDIVIDE_MATERIAL",
+        display_name: "Material",
+    },
+    BuiltInParameter {
+        code: -1155266,
+        enum_name: "TOPOSOLID_SUBDIVIDE_HEIGHT",
+        display_name: "Sub-divide Offset",
+    },
+    BuiltInParameter {
+        code: -1155265,
+        enum_name: "TOPOSOLID_INHERIT_CONTOURS",
+        display_name: "Inherit Contours",
+    },
+    BuiltInParameter {
+        code: -1155264,
+        enum_name: "TOPOSOLID_FUNCTION_PARAM",
+        display_name: "Function",
+    },
+    BuiltInParameter {
+        code: -1155263,
+        enum_name: "PREFER_PATTERN_ALIGN_UI_FILTER",
+        display_name: "Pattern:",
+    },
+    BuiltInParameter {
         code: -1155261,
         enum_name: "TOPOSOLID_ELEVATION_AT_TOP",
         display_name: "Elevation at Top",
@@ -17,6 +632,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1155259,
         enum_name: "TOPOSOLID_STRUCTURE_ID_PARAM",
         display_name: "Structure",
+    },
+    BuiltInParameter {
+        code: -1155258,
+        enum_name: "ANALYTICAL_MODEL_HEIGHT_PARAM",
+        display_name: "Height",
     },
     BuiltInParameter {
         code: -1155257,
@@ -109,14 +729,64 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Lock",
     },
     BuiltInParameter {
+        code: -1155239,
+        enum_name: "LAYER_ELEM_BASE_EXTENSION_DIS",
+        display_name: "Base Extension Distance",
+    },
+    BuiltInParameter {
+        code: -1155238,
+        enum_name: "LAYER_ELEM_TOP_EXTENSION_DIS",
+        display_name: "Top Extension Distance",
+    },
+    BuiltInParameter {
+        code: -1155237,
+        enum_name: "LAYER_ELEM_FUNCTION",
+        display_name: "Function",
+    },
+    BuiltInParameter {
+        code: -1155236,
+        enum_name: "LAYER_ELEM_MATERIALS",
+        display_name: "Material",
+    },
+    BuiltInParameter {
+        code: -1155235,
+        enum_name: "LAYER_ELEM_THICKNESS",
+        display_name: "Thickness",
+    },
+    BuiltInParameter {
         code: -1155234,
         enum_name: "LAYER_ELEM_AREA_COMPUTED",
         display_name: "Area",
     },
     BuiltInParameter {
+        code: -1155233,
+        enum_name: "LAYER_ELEM_OFFSET_FROM_HOST",
+        display_name: "Offset From Host",
+    },
+    BuiltInParameter {
         code: -1155232,
         enum_name: "LAYER_ELEM_VOLUME_COMPUTED",
         display_name: "Volume",
+    },
+    BuiltInParameter {
+        code: -1155231,
+        enum_name: "LAYER_TYPE_MATERIALS",
+        display_name: "Material",
+    },
+    BuiltInParameter {
+        code: -1155230,
+        enum_name: "LAYER_TYPE_THICKNESS",
+        display_name: "Thickness",
+    },
+    BuiltInParameter {
+        code: -1155229,
+        enum_name: "LAYER_ELEM_BASE_CONSTRAINT",
+        display_name: "Base Constraint",
+    },
+    BuiltInParameter {
+        code: -1155228,
+        enum_name: "LAYER_ELEM_TOP_CONSTRAINT",
+        display_name: "Top Constraint",
     },
     BuiltInParameter {
         code: -1155224,
@@ -155,13 +825,13 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     },
     BuiltInParameter {
         code: -1155217,
-        enum_name: "REBAR_HOOK_ROTATION_AT_END_SCHEDULES_TAGS_FILTERS",
-        display_name: "Hook Rotation At End",
+        enum_name: "REBAR_TERMINATION_ROTATION_AT_END_SCHEDULES_TAGS_FILTERS",
+        display_name: "Rotation At End",
     },
     BuiltInParameter {
         code: -1155216,
-        enum_name: "REBAR_HOOK_ROTATION_AT_START_SCHEDULES_TAGS_FILTERS",
-        display_name: "Hook Rotation At Start",
+        enum_name: "REBAR_TERMINATION_ROTATION_AT_START_SCHEDULES_TAGS_FILTERS",
+        display_name: "Rotation At Start",
     },
     BuiltInParameter {
         code: -1155215,
@@ -195,23 +865,23 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     },
     BuiltInParameter {
         code: -1155206,
-        enum_name: "REBAR_HOOK_ROTATION_AT_END",
-        display_name: "Hook Rotation At End",
+        enum_name: "REBAR_TERMINATION_ROTATION_AT_END",
+        display_name: "Rotation At End",
     },
     BuiltInParameter {
         code: -1155205,
-        enum_name: "REBAR_HOOK_ROTATION_AT_START",
-        display_name: "Hook Rotation At Start",
+        enum_name: "REBAR_TERMINATION_ROTATION_AT_START",
+        display_name: "Rotation At Start",
     },
     BuiltInParameter {
         code: -1155204,
-        enum_name: "REBAR_SHAPE_HOOK_ROTATION_AT_END",
-        display_name: "Hook Rotation At End",
+        enum_name: "REBAR_SHAPE_TERMINATION_ROTATION_AT_END",
+        display_name: "Rotation At End",
     },
     BuiltInParameter {
         code: -1155203,
-        enum_name: "REBAR_SHAPE_HOOK_ROTATION_AT_START",
-        display_name: "Hook Rotation At Start",
+        enum_name: "REBAR_SHAPE_TERMINATION_ROTATION_AT_START",
+        display_name: "Rotation At Start",
     },
     BuiltInParameter {
         code: -1155202,
@@ -222,6 +892,16 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1155201,
         enum_name: "PATH_OF_TRAVEL_TO_ROOM",
         display_name: "To Room",
+    },
+    BuiltInParameter {
+        code: -1155152,
+        enum_name: "RBS_ELEC_MAX_CIRCUITS_DATA_PANEL",
+        display_name: "Maximum Amount of Circuits",
+    },
+    BuiltInParameter {
+        code: -1155151,
+        enum_name: "RBS_ELEC_ANALYTICAL_TOTAL_COINCIDENT_LOAD",
+        display_name: "Total Coincident Loads",
     },
     BuiltInParameter {
         code: -1155150,
@@ -236,7 +916,7 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1155147,
         enum_name: "STEEL_ELEM_PROFILE_LENGTH",
-        display_name: "Length",
+        display_name: "System Length",
     },
     BuiltInParameter {
         code: -1155146,
@@ -401,17 +1081,17 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1155110,
         enum_name: "RBS_ELEC_PANEL_FEED_THRU_LUGS_APPARENT_LOAD_PHASEC",
-        display_name: "Feed Through Lugs Apparent Load Phase C",
+        display_name: "Feed Through Lugs Apparent Power Phase C",
     },
     BuiltInParameter {
         code: -1155109,
         enum_name: "RBS_ELEC_PANEL_FEED_THRU_LUGS_APPARENT_LOAD_PHASEB",
-        display_name: "Feed Through Lugs Apparent Load Phase B",
+        display_name: "Feed Through Lugs Apparent Power Phase B",
     },
     BuiltInParameter {
         code: -1155108,
         enum_name: "RBS_ELEC_PANEL_FEED_THRU_LUGS_APPARENT_LOAD_PHASEA",
-        display_name: "Feed Through Lugs Apparent Load Phase A",
+        display_name: "Feed Through Lugs Apparent Power Phase A",
     },
     BuiltInParameter {
         code: -1155107,
@@ -431,17 +1111,17 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1155104,
         enum_name: "RBS_ELEC_PANEL_BRANCH_CIRCUIT_APPARENT_LOAD_PHASEC",
-        display_name: "Branch Circuit Apparent Load Phase C",
+        display_name: "Branch Circuit Apparent Power Phase C",
     },
     BuiltInParameter {
         code: -1155103,
         enum_name: "RBS_ELEC_PANEL_BRANCH_CIRCUIT_APPARENT_LOAD_PHASEB",
-        display_name: "Branch Circuit Apparent Load Phase B",
+        display_name: "Branch Circuit Apparent Power Phase B",
     },
     BuiltInParameter {
         code: -1155102,
         enum_name: "RBS_ELEC_PANEL_BRANCH_CIRCUIT_APPARENT_LOAD_PHASEA",
-        display_name: "Branch Circuit Apparent Load Phase A",
+        display_name: "Branch Circuit Apparent Power Phase A",
     },
     BuiltInParameter {
         code: -1155101,
@@ -919,16 +1599,6 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Lon",
     },
     BuiltInParameter {
-        code: -1154691,
-        enum_name: "REBAR_FREE_FORM_HOOK_END_PLANE_ANGLE",
-        display_name: "Hook Orientation At End",
-    },
-    BuiltInParameter {
-        code: -1154690,
-        enum_name: "REBAR_FREE_FORM_HOOK_START_PLANE_ANGLE",
-        display_name: "Hook Orientation At Start",
-    },
-    BuiltInParameter {
         code: -1154689,
         enum_name: "ROOM_OUTDOOR_AIRFLOW_PARAM",
         display_name: "Outdoor Airflow",
@@ -987,16 +1657,6 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1154659,
         enum_name: "REBAR_INTERNAL_MULTIPLANAR_ARC_CONNECTOR",
         display_name: "INTERNAL: Multiplanar Arc Connector",
-    },
-    BuiltInParameter {
-        code: -1154658,
-        enum_name: "REBAR_SHAPE_ENDTREATMENT_END_TYPE",
-        display_name: "End Treatment At End",
-    },
-    BuiltInParameter {
-        code: -1154657,
-        enum_name: "REBAR_SHAPE_ENDTREATMENT_START_TYPE",
-        display_name: "End Treatment At Start",
     },
     BuiltInParameter {
         code: -1154656,
@@ -1129,6 +1789,36 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Show Hidden Lines",
     },
     BuiltInParameter {
+        code: -1153556,
+        enum_name: "RBS_ELEC_ANALYTICAL_DOWNSTREAM_CONNECTED_PHASES",
+        display_name: "Downstream Connected Phases",
+    },
+    BuiltInParameter {
+        code: -1153555,
+        enum_name: "RBS_ELEC_ANALYTICAL_SECONDARY_HIGH_LEG_PHASE",
+        display_name: "Secondary High-leg Phase",
+    },
+    BuiltInParameter {
+        code: -1153554,
+        enum_name: "RBS_ELEC_ANALYTICAL_HIGH_LEG_PHASE",
+        display_name: "High-leg Phase",
+    },
+    BuiltInParameter {
+        code: -1153553,
+        enum_name: "RBS_ELEC_ANALYTICAL_CONNECTED_PHASE",
+        display_name: "Connected Phases",
+    },
+    BuiltInParameter {
+        code: -1153552,
+        enum_name: "RBS_ELEC_ANALYTICAL_NUMPHASES",
+        display_name: "Number of Phases",
+    },
+    BuiltInParameter {
+        code: -1153551,
+        enum_name: "RBS_ELEC_ANALYTICAL_AREA",
+        display_name: "Area",
+    },
+    BuiltInParameter {
         code: -1153550,
         enum_name: "RBS_ELEC_ANALYTICAL_LOADS_IN_SET",
         display_name: "Loads in Set",
@@ -1136,7 +1826,7 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1153549,
         enum_name: "RBS_ELEC_ANALYTICAL_LOAD_SET_ON_STANDBY",
-        display_name: "Quantity of Standby",
+        display_name: "Quantity on Standby",
     },
     BuiltInParameter {
         code: -1153548,
@@ -1182,6 +1872,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1153539,
         enum_name: "RBS_ELEC_DISTRIBUTION_NODE_SUPPLY_FROM1",
         display_name: "Supply From 1",
+    },
+    BuiltInParameter {
+        code: -1153538,
+        enum_name: "RBS_ELEC_ANALYTICAL_LOAD_SET_ON_TOTAL",
+        display_name: "Total Quantity",
     },
     BuiltInParameter {
         code: -1153537,
@@ -1317,6 +2012,61 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1153500,
         enum_name: "MEP_ANALYTICAL_LOOP_NAME",
         display_name: "Name",
+    },
+    BuiltInParameter {
+        code: -1153129,
+        enum_name: "MEP_SEGMENT_FLOW_CHARACTERISTIC",
+        display_name: "Flow Characteristic",
+    },
+    BuiltInParameter {
+        code: -1153128,
+        enum_name: "MEP_SEGMENT_OVERRIDE",
+        display_name: "Overrides",
+    },
+    BuiltInParameter {
+        code: -1153127,
+        enum_name: "MEP_SEGMENT_ELEMENT_TYPENAME",
+        display_name: "Type Name",
+    },
+    BuiltInParameter {
+        code: -1153126,
+        enum_name: "MEP_SEGMENT_FAMILYNAME",
+        display_name: "Family Name",
+    },
+    BuiltInParameter {
+        code: -1153125,
+        enum_name: "MEP_SEGMENT_SYSTEMORSERVICE",
+        display_name: "System Type/Service Name",
+    },
+    BuiltInParameter {
+        code: -1153124,
+        enum_name: "MEP_SEGMENT_LENGTH",
+        display_name: "Analytical Length",
+    },
+    BuiltInParameter {
+        code: -1153123,
+        enum_name: "MEP_ANALYTICAL_ELEC_APPARENT_POWER_RATING",
+        display_name: "Apparent Power Rating",
+    },
+    BuiltInParameter {
+        code: -1153122,
+        enum_name: "MEP_ANALYTICAL_HYDRAULICLOOP",
+        display_name: "Hydraulic Loop",
+    },
+    BuiltInParameter {
+        code: -1153121,
+        enum_name: "MEP_ANALYTICAL_CRITICALSEQUENCE",
+        display_name: "Critical Sequence",
+    },
+    BuiltInParameter {
+        code: -1153120,
+        enum_name: "MEP_ANALYTICAL_HEADERSEGMENT",
+        display_name: "Header",
+    },
+    BuiltInParameter {
+        code: -1153119,
+        enum_name: "MEP_ANALYTICAL_NETWORK",
+        display_name: "Network Id",
     },
     BuiltInParameter {
         code: -1153118,
@@ -2774,6 +3524,16 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Assembly: Name",
     },
     BuiltInParameter {
+        code: -1150437,
+        enum_name: "PIPE_INSULATION_THICKNESS",
+        display_name: "Insulation Thickness",
+    },
+    BuiltInParameter {
+        code: -1150436,
+        enum_name: "DUCT_INSULATION_THICKNESS",
+        display_name: "Insulation Thickness",
+    },
+    BuiltInParameter {
         code: -1150435,
         enum_name: "RBS_REFERENCE_FREESIZE",
         display_name: "Free Size",
@@ -3859,6 +4619,56 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Curve Type Reference",
     },
     BuiltInParameter {
+        code: -1141057,
+        enum_name: "RBS_ELEC_CIRCUIT_CORE_TYPE_PARAM",
+        display_name: "Core Type",
+    },
+    BuiltInParameter {
+        code: -1141056,
+        enum_name: "RBS_ELEC_CIRCUIT_OTHER_CONDUCTOR_SIZE_PARAM",
+        display_name: "Size of Other Conductor",
+    },
+    BuiltInParameter {
+        code: -1141055,
+        enum_name: "RBS_ELEC_CIRCUIT_GROUND_CONDUCTOR_SIZE_PARAM",
+        display_name: "Size of Ground Conductor",
+    },
+    BuiltInParameter {
+        code: -1141054,
+        enum_name: "RBS_ELEC_CIRCUIT_NEUTRAL_CONDUCTOR_SIZE_PARAM",
+        display_name: "Size of Neutral Conductor",
+    },
+    BuiltInParameter {
+        code: -1141053,
+        enum_name: "RBS_ELEC_CIRCUIT_HOT_CONDUCTOR_SIZE_PARAM",
+        display_name: "Size of Hot Conductor",
+    },
+    BuiltInParameter {
+        code: -1141052,
+        enum_name: "RBS_ELEC_CIRCUIT_CABLE_SIZE_PARAM",
+        display_name: "Cable Size",
+    },
+    BuiltInParameter {
+        code: -1141051,
+        enum_name: "RBS_ELEC_CIRCUIT_CABLE_TYPE_PARAM",
+        display_name: "Cable Type",
+    },
+    BuiltInParameter {
+        code: -1141050,
+        enum_name: "RBS_DISTRIBUTIONSYS_HL_PHASE_PARAM",
+        display_name: "High-leg Phase",
+    },
+    BuiltInParameter {
+        code: -1141040,
+        enum_name: "RBS_PIPE_WALL_THICKNESS",
+        display_name: "Wall Thickness",
+    },
+    BuiltInParameter {
+        code: -1141034,
+        enum_name: "MEP_HORIZONTAIL_OFFSET",
+        display_name: "Horizontal Offset",
+    },
+    BuiltInParameter {
         code: -1141033,
         enum_name: "MEP_PIPE_LOWER_INVERT_ELEVATION",
         display_name: "Lower End Invert Elevation",
@@ -3927,6 +4737,16 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1141020,
         enum_name: "MEP_UPPER_CENTERLINE_ELEVATION",
         display_name: "Upper End Centerline Elevation",
+    },
+    BuiltInParameter {
+        code: -1141018,
+        enum_name: "FABRICATION_MATERIAL_GAUGE",
+        display_name: "Material Gauge",
+    },
+    BuiltInParameter {
+        code: -1141017,
+        enum_name: "FABRICATION_DUCTWORK_STIFFENER_SPEC",
+        display_name: "Stiffener Specification",
     },
     BuiltInParameter {
         code: -1141014,
@@ -4846,7 +5666,7 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1140410,
         enum_name: "PHY_MATERIAL_PARAM_SHEAR_PERPENDICULAR",
-        display_name: "Tension perpendicular to grain",
+        display_name: "Shear perpendicular to grain",
     },
     BuiltInParameter {
         code: -1140409,
@@ -5102,6 +5922,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1140300,
         enum_name: "PHY_MATERIAL_PARAM_YOUNG_MOD1",
         display_name: "Young modulus X",
+    },
+    BuiltInParameter {
+        code: -1140285,
+        enum_name: "PIPE_VELOCITY_PRESSURE",
+        display_name: "Velocity Pressure",
     },
     BuiltInParameter {
         code: -1140284,
@@ -5429,9 +6254,19 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Reynolds Number",
     },
     BuiltInParameter {
+        code: -1140210,
+        enum_name: "RELATIVE_ROUGHNESS",
+        display_name: "Relative Roughness",
+    },
+    BuiltInParameter {
         code: -1140209,
         enum_name: "RBS_PIPE_FLOW_STATE_PARAM",
         display_name: "Flow State",
+    },
+    BuiltInParameter {
+        code: -1140208,
+        enum_name: "FRICTION_FACTOR",
+        display_name: "Friction Factor",
     },
     BuiltInParameter {
         code: -1140207,
@@ -5449,6 +6284,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Pressure Drop",
     },
     BuiltInParameter {
+        code: -1140204,
+        enum_name: "PIPE_ROUGHNESS",
+        display_name: "Roughness",
+    },
+    BuiltInParameter {
         code: -1140202,
         enum_name: "RBS_PIPE_MATERIAL_PARAM",
         display_name: "Material",
@@ -5462,6 +6302,51 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1140200,
         enum_name: "RBS_PIPE_CLASS_PARAM",
         display_name: "Schedule/Type",
+    },
+    BuiltInParameter {
+        code: -1140190,
+        enum_name: "RBS_ELEC_CIRCUIT_WIRE_NUM_OTHERS_PARAM",
+        display_name: "# of Other Conductors",
+    },
+    BuiltInParameter {
+        code: -1140189,
+        enum_name: "RBS_ELEC_CIRCUIT_STATE",
+        display_name: "Circuit State",
+    },
+    BuiltInParameter {
+        code: -1140188,
+        enum_name: "PANEL_ID",
+        display_name: "Panel",
+    },
+    BuiltInParameter {
+        code: -1140187,
+        enum_name: "RBS_ELEC_DEMAND_CURRENT_PHASEC",
+        display_name: "Demand Current Phase C",
+    },
+    BuiltInParameter {
+        code: -1140186,
+        enum_name: "RBS_ELEC_DEMAND_CURRENT_PHASEB",
+        display_name: "Demand Current Phase B",
+    },
+    BuiltInParameter {
+        code: -1140185,
+        enum_name: "RBS_ELEC_DEMAND_CURRENT_PHASEA",
+        display_name: "Demand Current Phase A",
+    },
+    BuiltInParameter {
+        code: -1140184,
+        enum_name: "RBS_ELEC_DEMAND_LOAD_PHASEC",
+        display_name: "Demand Apparent Power Phase C",
+    },
+    BuiltInParameter {
+        code: -1140183,
+        enum_name: "RBS_ELEC_DEMAND_LOAD_PHASEB",
+        display_name: "Demand Apparent Power Phase B",
+    },
+    BuiltInParameter {
+        code: -1140182,
+        enum_name: "RBS_ELEC_DEMAND_LOAD_PHASEA",
+        display_name: "Demand Apparent Power Phase A",
     },
     BuiltInParameter {
         code: -1140181,
@@ -5571,7 +6456,7 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1140160,
         enum_name: "RBS_ELEC_LOADSUMMARY_DEMAND_LOAD_PARAM",
-        display_name: "Estimated Demand (VA)",
+        display_name: "Demand Apparent Power",
     },
     BuiltInParameter {
         code: -1140159,
@@ -5581,7 +6466,7 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1140158,
         enum_name: "RBS_ELEC_LOADSUMMARY_CONNECTED_LOAD_PARAM",
-        display_name: "Connected Load (VA)",
+        display_name: "Connected Apparent Power",
     },
     BuiltInParameter {
         code: -1140157,
@@ -5961,7 +6846,7 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1140080,
         enum_name: "RBS_ELEC_SHORT_CIRCUIT_RATING",
-        display_name: "Short Circuit Rating",
+        display_name: "Short Circuit Rating Comments",
     },
     BuiltInParameter {
         code: -1140079,
@@ -5976,52 +6861,52 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1140077,
         enum_name: "RBS_ELEC_PANEL_TOTALESTLOAD_HVAC_PARAM",
-        display_name: "HVAC Total Estimated Demand",
+        display_name: "HVAC Total Demand Apparent Power",
     },
     BuiltInParameter {
         code: -1140076,
         enum_name: "RBS_ELEC_PANEL_TOTALLOAD_HVAC_PARAM",
-        display_name: "HVAC Total Connected",
+        display_name: "HVAC Total Connected Apparent Power",
     },
     BuiltInParameter {
         code: -1140075,
         enum_name: "RBS_ELEC_PANEL_TOTALESTLOAD_LIGHT_PARAM",
-        display_name: "Lighting Total Estimated Demand",
+        display_name: "Lighting Total Demand Apparent Power",
     },
     BuiltInParameter {
         code: -1140074,
         enum_name: "RBS_ELEC_PANEL_TOTALLOAD_LIGHT_PARAM",
-        display_name: "Lighting Total Connected",
+        display_name: "Lighting Total Connected Apparent Power",
     },
     BuiltInParameter {
         code: -1140073,
         enum_name: "RBS_ELEC_PANEL_TOTALESTLOAD_POWER_PARAM",
-        display_name: "Power Total Estimated Demand",
+        display_name: "Power Total Demand Apparent Power",
     },
     BuiltInParameter {
         code: -1140072,
         enum_name: "RBS_ELEC_PANEL_TOTALLOAD_POWER_PARAM",
-        display_name: "Power Total Connected",
+        display_name: "Power Total Connected Apparent Power",
     },
     BuiltInParameter {
         code: -1140071,
         enum_name: "RBS_ELEC_PANEL_TOTALESTLOAD_OTHER_PARAM",
-        display_name: "Other Total Estimated Demand",
+        display_name: "Other Total Demand Apparent Power",
     },
     BuiltInParameter {
         code: -1140070,
         enum_name: "RBS_ELEC_PANEL_TOTALLOAD_OTHER_PARAM",
-        display_name: "Other Total Connected",
+        display_name: "Other Total Connected Apparent Power",
     },
     BuiltInParameter {
         code: -1140069,
         enum_name: "RBS_ELEC_PANEL_TOTALESTLOAD_PARAM",
-        display_name: "Total Estimated Demand",
+        display_name: "Total Demand Apparent Power",
     },
     BuiltInParameter {
         code: -1140068,
         enum_name: "RBS_ELEC_PANEL_TOTALLOAD_PARAM",
-        display_name: "Total Connected",
+        display_name: "Total Connected Apparent Power",
     },
     BuiltInParameter {
         code: -1140067,
@@ -6031,12 +6916,12 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1140066,
         enum_name: "RBS_ELEC_DEMANDFACTOR_LOAD_PARAM",
-        display_name: "Connected Load",
+        display_name: "Connected Apparent Power",
     },
     BuiltInParameter {
         code: -1140065,
         enum_name: "RBS_ELEC_DEMANDFACTOR_DEMANDLOAD_PARAM",
-        display_name: "Estimated Demand Load",
+        display_name: "Demand Apparent Power",
     },
     BuiltInParameter {
         code: -1140064,
@@ -6086,32 +6971,32 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1140055,
         enum_name: "RBS_ELEC_APPARENT_LOAD_PHASEC",
-        display_name: "Apparent Load Phase C",
+        display_name: "Apparent Power Phase C",
     },
     BuiltInParameter {
         code: -1140054,
         enum_name: "RBS_ELEC_APPARENT_LOAD_PHASEB",
-        display_name: "Apparent Load Phase B",
+        display_name: "Apparent Power Phase B",
     },
     BuiltInParameter {
         code: -1140053,
         enum_name: "RBS_ELEC_APPARENT_LOAD_PHASEA",
-        display_name: "Apparent Load Phase A",
+        display_name: "Apparent Power Phase A",
     },
     BuiltInParameter {
         code: -1140052,
         enum_name: "RBS_ELEC_TRUE_LOAD_PHASEC",
-        display_name: "True Load Phase C",
+        display_name: "True Power Phase C",
     },
     BuiltInParameter {
         code: -1140051,
         enum_name: "RBS_ELEC_TRUE_LOAD_PHASEB",
-        display_name: "True Load Phase B",
+        display_name: "True Power Phase B",
     },
     BuiltInParameter {
         code: -1140050,
         enum_name: "RBS_ELEC_TRUE_LOAD_PHASEA",
-        display_name: "True Load Phase A",
+        display_name: "True Power Phase A",
     },
     BuiltInParameter {
         code: -1140049,
@@ -6276,22 +7161,22 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1140013,
         enum_name: "RBS_ELEC_TRUE_LOAD_PHASE3",
-        display_name: "True Load Phase 3",
+        display_name: "True Power Phase 3",
     },
     BuiltInParameter {
         code: -1140012,
         enum_name: "RBS_ELEC_TRUE_LOAD_PHASE2",
-        display_name: "True Load Phase 2",
+        display_name: "True Power Phase 2",
     },
     BuiltInParameter {
         code: -1140011,
         enum_name: "RBS_ELEC_TRUE_LOAD_PHASE1",
-        display_name: "True Load Phase 1",
+        display_name: "True Power Phase 1",
     },
     BuiltInParameter {
         code: -1140010,
         enum_name: "RBS_ELEC_TRUE_LOAD",
-        display_name: "True Load",
+        display_name: "True Power",
     },
     BuiltInParameter {
         code: -1140009,
@@ -6306,22 +7191,22 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1140007,
         enum_name: "RBS_ELEC_APPARENT_LOAD_PHASE3",
-        display_name: "Apparent Load Phase 3",
+        display_name: "Apparent Power Phase 3",
     },
     BuiltInParameter {
         code: -1140006,
         enum_name: "RBS_ELEC_APPARENT_LOAD_PHASE2",
-        display_name: "Apparent Load Phase 2",
+        display_name: "Apparent Power Phase 2",
     },
     BuiltInParameter {
         code: -1140005,
         enum_name: "RBS_ELEC_APPARENT_LOAD_PHASE1",
-        display_name: "Apparent Load Phase 1",
+        display_name: "Apparent Power Phase 1",
     },
     BuiltInParameter {
         code: -1140004,
         enum_name: "RBS_ELEC_APPARENT_LOAD",
-        display_name: "Apparent Load",
+        display_name: "Apparent Power",
     },
     BuiltInParameter {
         code: -1140003,
@@ -6549,6 +7434,41 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Shape",
     },
     BuiltInParameter {
+        code: -1123518,
+        enum_name: "CREATE_CHAIN",
+        display_name: "Chain",
+    },
+    BuiltInParameter {
+        code: -1123517,
+        enum_name: "WORK_PLANE_PARAM",
+        display_name: "Work Plane",
+    },
+    BuiltInParameter {
+        code: -1123516,
+        enum_name: "MAKE_SURFACE_FROM_CLOSED_LOOPS",
+        display_name: "Make surface from closed loops",
+    },
+    BuiltInParameter {
+        code: -1123515,
+        enum_name: "PLANE_SELECTION_PARAM",
+        display_name: "Host",
+    },
+    BuiltInParameter {
+        code: -1123514,
+        enum_name: "PLANE_SHOW_PARAM",
+        display_name: "Show Host",
+    },
+    BuiltInParameter {
+        code: -1123513,
+        enum_name: "USE_3D_SNAPPING",
+        display_name: "3D Snapping",
+    },
+    BuiltInParameter {
+        code: -1123512,
+        enum_name: "ARC_ELEM_FIX_KEEP_CONCENTRIC",
+        display_name: "Keep Concentric",
+    },
+    BuiltInParameter {
         code: -1115974,
         enum_name: "PIPING_GENDER_TYPE",
         display_name: "Gender Type",
@@ -6567,6 +7487,151 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1115520,
         enum_name: "STRUCTURAL_CONNECTION_EDIT_RANGES_OF_APPLICABILITY",
         display_name: "Modify Ranges of applicability",
+    },
+    BuiltInParameter {
+        code: -1114863,
+        enum_name: "ENERGY_ANALYSIS_ZONE_DATA_JSON",
+        display_name: "Energy analysis zone data json",
+    },
+    BuiltInParameter {
+        code: -1114862,
+        enum_name: "ENERGY_ANALYSIS_WINDOW_TYPE_JSON",
+        display_name: "JSON data for Window Types",
+    },
+    BuiltInParameter {
+        code: -1114861,
+        enum_name: "ENERGY_ANALYSIS_CONSTRUCTION_JSON",
+        display_name: "JSON data for Analytical Constructions",
+    },
+    BuiltInParameter {
+        code: -1114860,
+        enum_name: "ENERGY_ANALYSIS_SPACE_JSON",
+        display_name: "JSON data for Analytical Spaces",
+    },
+    BuiltInParameter {
+        code: -1114855,
+        enum_name: "WINDOWTYPE_IS_SCHEMATIC",
+        display_name: "Schematic",
+    },
+    BuiltInParameter {
+        code: -1114854,
+        enum_name: "THERMAL_MATERIAL_SPECIFIC_HEAT_CAPACITY",
+        display_name: "Specific Heat Capacity",
+    },
+    BuiltInParameter {
+        code: -1114853,
+        enum_name: "THERMAL_MATERIAL_DENSITY",
+        display_name: "Density",
+    },
+    BuiltInParameter {
+        code: -1114852,
+        enum_name: "THERMAL_MATERIAL_CONDUCTIVITY",
+        display_name: "Thermal Conductivity",
+    },
+    BuiltInParameter {
+        code: -1114851,
+        enum_name: "THERMAL_MATERIAL_THICKNESS",
+        display_name: "Thickness",
+    },
+    BuiltInParameter {
+        code: -1114850,
+        enum_name: "THERMAL_MATERIAL_DESCRIPTION",
+        display_name: "Description",
+    },
+    BuiltInParameter {
+        code: -1114849,
+        enum_name: "THERMAL_MATERIAL_NAME",
+        display_name: "Name",
+    },
+    BuiltInParameter {
+        code: -1114848,
+        enum_name: "SPACE_COMPOSEDNAME_PARAM",
+        display_name: "Composed Name",
+    },
+    BuiltInParameter {
+        code: -1114847,
+        enum_name: "SPACE_NUMBER_PARAM",
+        display_name: "Number",
+    },
+    BuiltInParameter {
+        code: -1114846,
+        enum_name: "CONSTRUCTION_IS_SCHEMATIC",
+        display_name: "Schematic",
+    },
+    BuiltInParameter {
+        code: -1114845,
+        enum_name: "ANALYTICAL_ZONE_NAME",
+        display_name: "Name",
+    },
+    BuiltInParameter {
+        code: -1114844,
+        enum_name: "ZONE_DESIGN_COOL_TEMPERATURE",
+        display_name: "Design Temperature for Cooling",
+    },
+    BuiltInParameter {
+        code: -1114843,
+        enum_name: "ZONE_DESIGN_HEAT_TEMPERATURE",
+        display_name: "Design Temperature for Heating",
+    },
+    BuiltInParameter {
+        code: -1114842,
+        enum_name: "ZONE_OUTSIDE_AIR_FLOW_PER_PERSON",
+        display_name: "Outside Air Flow per Person",
+    },
+    BuiltInParameter {
+        code: -1114841,
+        enum_name: "ZONE_OUTSIDE_AIR_FLOW_PER_AREA",
+        display_name: "Outside Air Flow per Area",
+    },
+    BuiltInParameter {
+        code: -1114840,
+        enum_name: "ZONE_AIR_CHANGES_PER_HOUR",
+        display_name: "Air Changes per Hour",
+    },
+    BuiltInParameter {
+        code: -1114839,
+        enum_name: "ANALYTICAL_ZONE",
+        display_name: "Analytical Zone",
+    },
+    BuiltInParameter {
+        code: -1114838,
+        enum_name: "SPACE_NUMBER_OF_PEOPLE",
+        display_name: "Number of People",
+    },
+    BuiltInParameter {
+        code: -1114837,
+        enum_name: "SPACE_CONDITION_TYPE",
+        display_name: "Condition Type",
+    },
+    BuiltInParameter {
+        code: -1114836,
+        enum_name: "SPACE_TYPE_GBXML",
+        display_name: "Space Type (gbXML)",
+    },
+    BuiltInParameter {
+        code: -1114835,
+        enum_name: "ANALYTICAL_SURFACE",
+        display_name: "Analytical Surface",
+    },
+    BuiltInParameter {
+        code: -1114834,
+        enum_name: "SURFACE_NAME",
+        display_name: "Name",
+    },
+    BuiltInParameter {
+        code: -1114833,
+        enum_name: "ORIGINATING_ELEMENT_NAME",
+        display_name: "Originating Element",
+    },
+    BuiltInParameter {
+        code: -1114832,
+        enum_name: "WINDOW_TYPE_NAME",
+        display_name: "Name",
+    },
+    BuiltInParameter {
+        code: -1114831,
+        enum_name: "CONSTRUCTION_NAME",
+        display_name: "Name",
     },
     BuiltInParameter {
         code: -1114830,
@@ -6722,6 +7787,16 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1114800,
         enum_name: "PEAK_HEATING_LOAD_PARAM",
         display_name: "Peak Heating Load",
+    },
+    BuiltInParameter {
+        code: -1114714,
+        enum_name: "SYSTEM_ZONE_VOLUME",
+        display_name: "System-Zone Volume",
+    },
+    BuiltInParameter {
+        code: -1114712,
+        enum_name: "SYSTEM_ZONE_AREA",
+        display_name: "System-Zone Area",
     },
     BuiltInParameter {
         code: -1114711,
@@ -7829,6 +8904,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Friction",
     },
     BuiltInParameter {
+        code: -1114114,
+        enum_name: "DUCT_ROUGHNESS",
+        display_name: "Roughness",
+    },
+    BuiltInParameter {
         code: -1114113,
         enum_name: "RBS_CURVETYPE_DEFAULT_TRANSITION_PARAM",
         display_name: "Transition",
@@ -8064,6 +9144,96 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Layout",
     },
     BuiltInParameter {
+        code: -1027603,
+        enum_name: "WALL_SWEEP_PLACEMENT_VERTICAL",
+        display_name: "Vertical",
+    },
+    BuiltInParameter {
+        code: -1027602,
+        enum_name: "WALL_SWEEP_PLACEMENT_HORIZONTAL",
+        display_name: "Horizontal",
+    },
+    BuiltInParameter {
+        code: -1027601,
+        enum_name: "WALL_SWEEP_RETURN_ANGLE",
+        display_name: "Return Angle",
+    },
+    BuiltInParameter {
+        code: -1027557,
+        enum_name: "ARRAY_TYPE_PARAMETER",
+        display_name: "Type",
+    },
+    BuiltInParameter {
+        code: -1027556,
+        enum_name: "ARRAY_INSTANCE_PARAMETER",
+        display_name: "Instance",
+    },
+    BuiltInParameter {
+        code: -1027555,
+        enum_name: "ARRAY_LABEL",
+        display_name: "Label",
+    },
+    BuiltInParameter {
+        code: -1027554,
+        enum_name: "ARRAY_TYPE_INDEX",
+        display_name: "Array type",
+    },
+    BuiltInParameter {
+        code: -1027553,
+        enum_name: "ARRAY_MOVE_TO",
+        display_name: "Move To",
+    },
+    BuiltInParameter {
+        code: -1027552,
+        enum_name: "ARRAY_NUMBER",
+        display_name: "Number",
+    },
+    BuiltInParameter {
+        code: -1027551,
+        enum_name: "ARRAY_GROUP_AND_ASSOCIATE",
+        display_name: "Group And Associate",
+    },
+    BuiltInParameter {
+        code: -1027550,
+        enum_name: "ARRAY_ELEMENTS_APPEND_TO_END",
+        display_name: "Append To End",
+    },
+    BuiltInParameter {
+        code: -1027502,
+        enum_name: "ROTATE_ANGLE",
+        display_name: "Rotation Angle",
+    },
+    BuiltInParameter {
+        code: -1027501,
+        enum_name: "ROTATE_COPY",
+        display_name: "Copy",
+    },
+    BuiltInParameter {
+        code: -1027500,
+        enum_name: "ROTATE_DISJOIN",
+        display_name: "Disjoin",
+    },
+    BuiltInParameter {
+        code: -1027004,
+        enum_name: "MIRROR_COPY",
+        display_name: "Copy",
+    },
+    BuiltInParameter {
+        code: -1027003,
+        enum_name: "MOVE_MULTIPLE",
+        display_name: "Multiple",
+    },
+    BuiltInParameter {
+        code: -1027002,
+        enum_name: "MOVE_DISJOIN",
+        display_name: "Disjoin",
+    },
+    BuiltInParameter {
+        code: -1027001,
+        enum_name: "MOVE_CONSTRAIN",
+        display_name: "Constrain",
+    },
+    BuiltInParameter {
         code: -1019203,
         enum_name: "ALIGNMENT_STATION_LABEL_SET_END_STATION",
         display_name: "Alignment Label Set End Station",
@@ -8132,6 +9302,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1019100,
         enum_name: "WALL_CROSS_SECTION",
         display_name: "Cross-Section",
+    },
+    BuiltInParameter {
+        code: -1019018,
+        enum_name: "IFC_IMPORT_MATERIAL_NAME",
+        display_name: "IFC Material Name",
     },
     BuiltInParameter {
         code: -1019017,
@@ -8257,6 +9432,21 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1018800,
         enum_name: "STRUCT_CONNECTION_APPLY_TO",
         display_name: "Apply to",
+    },
+    BuiltInParameter {
+        code: -1018707,
+        enum_name: "LEADER_ORIENTATION",
+        display_name: "Orientation",
+    },
+    BuiltInParameter {
+        code: -1018706,
+        enum_name: "LEADER_ANGLE",
+        display_name: "Angle",
+    },
+    BuiltInParameter {
+        code: -1018705,
+        enum_name: "LEADER_LENGTH",
+        display_name: "Leader Length",
     },
     BuiltInParameter {
         code: -1018505,
@@ -8462,6 +9652,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1018300,
         enum_name: "PATH_REIN_FACE_SLAB",
         display_name: "Face",
+    },
+    BuiltInParameter {
+        code: -1018275,
+        enum_name: "REBAR_BAR_CRANK_LENGTHS",
+        display_name: "Crank Lengths",
     },
     BuiltInParameter {
         code: -1018274,
@@ -8954,6 +10149,16 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Rebar Cover Side/Edge",
     },
     BuiltInParameter {
+        code: -1017750,
+        enum_name: "ENERGY_ANALYSIS_CURRENT_VIEW_ONLY",
+        display_name: "Use Only Elements Visible In Current View",
+    },
+    BuiltInParameter {
+        code: -1017740,
+        enum_name: "FABRIC_PARAM_WIRES_AT_COVER",
+        display_name: "Wires at Cover",
+    },
+    BuiltInParameter {
         code: -1017739,
         enum_name: "FABRIC_WIRE_OFFSET",
         display_name: "Offset along wire direction",
@@ -9241,22 +10446,22 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1017064,
         enum_name: "REBAR_MIN_LENGTH",
-        display_name: "Minimum bar length",
+        display_name: "Minimum Bar Length",
     },
     BuiltInParameter {
         code: -1017063,
         enum_name: "REBAR_MAX_LENGTH",
-        display_name: "Maximum bar length",
+        display_name: "Maximum Bar Length",
     },
     BuiltInParameter {
         code: -1017062,
         enum_name: "REBAR_MAXIM_SUFFIX",
-        display_name: "Maxim Suffix",
+        display_name: "Maximum Suffix",
     },
     BuiltInParameter {
         code: -1017061,
         enum_name: "REBAR_MINIM_SUFFIX",
-        display_name: "Minim Suffix",
+        display_name: "Minimum Suffix",
     },
     BuiltInParameter {
         code: -1017060,
@@ -9409,16 +10614,6 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Style",
     },
     BuiltInParameter {
-        code: -1017024,
-        enum_name: "REBAR_SHAPE_HOOK_END_TYPE",
-        display_name: "Hook At End",
-    },
-    BuiltInParameter {
-        code: -1017023,
-        enum_name: "REBAR_SHAPE_HOOK_START_TYPE",
-        display_name: "Hook At Start",
-    },
-    BuiltInParameter {
         code: -1017022,
         enum_name: "REBAR_SHAPE_HOOK_STYLE",
         display_name: "Style",
@@ -9485,8 +10680,8 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     },
     BuiltInParameter {
         code: -1017009,
-        enum_name: "REBAR_ELEM_HOOK_END_ORIENT",
-        display_name: "Hook Orientation At End",
+        enum_name: "REBAR_ELEM_TERMINATION_END_ORIENT",
+        display_name: "Orientation At End",
     },
     BuiltInParameter {
         code: -1017008,
@@ -9495,8 +10690,8 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     },
     BuiltInParameter {
         code: -1017007,
-        enum_name: "REBAR_ELEM_HOOK_START_ORIENT",
-        display_name: "Hook Orientation At Start",
+        enum_name: "REBAR_ELEM_TERMINATION_START_ORIENT",
+        display_name: "Orientation At Start",
     },
     BuiltInParameter {
         code: -1017006,
@@ -10056,7 +11251,7 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1013427,
         enum_name: "BEAM_SYSTEM_3D_PARAM",
-        display_name: "3D",
+        display_name: "Non-planar",
     },
     BuiltInParameter {
         code: -1013419,
@@ -10459,6 +11654,31 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Layout",
     },
     BuiltInParameter {
+        code: -1013206,
+        enum_name: "VIEW_POSITION_NAME",
+        display_name: "Name",
+    },
+    BuiltInParameter {
+        code: -1013205,
+        enum_name: "VIEW_POSITION_Y",
+        display_name: "View Position Y",
+    },
+    BuiltInParameter {
+        code: -1013204,
+        enum_name: "VIEW_POSITION_X",
+        display_name: "View Position X",
+    },
+    BuiltInParameter {
+        code: -1013203,
+        enum_name: "VIEW_ANCHOR",
+        display_name: "View Anchor",
+    },
+    BuiltInParameter {
+        code: -1013202,
+        enum_name: "VIEW_POSITION",
+        display_name: "Saved Position",
+    },
+    BuiltInParameter {
         code: -1013201,
         enum_name: "DESIGN_OPTION_ID",
         display_name: "Design Option",
@@ -10854,6 +12074,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Radius",
     },
     BuiltInParameter {
+        code: -1012405,
+        enum_name: "TOPOSURFACE_CONTOUR_SUBCATEGORY_ID",
+        display_name: "Subcategory",
+    },
+    BuiltInParameter {
         code: -1012404,
         enum_name: "BOUNDARY_BEARING",
         display_name: "Bearing",
@@ -10902,6 +12127,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1012200,
         enum_name: "ORIENT_BY_VIEW",
         display_name: "Rotate With Text",
+    },
+    BuiltInParameter {
+        code: -1012114,
+        enum_name: "VOLUME_OF_INTEREST_HEIGHT",
+        display_name: "Height",
     },
     BuiltInParameter {
         code: -1012113,
@@ -11431,12 +12661,12 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1010401,
         enum_name: "ELECTICAL_EQUIP_VOLTAGE",
-        display_name: "Voltage",
+        display_name: "Voltage Comments",
     },
     BuiltInParameter {
         code: -1010400,
         enum_name: "ELECTICAL_EQUIP_WATTAGE",
-        display_name: "Wattage",
+        display_name: "Wattage Comments",
     },
     BuiltInParameter {
         code: -1010304,
@@ -11984,6 +13214,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Name",
     },
     BuiltInParameter {
+        code: -1007908,
+        enum_name: "CURVE_IS_MULTILEVEL",
+        display_name: "Multilevel Boundary",
+    },
+    BuiltInParameter {
         code: -1007907,
         enum_name: "CURVE_BASE_LEVEL",
         display_name: "Bottom Level",
@@ -12174,6 +13409,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Type Name",
     },
     BuiltInParameter {
+        code: -1007729,
+        enum_name: "RVT_LINK_INSTANCE_PROJECT_INFORMATION",
+        display_name: "Project Information",
+    },
+    BuiltInParameter {
         code: -1007728,
         enum_name: "RVT_LINK_PHASE_MAP",
         display_name: "Phase Mapping",
@@ -12317,6 +13557,16 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1007502,
         enum_name: "COLOR_FILL_FILTERED_PARAM",
         display_name: "Values Displayed",
+    },
+    BuiltInParameter {
+        code: -1007422,
+        enum_name: "SHEET_PRIMARY_TITLE_BLOCK",
+        display_name: "Primary Title Block",
+    },
+    BuiltInParameter {
+        code: -1007421,
+        enum_name: "SHEET_COLLECTION",
+        display_name: "Sheet Collection",
     },
     BuiltInParameter {
         code: -1007419,
@@ -12932,6 +14182,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1007100,
         enum_name: "LEVEL_HEAD_TAG",
         display_name: "Symbol",
+    },
+    BuiltInParameter {
+        code: -1007071,
+        enum_name: "SHEET_COLLECTION_NAME",
+        display_name: "Name",
     },
     BuiltInParameter {
         code: -1007054,
@@ -14764,11 +16019,6 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         display_name: "Heat Transfer Coefficient (U)",
     },
     BuiltInParameter {
-        code: -1005400,
-        enum_name: "VIEW_DESIGN_OPTIONS_CONFIG",
-        display_name: "Design Option Configuration",
-    },
-    BuiltInParameter {
         code: -1005378,
         enum_name: "VIEW_SOLARSTUDY_LIGHTING_ALTITUDE_TEXT",
         display_name: "Lighting altitude text",
@@ -15037,6 +16287,31 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1005230,
         enum_name: "VIEW_SCALE_CUSTOMNAME",
         display_name: "Display Name",
+    },
+    BuiltInParameter {
+        code: -1005224,
+        enum_name: "VIEWER_SHEET_COLLECTION",
+        display_name: "Sheet Collection",
+    },
+    BuiltInParameter {
+        code: -1005223,
+        enum_name: "VIEWER_SHEET_NAME",
+        display_name: "Sheet Name",
+    },
+    BuiltInParameter {
+        code: -1005222,
+        enum_name: "VIEW_REFERENCING_SHEET_COLLECTION",
+        display_name: "Referencing Sheet Collection",
+    },
+    BuiltInParameter {
+        code: -1005221,
+        enum_name: "VIEWPORT_SHEET_COLLECTION",
+        display_name: "Sheet Collection",
+    },
+    BuiltInParameter {
+        code: -1005211,
+        enum_name: "VIEWPORT_ATTR_PRESERVE_TITLE_POSITION",
+        display_name: "Preserve Title Position",
     },
     BuiltInParameter {
         code: -1005210,
@@ -15346,7 +16621,7 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1005122,
         enum_name: "VIEWER_REFERENCE_LABEL_TEXT",
-        display_name: "Reference Label",
+        display_name: "Default Reference Label",
     },
     BuiltInParameter {
         code: -1005121,
@@ -15477,6 +16752,11 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1005000,
         enum_name: "VIEWER_EYE_ELEVATION",
         display_name: "Eye Elevation",
+    },
+    BuiltInParameter {
+        code: -1004519,
+        enum_name: "DIM_LABEL_IS_TYPE",
+        display_name: "Is Type Parameter",
     },
     BuiltInParameter {
         code: -1004518,
@@ -15690,22 +16970,22 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     },
     BuiltInParameter {
         code: -1002503,
-        enum_name: "OMNICLASS_DESCRIPTION",
-        display_name: "OmniClass Title",
+        enum_name: "CLASSIFICATION_DESCRIPTION",
+        display_name: "Classification Title",
     },
     BuiltInParameter {
         code: -1002502,
-        enum_name: "OMNICLASS_CODE",
-        display_name: "OmniClass Number",
+        enum_name: "CLASSIFICATION_CODE",
+        display_name: "Classification Number",
     },
     BuiltInParameter {
         code: -1002501,
-        enum_name: "UNIFORMAT_DESCRIPTION",
+        enum_name: "ASSEMBLY_DESCRIPTION",
         display_name: "Assembly Description",
     },
     BuiltInParameter {
         code: -1002500,
-        enum_name: "UNIFORMAT_CODE",
+        enum_name: "ASSEMBLY_CODE",
         display_name: "Assembly Code",
     },
     BuiltInParameter {
@@ -16202,6 +17482,16 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1001800,
         enum_name: "EXTRUSION_START_PARAM",
         display_name: "Extrusion Start",
+    },
+    BuiltInParameter {
+        code: -1001799,
+        enum_name: "EXTRUSION_DEPTH_PARAM",
+        display_name: "Depth",
+    },
+    BuiltInParameter {
+        code: -1001798,
+        enum_name: "JOINT_GAP_PARAM",
+        display_name: "Joint Gap",
     },
     BuiltInParameter {
         code: -1001718,
@@ -16846,7 +18136,7 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
     BuiltInParameter {
         code: -1001375,
         enum_name: "INSTANCE_LENGTH_PARAM",
-        display_name: "Length",
+        display_name: "System Length",
     },
     BuiltInParameter {
         code: -1001371,
@@ -17162,6 +18452,16 @@ pub(super) static VALUES: &[BuiltInParameter] = &[
         code: -1001102,
         enum_name: "WALL_BASE_HEIGHT_PARAM",
         display_name: "Base height",
+    },
+    BuiltInParameter {
+        code: -1001011,
+        enum_name: "WALL_JOIN_VIS",
+        display_name: "Display",
+    },
+    BuiltInParameter {
+        code: -1001010,
+        enum_name: "SCALE_FACTOR_PARAM",
+        display_name: "Scale",
     },
     BuiltInParameter {
         code: -1001009,

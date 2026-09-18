@@ -62,6 +62,17 @@ pub struct BimModel {
 pub struct BimSource {
     pub application: String,
     pub release: Option<String>,
+    /// Whether the reader had an identifier catalog for [`Self::release`].
+    ///
+    /// `None` where the question does not arise - an IFC states its own
+    /// property names, so no release table is consulted to read one. `false`
+    /// says the file was read by a reader that has no table for the release
+    /// that wrote it, which is not a failure but is a different reading:
+    /// built-in parameter names, their units and every category-driven
+    /// classification fall away, and what is left came from class names
+    /// alone. Carried so that a report or a viewer can say so rather than
+    /// showing a thinner model with no explanation.
+    pub release_catalogued: Option<bool>,
 }
 
 /// What a Revit project's own `ProjectInfo` element states about itself.
@@ -1397,6 +1408,7 @@ mod tests {
             source: Some(BimSource {
                 application: "Test".to_owned(),
                 release: None,
+                release_catalogued: None,
             }),
             project: Some(BimProjectIdentity {
                 number: Some("PN-1".to_owned()),

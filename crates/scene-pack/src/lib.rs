@@ -78,6 +78,9 @@ pub struct SourceInfo {
     pub kind: String,
     pub application: Option<String>,
     pub release: Option<String>,
+    /// Whether the reader had an identifier catalog for `release`. `None`
+    /// where the question does not arise. See `bim_core::BimSource`.
+    pub release_catalogued: Option<bool>,
 }
 
 /// How to build a scene.

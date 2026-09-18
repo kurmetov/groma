@@ -2924,6 +2924,10 @@ pub fn metadata_model(
             source: Some(BimSource {
                 application: "Autodesk Revit".to_owned(),
                 release: recovered.release.map(|release| release.to_string()),
+                // A file whose release `BasicFileInfo` does not state is no
+                // better off than one from a release with no tables: either
+                // way nothing named the built-in codes this model carries.
+                release_catalogued: Some(recovered.catalog.is_some()),
             }),
             project: project_identity(recovered),
             document_identity: recovered.document_identity.clone(),

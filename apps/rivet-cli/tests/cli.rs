@@ -96,6 +96,18 @@ fn fixture_with_elem_table_and_partition(elem_table: &[u8], partition: &[u8]) ->
 }
 
 fn fixture_with_streams(schema: &[u8], partition: &[u8], elem_table: &[u8]) -> NamedTempFile {
+    fixture_with_release(schema, partition, elem_table, "2026")
+}
+
+/// The same fixture, with the release `BasicFileInfo` states chosen by the
+/// caller. A release decides which identifier tables apply, and the tables
+/// are the one part of a read that a file cannot supply for itself.
+fn fixture_with_release(
+    schema: &[u8],
+    partition: &[u8],
+    elem_table: &[u8],
+    release: &str,
+) -> NamedTempFile {
     let file = NamedTempFile::new().unwrap();
     let mut compound = cfb::create(file.path()).unwrap();
     compound.create_storage("/Formats").unwrap();
@@ -105,7 +117,7 @@ fn fixture_with_streams(schema: &[u8], partition: &[u8], elem_table: &[u8]) -> N
     let mut basic_info = 14_u32.to_le_bytes().to_vec();
     basic_info.extend([0xaa, 0xbb]);
     basic_info.extend([4, 0, 0, 0]);
-    for unit in "2026".encode_utf16() {
+    for unit in release.encode_utf16() {
         basic_info.extend(unit.to_le_bytes());
     }
 
@@ -248,8 +260,60 @@ fn info_reports_container_inventory() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Container: CFB/OLE"));
     assert!(stdout.contains("Revit version: 2026"));
+    assert!(stdout.contains("Identifier catalog: Revit 2026"));
     assert!(stdout.contains("Streams: 5"));
     assert!(stdout.contains("Partitions: 1"));
+}
+
+#[test]
+fn info_says_when_no_catalog_covers_the_release() {
+    // 2024 is a real release whose enumerations have never been generated
+    // here. The container still reads; what is missing is every name that
+    // would have come from a table rather than from the file.
+    let fixture = fixture_with_release(
+        &schema_fixture(),
+        b"partition",
+        &elem_table_fixture(),
+        "2024",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args(["info", fixture.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Revit version: 2024"));
+    assert!(stdout.contains("Identifier catalog: none for this release"));
+    assert!(stdout.contains("2023, 2026"));
+}
+
+#[test]
+fn export_scene_says_when_no_catalog_covers_the_release() {
+    let fixture = fixture_with_release(
+        &schema_fixture(),
+        &parameter_partition(),
+        &elem_table_fixture(),
+        "2024",
+    );
+    let target = NamedTempFile::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        .args([
+            "export-scene",
+            fixture.path().to_str().unwrap(),
+            "--output",
+            target.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // The conversion goes through; what it says is which part of it was read
+    // without a table, so nobody reads the thinner result as the whole model.
+    assert!(stdout.contains("Scene written:"));
+    assert!(stdout.contains("Revit 2024 wrote this file"));
+    assert!(stdout.contains("identifier tables"));
 }
 
 #[test]
@@ -1199,8 +1263,16 @@ fn export_json_carries_parameter_values() {
         .find(|line| line.contains("\"id\":8"))
         .unwrap();
     assert!(line.contains("\"parameters\":["));
-    assert!(line.contains("{\"id\":-1114242,\"name\":\"param_-1114242\",\"int\":0}"));
-    assert!(line.contains("{\"id\":-1001203,\"name\":\"param_-1001203\",\"text\":\"153\"}"));
+    // The fixture states release 2026, and 2026 is catalogued, so both codes
+    // reach the export under the names Autodesk publishes for them rather
+    // than under the `param_<code>` fallback an uncatalogued release leaves.
+    assert!(line.contains(
+        "{\"id\":-1114242,\"name\":\"Use Annotation Scale\",\
+         \"built_in\":\"RBS_FAMILY_CONTENT_ANNOTATION_DISPLAY\",\"int\":0}"
+    ));
+    assert!(line.contains(
+        "{\"id\":-1001203,\"name\":\"Mark\",\"built_in\":\"ALL_MODEL_MARK\",\"text\":\"153\"}"
+    ));
 }
 
 #[test]

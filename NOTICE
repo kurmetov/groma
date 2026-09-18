@@ -61,7 +61,7 @@ depends on staying inside the two boundaries above.
 Rivet's dependencies are declared in `Cargo.toml` and pinned in `Cargo.lock`;
 each carries its own license. Run `cargo tree` to enumerate them.
 
-The Revit 2023 catalogue tables under `crates/revit-catalog/src/` are built from
-publicly documented enumeration names and identifiers. They contain no Autodesk
-source code. `scripts/generate_revit_2023_catalog.py` records how they were
-produced.
+The Revit 2023 and 2026 catalogue tables under `crates/revit-catalog/src/` are
+built from publicly documented enumeration names and identifiers. They contain
+no Autodesk source code. `scripts/generate_revit_catalog.py` records how they
+were produced.

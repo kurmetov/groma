@@ -426,6 +426,9 @@ fn source(parsed: &Parsed) -> Option<BimSource> {
     parsed.application.clone().map(|application| BimSource {
         application,
         release: parsed.schema.clone(),
+        // An IFC names its own properties and classes, so no release-keyed
+        // table is consulted to read one and there is nothing to report.
+        release_catalogued: None,
     })
 }
 

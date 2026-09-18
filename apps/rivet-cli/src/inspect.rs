@@ -195,12 +195,26 @@ pub(crate) fn info(path: &Path) -> Result<(), Box<dyn Error>> {
 
     println!("File: {}", path.display());
     println!("Container: CFB/OLE");
+    let release = basic_info.as_ref().and_then(|info| info.revit_version);
     println!(
         "Revit version: {}",
-        basic_info
-            .as_ref()
-            .and_then(|info| info.revit_version)
-            .map_or_else(|| "unknown".to_owned(), |year| year.to_string())
+        release.map_or_else(|| "unknown".to_owned(), |year| year.to_string())
+    );
+    // Reading the release is one thing; having tables for it is another, and
+    // only the second decides whether this file's built-in codes get names.
+    println!(
+        "Identifier catalog: {}",
+        match release {
+            Some(year) if Catalog::supports_release(year) => format!("Revit {year}"),
+            _ => format!(
+                "none for this release (this build carries {})",
+                revit_catalog::RELEASES
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
     );
     if let Some(identity) = rvt_import::document_identity(&container)? {
         print_identity("", &identity);

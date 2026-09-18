@@ -131,10 +131,14 @@ exists to prevent. Geometry stays out of both exporters until the object graph
 and semantics are reliable.
 
 Built-in names are external catalog data, not RVT serialization.
-`revit-catalog` implements the Revit 2023 `BuiltInParameter` and
-`BuiltInCategory` tables selected from `BasicFileInfo.release`: stable enum
+`revit-catalog` implements the Revit 2023 and 2026 `BuiltInParameter` and
+`BuiltInCategory` tables, selected from `BasicFileInfo.release`: stable enum
 names are the machine-readable default and unknown codes retain a numeric
-fallback. It also converts a known Forge spec from Revit's internal base units
+fallback. A release keeps its own tables rather than borrowing a neighbour's -
+2026 renames twelve parameters and one category that 2023 spells differently,
+and the reading of a code has to be the one its own release publishes. A
+release with no tables gets none: `Catalog::for_release` answers `None`, and
+the reader says so rather than leaving a thinner model unexplained. It also converts a known Forge spec from Revit's internal base units
 to the registry's canonical storage unit. Catalog lookups never erase the
 source code or become a prerequisite for lossless parsing.
 

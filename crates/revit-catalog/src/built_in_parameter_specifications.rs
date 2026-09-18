@@ -2,13 +2,19 @@
 //!
 //! Hand-maintained, unlike its neighbours. Autodesk's published
 //! `BuiltInParameter` tables - the ones
-//! `scripts/generate_revit_2023_catalog.py` scrapes - carry a code, an enum
+//! `scripts/generate_revit_catalog.py` scrapes - carry a code, an enum
 //! name and a label, and no spec at all; the binding exists only behind
 //! `ParameterUtils.GetParameterTypeId` at runtime. So each row here is read
 //! off the enum name in `built_in_parameters_2023.rs`, which is generated and
 //! is not invented here, and is taken from the published specification rather
 //! than verified against a second implementation - the same standing the DWG
 //! signature has, and for the same reason.
+//!
+//! One table serves every release. That is not an assumption: a test asserts
+//! that each release in `RELEASES` publishes every code below, and publishes
+//! it under one name. A code whose name moved between releases would be a
+//! different parameter, and would have to be keyed by release like the names
+//! in `built_in_parameters_<release>.rs` are.
 //!
 //! A row is only worth adding where the enum name settles the quantity on its
 //! own. A double whose parameter is not listed keeps reaching the exporter

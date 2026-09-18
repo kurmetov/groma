@@ -230,6 +230,13 @@ pub(crate) enum SourceDetail {
 /// itself a result. Boxed into its variant, because the tallies alone are far
 /// larger than everything the STEP reader reports.
 pub(crate) struct RvtDetail {
+    /// The release `BasicFileInfo` states, where a verified layout states one.
+    pub(crate) release: Option<u16>,
+    /// Whether this build has identifier tables for that release. Reported,
+    /// because a file read without them is read without built-in parameter
+    /// names, their units, or any category-driven classification, and nothing
+    /// else in the output would say so.
+    pub(crate) release_catalogued: bool,
     pub(crate) geometry: GeometryStatistics,
     /// Counted here rather than at report time because the join is by element
     /// identifier, and a federated model has qualified every one of them.
@@ -323,6 +330,8 @@ pub(crate) fn read_rvt_source(
         name,
         model,
         detail: SourceDetail::Rvt(Box::new(RvtDetail {
+            release: recovered.release,
+            release_catalogued: recovered.catalog.is_some(),
             geometry,
             mapped_family_instances,
             mapped_family_instance_placements,
@@ -404,7 +413,10 @@ impl SourceDetail {
     /// Asked so that a federated conversion can put a file's name above its
     /// own lines without leaving a bare heading over nothing.
     pub(crate) fn reports_read(&self) -> bool {
-        matches!(self, Self::Ifc(_))
+        match self {
+            Self::Rvt(detail) => !detail.release_catalogued,
+            Self::Ifc(_) => true,
+        }
     }
 
     pub(crate) fn reports_model(&self) -> bool {
@@ -434,7 +446,26 @@ impl SourceDetail {
         match self {
             // The record walk's own findings are reported with the model,
             // because every one of them is about what was recovered from it.
-            Self::Rvt(_) => {}
+            // What belongs here is the one thing that is about the file rather
+            // than the walk: which release wrote it, when this build has no
+            // tables for that release.
+            Self::Rvt(detail) => {
+                if !detail.release_catalogued {
+                    let stated = detail.release.map_or_else(
+                        || "The file states no Revit release".to_owned(),
+                        |release| format!("Revit {release} wrote this file, and it"),
+                    );
+                    let known: Vec<String> =
+                        revit_catalog::RELEASES.iter().map(u16::to_string).collect();
+                    println!(
+                        "{stated} is not a release this build has identifier tables for \
+                         ({}). Built-in parameter names, their units and \
+                         category-driven classification are not read; what is named \
+                         here was named by the file itself.",
+                        known.join(", ")
+                    );
+                }
+            }
             Self::Ifc(IfcDetail {
                 entities,
                 skipped,
@@ -653,6 +684,10 @@ impl Conversion {
                     .source
                     .as_ref()
                     .and_then(|source| source.release.clone()),
+                release_catalogued: only
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.release_catalogued),
             };
         }
         // A federated set has no one application behind it, and its kind is
@@ -679,6 +714,9 @@ impl Conversion {
             },
             application: None,
             release: None,
+            // A federated set is read file by file, and one uncatalogued
+            // file among many would be a claim about all of them.
+            release_catalogued: None,
         }
     }
 

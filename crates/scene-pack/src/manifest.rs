@@ -266,6 +266,10 @@ impl<'model> Builder<'model> {
                     "kind": document.kind,
                     "application": document.source.as_ref().map(|source| &source.application),
                     "release": document.source.as_ref().and_then(|source| source.release.as_ref()),
+                    "releaseCatalogued": document
+                        .source
+                        .as_ref()
+                        .and_then(|source| source.release_catalogued),
                     "elements": document.elements,
                 })
             })
@@ -297,6 +301,7 @@ impl<'model> Builder<'model> {
                 "kind": self.source.kind,
                 "application": self.source.application,
                 "release": self.source.release,
+                "releaseCatalogued": self.source.release_catalogued,
             },
             "counts": {
                 "elements": stats.elements,
