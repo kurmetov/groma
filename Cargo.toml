@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "apps/rivet-api",
-    "apps/rivet-cli",
+    "apps/openrvt-api",
+    "apps/openrvt-cli",
     "crates/bim-core",
     "crates/bim-convert",
     "crates/bim-mesh",

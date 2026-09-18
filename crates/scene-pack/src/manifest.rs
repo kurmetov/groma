@@ -293,7 +293,7 @@ impl<'model> Builder<'model> {
             .collect();
 
         json!({
-            "format": "rivet-scene",
+            "format": crate::FORMAT,
             "version": VERSION,
             "unit": "metre",
             "source": {

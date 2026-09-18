@@ -434,7 +434,7 @@ fn source(parsed: &Parsed) -> Option<BimSource> {
 
 /// Which file, and which save of it, an IFC states it was made from.
 ///
-/// This reads back the `Rivet Source Document` set this project's own
+/// This reads back the `openRVT Source Document` set this project's own
 /// exporter writes on `IfcProject`. It is what lets the question "is this IFC
 /// the file I already have?" be put to the IFC rather than to a file name:
 /// nothing else in an exported IFC survives a rename, and an element's
@@ -445,18 +445,26 @@ fn source(parsed: &Parsed) -> Option<BimSource> {
 fn document_identity(parsed: &Parsed, index: &Index, units: Units) -> Option<BimDocumentIdentity> {
     let (project, _) = *parsed.of_type("IFCPROJECT").first()?;
     let stated = properties(parsed, index, project, units);
+    // Either spelling of the set names it: the current one, and the one
+    // written before the rename from Rivet. A set can also carry a suffix
+    // after the name, which is why this is a prefix test and not equality.
+    let from_our_set = |value: &str| {
+        [
+            BimDocumentIdentity::IFC_PROPERTY_SET,
+            BimDocumentIdentity::IFC_PROPERTY_SET_LEGACY,
+        ]
+        .iter()
+        .any(|set| value == *set || value.starts_with(&format!("{set}: ")))
+    };
     let text = |name: &str| {
         stated
             .iter()
             .find(|property| {
                 property.name == name
-                    && property.id.as_ref().is_some_and(|id| {
-                        id.value == BimDocumentIdentity::IFC_PROPERTY_SET
-                            || id.value.starts_with(&format!(
-                                "{}: ",
-                                BimDocumentIdentity::IFC_PROPERTY_SET
-                            ))
-                    })
+                    && property
+                        .id
+                        .as_ref()
+                        .is_some_and(|id| from_our_set(id.value.as_str()))
             })
             .and_then(|property| match &property.value {
                 BimPropertyValue::Text(value) => Some(value.clone()),
@@ -1045,7 +1053,7 @@ mod tests {
         #4=IFCPROPERTYSINGLEVALUE('CreationGuid',$,IFCLABEL('3f0befca-10b5-414a-ab7a-9b96f8c4a616'),$);\n\
         #5=IFCPROPERTYSINGLEVALUE('DetachGuid',$,IFCLABEL('be18304c-03bf-4e5d-a6dd-bffa7798c29e'),$);\n\
         #6=IFCPROPERTYSINGLEVALUE('Worksharing',$,IFCLABEL('Central'),$);\n\
-        #7=IFCPROPERTYSET('set',$,'Rivet Source Document',$,(#2,#3,#4,#5,#6));\n\
+        #7=IFCPROPERTYSET('set',$,'openRVT Source Document',$,(#2,#3,#4,#5,#6));\n\
         #8=IFCRELDEFINESBYPROPERTIES('rel',$,$,$,(#1),#7);\n\
         #9=IFCPROPERTYSINGLEVALUE('DocumentGuid',$,IFCLABEL('00000000-0000-0000-0000-000000000000'),$);\n\
         #10=IFCPROPERTYSET('other',$,'Something Else',$,(#9));\n\
@@ -1074,6 +1082,25 @@ mod tests {
             identity.detach_guid.as_deref(),
             Some("be18304c-03bf-4e5d-a6dd-bffa7798c29e")
         );
+        assert_eq!(identity.worksharing.as_deref(), Some("Central"));
+    }
+
+    #[test]
+    fn reads_back_the_source_document_the_old_name_wrote() {
+        // Every IFC this project exported before it was renamed from Rivet
+        // states the set under the old spelling. Those files are on disk and
+        // cannot be rewritten, so the reader keeps answering for them.
+        let legacy = SOURCED.replace("openRVT Source Document", "Rivet Source Document");
+        let parsed = parse(legacy.as_bytes()).unwrap();
+        let identity = convert(&parsed, &Options::default())
+            .model
+            .document_identity
+            .expect("the project states a source document under the old name");
+        assert_eq!(
+            identity.document_guid.as_deref(),
+            Some("11e41a02-892f-4b12-ba15-42a8028ff452")
+        );
+        assert_eq!(identity.increment, Some(773));
         assert_eq!(identity.worksharing.as_deref(), Some("Central"));
     }
 

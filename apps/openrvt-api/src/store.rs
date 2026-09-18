@@ -2,7 +2,7 @@
 //! memory, and answer the questions an agent asks of it.
 //!
 //! The store deliberately does no decoding of its own. It reads what
-//! `rivet export-json` produced, so anything it reports is traceable to that
+//! `openrvt export-json` produced, so anything it reports is traceable to that
 //! artefact and to the `source` record inside it, and a decode improvement
 //! reaches the API by re-running the export rather than by changing this.
 
@@ -671,7 +671,8 @@ mod tests {
         ];
         // Each test gets its own file: the suite runs them in parallel and a
         // shared path lets one test read another's half-written artefact.
-        let directory = std::env::temp_dir().join(format!("rivet-api-test-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("openrvt-api-test-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(format!("{test}.jsonl"));
         std::fs::write(&path, lines.join("\n")).unwrap();

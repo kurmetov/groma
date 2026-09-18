@@ -1,6 +1,6 @@
-# rivet-api
+# openrvt-api
 
-A read-only HTTP/JSON API over the models `rivet export-json` produced, so an
+A read-only HTTP/JSON API over the models `openrvt export-json` produced, so an
 agent can be given tools against them and a retrieval index can be fed from
 them.
 
@@ -15,11 +15,11 @@ improvement reaches the API by re-running the export.
 # 1. Produce one artefact per model. Name the file what you want the model
 #    called - the file stem is the model id in every route.
 mkdir -p data/api
-./target/release/rivet export-json path/to/AR_S1.rvt -o data/api/AR_S1.jsonl
+./target/release/openrvt export-json path/to/AR_S1.rvt -o data/api/AR_S1.jsonl
 
 # 2. Serve the directory.
-./target/release/rivet-api --data data/api
-# rivet-api listening on http://127.0.0.1:8787 over data/api (1 model(s))
+./target/release/openrvt-api --data data/api
+# openrvt-api listening on http://127.0.0.1:8787 over data/api (1 model(s))
 ```
 
 `--addr` changes the bind address (default `127.0.0.1:8787`), `--threads` the
@@ -96,7 +96,7 @@ agent gets wrong unprompted: it will quote a raw internal-unit number as
 metres, and it will filter instances by category when instances carry none.
 
 ```python
-tools = json.load(open("apps/rivet-api/agent-tools.json"))["tools"]
+tools = json.load(open("apps/openrvt-api/agent-tools.json"))["tools"]
 ```
 
 Drop `"strict": true` from a tool if your client rejects a schema whose

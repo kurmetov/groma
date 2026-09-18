@@ -2,7 +2,7 @@
 # Then open:       http://127.0.0.1:8800/viewer
 
 services:
-  rivet:
+  openrvt:
     build: .
     # Run as the person who started it, not as the image's own user. A bind
     # mount keeps the host's ownership - the `chown` in the Dockerfile applies

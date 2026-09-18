@@ -60,7 +60,7 @@ mod source;
 use crate::{export::*, inspect::*, probe::*, source::SourceLimits};
 
 #[derive(Debug, Parser)]
-#[command(name = "rivet", version, about = "Read-only RVT inspection")]
+#[command(name = "openrvt", version, about = "Read-only RVT inspection")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

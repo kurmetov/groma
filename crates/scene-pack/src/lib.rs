@@ -12,7 +12,7 @@
 //!
 //! # Why a format rather than JSON
 //!
-//! `rivet export-json --full` states the same model as text and costs 794 MB
+//! `openrvt export-json --full` states the same model as text and costs 794 MB
 //! on one 800 000-element file. Nearly all of it is geometry written as
 //! decimal, which a browser then has to parse before it can draw anything.
 //! This format writes geometry as the buffers a GPU already wants, so loading
@@ -21,10 +21,10 @@
 //! # Layout
 //!
 //! ```text
-//! "RIVETSCN"  u32 version  u32 reserved
+//! "OPENRVTS"  u32 version  u32 reserved
 //! ... sections, in any order, located by the manifest ...
 //! manifest, raw-deflate JSON
-//! u64 manifest offset   u32 stored length   u32 length   "RIVETEND"
+//! u64 manifest offset   u32 stored length   u32 length   "OPENRVTE"
 //! ```
 //!
 //! The trailer is last so the writer never has to seek: a converter streams
@@ -59,10 +59,25 @@ const CHUNK_FLUSH_BATCH: usize = 8;
 /// that the meshes held at once stay a fraction of the scene.
 const TESSELLATION_BATCH: usize = 1024;
 
-/// `RIVETSCN`, the eight bytes every scene begins with.
-pub const MAGIC: &[u8; 8] = b"RIVETSCN";
-/// `RIVETEND`, the eight bytes every scene ends with.
-pub const TRAILER_MAGIC: &[u8; 8] = b"RIVETEND";
+/// `OPENRVTS`, the eight bytes every scene begins with.
+pub const MAGIC: &[u8; 8] = b"OPENRVTS";
+/// `OPENRVTE`, the eight bytes every scene ends with.
+pub const TRAILER_MAGIC: &[u8; 8] = b"OPENRVTE";
+/// What a manifest states it is, so a reader can refuse a file that merely
+/// happens to begin with the right eight bytes.
+pub const FORMAT: &str = "openrvt-scene";
+
+/// The same three, as written before the project was renamed from Rivet.
+///
+/// Nothing writes them. They exist so that a reader can open a scene packed
+/// by an earlier build - the bytes of the format did not change, only the
+/// name stamped in them, and a scene costs minutes of decoding to rebuild.
+pub const LEGACY_MAGIC: &[u8; 8] = b"RIVETSCN";
+/// See [`LEGACY_MAGIC`].
+pub const LEGACY_TRAILER_MAGIC: &[u8; 8] = b"RIVETEND";
+/// See [`LEGACY_MAGIC`].
+pub const LEGACY_FORMAT: &str = "rivet-scene";
+
 /// The version a reader must understand to read a scene written by this crate.
 pub const VERSION: u32 = 1;
 /// Bytes at the end of the file: offset, stored length, length, magic.
@@ -383,7 +398,10 @@ fn interleave(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAGIC, PackOptions, SourceInfo, TRAILER_MAGIC, interleave, write_scene};
+    use super::{
+        FORMAT, LEGACY_FORMAT, LEGACY_MAGIC, LEGACY_TRAILER_MAGIC, MAGIC, PackOptions, SourceInfo,
+        TRAILER_MAGIC, interleave, write_scene,
+    };
     use bim_core::{
         BimBoundingBox, BimElement, BimElementId, BimElementType, BimGeometry, BimModel, BimPoint3,
         BimProperty, BimPropertyValue, BimUnit,
@@ -391,6 +409,19 @@ mod tests {
 
     fn metres() -> BimUnit {
         BimUnit::new(bim_mesh::METRES, "Meters")
+    }
+
+    #[test]
+    fn keeps_the_bytes_scenes_on_disk_already_state() {
+        // Not a tautology: these three are read out of files this build did
+        // not write and cannot rewrite, so they are fixed data rather than a
+        // spelling anyone is free to tidy along with the rest of the name.
+        assert_eq!(LEGACY_MAGIC, b"RIVETSCN");
+        assert_eq!(LEGACY_TRAILER_MAGIC, b"RIVETEND");
+        assert_eq!(LEGACY_FORMAT, "rivet-scene");
+        assert_ne!(MAGIC, LEGACY_MAGIC);
+        assert_ne!(TRAILER_MAGIC, LEGACY_TRAILER_MAGIC);
+        assert_ne!(FORMAT, LEGACY_FORMAT);
     }
 
     fn at(coordinates: [f64; 3]) -> BimPoint3 {
@@ -481,7 +512,7 @@ mod tests {
         let manifest = inflate(&bytes[offset as usize..offset as usize + stored as usize]);
         let parsed: serde_json::Value =
             serde_json::from_slice(&manifest).expect("the manifest is JSON");
-        assert_eq!(parsed["format"], "rivet-scene");
+        assert_eq!(parsed["format"], "openrvt-scene");
         assert_eq!(parsed["elements"]["ids"][0], "77");
         assert_eq!(parsed["chunks"].as_array().expect("chunks").len(), 1);
     }

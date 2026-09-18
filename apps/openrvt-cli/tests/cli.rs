@@ -251,7 +251,7 @@ fn schema_fixture() -> Vec<u8> {
 #[test]
 fn info_reports_container_inventory() {
     let fixture = fixture();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["info", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -276,7 +276,7 @@ fn info_says_when_no_catalog_covers_the_release() {
         &elem_table_fixture(),
         "2024",
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["info", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -297,7 +297,7 @@ fn export_scene_says_when_no_catalog_covers_the_release() {
         "2024",
     );
     let target = NamedTempFile::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-scene",
             fixture.path().to_str().unwrap(),
@@ -319,7 +319,7 @@ fn export_scene_says_when_no_catalog_covers_the_release() {
 #[test]
 fn streams_lists_nested_paths() {
     let fixture = fixture();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["streams", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -333,7 +333,7 @@ fn streams_lists_nested_paths() {
 #[test]
 fn dump_stream_writes_only_raw_bytes_to_stdout() {
     let fixture = fixture();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "dump-stream",
             fixture.path().to_str().unwrap(),
@@ -350,7 +350,7 @@ fn dump_stream_writes_only_raw_bytes_to_stdout() {
 #[test]
 fn schema_decodes_and_lists_classes() {
     let fixture = fixture();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["schema", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -366,7 +366,7 @@ fn schema_decodes_and_lists_classes() {
 #[test]
 fn schema_recovers_checksum_paged_storage_after_strict_failure() {
     let fixture = fixture_with_schema(&checksum_paged_schema_fixture());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["schema", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -384,7 +384,7 @@ fn partitions_inventories_validated_members() {
     partition.extend(truncated_gzip(b"first"));
     partition.extend(truncated_gzip(b"second payload"));
     let fixture = fixture_with_schema_and_partition(&schema_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["partitions", fixture.path().to_str().unwrap(), "--members"])
         .output()
         .unwrap();
@@ -402,7 +402,7 @@ fn partitions_inventories_validated_members() {
 #[test]
 fn elem_table_reports_layout_without_listing_ids_by_default() {
     let fixture = fixture_with_elem_table(&elem_table_fixture());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["elem-table", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -421,7 +421,7 @@ fn elem_table_reports_layout_without_listing_ids_by_default() {
 #[test]
 fn elem_table_cleans_known_checksum_pages_before_inflation() {
     let fixture = fixture_with_elem_table(&checksum_paged_elem_table_fixture());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["elem-table", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -440,7 +440,7 @@ fn partition_id_probe_reports_aggregate_overlap_without_ids() {
     payload.extend(b"member payload");
     let partition = truncated_gzip(&payload);
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["partition-id-probe", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -461,7 +461,7 @@ fn schema_prefix_probe_counts_candidates_during_streaming_decode() {
     payload.extend(b"member payload");
     let partition = truncated_gzip(&payload);
     let fixture = fixture_with_schema_and_partition(&schema_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "schema-prefix-probe",
             fixture.path().to_str().unwrap(),
@@ -485,7 +485,7 @@ fn flags_probe_reports_the_width_check_over_a_walked_class() {
     payload.extend(b"member payload");
     let partition = truncated_gzip(&payload);
     let fixture = fixture_with_schema_and_partition(&schema_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "flags-probe",
             fixture.path().to_str().unwrap(),
@@ -521,7 +521,7 @@ fn marker_payload() -> Vec<u8> {
 fn marker_envelopes_report_record_boundary_evidence() {
     let partition = truncated_gzip(&marker_payload());
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "marker-envelopes",
             fixture.path().to_str().unwrap(),
@@ -558,7 +558,7 @@ fn marker_envelopes_report_record_boundary_evidence() {
 fn marker_envelopes_report_the_capture_budget_without_losing_candidates() {
     let partition = truncated_gzip(&marker_payload());
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "marker-envelopes",
             fixture.path().to_str().unwrap(),
@@ -616,7 +616,7 @@ fn member_framing_validates_descriptors_and_the_record_array() {
     let payload = member_record_payload();
     let partition = framed_partition(&payload, 2, 32, 102);
     let fixture = fixture_with_schema_and_partition(&schema_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "member-framing",
             fixture.path().to_str().unwrap(),
@@ -648,7 +648,7 @@ fn member_framing_carries_a_record_into_the_next_member() {
     let mut partition = framed_partition(&first, 2, 32, 102);
     partition.extend(framed_partition(&tail, 0, 0, 102));
     let fixture = fixture_with_schema_and_partition(&schema_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["member-framing", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -675,7 +675,7 @@ fn member_framing_reports_a_header_cut_by_the_payload_end() {
     payload.extend([0; 8]);
     let partition = framed_partition(&payload, 2, 32, 102);
     let fixture = fixture_with_schema_and_partition(&schema_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["member-framing", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -693,7 +693,7 @@ fn dump_member_writes_the_inflated_payload() {
     let payload = member_record_payload();
     let partition = framed_partition(&payload, 2, 32, 102);
     let fixture = fixture_with_schema_and_partition(&schema_fixture(), &partition);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "dump-member",
             fixture.path().to_str().unwrap(),
@@ -738,7 +738,7 @@ fn object_partition() -> Vec<u8> {
 #[test]
 fn records_resolve_identifiers_and_classes() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["records", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -757,7 +757,7 @@ fn records_resolve_identifiers_and_classes() {
 #[test]
 fn inspect_reports_the_object_inventory() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["inspect", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -775,7 +775,7 @@ fn inspect_reports_the_object_inventory() {
 #[test]
 fn inspect_can_skip_the_partition_walk() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "inspect",
             fixture.path().to_str().unwrap(),
@@ -793,7 +793,7 @@ fn inspect_can_skip_the_partition_walk() {
 #[test]
 fn element_lists_every_record_for_one_identifier() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "element",
             fixture.path().to_str().unwrap(),
@@ -816,7 +816,7 @@ fn element_lists_every_record_for_one_identifier() {
 #[test]
 fn element_reports_an_identifier_that_is_absent() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["element", fixture.path().to_str().unwrap(), "9999"])
         .output()
         .unwrap();
@@ -830,7 +830,7 @@ fn element_reports_an_identifier_that_is_absent() {
 #[test]
 fn schema_lists_the_properties_of_one_class() {
     let fixture = fixture();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "schema",
             fixture.path().to_str().unwrap(),
@@ -851,7 +851,7 @@ fn schema_lists_the_properties_of_one_class() {
 #[test]
 fn schema_rejects_an_unknown_class_name() {
     let fixture = fixture();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "schema",
             fixture.path().to_str().unwrap(),
@@ -869,7 +869,7 @@ fn schema_rejects_an_unknown_class_name() {
 #[test]
 fn bodies_print_record_payloads_of_one_class() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "bodies",
             fixture.path().to_str().unwrap(),
@@ -942,7 +942,7 @@ fn export_json_emits_one_object_per_element() {
     let partition = framed_partition(&wide, 1, u32::try_from(body.len()).unwrap(), 102);
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &partition);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["export-json", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -968,7 +968,7 @@ fn export_json_emits_one_object_per_element() {
 #[test]
 fn export_json_full_indexes_the_model_before_the_elements() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["export-json", fixture.path().to_str().unwrap(), "--full"])
         .output()
         .unwrap();
@@ -999,7 +999,7 @@ fn export_json_full_indexes_the_model_before_the_elements() {
 
     // Without the flag the model line is not written at all, so an existing
     // reader of the element lines sees the same file it did before.
-    let plain = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let plain = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["export-json", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -1011,7 +1011,7 @@ fn export_json_full_indexes_the_model_before_the_elements() {
 fn export_json_writes_to_a_file_and_honours_the_limit() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
     let target = NamedTempFile::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-json",
             fixture.path().to_str().unwrap(),
@@ -1035,7 +1035,7 @@ fn export_json_writes_to_a_file_and_honours_the_limit() {
 fn export_ifc_writes_an_ifc4_spatial_model() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
     let target = NamedTempFile::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-ifc",
             fixture.path().to_str().unwrap(),
@@ -1073,7 +1073,7 @@ fn export_ifc_saves_and_reuses_an_export_setup() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
     let target = NamedTempFile::new().unwrap();
     let setup = NamedTempFile::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-ifc",
             fixture.path().to_str().unwrap(),
@@ -1107,7 +1107,7 @@ fn export_ifc_saves_and_reuses_an_export_setup() {
 
     // Read back, the same setup produces the same file - and the flag beside
     // it overrides the one setting it names.
-    let again = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let again = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-ifc",
             fixture.path().to_str().unwrap(),
@@ -1144,7 +1144,7 @@ fn export_ifc_refuses_a_mapping_table_it_cannot_apply() {
     writeln!(mapping, "OST_Ceilings\t\tIfcCeiling\t").unwrap();
     mapping.flush().unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-ifc",
             fixture.path().to_str().unwrap(),
@@ -1166,7 +1166,7 @@ fn export_ifc_refuses_a_mapping_table_it_cannot_apply() {
 fn export_ifc_refuses_to_overwrite_the_source_file() {
     let fixture = fixture();
     let before = std::fs::read(fixture.path()).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-ifc",
             fixture.path().to_str().unwrap(),
@@ -1199,7 +1199,7 @@ fn names_report_where_a_class_keeps_its_string() {
     let partition = framed_partition(&wide, 2, body_bytes, 102);
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &partition);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["names", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -1234,7 +1234,7 @@ fn parameter_partition() -> Vec<u8> {
 fn parameters_report_values_and_their_identifiers() {
     let fixture =
         fixture_with_elem_table_and_partition(&elem_table_fixture(), &parameter_partition());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["parameters", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -1251,7 +1251,7 @@ fn parameters_report_values_and_their_identifiers() {
 fn export_json_carries_parameter_values() {
     let fixture =
         fixture_with_elem_table_and_partition(&elem_table_fixture(), &parameter_partition());
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args(["export-json", fixture.path().to_str().unwrap()])
         .output()
         .unwrap();
@@ -1279,7 +1279,7 @@ fn export_json_carries_parameter_values() {
 fn export_scene_writes_a_framed_scene_a_reader_can_locate() {
     let fixture = fixture_with_elem_table_and_partition(&elem_table_fixture(), &object_partition());
     let target = NamedTempFile::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-scene",
             fixture.path().to_str().unwrap(),
@@ -1302,8 +1302,8 @@ fn export_scene_writes_a_framed_scene_a_reader_can_locate() {
     );
 
     let written = std::fs::read(target.path()).unwrap();
-    assert!(written.starts_with(b"RIVETSCN"));
-    assert!(written.ends_with(b"RIVETEND"));
+    assert!(written.starts_with(b"OPENRVTS"));
+    assert!(written.ends_with(b"OPENRVTE"));
 
     // A reader takes the last 24 bytes and follows them to the manifest. That
     // is the whole contract for finding anything in the file, so the test
@@ -1317,7 +1317,7 @@ fn export_scene_writes_a_framed_scene_a_reader_can_locate() {
     assert_eq!(manifest.len(), length as usize);
     let manifest = String::from_utf8(manifest).unwrap();
     assert!(
-        manifest.contains("\"format\":\"rivet-scene\""),
+        manifest.contains("\"format\":\"openrvt-scene\""),
         "{manifest}"
     );
     assert!(manifest.contains("\"unit\":\"metre\""), "{manifest}");
@@ -1332,7 +1332,7 @@ fn export_scene_writes_a_framed_scene_a_reader_can_locate() {
 fn export_scene_reads_ifc_geometry_levels_and_source_classes() {
     let fixture = ifc_fixture();
     let target = NamedTempFile::new().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-scene",
             fixture.path().to_str().unwrap(),
@@ -1371,7 +1371,7 @@ fn export_scene_reads_ifc_geometry_levels_and_source_classes() {
 #[test]
 fn export_scene_refuses_an_ifc_above_the_safe_parsing_limit_before_reading_it() {
     let fixture = ifc_fixture();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-scene",
             fixture.path().to_str().unwrap(),
@@ -1397,7 +1397,7 @@ fn export_scene_refuses_an_ifc_above_the_safe_parsing_limit_before_reading_it() 
 fn the_rvt_member_ceiling_no_longer_bounds_an_ifc_source() {
     let fixture = ifc_fixture();
     let scene = tempfile::Builder::new().suffix(".rvs").tempfile().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-scene",
             fixture.path().to_str().unwrap(),
@@ -1420,7 +1420,7 @@ fn the_rvt_member_ceiling_no_longer_bounds_an_ifc_source() {
 fn export_scene_refuses_to_overwrite_the_source_file() {
     let fixture = fixture();
     let before = std::fs::read(fixture.path()).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-scene",
             fixture.path().to_str().unwrap(),
@@ -1462,7 +1462,7 @@ fn export_scene_rejects_its_options_before_reading_the_file() {
             "a property block must hold at least one element",
         ),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+        let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
             .args(["export-scene", "no/such/model.rvt", flag, value])
             .output()
             .unwrap();
@@ -1487,7 +1487,7 @@ fn export_ifc_federates_several_sources_and_keeps_their_identifiers_apart() {
     let architecture = ifc_fixture_in(directory.path(), "architecture.ifc", 0.0);
     let structure = ifc_fixture_in(directory.path(), "structure.ifc", 1.0);
     let target = directory.path().join("federated.ifc");
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-ifc",
             architecture.to_str().unwrap(),
@@ -1536,7 +1536,7 @@ fn export_scene_reports_documents_that_are_stated_about_different_origins() {
     let here = ifc_fixture_in(directory.path(), "here.ifc", 0.0);
     let far = ifc_fixture_in(directory.path(), "far.ifc", 100_000.0);
     let target = directory.path().join("federated.rvs");
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-scene",
             here.to_str().unwrap(),
@@ -1597,7 +1597,7 @@ fn an_export_of_several_sources_will_not_guess_an_output_name() {
     let directory = tempfile::tempdir().unwrap();
     let first = ifc_fixture_in(directory.path(), "first.ifc", 0.0);
     let second = ifc_fixture_in(directory.path(), "second.ifc", 1.0);
-    let output = Command::new(env!("CARGO_BIN_EXE_rivet"))
+    let output = Command::new(env!("CARGO_BIN_EXE_openrvt"))
         .args([
             "export-scene",
             first.to_str().unwrap(),

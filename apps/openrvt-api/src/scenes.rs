@@ -340,7 +340,7 @@ mod tests {
     /// - and nothing else, however the request spells the name or the format.
     #[test]
     fn deletes_a_scene_with_its_preview_and_named_source_only() {
-        let root = std::env::temp_dir().join(format!("rivet-scenes-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("openrvt-scenes-{}", std::process::id()));
         let uploads = root.join("uploads");
         std::fs::create_dir_all(&uploads).unwrap();
         std::fs::create_dir_all(root.join("previews")).unwrap();

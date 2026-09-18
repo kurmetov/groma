@@ -1,5 +1,5 @@
 {
-  "_comment": "Tool definitions for the Anthropic Messages API, one per rivet-api route. Paste the `tools` array into client.messages.create(tools=...). Each tool maps to a GET on the base URL (default http://127.0.0.1:8787) and your executor only has to build the URL and return the JSON body verbatim. `strict: true` guarantees the arguments validate against the schema.",
+  "_comment": "Tool definitions for the Anthropic Messages API, one per openrvt-api route. Paste the `tools` array into client.messages.create(tools=...). Each tool maps to a GET on the base URL (default http://127.0.0.1:8787) and your executor only has to build the URL and return the JSON body verbatim. `strict: true` guarantees the arguments validate against the schema.",
   "tools": [
     {
       "name": "list_models",

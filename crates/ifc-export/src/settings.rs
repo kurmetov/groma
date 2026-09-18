@@ -98,9 +98,9 @@ impl fmt::Display for LengthUnit {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PropertySetSettings {
-    /// The element's own Revit parameters, as `Rivet Properties`.
+    /// The element's own Revit parameters, as `openRVT Properties`.
     pub revit_parameters: bool,
-    /// The parameters the element's type carries, as `Rivet Type Properties`.
+    /// The parameters the element's type carries, as `openRVT Type Properties`.
     pub revit_type_parameters: bool,
     /// IFC's own `Pset_..Common` for each element, which Revit exports too.
     ///

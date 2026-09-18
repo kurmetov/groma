@@ -374,6 +374,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openrvt-api"
+version = "0.9.0"
+dependencies = [
+ "bim-convert",
+ "clap",
+ "mimalloc",
+ "serde",
+ "serde_json",
+ "tiny_http",
+]
+
+[[package]]
+name = "openrvt-cli"
+version = "0.9.0"
+dependencies = [
+ "bim-convert",
+ "bim-core",
+ "bim-mesh",
+ "cfb",
+ "clap",
+ "flate2",
+ "ifc-export",
+ "ifc-import",
+ "mimalloc",
+ "revit-catalog",
+ "rvt-container",
+ "rvt-import",
+ "rvt-model",
+ "rvt-schema",
+ "scene-pack",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -406,41 +441,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "revit-catalog"
 version = "0.9.0"
-
-[[package]]
-name = "rivet-api"
-version = "0.9.0"
-dependencies = [
- "bim-convert",
- "clap",
- "mimalloc",
- "serde",
- "serde_json",
- "tiny_http",
-]
-
-[[package]]
-name = "rivet-cli"
-version = "0.9.0"
-dependencies = [
- "bim-convert",
- "bim-core",
- "bim-mesh",
- "cfb",
- "clap",
- "flate2",
- "ifc-export",
- "ifc-import",
- "mimalloc",
- "revit-catalog",
- "rvt-container",
- "rvt-import",
- "rvt-model",
- "rvt-schema",
- "scene-pack",
- "serde_json",
- "tempfile",
-]
 
 [[package]]
 name = "rustix"

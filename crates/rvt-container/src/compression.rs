@@ -190,8 +190,8 @@ mod tests {
 
     #[test]
     fn decodes_truncated_gzip_without_trailer() {
-        let input = truncated_gzip(b"rivet");
-        assert_eq!(decode_truncated_gzip(&input, 100).unwrap(), b"rivet");
+        let input = truncated_gzip(b"openrvt");
+        assert_eq!(decode_truncated_gzip(&input, 100).unwrap(), b"openrvt");
     }
 
     #[test]

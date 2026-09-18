@@ -1,6 +1,6 @@
-# Rivet
+# openRVT
 
-Rivet is an early-stage, Linux-native, read-only ingestion engine for building
+openRVT is an early-stage, Linux-native, read-only ingestion engine for building
 models. It reads Autodesk Revit `.rvt` files - releases 2023 and 2026, on the
 evidence set out below - and IFC (ISO 10303-21), converts between them, and needs neither Revit, Windows,
 Wine, Autodesk Platform Services, nor ODA BimRv.
@@ -22,12 +22,12 @@ complete partitions into memory.
 
 ## Supported Revit releases
 
-Rivet carries identifier tables for **Revit 2023 and Revit 2026**, and for no
+openRVT carries identifier tables for **Revit 2023 and Revit 2026**, and for no
 other release. `Catalog::for_release` answers for those two and returns nothing
 for anything else, so a file from 2024 or 2025 is read without built-in
 parameter names, without their units, and without any category-driven IFC
 classification, leaving only the handful of mappings made from class names.
-`rivet info` states which of the two applies to a file, `export-scene` and
+`openrvt info` states which of the two applies to a file, `export-scene` and
 `export-ifc` say so when neither does, `export-json --full` writes it as
 `parameter_catalog`, and a converted scene carries the same answer into the
 viewer, which marks a model read without a catalog.
@@ -64,7 +64,7 @@ so a newer release's additions cost coverage rather than correctness.
 
 ## Build
 
-Rivet requires Rust 1.85 or newer.
+openRVT requires Rust 1.85 or newer.
 
 ```bash
 cargo build --workspace
@@ -80,13 +80,13 @@ models and those are not redistributable. If you have a corpus, run:
 ```bash
 scripts/corpus_check.sh                   # measure and compare
 scripts/corpus_check.sh --write           # accept the current numbers
-RIVET_CORPUS=/path/to/models scripts/corpus_check.sh
+OPENRVT_CORPUS=/path/to/models scripts/corpus_check.sh
 ```
 
 It re-measures the numbers in [`tests/baseline/corpus_metrics.tsv`](tests/baseline/corpus_metrics.tsv)
 and fails if any of them moved the wrong way. Run it before and after any change
 to the record walk: such a change can buy one class by selling another, and this
-is what catches that. Without `RIVET_CORPUS` the gate skips, so `cargo test`
+is what catches that. Without `OPENRVT_CORPUS` the gate skips, so `cargo test`
 stays fast and CI stays meaningful.
 
 ## Size
@@ -243,31 +243,31 @@ are read a batch at a time. `MEMBER_PREPARE_BATCH` in `rvt-import` is the knob.
 ## CLI
 
 ```bash
-cargo run -p rivet-cli -- info model.rvt
-cargo run -p rivet-cli -- streams model.rvt
-cargo run -p rivet-cli -- dump-stream model.rvt BasicFileInfo --output BasicFileInfo.bin
-cargo run -p rivet-cli -- partitions model.rvt
-cargo run -p rivet-cli -- schema model.rvt
-cargo run -p rivet-cli -- elem-table model.rvt
-cargo run -p rivet-cli -- partition-id-probe model.rvt
-cargo run -p rivet-cli -- schema-prefix-probe model.rvt
-cargo run -p rivet-cli -- marker-envelopes model.rvt --dump 8
-cargo run -p rivet-cli -- member-framing model.rvt --dump 4
-cargo run -p rivet-cli -- dump-member model.rvt Partitions/81 44 --output member.bin
-cargo run -p rivet-cli -- schema model.rvt --class ElementHeader
-cargo run -p rivet-cli -- records model.rvt
-cargo run -p rivet-cli -- bodies model.rvt --class ElementHeader --count 8
-cargo run -p rivet-cli -- element model.rvt <element-id> --bytes 32
-cargo run -p rivet-cli -- inspect model.rvt
-cargo run -p rivet-cli -- names model.rvt
-cargo run -p rivet-cli -- parameters model.rvt --class FamilyInstance
-cargo run -p rivet-cli -- export-json model.rvt --output model.jsonl
-cargo run -p rivet-cli -- export-json model.rvt --full --output model.jsonl
-cargo run -p rivet-cli -- export-ifc model.rvt --output model.ifc
+cargo run -p openrvt-cli -- info model.rvt
+cargo run -p openrvt-cli -- streams model.rvt
+cargo run -p openrvt-cli -- dump-stream model.rvt BasicFileInfo --output BasicFileInfo.bin
+cargo run -p openrvt-cli -- partitions model.rvt
+cargo run -p openrvt-cli -- schema model.rvt
+cargo run -p openrvt-cli -- elem-table model.rvt
+cargo run -p openrvt-cli -- partition-id-probe model.rvt
+cargo run -p openrvt-cli -- schema-prefix-probe model.rvt
+cargo run -p openrvt-cli -- marker-envelopes model.rvt --dump 8
+cargo run -p openrvt-cli -- member-framing model.rvt --dump 4
+cargo run -p openrvt-cli -- dump-member model.rvt Partitions/81 44 --output member.bin
+cargo run -p openrvt-cli -- schema model.rvt --class ElementHeader
+cargo run -p openrvt-cli -- records model.rvt
+cargo run -p openrvt-cli -- bodies model.rvt --class ElementHeader --count 8
+cargo run -p openrvt-cli -- element model.rvt <element-id> --bytes 32
+cargo run -p openrvt-cli -- inspect model.rvt
+cargo run -p openrvt-cli -- names model.rvt
+cargo run -p openrvt-cli -- parameters model.rvt --class FamilyInstance
+cargo run -p openrvt-cli -- export-json model.rvt --output model.jsonl
+cargo run -p openrvt-cli -- export-json model.rvt --full --output model.jsonl
+cargo run -p openrvt-cli -- export-ifc model.rvt --output model.ifc
 python -m ifcopenshell.validate model.ifc --rules
-cargo run -p rivet-cli -- export-scene model.rvt --output model.rvs
-cargo run -p rivet-cli -- export-scene ar.ifc st.ifc mep.ifc --output site.rvs
-cargo run -p rivet-cli -- export-ifc ar.ifc st.ifc mep.ifc --output site.ifc
+cargo run -p openrvt-cli -- export-scene model.rvt --output model.rvs
+cargo run -p openrvt-cli -- export-scene ar.ifc st.ifc mep.ifc --output site.rvs
+cargo run -p openrvt-cli -- export-ifc ar.ifc st.ifc mep.ifc --output site.ifc
 ```
 
 `schema` reports the generic class hierarchy and property counts without
@@ -340,11 +340,11 @@ The export is configurable the way Revit's own IFC setup is, and the setup can
 be saved and reused:
 
 ```bash
-cargo run -p rivet-cli -- export-ifc model.rvt \
+cargo run -p openrvt-cli -- export-ifc model.rvt \
     --length-unit millimetre \
     --class-mapping export-classes.txt \
     --write-settings setup.json
-cargo run -p rivet-cli -- export-ifc other.rvt --settings setup.json
+cargo run -p openrvt-cli -- export-ifc other.rvt --settings setup.json
 ```
 
 `--length-unit` writes every length in metres (the default) or millimetres,
@@ -446,7 +446,7 @@ behind something.
 as one model:
 
 ```bash
-cargo run -p rivet-cli -- export-ifc ar.ifc st.ifc mep.ifc --output site.ifc
+cargo run -p openrvt-cli -- export-ifc ar.ifc st.ifc mep.ifc --output site.ifc
 ```
 
 Every identifier is qualified by the file it came from - `ar/1G4h...` rather
@@ -561,7 +561,7 @@ Being one page is what makes it embeddable: another application mounts a
 single URL in an `iframe` and gets the library, the conversions and the 3D
 view, with `/viewer?tabs=NAME` linking straight to one model. Every route the
 page calls is resolved against the directory the page was served from, so the
-whole viewer also works behind a path prefix - proxied at `/rivet/viewer`
+whole viewer also works behind a path prefix - proxied at `/openrvt/viewer`
 inside another application - and it degrades rather than breaks where an
 embedder denies it history or storage access.
 
@@ -573,7 +573,7 @@ server whenever the React components change:
 ```bash
 npm ci
 npm run build:web
-cargo build --release -p rivet-api
+cargo build --release -p openrvt-api
 ```
 
 Unknown stream bytes are always available through `dump-stream` and the
@@ -603,8 +603,8 @@ Writers:
 
 Applications:
 
-- `rivet-cli`: command-line interface
-- `rivet-api`: HTTP server and the viewer it serves
+- `openrvt-cli`: command-line interface
+- `openrvt-api`: HTTP server and the viewer it serves
 
 Every reader ends at `bim-core` and every writer starts there, so a new source
 format is a reader crate plus an arm in `Format::sniff` - not a change to any
@@ -616,14 +616,14 @@ evidence.
 
 ## Status
 
-Rivet is experimental, and at 0.9 it carries identifier tables for two Revit
+openRVT is experimental, and at 0.9 it carries identifier tables for two Revit
 releases, 2023 and 2026, of which only 2023 has been measured against real
 models. It recovers the object graph's records, identifiers,
 classes, selected fields, level elevations, names, and schema-bound parameter
 sets, plus independently checked straight-pipe bodies, straight fitting axes
 and boundary representations. On the reference model 56.4% of the products
 Revit's own export gives a shape now carry one, every emitted body builds in
-IfcOpenShell, and Rivet never writes RVT files.
+IfcOpenShell, and openRVT never writes RVT files.
 
 The JSON-lines diagnostic exporter and a conservative IFC4 exporter are
 implemented. Coordination IFC still requires most element geometry, and legacy
@@ -635,17 +635,17 @@ IFC4 EXPRESS rules in addition to the Rust test suite.
 
 ## License
 
-Rivet is free software under the [GNU Affero General Public License v3.0
+openRVT is free software under the [GNU Affero General Public License v3.0
 only](LICENSE).
 
-Section 13 is the clause to read before deploying it: if you modify Rivet and
-let users interact with it over a network — including through `rivet-api` or any
+Section 13 is the clause to read before deploying it: if you modify openRVT and
+let users interact with it over a network — including through `openrvt-api` or any
 service built on these crates — you must offer those users the source of your
 modified version.
 
-Rivet is an independent clean-room implementation. It contains no Autodesk code
+openRVT is an independent clean-room implementation. It contains no Autodesk code
 and is not affiliated with or endorsed by Autodesk, Inc.; "Autodesk" and "Revit"
-are their trademarks, used here only to say which format Rivet reads. See
+are their trademarks, used here only to say which format openRVT reads. See
 [`NOTICE`](NOTICE) for the boundaries this project keeps, including the two that
 contributions must respect: no proprietary model content in the repository, and
 no decoding of the inter-member protection block.

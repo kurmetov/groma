@@ -147,7 +147,14 @@ impl BimDocumentIdentity {
     /// agreement, kept here rather than in either of them, because an
     /// exported file outlives the session that wrote it: changing one of
     /// these strings orphans every IFC already written under the old one.
-    pub const IFC_PROPERTY_SET: &'static str = "Rivet Source Document";
+    pub const IFC_PROPERTY_SET: &'static str = "openRVT Source Document";
+    /// The spelling written before the project was renamed from Rivet.
+    ///
+    /// A reader accepts it and nothing writes it, for the reason the note
+    /// above gives: the strings outlive the session that wrote them, so the
+    /// old one has to keep resolving or every IFC already exported stops
+    /// being recognisable as one of ours.
+    pub const IFC_PROPERTY_SET_LEGACY: &'static str = "Rivet Source Document";
     /// [`Self::document_guid`], the property that identifies the save.
     pub const IFC_DOCUMENT_GUID: &'static str = "DocumentGuid";
     /// [`Self::increment`], which orders two saves of one model.

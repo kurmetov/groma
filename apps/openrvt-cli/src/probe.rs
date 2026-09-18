@@ -4576,7 +4576,7 @@ impl IfcSettingsArguments<'_> {
 }
 
 /// Report which classes own the decoded bodies, and which classes of model
-/// element reach one. `rivet brep` says how much geometry comes out of the
+/// element reach one. `openrvt brep` says how much geometry comes out of the
 /// file; this says whose it is and what carries it out.
 pub(crate) fn body_owners(
     path: &Path,

@@ -12,7 +12,7 @@
 //! movement in the wrong direction.
 //!
 //! The corpus is confidential and is not in the repository, so the gate is
-//! opt-in: it runs only when `RIVET_CORPUS` points at a directory of `.rvt`
+//! opt-in: it runs only when `OPENRVT_CORPUS` points at a directory of `.rvt`
 //! files, and skips otherwise. That keeps `cargo test` fast and keeps CI - which
 //! has no corpus - meaningful.
 //!
@@ -91,15 +91,17 @@ fn baseline_path() -> PathBuf {
     workspace_root().join("tests/baseline/corpus_metrics.tsv")
 }
 
-/// The `rivet` binary to measure with.
+/// The `openrvt` binary to measure with.
 ///
 /// Defaults to the one cargo built for this test, but the corpus files run to
 /// hundreds of megabytes and an unoptimized walk over them is slow enough to
 /// discourage running the gate at all, so `scripts/corpus_check.sh` points this
 /// at the release build.
-fn rivet_binary() -> PathBuf {
-    std::env::var_os("RIVET_BIN")
-        .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_rivet")), PathBuf::from)
+fn openrvt_binary() -> PathBuf {
+    std::env::var_os("OPENRVT_BIN").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_openrvt")),
+        PathBuf::from,
+    )
 }
 
 /// The corpus files, labelled by the prefix of their name up to the first `_`.
@@ -126,7 +128,7 @@ fn corpus_files(directory: &Path) -> Vec<(String, PathBuf)> {
     files
 }
 
-fn run_rivet(binary: &Path, args: &[&str]) -> String {
+fn run_openrvt(binary: &Path, args: &[&str]) -> String {
     let output = Command::new(binary)
         .args(args)
         .output()
@@ -160,7 +162,7 @@ fn field(text: &str, label: &str) -> Option<u64> {
 
 /// A file's most numerous element classes, most numerous first.
 fn top_classes(binary: &Path, file: &Path) -> Vec<String> {
-    let text = run_rivet(binary, &["inspect", &file.to_string_lossy()]);
+    let text = run_openrvt(binary, &["inspect", &file.to_string_lossy()]);
     let mut classes = Vec::new();
     let mut inside = false;
     for line in text.lines() {
@@ -199,7 +201,7 @@ fn measure(binary: &Path, label: &str, file: &Path, classes: &[String]) -> Vec<M
     };
 
     for class in classes {
-        let text = run_rivet(
+        let text = run_openrvt(
             binary,
             &["serial-probe", &path, "--record", "--class", class],
         );
@@ -235,7 +237,7 @@ fn measure(binary: &Path, label: &str, file: &Path, classes: &[String]) -> Vec<M
         }
     }
 
-    let text = run_rivet(binary, &["brep", &path]);
+    let text = run_openrvt(binary, &["brep", &path]);
     for (key, label, better) in [
         (
             "brep.records_with_body",
@@ -280,7 +282,7 @@ fn measure(binary: &Path, label: &str, file: &Path, classes: &[String]) -> Vec<M
 fn write_baseline(metrics: &[Metric], path: &Path) {
     let mut text = String::new();
     text.push_str(
-        "# Rivet corpus regression baseline.\n\
+        "# openRVT corpus regression baseline.\n\
          #\n\
          # Accepted measurements over the reference corpus. Counts only: no bytes\n\
          # and no file names from the corpus appear here, so this file carries no\n\
@@ -364,7 +366,7 @@ fn baselined_classes(baseline: &Baseline, label: &str) -> Vec<String> {
 
 #[test]
 fn corpus_measurements_have_not_regressed() {
-    let Some(corpus) = std::env::var_os("RIVET_CORPUS").map(|value| {
+    let Some(corpus) = std::env::var_os("OPENRVT_CORPUS").map(|value| {
         // Cargo runs a test with the package directory as its working
         // directory, not the workspace root, so a relative corpus path means
         // what the person typing it meant only if it is resolved from the root.
@@ -376,7 +378,7 @@ fn corpus_measurements_have_not_regressed() {
         }
     }) else {
         eprintln!(
-            "skipping the corpus regression gate: RIVET_CORPUS is not set.\n\
+            "skipping the corpus regression gate: OPENRVT_CORPUS is not set.\n\
              Run `scripts/corpus_check.sh` on a machine that has the corpus."
         );
         return;
@@ -385,13 +387,13 @@ fn corpus_measurements_have_not_regressed() {
     let files = corpus_files(&corpus);
     assert!(
         !files.is_empty(),
-        "RIVET_CORPUS points at {} but it holds no .rvt files",
+        "OPENRVT_CORPUS points at {} but it holds no .rvt files",
         corpus.display()
     );
 
-    let binary = rivet_binary();
+    let binary = openrvt_binary();
     let path = baseline_path();
-    let writing = std::env::var_os("RIVET_BASELINE_WRITE").is_some();
+    let writing = std::env::var_os("OPENRVT_BASELINE_WRITE").is_some();
 
     if writing {
         let mut metrics = Vec::new();

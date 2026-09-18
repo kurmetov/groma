@@ -1,5 +1,5 @@
-Rivet
-Copyright (C) 2026 Rivet contributors
+openRVT
+Copyright (C) 2026 openRVT contributors
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU Affero General Public License as published by the Free
@@ -15,22 +15,22 @@ with this program. If not, see <https://www.gnu.org/licenses/>.
 
 The full license text is in the LICENSE file at the root of this repository.
 
-Because Rivet is offered under the AGPL, section 13 applies: if you modify it
+Because openRVT is offered under the AGPL, section 13 applies: if you modify it
 and let users interact with it remotely over a network — for example by running
-the `rivet-api` server, or a service built on these crates — those users must be
+the `openrvt-api` server, or a service built on these crates — those users must be
 offered the corresponding source of your modified version.
 
 
 ## Relationship to Autodesk
 
-Rivet is an independent, clean-room, read-only implementation. It is not
+openRVT is an independent, clean-room, read-only implementation. It is not
 affiliated with, endorsed by, or derived from Autodesk, Inc.
 
 "Autodesk", "Revit", "RVT" and "BIM 360" are trademarks or registered
 trademarks of Autodesk, Inc. They are used here only nominatively — to state
 which file format this software reads — and not as branding for this project.
 
-Rivet contains no Autodesk source code, no decompiled Autodesk binaries, no
+openRVT contains no Autodesk source code, no decompiled Autodesk binaries, no
 Autodesk SDK, and no code derived from the Revit API or the ODA BimRv SDK. The
 format knowledge in `docs/` was obtained by observing bytes in files the
 project's authors were entitled to read, and every recovered rule is recorded
@@ -58,7 +58,7 @@ depends on staying inside the two boundaries above.
 
 ## Third-party components
 
-Rivet's dependencies are declared in `Cargo.toml` and pinned in `Cargo.lock`;
+openRVT's dependencies are declared in `Cargo.toml` and pinned in `Cargo.lock`;
 each carries its own license. Run `cargo tree` to enumerate them.
 
 The Revit 2023 and 2026 catalogue tables under `crates/revit-catalog/src/` are

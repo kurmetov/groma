@@ -7,10 +7,10 @@ carries, per wall, the element identifier Revit gives it (`IfcWall.Tag`), the
 name of its type (`IfcWall.Name`, `family:type:id`) and an
 `IfcMaterialConstituentSet` listing the wall's layers in order with each
 layer's material name and its share of the total width. Those are exactly the
-things `rivet layers` decodes out of `CompoundStructure`, so the two can be
+things `openrvt layers` decodes out of `CompoundStructure`, so the two can be
 joined and disagreements counted.
 
-    rivet layers model.rvt --types 4000 --links > layers.txt
+    openrvt layers model.rvt --types 4000 --links > layers.txt
     scripts/compare_wall_layers.py revit-export.ifc layers.txt
 
 The second argument may instead be our own `export-ifc` output, which carries
@@ -18,7 +18,7 @@ the same element identifier in `IfcWall.Tag` and the layers as an
 `IfcMaterialLayerSet`. That checks the export path as well as the decode, since
 the layers then travel all the way through `bim-core` and the IFC writer.
 
-    rivet export-ifc model.rvt --output ours.ifc
+    openrvt export-ifc model.rvt --output ours.ifc
     scripts/compare_wall_layers.py revit-export.ifc ours.ifc
 
 Two measurements come out:
@@ -239,7 +239,7 @@ def read_our_export(path):
 
 
 def read_layers_report(path):
-    """`rivet layers --links` output: the type links and the layer tables."""
+    """`openrvt layers --links` output: the type links and the layer tables."""
     links, types, current = {}, {}, None
     for line in open(path, encoding="utf-8"):
         line = line.rstrip("\n")

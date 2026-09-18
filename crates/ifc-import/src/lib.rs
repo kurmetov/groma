@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! IFC STEP parsing and conversion into Rivet's format-neutral BIM model.
+//! IFC STEP parsing and conversion into openRVT's format-neutral BIM model.
 //!
 //! The parser and the model conversion are separate on purpose: callers can
 //! report the time spent reading STEP independently from the time spent

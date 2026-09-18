@@ -1,4 +1,4 @@
-# Rivet corpus regression baseline.
+# openRVT corpus regression baseline.
 #
 # Accepted measurements over the reference corpus. Counts only: no bytes
 # and no file names from the corpus appear here, so this file carries no

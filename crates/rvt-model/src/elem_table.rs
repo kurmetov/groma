@@ -11,7 +11,7 @@
 //! payload is a two-byte class-index tag, a four-byte count, and the array.
 //!
 //! Verified by walking the stream against those declarations with
-//! `rivet global FILE Global/ElemTable --class ElemTable --skip 2`, which
+//! `openrvt global FILE Global/ElemTable --class ElemTable --skip 2`, which
 //! consumes all but the trailing 8 bytes on all 28 project files available -
 //! the four corpus files and the 24 AR/KJ models beside them.
 //!

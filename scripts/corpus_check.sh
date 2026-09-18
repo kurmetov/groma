@@ -9,24 +9,24 @@
 #   scripts/corpus_check.sh            # measure and compare
 #   scripts/corpus_check.sh --write    # accept the current numbers as baseline
 #
-#   RIVET_CORPUS=/path/to/rvt/files scripts/corpus_check.sh
+#   OPENRVT_CORPUS=/path/to/rvt/files scripts/corpus_check.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-export RIVET_CORPUS=${RIVET_CORPUS:-data/test}
+export OPENRVT_CORPUS=${OPENRVT_CORPUS:-data/test}
 
-if [ ! -d "$RIVET_CORPUS" ]; then
-  echo "no corpus at $RIVET_CORPUS - set RIVET_CORPUS to a directory of .rvt files" >&2
+if [ ! -d "$OPENRVT_CORPUS" ]; then
+  echo "no corpus at $OPENRVT_CORPUS - set OPENRVT_CORPUS to a directory of .rvt files" >&2
   exit 1
 fi
 
 # cargo runs a test from its package directory, so hand the test an absolute path.
-RIVET_CORPUS=$(cd "$RIVET_CORPUS" && pwd)
-export RIVET_CORPUS
+OPENRVT_CORPUS=$(cd "$OPENRVT_CORPUS" && pwd)
+export OPENRVT_CORPUS
 
 if [ "${1:-}" = "--write" ]; then
-  export RIVET_BASELINE_WRITE=1
+  export OPENRVT_BASELINE_WRITE=1
   echo "accepting current measurements as the new baseline"
 elif [ -n "${1:-}" ]; then
   echo "usage: $0 [--write]" >&2
@@ -35,7 +35,7 @@ fi
 
 # The corpus runs to hundreds of megabytes a file; measure with the optimized
 # build or the gate is slow enough that nobody runs it.
-cargo build --release -p rivet-cli
-export RIVET_BIN=${RIVET_BIN:-$PWD/target/release/rivet}
+cargo build --release -p openrvt-cli
+export OPENRVT_BIN=${OPENRVT_BIN:-$PWD/target/release/openrvt}
 
-cargo test -p rivet-cli --test corpus_regression -- --nocapture
+cargo test -p openrvt-cli --test corpus_regression -- --nocapture

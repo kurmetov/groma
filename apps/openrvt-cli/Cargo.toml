@@ -1,13 +1,13 @@
 [package]
-name = "rivet-cli"
-description = "Command-line inspection tools for Rivet"
+name = "openrvt-cli"
+description = "Command-line inspection tools for openRVT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "rivet"
+name = "openrvt"
 path = "src/main.rs"
 
 [dependencies]

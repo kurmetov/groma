@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Read a `.rvs` scene the way a browser reads it, and check it holds together.
 
-`rivet export-scene` reports what it believes it wrote. This reads the file
+`openrvt export-scene` reports what it believes it wrote. This reads the file
 back through the format's own contract - the 24-byte trailer, the manifest, the
 raw-deflate sections - and checks that report against what is actually there.
 Every decompression here is plain raw deflate, which is what a browser gets
 from `DecompressionStream("deflate-raw")`, so a file this script reads is a
 file a viewer can read.
 
-    rivet export-scene model.rvt --output model.rvs
+    openrvt export-scene model.rvt --output model.rvs
     scripts/check_scene.py model.rvs
 
 Pass `--obj model.obj` to dequantize the triangles into a single OBJ in world
@@ -58,12 +58,17 @@ def section(data, span):
 
 
 def read_manifest(data):
-    check(data[:8] == b"RIVETSCN", "file does not start with RIVETSCN")
-    check(data[-8:] == b"RIVETEND", "file does not end with RIVETEND")
+    # The second of each pair is what a scene packed before the rename from
+    # Rivet carries. Only the name stamped in the header changed.
+    check(data[:8] in (b"OPENRVTS", b"RIVETSCN"), "file does not start with OPENRVTS")
+    check(data[-8:] in (b"OPENRVTE", b"RIVETEND"), "file does not end with OPENRVTE")
     version, _reserved = struct.unpack_from("<II", data, 8)
     offset, stored, length = struct.unpack_from("<QII", data, len(data) - TRAILER_BYTES)
     manifest = json.loads(section(data, {"offset": offset, "stored": stored, "length": length}))
-    check(manifest["format"] == "rivet-scene", f"unexpected format {manifest['format']!r}")
+    check(
+        manifest["format"] in ("openrvt-scene", "rivet-scene"),
+        f"unexpected format {manifest['format']!r}",
+    )
     return version, manifest
 
 
