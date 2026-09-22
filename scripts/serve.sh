@@ -31,4 +31,5 @@ exec ./target/release/openrvt-api \
   --openrvt "$PWD/target/release/openrvt" \
   --data "$MODELS" \
   --scenes "$SCENES" \
+  --viewer "$PWD/web" \
   --addr "127.0.0.1:$PORT"

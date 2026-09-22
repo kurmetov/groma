@@ -20,7 +20,7 @@ mod upload;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::{Cursor, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use clap::Parser;
@@ -29,11 +29,39 @@ use store::{Model, Query};
 use tiny_http::{Header, Method, Request, Response, Server};
 use upload::{DEFAULT_MAX_UPLOAD_BYTES, Job, Uploads};
 
-/// The viewer page, embedded so the binary needs nothing beside it.
-const VIEWER_HTML: &str = include_str!("../../../web/viewer.html");
-/// The React shell and Anime.js motion layer are bundled separately so the
-/// WebGL reader can stay a small, dependency-free inline program.
-const VIEWER_UI_JS: &str = include_str!("../../../web/viewer-ui.js");
+/// What a request for the page is told when this server was started without
+/// one. Said the same way everywhere, because the cause is a missing flag
+/// rather than a missing file and the answer is the same in both places.
+const NO_VIEWER: &str = "this server was started without --viewer";
+
+/// The viewer page, when one is configured.
+///
+/// This server is the API first; the page that draws its scenes is a separate
+/// project with its own build. So the two files are read from a directory at
+/// startup rather than compiled in, and a server started without one serves
+/// the JSON routes alone. Read once and held, not read per request: the page
+/// is served with `no-store` so that a restart publishes a new UI, and a
+/// restart is exactly when this is re-read.
+struct Viewer {
+    html: Vec<u8>,
+    bundle: Vec<u8>,
+}
+
+impl Viewer {
+    /// Both files or neither. A page served without its bundle renders an
+    /// empty frame with nothing in the console to say why, which is a worse
+    /// failure than refusing to start.
+    fn load(directory: &Path) -> Result<Self, String> {
+        Ok(Self {
+            html: read_viewer_file(&directory.join("viewer.html"))?,
+            bundle: read_viewer_file(&directory.join("viewer-ui.js"))?,
+        })
+    }
+}
+
+fn read_viewer_file(path: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))
+}
 
 /// Page size a request gets when it asks for none.
 const DEFAULT_LIMIT: usize = 50;
@@ -63,6 +91,11 @@ struct Cli {
     /// one, `/viewer` draws them; without one, the scene routes are absent.
     #[arg(long)]
     scenes: Option<PathBuf>,
+    /// Directory holding the viewer's `viewer.html` and `viewer-ui.js`. With
+    /// one, `/` and `/viewer` serve the page; without one, this is the JSON
+    /// API alone and those routes are absent.
+    #[arg(long)]
+    viewer: Option<PathBuf>,
     /// The `openrvt` binary that converts an uploaded model. Defaults to the one
     /// beside this executable; without either, uploading is refused and the
     /// scenes already on disk are still served.
@@ -481,6 +514,7 @@ fn describe_batch(job: &mut Job, id: &str, params: &BTreeMap<String, String>, ta
 
 /// Receive a model - or a federation of them - and start converting it to a
 /// scene.
+#[allow(clippy::too_many_lines)] // One request read through to the job it starts.
 fn serve_upload(
     slot: Option<&ConversionSlot>,
     params: &BTreeMap<String, String>,
@@ -983,6 +1017,7 @@ fn handle(
     store: &Store,
     scenes: Option<&Scenes>,
     uploads: Option<&ConversionSlot>,
+    viewer: Option<&Viewer>,
     request: Request,
 ) -> std::io::Result<()> {
     let (segments, params) = parse_target(request.url());
@@ -992,24 +1027,36 @@ fn handle(
     // is bytes served by range, not a document, and the page is HTML.
     match route.as_slice() {
         [] | ["files" | "convert" | "viewer"] => {
-            let content_type =
-                Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-                    .expect("static header");
-            return request.respond(
-                Response::from_data(VIEWER_HTML)
-                    .with_header(content_type)
-                    // The viewer is embedded in this binary. A local server
-                    // restart must publish its new UI immediately rather than
-                    // leave a browser running a cached copy of the old one.
-                    .with_header(header("Cache-Control", "no-store, max-age=0")),
-            );
+            if let Some(viewer) = viewer {
+                let content_type =
+                    Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
+                        .expect("static header");
+                return request.respond(
+                    Response::from_data(viewer.html.clone())
+                        .with_header(content_type)
+                        // A local server restart must publish its new UI
+                        // immediately rather than leave a browser running a
+                        // cached copy of the old one.
+                        .with_header(header("Cache-Control", "no-store, max-age=0")),
+                );
+            }
+            // A named workspace route with no page behind it is a plain
+            // absence. The bare root is not: it falls through to the API's own
+            // index below, so a server answering its address says what it is
+            // rather than 404-ing at whoever just opened it in a browser.
+            if !route.is_empty() {
+                return request.respond(error(404, NO_VIEWER));
+            }
         }
         ["viewer-ui.js"] => {
+            let Some(viewer) = viewer else {
+                return request.respond(error(404, NO_VIEWER));
+            };
             let content_type =
                 Header::from_bytes(&b"Content-Type"[..], &b"text/javascript; charset=utf-8"[..])
                     .expect("static header");
             return request.respond(
-                Response::from_data(VIEWER_UI_JS)
+                Response::from_data(viewer.bundle.clone())
                     .with_header(content_type)
                     .with_header(header("Cache-Control", "no-store, max-age=0")),
             );
@@ -1087,7 +1134,7 @@ fn handle(
     }
 
     let response = match route.as_slice() {
-        ["api" | "health"] => json_response(
+        [] | ["api" | "health"] => json_response(
             200,
             &serde_json::json!({
                 "status": "ok",
@@ -1101,7 +1148,7 @@ fn handle(
                     "/models/{model}/rooms",
                     "/models/{model}/levels",
                     "/models/{model}/documents",
-                    "/ (the workspace: /files, /convert and /viewer)",
+                    "/ (the workspace: /files, /convert and /viewer - needs --viewer)",
                     "/api (this list)",
                     "/scenes",
                     "/scenes/{scene}",
@@ -1190,6 +1237,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             jobs: Mutex::new(BTreeMap::new()),
         }))
     });
+    let viewer = match cli.viewer.as_ref() {
+        // Refused here rather than at the first request: a mistyped path is a
+        // start-up error, and finding it out from a browser is too late.
+        Some(directory) => Some(Arc::new(
+            Viewer::load(directory).map_err(|error| format!("--viewer {error}"))?,
+        )),
+        None => None,
+    };
     let store = Arc::new(Store::new(cli.data.clone()));
     let available = store.available();
     if cli.preload {
@@ -1199,25 +1254,87 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let server = Server::http(&cli.addr).map_err(|error| format!("listen failed: {error}"))?;
+    announce(
+        &cli,
+        scenes.as_deref(),
+        uploads.as_deref(),
+        viewer.as_deref(),
+        available.len(),
+    );
+    let server = Arc::new(server);
+    let mut workers = Vec::new();
+    for _ in 0..cli.threads.max(1) {
+        let server = Arc::clone(&server);
+        let store = Arc::clone(&store);
+        let scenes = scenes.clone();
+        let uploads = uploads.clone();
+        let viewer = viewer.clone();
+        workers.push(std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                if let Err(error) = handle(
+                    &store,
+                    scenes.as_deref(),
+                    uploads.as_deref(),
+                    viewer.as_deref(),
+                    request,
+                ) {
+                    eprintln!("request failed: {error}");
+                }
+            }
+        }));
+    }
+    for worker in workers {
+        let _ = worker.join();
+    }
+    Ok(())
+}
+
+/// Everything this server says about itself before it starts answering.
+///
+/// Lifted out of `main` because the banner grows with every surface the server
+/// gains - scenes, uploads, now a viewer - while `main`'s own job is the
+/// wiring. What is said here is read by someone deciding whether the thing
+/// came up the way they meant it to, so each line names a surface and where it
+/// is, or says plainly that it is absent.
+fn announce(
+    cli: &Cli,
+    scenes: Option<&Scenes>,
+    uploads: Option<&ConversionSlot>,
+    viewer: Option<&Viewer>,
+    models: usize,
+) {
     println!(
         "openrvt-api listening on http://{} over {} ({} model(s))",
         cli.addr,
         cli.data.display(),
-        available.len()
+        models
     );
-    if let Some(scenes) = scenes.as_ref() {
+    if let Some(scenes) = scenes {
         let names = scenes.available();
         println!(
-            "viewer on http://{}/viewer ({} scene(s): {})",
-            cli.addr,
+            "{} scene(s) on http://{}/scenes: {}",
             names.len(),
+            cli.addr,
             if names.is_empty() {
                 "none yet - upload one, or run `openrvt export-scene`".to_owned()
             } else {
                 names.join(", ")
             }
         );
-        match uploads.as_ref() {
+        match viewer {
+            Some(_) => println!(
+                "viewer on http://{}/viewer, drawn from {}",
+                cli.addr,
+                cli.viewer
+                    .as_ref()
+                    .expect("a viewer was loaded from a path")
+                    .display()
+            ),
+            None => println!(
+                "no viewer: scenes are served over the API alone (pass --viewer to draw them)"
+            ),
+        }
+        match uploads {
             Some(slot) => {
                 println!("uploads convert with {}", slot.uploads.openrvt.display());
                 // Said out loud, because "why was my file refused" should not
@@ -1247,108 +1364,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
         }
     }
-    let server = Arc::new(server);
-    let mut workers = Vec::new();
-    for _ in 0..cli.threads.max(1) {
-        let server = Arc::clone(&server);
-        let store = Arc::clone(&store);
-        let scenes = scenes.clone();
-        let uploads = uploads.clone();
-        workers.push(std::thread::spawn(move || {
-            for request in server.incoming_requests() {
-                if let Err(error) = handle(&store, scenes.as_deref(), uploads.as_deref(), request) {
-                    eprintln!("request failed: {error}");
-                }
-            }
-        }));
-    }
-    for worker in workers {
-        let _ = worker.join();
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    /// Every GLSL source in the viewer is a JavaScript template literal, so a
-    /// backtick inside one ends the string early and silently breaks the whole
-    /// page - no shader error, no console message, just every function in the
-    /// script undefined. It cost an afternoon once; it costs a test now.
-    #[test]
-    fn no_shader_source_in_the_viewer_contains_a_backtick() {
-        let mut offenders = Vec::new();
-        let mut rest = VIEWER_HTML;
-        while let Some(at) = rest
-            .find("_FRAGMENT = `")
-            .or_else(|| rest.find("_VERTEX = `"))
-        {
-            // The name is the identifier immediately before the assignment.
-            let head = &rest[..at];
-            let name: String = head
-                .chars()
-                .rev()
-                .take_while(|character| character.is_alphanumeric() || *character == '_')
-                .collect::<Vec<char>>()
-                .into_iter()
-                .rev()
-                .collect();
-            let opened = rest[at..].find('`').expect("the backtick just matched") + at + 1;
-            let body = &rest[opened..];
-            let closed = body.find('`').unwrap_or(body.len());
-            let source = &body[..closed];
-            // A source that ends at a backtick which is not followed by `;` is
-            // one that ended early.
-            let tail = body[closed..].trim_start_matches('`');
-            if !tail.starts_with(';') {
-                offenders.push(format!("{name} (source ends at a stray backtick)"));
-            }
-            if source.contains('`') {
-                offenders.push(format!("{name} (backtick inside the source)"));
-            }
-            rest = &body[closed..];
-        }
-        assert!(
-            offenders.is_empty(),
-            "shader sources with a backtick in them: {}",
-            offenders.join(", ")
-        );
-    }
-
-    /// The WebGL engine remains the page's final inline script; an odd number
-    /// of backticks in it means a template literal somewhere is unterminated.
-    #[test]
-    fn the_viewers_template_literals_are_balanced() {
-        let script = VIEWER_HTML
-            .rsplit_once("<script")
-            .and_then(|(_, rest)| rest.split_once('>'))
-            .map(|(_, rest)| rest.split("</script>").next().unwrap_or_default())
-            .expect("the viewer has an inline WebGL script");
-        let backticks = script.matches('`').count();
-        assert_eq!(
-            backticks % 2,
-            0,
-            "the viewer's script has {backticks} backticks, which cannot pair up"
-        );
-    }
-
-    #[test]
-    fn the_react_shell_loads_before_the_webgl_engine() {
-        let bundle = VIEWER_HTML
-            .find("<script src=\"viewer-ui.js\"></script>")
-            .expect("the viewer loads its React bundle");
-        let engine = VIEWER_HTML
-            .find("<script>\n\"use strict\";")
-            .expect("the viewer keeps its WebGL engine inline");
-        assert!(
-            bundle < engine,
-            "React must mount the controls before the engine reads them"
-        );
-        assert!(
-            VIEWER_UI_JS.len() > 100_000,
-            "the embedded UI bundle is unexpectedly empty"
-        );
-    }
-
     use super::*;
 
     #[test]
