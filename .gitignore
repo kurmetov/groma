@@ -13,6 +13,7 @@
 # Python bytecode from the helper scripts.
 __pycache__/
 /.venv/
+/.venv-ifc/
 .env
 node_modules/
 

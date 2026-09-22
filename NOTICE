@@ -61,6 +61,22 @@ depends on staying inside the two boundaries above.
 openRVT's dependencies are declared in `Cargo.toml` and pinned in `Cargo.lock`;
 each carries its own license. Run `cargo tree` to enumerate them.
 
+The viewer page ships as a built bundle, `web/viewer-ui.js`, so unlike the Rust
+dependencies these are redistributed here in object form and their notices have
+to travel with them. It is built by `npm run build:web` from
+`web/src/viewer-ui.jsx` and contains, under the MIT license:
+
+- React, React DOM 19.3.0 and scheduler 0.28.0 - Copyright (c) Meta Platforms,
+  Inc. and affiliates. <https://github.com/facebook/react/blob/main/LICENSE>
+- anime.js 4.5.0 - Copyright (c) 2025 Julian Garnier.
+  <https://github.com/juliangarnier/anime/blob/master/LICENSE.md>
+
+The MIT license grants use, copying, modification and distribution provided its
+notice is kept with the software; the bundle carries that notice in its own
+banner, and the versions are pinned in `package.json` and `package-lock.json`.
+Combining them into an AGPL work is permitted - MIT imposes no reciprocal
+condition - and the bundle as a whole is offered under the AGPL.
+
 The Revit 2023 and 2026 catalogue tables under `crates/revit-catalog/src/` are
 built from publicly documented enumeration names and identifiers. They contain
 no Autodesk source code. `scripts/generate_revit_catalog.py` records how they
