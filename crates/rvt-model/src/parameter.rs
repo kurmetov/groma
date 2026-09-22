@@ -130,13 +130,11 @@ impl FamilyParameterClassIndexes {
         let named = schema.class_by_name("NamedParam")?;
         if named.parent != rvt_schema::TypeReference::None
             || named.properties.len() != NAMED_PARAMETER_PROPERTIES.len()
-            || !named
-                .properties
-                .iter()
-                .zip(NAMED_PARAMETER_PROPERTIES)
-                .all(|(declared, (name, field_type))| {
+            || !named.properties.iter().zip(NAMED_PARAMETER_PROPERTIES).all(
+                |(declared, (name, field_type))| {
                     declared.name == *name && declared.field_type == *field_type
-                })
+                },
+            )
         {
             return None;
         }
@@ -683,7 +681,9 @@ mod tests {
         for (value, element_id, parameter_id, integer) in entries {
             object.strings.push(String::new());
             object.numbers.push(*value);
-            object.integers.extend([*element_id, *parameter_id, *integer]);
+            object
+                .integers
+                .extend([*element_id, *parameter_id, *integer]);
             object.small_integers.extend([0, 0]);
         }
         object

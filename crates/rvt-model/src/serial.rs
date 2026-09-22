@@ -1903,7 +1903,13 @@ mod tests {
                 TypeReference::None,
                 vec![
                     property("m_activeGeoLocationId", FieldType::Integer32, 0x00, 0, None),
-                    property("m_projectGeoLocationId", FieldType::Integer32, 0x00, 0, None),
+                    property(
+                        "m_projectGeoLocationId",
+                        FieldType::Integer32,
+                        0x00,
+                        0,
+                        None,
+                    ),
                 ],
             )],
             top_level_class_count: 1,

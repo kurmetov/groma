@@ -168,9 +168,8 @@ fn bridge_hole(chain: &mut Vec<Vertex>, hole: &[Vertex]) {
     for vertex in chain.iter() {
         *cut.entry(vertex.origin).or_default() += 1;
     }
-    let free = |chain: &[Vertex], index: usize| {
-        cut.get(&chain[index].origin).copied().unwrap_or(0) <= 1
-    };
+    let free =
+        |chain: &[Vertex], index: usize| cut.get(&chain[index].origin).copied().unwrap_or(0) <= 1;
     let derived = visible_from(chain, origin);
     let outer_index = match derived {
         Some(index) if free(chain, index) && reaches(chain, hole, hole_index, index) => Some(index),
@@ -571,12 +570,7 @@ mod corpus_tests {
             [19.125, -2.75],
             [15.225, -2.75],
         ];
-        let second: Vec<Point2> = vec![
-            [17.2, -2.95],
-            [19.9, -2.95],
-            [19.9, -4.95],
-            [17.2, -4.95],
-        ];
+        let second: Vec<Point2> = vec![[17.2, -2.95], [19.9, -2.95], [19.9, -4.95], [17.2, -4.95]];
         let want = 551.96875 - 5.4 - 9.945;
         let area = tiled(&outer, &[&first, &second]);
         assert!((area - want).abs() < 1e-6, "tiled {area}, want {want}");

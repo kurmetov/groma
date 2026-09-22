@@ -1667,7 +1667,10 @@ mod prism_tests {
         let brep = prism(&region, [0.0, 0.0, 2.0], &IDENTITY).expect("a prism");
         let area = tiled_area(brep);
         let want = expected(&region, 2.0);
-        assert!((area - want).abs() < 1e-6, "tiled {area} m² of a solid with {want}");
+        assert!(
+            (area - want).abs() < 1e-6,
+            "tiled {area} m² of a solid with {want}"
+        );
     }
 
     /// One slab of the architectural corpus, to its own numbers: six corners
@@ -1703,6 +1706,9 @@ mod prism_tests {
         let brep = prism(&region, [0.0, 0.0, 0.2], &IDENTITY).expect("a prism");
         let area = tiled_area(brep);
         let want = expected(&region, 0.2);
-        assert!((area - want).abs() < 1e-3, "tiled {area} m² of a solid with {want}");
+        assert!(
+            (area - want).abs() < 1e-3,
+            "tiled {area} m² of a solid with {want}"
+        );
     }
 }

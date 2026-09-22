@@ -543,10 +543,7 @@ pub(crate) fn write_decoded_sections_json(
 /// residual alone cannot: a body 70 mm off its record's box and a body in a
 /// symbol's local frame both read as "not placed", and only the extent tells
 /// them apart.
-fn write_body_extent_json(
-    writer: &mut impl Write,
-    brep: &rvt_model::SymbolBrep,
-) -> io::Result<()> {
+fn write_body_extent_json(writer: &mut impl Write, brep: &rvt_model::SymbolBrep) -> io::Result<()> {
     let Some((min, max)) = rvt_import::body_extent_feet(brep) else {
         return Ok(());
     };

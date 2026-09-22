@@ -1050,8 +1050,8 @@ pub fn federate(sources: Vec<(BimDocument, BimModel)>) -> (BimModel, BimFederati
         // A single source keeps its own provenance in the shorthand field as
         // well, so every consumer that reads only that still works.
         if !qualify {
-            out.source = model.source.clone();
-            out.project = model.project.clone();
+            out.source.clone_from(&model.source);
+            out.project.clone_from(&model.project);
             out.document_identity.clone_from(&model.document_identity);
             out.site = model.site;
             // A federated model has no single frame to be shared in - each

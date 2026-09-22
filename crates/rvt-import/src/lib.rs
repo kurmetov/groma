@@ -1877,8 +1877,7 @@ fn decode_element(context: &RecordContext<'_>, header: RecordHeader, body: &[u8]
                     .and_then(|schema| GeoSiteFields::parse(schema, header.class_index, body))
             })
             .flatten(),
-        active_geo_location: (Some(header.class_index)
-            == context.active_geo_location_class_index)
+        active_geo_location: (Some(header.class_index) == context.active_geo_location_class_index)
             .then(|| {
                 context.schema.and_then(|schema| {
                     rvt_model::ActiveGeoLocationFields::parse(schema, header.class_index, body)
@@ -6382,12 +6381,11 @@ mod tests {
     fn site_placement_follows_the_location_the_file_declares_active() {
         let placement =
             site_placement(&recovered_with(geo_location_elements())).expect("an active location");
-        for (actual, expected) in placement
-            .origin
-            .coordinates
-            .into_iter()
-            .zip([30.870_841_580_725_212, 16.311_922_695_017_76, -0.275])
-        {
+        for (actual, expected) in placement.origin.coordinates.into_iter().zip([
+            30.870_841_580_725_212,
+            16.311_922_695_017_76,
+            -0.275,
+        ]) {
             assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
         }
         assert!((placement.reference_direction[1] - 0.999_667_267_756_612_7).abs() < 1e-12);

@@ -591,6 +591,7 @@ pub enum Product {
 }
 
 /// Read the converter's stages into `job` until it exits.
+#[allow(clippy::too_many_lines)] // One streaming read of a child's output.
 pub fn follow(
     mut child: Child,
     name: &str,

@@ -927,7 +927,10 @@ mod tests {
         entities.insert(u64::MAX, entity(3));
         assert_eq!(entities.len(), 3);
         assert_eq!(entities.get(1).expect("#1").type_name, "T1");
-        assert_eq!(entities.get(1 << 40).expect("a far identifier").type_name, "T2");
+        assert_eq!(
+            entities.get(1 << 40).expect("a far identifier").type_name,
+            "T2"
+        );
         assert_eq!(entities.get(u64::MAX).expect("the last").type_name, "T3");
         // The point of the policy: the vector did not grow to meet them.
         assert!(
