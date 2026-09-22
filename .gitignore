@@ -16,9 +16,3 @@ __pycache__/
 /.venv-ifc/
 .env
 node_modules/
-
-# Working notes kept locally, outside the published repository: the founding
-# brief and the working notes journals written between sessions.
-/BRIEF.md
-/docs/working-notes.md
-/docs/ifc-import-notes.md
