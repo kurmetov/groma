@@ -1,6 +1,6 @@
 //! Converting a model a user hands the server into a scene it can draw.
 //!
-//! The conversion is the `openrvt` binary, run as a child process. That is a
+//! The conversion is the `groma` binary, run as a child process. That is a
 //! deliberate choice rather than a shortcut: a decode holds gigabytes and can
 //! fail on a malformed file, and a request handler is the wrong place for
 //! either. As a child it is bounded, killable, and its stages arrive on a pipe
@@ -69,21 +69,17 @@ fn conversion_limit(format: Format, configured: u64) -> u64 {
 pub struct Uploads {
     /// The directory scenes are served from.
     pub scenes: PathBuf,
-    /// The `openrvt` binary that does the conversion.
-    pub openrvt: PathBuf,
+    /// The `groma` binary that does the conversion.
+    pub groma: PathBuf,
     pub max_bytes: u64,
 }
 
-/// The `openrvt` binary to run: the one beside this executable, which is where
+/// The `groma` binary to run: the one beside this executable, which is where
 /// a cargo build and an installed pair both put it.
 #[must_use]
-pub fn openrvt_beside_this_executable() -> Option<PathBuf> {
+pub fn groma_beside_this_executable() -> Option<PathBuf> {
     let directory = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let candidate = directory.join(if cfg!(windows) {
-        "openrvt.exe"
-    } else {
-        "openrvt"
-    });
+    let candidate = directory.join(if cfg!(windows) { "groma.exe" } else { "groma" });
     candidate.is_file().then_some(candidate)
 }
 
@@ -213,7 +209,7 @@ impl Uploads {
         formats: &[Format],
     ) -> std::io::Result<Child> {
         let scene = self.scenes.join(format!("{scene_name}.rvs"));
-        let mut command = Command::new(&self.openrvt);
+        let mut command = Command::new(&self.groma);
         command.arg("export-scene");
         // Several sources are read as one federated model. The converter
         // qualifies every identifier by the file it came from, so the scene
@@ -270,7 +266,7 @@ impl Uploads {
         let directory = self.exports();
         std::fs::create_dir_all(&directory)?;
         let output = directory.join(format!("{name}.jsonl"));
-        let mut command = Command::new(&self.openrvt);
+        let mut command = Command::new(&self.groma);
         command
             .arg("export-json")
             .arg(source)
@@ -304,7 +300,7 @@ impl Uploads {
         let directory = self.exports();
         std::fs::create_dir_all(&directory)?;
         let output = directory.join(format!("{name}.ifc"));
-        let mut command = Command::new(&self.openrvt);
+        let mut command = Command::new(&self.groma);
         command.arg("export-ifc");
         // Several sources are read as one federated model, exactly as a scene
         // conversion reads them.
@@ -471,12 +467,12 @@ impl Default for Job {
 /// The IFC export setup a request asks for.
 ///
 /// The names are the exporter's own flags, so what a caller may ask for over
-/// HTTP and what `openrvt export-ifc` accepts stay one list rather than two that
+/// HTTP and what `groma export-ifc` accepts stay one list rather than two that
 /// drift. A parameter this does not know is refused: a setting silently
 /// dropped is a file that is not what was asked for.
 // One field per exporter flag, on purpose: this is the list of what a caller
 // may ask for, and keeping it flat is what makes it readable beside
-// `openrvt export-ifc --help`.
+// `groma export-ifc --help`.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IfcRequest {
@@ -739,7 +735,7 @@ fn failure_reason(status: Option<std::process::ExitStatus>, stderr_text: &str) -
                  {budget}. Geometry-heavy models cost far more than their file size suggests - \
                  a 709 MB structural IFC measured here reached 39 GB, against 2.2 GB for a \
                  643 MB one - so raise the limit for the container or convert it with the \
-                 `openrvt export-scene` command directly."
+                 `groma export-scene` command directly."
             );
         }
     }
@@ -778,11 +774,11 @@ mod tests {
     /// order has to be the same every time the same files are converted.
     #[test]
     fn a_set_is_read_back_in_a_deterministic_order_and_can_be_forgotten() {
-        let directory = std::env::temp_dir().join(format!("openrvt-set-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("groma-set-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         let uploads = Uploads {
             scenes: directory.clone(),
-            openrvt: std::path::PathBuf::from("openrvt"),
+            groma: std::path::PathBuf::from("groma"),
             max_bytes: 1 << 20,
         };
 

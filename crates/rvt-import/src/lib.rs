@@ -3,7 +3,7 @@
 //! [`bim_core::BimModel`].
 //!
 //! This is the stage between RVT serialization decoding and the exporters.
-//! It used to live inside the `openrvt` binary,
+//! It used to live inside the `groma` binary,
 //! which is why adding a second source format meant editing the CLI; IFC
 //! reading was already a crate of its own and this is now its peer.
 //!
@@ -669,7 +669,7 @@ fn spilled_tail<'a>(owing: usize, following: impl Iterator<Item = &'a [u8]>) -> 
 /// `NewCurtainWallType` 15 / 10, three classes of one chain out of the file's
 /// 4 418. Joined to the reference export by element id, all 7 617 / 7 739 walls
 /// Revit exports have a type here, and it is the type Revit names for 7 615 /
-/// 7 739 of them. `openrvt layers` is the instrument and
+/// 7 739 of them. `groma layers` is the instrument and
 /// `scripts/compare_wall_layers.py` is the join.
 const TYPE_ELEMENT_ID_PROPERTIES: &[&str] = DECLARED_ID_PROPERTIES
     .split_at(TYPE_ELEMENT_ID_PROPERTY_COUNT)
@@ -3029,7 +3029,7 @@ pub fn place_declared_body(
 /// What Revit calls it is not established - the flags word carries no
 /// declaration beyond its name - so it is named here for what it separates,
 /// and it was chosen by measurement rather than read off one record.
-/// `openrvt face-mark-probe` scores every mark a `GFace` declares against the
+/// `groma face-mark-probe` scores every mark a `GFace` declares against the
 /// one answer that is independent of them: whether the face reaches outside
 /// the box its own record carries. On AR S1 this bit is clear on 9 828 faces
 /// that do and set on all but 1 039 of the 355 361 that do not, and dropping

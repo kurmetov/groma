@@ -256,7 +256,7 @@ fn validate_model(model: &BimModel) -> Result<(), MetadataError> {
 }
 
 /// What wrote this file, named the same way everywhere it is named.
-const PREPROCESSOR: &str = concat!("openRVT ", env!("CARGO_PKG_VERSION"));
+const PREPROCESSOR: &str = concat!("groma ", env!("CARGO_PKG_VERSION"));
 
 fn step_header(options: &MetadataOptions, model: &BimModel) -> StepHeader {
     StepHeader {
@@ -277,7 +277,7 @@ fn step_header(options: &MetadataOptions, model: &BimModel) -> StepHeader {
             ),
         ]
         .into_iter()
-        // The same identity the `openRVT Source Document` set states, said
+        // The same identity the `groma Source Document` set states, said
         // again where it costs the reader nothing to reach: a pipeline
         // asking "have I converted this file already?" answers it from the
         // first few hundred bytes of the file instead of parsing all of it.
@@ -290,10 +290,10 @@ fn step_header(options: &MetadataOptions, model: &BimModel) -> StepHeader {
         .collect(),
         file_name: options.file_name.clone(),
         timestamp: options.timestamp.clone(),
-        authors: vec!["openRVT".to_owned()],
-        organizations: vec!["openRVT".to_owned()],
+        authors: vec!["groma".to_owned()],
+        organizations: vec!["groma".to_owned()],
         preprocessor_version: PREPROCESSOR.to_owned(),
-        originating_system: "openRVT".to_owned(),
+        originating_system: "groma".to_owned(),
         authorization: String::new(),
         schema: "IFC4".to_owned(),
     }
@@ -305,7 +305,7 @@ fn push_ownership(file: &mut StepFile, creation_time: i64) -> EntityRef {
         vec![
             omitted(),
             omitted(),
-            string("openRVT"),
+            string("groma"),
             omitted(),
             omitted(),
             omitted(),
@@ -315,13 +315,7 @@ fn push_ownership(file: &mut StepFile, creation_time: i64) -> EntityRef {
     );
     let organization = file.push(
         "IFCORGANIZATION",
-        vec![
-            omitted(),
-            string("openRVT"),
-            omitted(),
-            omitted(),
-            omitted(),
-        ],
+        vec![omitted(), string("groma"), omitted(), omitted(), omitted()],
     );
     let user = file.push(
         "IFCPERSONANDORGANIZATION",
@@ -332,8 +326,8 @@ fn push_ownership(file: &mut StepFile, creation_time: i64) -> EntityRef {
         vec![
             reference(organization),
             string(env!("CARGO_PKG_VERSION")),
-            string("openRVT"),
-            string("OPENRVT"),
+            string("groma"),
+            string("GROMA"),
         ],
     );
     file.push(
@@ -1557,7 +1551,7 @@ impl TypeLibrary {
                             file,
                             &element.type_properties,
                             context,
-                            "openRVT Type Properties",
+                            "groma Type Properties",
                             &format!("type-properties:{}", type_id.0),
                         )
                     })
@@ -4279,7 +4273,7 @@ fn push_property_set(
             &element.properties,
             product,
             context,
-            "openRVT Properties",
+            "groma Properties",
             &format!("properties:{}", element.id.0),
             &format!("properties-relation:{}", element.id.0),
         );
@@ -4295,7 +4289,7 @@ fn push_property_set(
             &element.type_properties,
             product,
             context,
-            "openRVT Type Properties",
+            "groma Type Properties",
             &format!("type-properties:{}", element.id.0),
             &format!("type-properties-relation:{}", element.id.0),
         );
@@ -5350,7 +5344,7 @@ mod tests {
         // one stating no identity contributes nothing rather than a set of
         // blanks that reads like one.
         assert_eq!(
-            text.matches("'openRVT Source Document: first'").count(),
+            text.matches("'groma Source Document: first'").count(),
             1,
             "the set is not named for its document"
         );
@@ -5365,7 +5359,7 @@ mod tests {
         file.write_to(&mut bytes).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("SourceDocument ["));
-        assert!(!text.contains("openRVT Source Document"));
+        assert!(!text.contains("groma Source Document"));
     }
 
     /// One source file, so the set carries the plain name: what a reader of a
@@ -5577,8 +5571,8 @@ mod tests {
 
         // Both sets are written, under names that keep them apart, and the
         // type's value is not merged into the element's own set.
-        assert!(text.contains("'openRVT Properties'"));
-        assert!(text.contains("'openRVT Type Properties'"));
+        assert!(text.contains("'groma Properties'"));
+        assert!(text.contains("'groma Type Properties'"));
         assert_eq!(text.matches("=IFCPROPERTYSET(").count(), 2);
         assert_eq!(text.matches("=IFCRELDEFINESBYPROPERTIES(").count(), 2);
         assert!(text.contains("'SANEXT'"));
@@ -5590,7 +5584,7 @@ mod tests {
         file.write_to(&mut bytes).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text.matches("=IFCPROPERTYSET(").count(), 1);
-        assert!(!text.contains("'openRVT Type Properties'"));
+        assert!(!text.contains("'groma Type Properties'"));
     }
 
     /// Two elements of one Revit type: one type object, one relationship
@@ -5633,8 +5627,8 @@ mod tests {
             .expect("the wall type");
         assert!(written.contains("'Basic Wall: 200mm'"), "{written}");
         assert!(written.contains(",'900',"), "{written}");
-        assert!(text.contains("'openRVT Type Properties'"));
-        assert_eq!(text.matches("'openRVT Type Properties'").count(), 1);
+        assert!(text.contains("'groma Type Properties'"));
+        assert_eq!(text.matches("'groma Type Properties'").count(), 1);
         // Stated on the type, so no element repeats it: the property
         // relationships left are the two elements' own parameters and the one
         // IFC common set both of them share.
@@ -6409,7 +6403,7 @@ mod tests {
         assert!(!text.contains("=IFCDISTRIBUTIONFLOWELEMENTTYPE("));
         assert!(!text.contains("=IFCRELDEFINESBYTYPE("));
         // Nothing holds the type's parameters now, so the element does.
-        assert!(text.contains("'openRVT Type Properties'"));
+        assert!(text.contains("'groma Type Properties'"));
 
         // The concrete sibling is written.
         model.elements[0].element_type = BimElementType::DistributionElement;
@@ -6445,7 +6439,7 @@ mod tests {
 
         assert!(!text.contains("=IFCWALLTYPE("));
         assert!(!text.contains("=IFCRELDEFINESBYTYPE("));
-        assert!(text.contains("'openRVT Type Properties'"));
+        assert!(text.contains("'groma Type Properties'"));
         assert_eq!(text.matches("=IFCRELDEFINESBYPROPERTIES(").count(), 2);
     }
 

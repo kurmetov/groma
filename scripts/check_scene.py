@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Read a `.rvs` scene the way a browser reads it, and check it holds together.
 
-`openrvt export-scene` reports what it believes it wrote. This reads the file
+`groma export-scene` reports what it believes it wrote. This reads the file
 back through the format's own contract - the 24-byte trailer, the manifest, the
 raw-deflate sections - and checks that report against what is actually there.
 Every decompression here is plain raw deflate, which is what a browser gets
 from `DecompressionStream("deflate-raw")`, so a file this script reads is a
 file a viewer can read.
 
-    openrvt export-scene model.rvt --output model.rvs
+    groma export-scene model.rvt --output model.rvs
     scripts/check_scene.py model.rvs
 
 Pass `--obj model.obj` to dequantize the triangles into a single OBJ in world

@@ -33,7 +33,7 @@
 //! error, so every one of them measured worse in isolation than the wrong
 //! reading it replaced - and no discriminator was ever going to rescue them
 //! one at a time. The switch that measured the eight combinations was
-//! temporary and is gone; `openrvt flags-probe` is what remains, and it checks
+//! temporary and is gone; `groma flags-probe` is what remains, and it checks
 //! the width the walk reads against the width the following bytes prove.
 //!
 //! What is *not* established is how to interpret `GInfo.m_flags`. Its four

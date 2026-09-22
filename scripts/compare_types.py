@@ -11,18 +11,18 @@ own `RepresentationMaps`, so one Revit type reaches the file as many entities
 all carrying the same `Tag`. Counting entities reads as a collapse on our side
 that the ids say is not there.
 
-    openrvt export-ifc model.rvt --output ours.ifc
+    groma export-ifc model.rvt --output ours.ifc
     scripts/compare_types.py revit-export.ifc ours.ifc
 
 A reference type id this export names nowhere is reported separately, because
 that is what a mismatched pair looks like: a reference exported from a *later
 save* of the project names types created after the `.rvt` in hand was written,
-and `openrvt element <id>` finds no record for them at all - their ids sit above
+and `groma element <id>` finds no record for them at all - their ids sit above
 the file's own largest element id. Check the pairing before reading anything
 into a disagreement: the reference's `FILE_NAME` and its `NumberOfSaves`
 against the save the `.rvt` is. The line is only a flag, not a verdict - an id
 that does name a real element the export happens not to use as a type lands in
-it too, and separating those needs `openrvt element`.
+it too, and separating those needs `groma element`.
 
 The residue that survives a correctly paired run on AR S1 is 37 curtain-wall
 panels, and it is Revit's own convention rather than a disagreement about the

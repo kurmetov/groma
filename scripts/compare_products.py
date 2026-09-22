@@ -7,7 +7,7 @@ disagreement counted. That is the measurement the typing rules are justified
 by: a `(class, category)` pair earns a mapping row when the join shows it maps
 to one entity with no spread.
 
-    openrvt export-ifc model.rvt --output ours.ifc
+    groma export-ifc model.rvt --output ours.ifc
     scripts/compare_products.py revit-export.ifc ours.ifc
 
 Revit writes the void it cuts with the same element id as the product that cuts

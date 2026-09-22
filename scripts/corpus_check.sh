@@ -9,24 +9,24 @@
 #   scripts/corpus_check.sh            # measure and compare
 #   scripts/corpus_check.sh --write    # accept the current numbers as baseline
 #
-#   OPENRVT_CORPUS=/path/to/rvt/files scripts/corpus_check.sh
+#   GROMA_CORPUS=/path/to/rvt/files scripts/corpus_check.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-export OPENRVT_CORPUS=${OPENRVT_CORPUS:-data/test}
+export GROMA_CORPUS=${GROMA_CORPUS:-data/test}
 
-if [ ! -d "$OPENRVT_CORPUS" ]; then
-  echo "no corpus at $OPENRVT_CORPUS - set OPENRVT_CORPUS to a directory of .rvt files" >&2
+if [ ! -d "$GROMA_CORPUS" ]; then
+  echo "no corpus at $GROMA_CORPUS - set GROMA_CORPUS to a directory of .rvt files" >&2
   exit 1
 fi
 
 # cargo runs a test from its package directory, so hand the test an absolute path.
-OPENRVT_CORPUS=$(cd "$OPENRVT_CORPUS" && pwd)
-export OPENRVT_CORPUS
+GROMA_CORPUS=$(cd "$GROMA_CORPUS" && pwd)
+export GROMA_CORPUS
 
 if [ "${1:-}" = "--write" ]; then
-  export OPENRVT_BASELINE_WRITE=1
+  export GROMA_BASELINE_WRITE=1
   echo "accepting current measurements as the new baseline"
 elif [ -n "${1:-}" ]; then
   echo "usage: $0 [--write]" >&2
@@ -35,7 +35,7 @@ fi
 
 # The corpus runs to hundreds of megabytes a file; measure with the optimized
 # build or the gate is slow enough that nobody runs it.
-cargo build --release -p openrvt-cli
-export OPENRVT_BIN=${OPENRVT_BIN:-$PWD/target/release/openrvt}
+cargo build --release -p groma-cli
+export GROMA_BIN=${GROMA_BIN:-$PWD/target/release/groma}
 
-cargo test -p openrvt-cli --test corpus_regression -- --nocapture
+cargo test -p groma-cli --test corpus_regression -- --nocapture

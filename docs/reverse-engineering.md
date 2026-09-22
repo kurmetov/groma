@@ -1,6 +1,6 @@
 # Reverse-engineering workflow
 
-openRVT accepts only clean-room, reproducible observations.
+groma accepts only clean-room, reproducible observations.
 
 ## Evidence record
 
@@ -40,13 +40,13 @@ containers.
 ## Experimental probes
 
 Experimental correlations must remain visibly separate from accepted format
-semantics. `openrvt partition-id-probe model.rvt` compares each independently
+semantics. `groma partition-id-probe model.rvt` compares each independently
 inflated partition member's first little-endian `u32` with candidate IDs from
 `Global/ElemTable`. It reports aggregate overlap only. A low overlap refutes
 the simple one-member-per-element hypothesis; a high overlap is evidence for
 further study, not by itself proof of field semantics.
 
-`openrvt schema-prefix-probe model.rvt` resolves one exact class name (default:
+`groma schema-prefix-probe model.rvt` resolves one exact class name (default:
 `GElement`) through the strict schema and counts byte windows shaped as
 `[class index:u16][zero:u16]` while partition members are already being
 stream-decoded. Restricting the probe to an independently supported root marker
@@ -54,7 +54,7 @@ avoids treating every embedded schema type as a possible record boundary. It
 still reports candidates, not objects: field ownership requires stronger
 validation.
 
-`openrvt marker-envelopes model.rvt` keeps the schema-resolved marker of one
+`groma marker-envelopes model.rvt` keeps the schema-resolved marker of one
 exact class and stores a bounded byte window around every candidate together
 with its partition, member index, and offset inside that member's inflated
 stream. Capture stays streaming and budgeted: context is limited to 4,096
@@ -95,7 +95,7 @@ capture path is covered by tests while the corpus numbers stay local.
 
 ## Member framing
 
-`openrvt member-framing model.rvt` validates two structures at once and reports
+`groma member-framing model.rvt` validates two structures at once and reports
 only what it could confirm: the fixed descriptor in front of every compressed
 member, and the record array inside the decoded member.
 
@@ -221,7 +221,7 @@ predicts. `+2` holds category-range values for 19.1% of records with 0% at the
 neighbouring offsets, and `+6` matches `ElemTable` for 25.0%, again with 0%
 next to it. Across the three models 17.9-21.6% of headers carry a category and
 79.4-90.6% a family reference, with 269, 830, and 1,423 distinct category
-codes. `openrvt element <id>` now reports both.
+codes. `groma element <id>` now reports both.
 
 Confidence. High for `+2` and `+6`. The four later `ElementId` slots are read
 at the alignment the schema implies but show no independent signal, so they are
@@ -573,7 +573,7 @@ export in world coordinates within `1e-9`.
 ### Result: the walk had three compensating two-byte errors, and each one measured worse alone
 
 Observation. Face-bearing `GElement` records tiled exactly 88.0% / 84.8% /
-71.9% of the time on SMALL / MEDIUM / BIG, and `openrvt brep` showed that
+71.9% of the time on SMALL / MEDIUM / BIG, and `groma brep` showed that
 97.5% / 99.97% / 99.8% of every excluded B-Rep face sat in a record that had
 not tiled. The framing, not the geometry, was the whole of the gap. One
 misread was located by hand: record 635645's tenth face named a first loop
@@ -591,7 +591,7 @@ class the schema fixes - `GEdgeLoop.m_nextLoop` and `GFace.m_pFirstLoop`, both
 naming an edge loop - read six bytes at both candidate offsets and keep the one
 that lands on a live reference of that class: one class index out of 4 418, so a
 two-byte misread has no way to pass. Then cross-tabulate the label against every
-candidate the header carries. `openrvt flags-probe` is that instrument.
+candidate the header carries. `groma flags-probe` is that instrument.
 
 Result. The hypothesis is refuted, and there is nothing to find: across 73 354
 labelled sites on SMALL and 123 473 on BIG, **every** one proves four bytes and
@@ -634,7 +634,7 @@ declaration as declared and does not interpret the value.
 
 ### Result: three verification gates, not the decode, were withholding the geometry
 
-Observation. `openrvt brep` resolved 12 330 / 7 222 / 8 945 bodies whose every
+Observation. `groma brep` resolved 12 330 / 7 222 / 8 945 bodies whose every
 face came out, but the IFC export carried 8 / 1 / 43 closed solids and SMALL's
 JSON put B-Rep faces on 136 elements. The bodies were decoded and not reaching
 any element.
@@ -643,7 +643,7 @@ Hypothesis. The element -> symbol -> body -> placement hop is failing, and the
 failure is in one of its gates rather than in the decode.
 
 Experiment. Instrument the hop as a funnel, counting the instances that survive
-each gate in turn, and report it from `openrvt export-ifc`
+each gate in turn, and report it from `groma export-ifc`
 (`report_symbol_link_funnel`). Then, for the gate that loses the most, measure
 what it is actually rejecting rather than assuming.
 
@@ -1014,7 +1014,7 @@ building classes the exporter emits, and `RoomElem` is not one of them, so
 rooms - a number an agent reads as "this model has no rooms". The filter is
 right; saying nothing about what it removed was not.
 
-Fixed in `openrvt-api`: `/levels` publishes `level_ids`, `ambiguous_name` and
+Fixed in `groma-api`: `/levels` publishes `level_ids`, `ambiguous_name` and
 per-storey `model_elements` and `rooms` counts, `/elements?storey=` filters on
 the whole folded set (an id that is not a storey is a 400, not an empty page),
 `/summary` carries `model_elements_without_level`, and a page reports
@@ -1022,7 +1022,7 @@ the whole folded set (an id that is not a storey is a 400, not an empty page),
 
 ### Result: the bodies the export never asks for are the building itself
 
-Observation. `openrvt brep` assembles 43 622 bodies from AR S1's face-bearing
+Observation. `groma brep` assembles 43 622 bodies from AR S1's face-bearing
 records while the IFC carries 1 468 shapes, and the JSON puts geometry on 577
 of 17 377 model elements - none of them a wall, a floor, a stair or a roof.
 The symbol-link funnel accounts for only its own path: 3 140 instances name a
@@ -1033,7 +1033,7 @@ Hypothesis. The classes with no geometry have no body in the file, and their
 shape would have to be constructed from their parameters.
 
 Experiment. A body is decoded from a `GElement` record, and that record carries
-the element id it belongs to, so every body already names an owner. `openrvt
+the element id it belongs to, so every body already names an owner. `groma
 body-owners` tallies the decoded bodies by the owning element's class, and
 against each owner asks three further questions: does any instance name it as
 a symbol, does the body's own extent reproduce the bounds block in the same
@@ -1330,7 +1330,7 @@ first loop"`. This tier moved the gate from "no box to check against" to
 
 The entry above ended on the exclusion that now dominates every other:
 `"face has no first loop"`, 76 510 of AR S1's 80 205 excluded faces.
-`openrvt loop-owner-probe` is the measurement, on AR S1, KJ S1, ВК S1 and ОВ S1.
+`groma loop-owner-probe` is the measurement, on AR S1, KJ S1, ВК S1 and ОВ S1.
 
 *What such a face is.* `assemble_face` reads the boundary from the face's own
 first reference, `GFace.m_pFirstLoop`. The faces that fail carry a literal
@@ -1413,7 +1413,7 @@ elsewhere evidence rather than a failure to find.
 ### Result: nothing is missing from the record - the boundary is a written null
 
 The entry above ended by pointing at the identifiers those broken chains end
-on. There are none: they end on zero. `openrvt identifier-probe` asks the
+on. There are none: they end on zero. `groma identifier-probe` asks the
 question properly and the answer closes the direction rather than opening it.
 
 *Why an identifier could have been missing.* A node reaches a record's node
@@ -1627,7 +1627,7 @@ ones: on AR S1, 4 349 faces meet ambiguously at a corner, 268 do not close,
 **all 11 896 with zero failures** - `IfcWall` 9 077 -> 9 157, and the whole
 gain is walls - and `ifcopenshell.validate --rules` reports no issues.
 
-The export gains 81 solids where `openrvt brep` gains 732 whole records, and the
+The export gains 81 solids where `groma brep` gains 732 whole records, and the
 difference is [`keep_body`]: 13 127 of AR S1's body-bearing records are held
 out by keeping one body per element id, so a record completed for the first
 time is usually not the one its element kept.
@@ -1956,7 +1956,7 @@ carries exactly that - no residue, on any of the three files. Unlike every
 other surface read so far it declares no frame at all, so both profiles are
 already in the body's own coordinates.
 
-`openrvt ruled-surf-probe` is the census. It reports, per file, the class pair
+`groma ruled-surf-probe` is the census. It reports, per file, the class pair
 the two references name, whether the named object is written in the same
 record, what each point holds, the envelope, and what the adjacent edges'
 `EdgePnt`s do on the surface's two axes.
@@ -2112,7 +2112,7 @@ type property. The candidate was `VWall.m_WallAttributesId`, added to
 `TYPE_ELEMENT_ID_PROPERTIES` and measured the way `m_masterSymbolId` and
 `RbsCurve.m_idType` were.
 
-Experiment: `openrvt layers` on AR S1 and S2, the two corpus files that ship the
+Experiment: `groma layers` on AR S1 and S2, the two corpus files that ship the
 IFC Revit itself exported from the same model. That export is an answer this
 project did not produce and it carries, per wall, the Revit element id
 (`IfcWall.Tag`), the type's name (`IfcWall.Name`) and an
@@ -2197,7 +2197,7 @@ Observation: the layer table decoded but went nowhere. Neither export emitted
 it, so nothing outside the instrument could see what a wall is made of.
 
 Hypothesis: the same `...AttributesId` reading covers every compound host, not
-just walls. `openrvt schema --property AttributesId` returns exactly five
+just walls. `groma schema --property AttributesId` returns exactly five
 declarations in the whole schema - `VWall.m_WallAttributesId`,
 `Floor.m_floorAttributesId`, `RoofBase.m_roofAttributesId`,
 `Ceiling.m_ceilingAttributesId` and `HostInfill.m_AttributesId` - so the
@@ -2230,7 +2230,7 @@ Against Revit's own export, by product:
 | same material names, in order | 5 582 | **5 858** |
 | every layer's share agreeing to 1e-6 | 5 590 | 5 858 |
 
-Run twice on S1, once against the `openrvt layers` report and once against our
+Run twice on S1, once against the `groma layers` report and once against our
 own `export-ifc` output: **identical numbers**, so nothing is lost between the
 decode and the file. (`IfcPlate` is the one exception, 37 linked from the
 report and 0 from our IFC: we type those products differently, so the join

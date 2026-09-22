@@ -1,5 +1,5 @@
-openRVT
-Copyright (C) 2026 openRVT contributors
+groma
+Copyright (C) 2026 groma contributors
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU Affero General Public License as published by the Free
@@ -15,26 +15,34 @@ with this program. If not, see <https://www.gnu.org/licenses/>.
 
 The full license text is in the LICENSE file at the root of this repository.
 
-Because openRVT is offered under the AGPL, section 13 applies: if you modify it
+Because groma is offered under the AGPL, section 13 applies: if you modify it
 and let users interact with it remotely over a network — for example by running
-the `openrvt-api` server, or a service built on these crates — those users must be
+the `groma-api` server, or a service built on these crates — those users must be
 offered the corresponding source of your modified version.
 
 
 ## Relationship to Autodesk
 
-openRVT is an independent, clean-room, read-only implementation. It is not
+groma is an independent, clean-room, read-only implementation. It is not
 affiliated with, endorsed by, or derived from Autodesk, Inc.
 
 "Autodesk", "Revit", "RVT" and "BIM 360" are trademarks or registered
 trademarks of Autodesk, Inc. They are used here only nominatively — to state
-which file format this software reads — and not as branding for this project.
+which file formats this software reads — and not as branding for this project:
+the name "groma" is a Roman surveying instrument and refers to no product of
+Autodesk's. Where an earlier name of this project survives, it survives inside
+a file format rather than on it — the eight bytes a packed scene begins with,
+documented in `crates/scene-pack` and kept because scenes already written
+carry them.
 
-openRVT contains no Autodesk source code, no decompiled Autodesk binaries, no
+groma contains no Autodesk source code, no decompiled Autodesk binaries, no
 Autodesk SDK, and no code derived from the Revit API or the ODA BimRv SDK. The
 format knowledge in `docs/` was obtained by observing bytes in files the
 project's authors were entitled to read, and every recovered rule is recorded
 with the measurement that justifies it.
+
+The IFC side reads and writes ISO 10303-21 and IFC4, which are open published
+standards; nothing in this paragraph is needed for that half of the work.
 
 Two boundaries are deliberate and must be preserved by contributors:
 
@@ -58,7 +66,7 @@ depends on staying inside the two boundaries above.
 
 ## Third-party components
 
-openRVT's dependencies are declared in `Cargo.toml` and pinned in `Cargo.lock`;
+groma's dependencies are declared in `Cargo.toml` and pinned in `Cargo.lock`;
 each carries its own license. Run `cargo tree` to enumerate them.
 
 The viewer page ships as a built bundle, `web/viewer-ui.js`, so unlike the Rust

@@ -13,7 +13,7 @@
 //! Coordinates stay in the symbol's own local frame and Revit internal feet;
 //! callers apply the instance's `GInstance` transform afterward.
 //!
-//! What one record could not settle, `openrvt brep FILE` measures over all of
+//! What one record could not settle, `groma brep FILE` measures over all of
 //! them: faces resolved, bodies whose every face resolved, and each excluded
 //! face grouped by the reason given here. Reading an edge from both adjacent
 //! cylinders rather than dropping it was accepted on that - faces resolved

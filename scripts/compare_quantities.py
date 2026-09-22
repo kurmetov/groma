@@ -7,7 +7,7 @@ element, joined to ours on the element identifier in `IfcElement.Tag`. Revit's
 number comes from its own kernel, so it is an answer this project did not
 produce - the independent oracle for anything that changes the solid.
 
-    openrvt export-ifc model.rvt --output ours.ifc --base-quantities
+    groma export-ifc model.rvt --output ours.ifc --base-quantities
     scripts/compare_quantities.py revit-export.ifc ours.ifc
 
 Products are grouped by the `IfcShapeRepresentation.RepresentationType` our

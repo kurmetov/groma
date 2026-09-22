@@ -18,7 +18,7 @@ MODELS=${MODELS:-data/api}
 mkdir -p "$SCENES" "$MODELS"
 
 echo "building (release, so a big model is not decoded by a debug build)..."
-cargo build --release -p openrvt-api -p openrvt-cli
+cargo build --release -p groma-api -p groma-cli
 
 # Refuse to start on a port already in use rather than failing obscurely.
 if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
@@ -27,8 +27,8 @@ if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
 fi
 
 echo
-exec ./target/release/openrvt-api \
-  --openrvt "$PWD/target/release/openrvt" \
+exec ./target/release/groma-api \
+  --groma "$PWD/target/release/groma" \
   --data "$MODELS" \
   --scenes "$SCENES" \
   --viewer "$PWD/web" \

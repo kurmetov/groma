@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "apps/openrvt-api",
-    "apps/openrvt-cli",
+    "apps/groma-api",
+    "apps/groma-cli",
     "crates/bim-core",
     "crates/bim-convert",
     "crates/bim-mesh",

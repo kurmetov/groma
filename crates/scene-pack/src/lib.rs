@@ -12,7 +12,7 @@
 //!
 //! # Why a format rather than JSON
 //!
-//! `openrvt export-json --full` states the same model as text and costs 794 MB
+//! `groma export-json --full` states the same model as text and costs 794 MB
 //! on one 800 000-element file. Nearly all of it is geometry written as
 //! decimal, which a browser then has to parse before it can draw anything.
 //! This format writes geometry as the buffers a GPU already wants, so loading
@@ -60,6 +60,12 @@ const CHUNK_FLUSH_BATCH: usize = 8;
 const TESSELLATION_BATCH: usize = 1024;
 
 /// `OPENRVTS`, the eight bytes every scene begins with.
+///
+/// The name this project used when the format was settled. It stays: these
+/// eight bytes, the trailer below and the `format` string are already written
+/// into every scene on disk, and are read by a viewer that is now a separate
+/// project. A wire format identifies itself, it does not carry branding, so
+/// renaming it would cost every existing file for nothing.
 pub const MAGIC: &[u8; 8] = b"OPENRVTS";
 /// `OPENRVTE`, the eight bytes every scene ends with.
 pub const TRAILER_MAGIC: &[u8; 8] = b"OPENRVTE";

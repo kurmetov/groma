@@ -295,7 +295,7 @@ fn fill_project_identity(settings: &mut ExportSettings, identity: Option<&BimPro
 }
 
 // The command's own arguments, one parameter each. They are the flags
-// `openrvt export-ifc` declares, and grouping them into a struct here would put
+// `groma export-ifc` declares, and grouping them into a struct here would put
 // a second shape between the parser and this function for nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn export_ifc(
@@ -346,7 +346,7 @@ pub(crate) fn export_ifc(
         .file_stem()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or("openRVT Project")
+        .unwrap_or("groma Project")
         .to_owned();
     let level_count = conversion.model.levels.len();
     let element_count = conversion.model.elements.len();

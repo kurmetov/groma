@@ -2,7 +2,7 @@
 //! memory, and answer the questions an agent asks of it.
 //!
 //! The store deliberately does no decoding of its own. It reads what
-//! `openrvt export-json` produced, so anything it reports is traceable to that
+//! `groma export-json` produced, so anything it reports is traceable to that
 //! artefact and to the `source` record inside it, and a decode improvement
 //! reaches the API by re-running the export rather than by changing this.
 
@@ -669,21 +669,23 @@ mod tests {
             r#"{"id":9,"class":"SWall","created_phase_id":3}"#,
             r#"{"id":10,"class":"Level","name":"02 Этаж","elevation_meters":6.6}"#,
         ];
-        // Each test gets its own file: the suite runs them in parallel and a
-        // shared path lets one test read another's half-written artefact.
+        // A directory per test, not a file per test in a shared one. The suite
+        // runs in parallel, and a directory two tests both create and both
+        // remove can be taken away between another test's `create_dir_all` and
+        // its `write`, which fails that write for a reason nothing about the
+        // failing test explains. Owning the directory outright removes the
+        // race rather than narrowing it.
         let directory =
-            std::env::temp_dir().join(format!("openrvt-api-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("groma-api-test-{}-{test}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join(format!("{test}.jsonl"));
         std::fs::write(&path, lines.join("\n")).unwrap();
         let (model, skipped) = Model::load(test, &path).unwrap();
         assert_eq!(skipped, 0);
-        // `load` has read the whole file, so nothing needs it after this. Both
-        // removals run while other tests of this process may still hold files
-        // here: the directory only goes when the last of them has taken its
-        // own away, and fails harmlessly until then rather than being retried.
+        // `load` has read the whole file, so nothing needs either of these
+        // after this, and nothing else can be holding them.
         std::fs::remove_file(&path).unwrap();
-        drop(std::fs::remove_dir(&directory));
+        std::fs::remove_dir(&directory).unwrap();
         model
     }
 

@@ -1,4 +1,4 @@
-//! A read-only HTTP/JSON API over the models `openrvt export-json` produced, so
+//! A read-only HTTP/JSON API over the models `groma export-json` produced, so
 //! an agent can be given tools against them and a retrieval index can be fed
 //! from them.
 //!
@@ -71,11 +71,11 @@ const MAX_LIMIT: usize = 1000;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "openrvt-api",
+    name = "groma-api",
     about = "Read-only HTTP/JSON API over exported RVT models"
 )]
 struct Cli {
-    /// Directory of `<model>.jsonl` files written by `openrvt export-json`.
+    /// Directory of `<model>.jsonl` files written by `groma export-json`.
     #[arg(long)]
     data: PathBuf,
     /// Address to listen on.
@@ -87,7 +87,7 @@ struct Cli {
     /// Load every model at startup instead of on first use.
     #[arg(long)]
     preload: bool,
-    /// Directory of `<scene>.rvs` files written by `openrvt export-scene`. With
+    /// Directory of `<scene>.rvs` files written by `groma export-scene`. With
     /// one, `/viewer` draws them; without one, the scene routes are absent.
     #[arg(long)]
     scenes: Option<PathBuf>,
@@ -96,11 +96,11 @@ struct Cli {
     /// API alone and those routes are absent.
     #[arg(long)]
     viewer: Option<PathBuf>,
-    /// The `openrvt` binary that converts an uploaded model. Defaults to the one
+    /// The `groma` binary that converts an uploaded model. Defaults to the one
     /// beside this executable; without either, uploading is refused and the
     /// scenes already on disk are still served.
     #[arg(long)]
-    openrvt: Option<PathBuf>,
+    groma: Option<PathBuf>,
     /// Largest upload accepted, in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_UPLOAD_BYTES)]
     max_upload: u64,
@@ -203,7 +203,7 @@ fn error(status: u16, message: &str) -> Response<Cursor<Vec<u8>>> {
 
 fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap_or_else(|()| {
-        Header::from_bytes(&b"X-openRVT"[..], &b"header"[..]).expect("static header")
+        Header::from_bytes(&b"X-groma"[..], &b"header"[..]).expect("static header")
     })
 }
 
@@ -523,8 +523,8 @@ fn serve_upload(
     let Some(slot) = slot else {
         return request.respond(error(
             503,
-            "this server cannot convert uploads: no openrvt binary was found beside it, \
-             and none was given with --openrvt",
+            "this server cannot convert uploads: no groma binary was found beside it, \
+             and none was given with --groma",
         ));
     };
     if request.method() != &tiny_http::Method::Post {
@@ -647,8 +647,8 @@ fn serve_export_ifc(
     let Some(slot) = slot else {
         return request.respond(error(
             503,
-            "this server cannot export: no openrvt binary was found beside it, \
-             and none was given with --openrvt",
+            "this server cannot export: no groma binary was found beside it, \
+             and none was given with --groma",
         ));
     };
     if request.method() != &tiny_http::Method::Post {
@@ -779,8 +779,8 @@ fn serve_export_json(
     let Some(slot) = slot else {
         return request.respond(error(
             503,
-            "this server cannot export: no openrvt binary was found beside it, \
-             and none was given with --openrvt",
+            "this server cannot export: no groma binary was found beside it, \
+             and none was given with --groma",
         ));
     };
     if request.method() != &Method::Post {
@@ -1138,7 +1138,7 @@ fn handle(
             200,
             &serde_json::json!({
                 "status": "ok",
-                "service": "openrvt-api",
+                "service": "groma-api",
                 "models": store.available(),
                 "routes": [
                     "/models",
@@ -1223,14 +1223,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         None => None,
     };
     let uploads = scenes.as_ref().and_then(|_| {
-        let openrvt = cli
-            .openrvt
+        let groma = cli
+            .groma
             .clone()
-            .or_else(upload::openrvt_beside_this_executable)?;
+            .or_else(upload::groma_beside_this_executable)?;
         Some(Arc::new(ConversionSlot {
             uploads: Uploads {
                 scenes: cli.scenes.clone()?,
-                openrvt,
+                groma,
                 max_bytes: cli.max_upload,
             },
             running: Arc::new(Mutex::new(())),
@@ -1304,7 +1304,7 @@ fn announce(
     models: usize,
 ) {
     println!(
-        "openrvt-api listening on http://{} over {} ({} model(s))",
+        "groma-api listening on http://{} over {} ({} model(s))",
         cli.addr,
         cli.data.display(),
         models
@@ -1316,7 +1316,7 @@ fn announce(
             names.len(),
             cli.addr,
             if names.is_empty() {
-                "none yet - upload one, or run `openrvt export-scene`".to_owned()
+                "none yet - upload one, or run `groma export-scene`".to_owned()
             } else {
                 names.join(", ")
             }
@@ -1336,7 +1336,7 @@ fn announce(
         }
         match uploads {
             Some(slot) => {
-                println!("uploads convert with {}", slot.uploads.openrvt.display());
+                println!("uploads convert with {}", slot.uploads.groma.display());
                 // Said out loud, because "why was my file refused" should not
                 // need a reading of the source. An IFC is held in memory to be
                 // parsed and so stops sooner than an RVT does.
@@ -1349,7 +1349,7 @@ fn announce(
                 );
             }
             None => println!(
-                "uploads are refused: no `openrvt` binary beside this one, and no --openrvt given"
+                "uploads are refused: no `groma` binary beside this one, and no --groma given"
             ),
         }
         // The upload route writes files and runs a converter, so it is worth

@@ -1,6 +1,6 @@
 # Architecture
 
-openRVT is deliberately split at format boundaries so that uncertain
+groma is deliberately split at format boundaries so that uncertain
 reverse-engineering work cannot leak into the canonical BIM model.
 
 ```text

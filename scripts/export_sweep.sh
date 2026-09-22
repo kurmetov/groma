@@ -9,7 +9,7 @@
 # Each IFC is counted and then deleted: the corpus is 50 files of a few hundred
 # megabytes each and only the counts are wanted.
 set -u
-openrvt=${OPENRVT:-./target/release/openrvt}
+groma=${GROMA:-./target/release/groma}
 out=${1:?usage: export_sweep.sh <output.tsv>}
 work=${WORK:-data/test/project/ifc-out/sweep}
 mkdir -p "$work"
@@ -18,7 +18,7 @@ for f in data/test/project/extracted/*/*.rvt; do
   name=$(basename "$f" .rvt)
   ifc="$work/$name.ifc"
   started=$SECONDS
-  if log=$("$openrvt" export-ifc "$f" --include-unplaced -o "$ifc" 2>&1); then
+  if log=$("$groma" export-ifc "$f" --include-unplaced -o "$ifc" 2>&1); then
     status=ok
   else
     status=failed

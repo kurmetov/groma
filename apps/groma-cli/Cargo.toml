@@ -1,13 +1,13 @@
 [package]
-name = "openrvt-cli"
-description = "Command-line inspection tools for openRVT"
+name = "groma-cli"
+description = "Command-line inspection tools for groma"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "openrvt"
+name = "groma"
 path = "src/main.rs"
 
 [dependencies]

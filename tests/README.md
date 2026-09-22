@@ -1,7 +1,7 @@
 # Cross-crate tests
 
 Unit tests live beside their parsers, and the CLI's end-to-end tests are in
-`apps/openrvt-cli/tests/`. Both run on synthetic CFB files built at runtime, so
+`apps/groma-cli/tests/`. Both run on synthetic CFB files built at runtime, so
 they need no `.rvt` model and run in CI.
 
 ## `baseline/corpus_metrics.tsv`
@@ -16,16 +16,16 @@ what is committed instead is the *result* of measuring them - counts only, keyed
 by the `SMALL`/`MEDIUM`/`BIG` prefix of a file's name. No bytes and no client
 file names appear here.
 
-`apps/openrvt-cli/tests/corpus_regression.rs` re-measures those numbers and fails
+`apps/groma-cli/tests/corpus_regression.rs` re-measures those numbers and fails
 if any moved the wrong way. It is opt-in, because it needs the corpus:
 
 ```bash
 scripts/corpus_check.sh                   # measure and compare
 scripts/corpus_check.sh --write           # accept the current numbers
-OPENRVT_CORPUS=/path/to/models scripts/corpus_check.sh
+GROMA_CORPUS=/path/to/models scripts/corpus_check.sh
 ```
 
-Without `OPENRVT_CORPUS` the test skips, so `cargo test --workspace` stays fast
+Without `GROMA_CORPUS` the test skips, so `cargo test --workspace` stays fast
 and CI - which has no corpus - still runs everything it can.
 
 Run it before and after any change to the record walk. The reason: a change
