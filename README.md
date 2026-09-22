@@ -29,8 +29,8 @@ parameter names, without their units, and without any category-driven IFC
 classification, leaving only the handful of mappings made from class names.
 `groma info` states which of the two applies to a file, `export-scene` and
 `export-ifc` say so when neither does, `export-json --full` writes it as
-`parameter_catalog`, and a converted scene carries the same answer into the
-viewer, which marks a model read without a catalog.
+`parameter_catalog`, and a converted scene carries the same answer in its
+manifest, so a reader can mark a model read without a catalog.
 
 The two releases do not stand on the same evidence, and it is worth being
 precise about the difference.
@@ -428,18 +428,6 @@ are the flags by name - `length-unit`, `base-quantities`, `no-types`,
 `no-ifc-common-property-sets`, `class-mapping` -
 and a parameter this server does not have is a 400 rather than a file that is
 quietly not what was asked for.
-## Rooms in the viewer
-
-A room bounds volume; it is not a thing you can touch. The viewer draws one as
-a faint translucent shell that never hides what stands inside it, and its body
-is not clickable at all - a room encloses everything in it, so clicking one
-would select the room instead of what is being pointed at.
-
-A room is selected by the ring at the centre of its extent. Rings are
-depth-tested in the solid view, so you can select a room where you can see one,
-and drawn through everything in X-ray, which is the mode for seeing what is
-behind something.
-
 ## Federating several files
 
 `export-scene` and `export-ifc` accept more than one source file and read them
@@ -461,8 +449,8 @@ A **single** file is never renamed. Its identifiers, and every IFC `GlobalId`
 derived from them, reach the output exactly as its reader stated them.
 
 The scene records one entry per file in `documents`, and each element indexes
-the one it came from, so the viewer shows a **Files** panel for a federated
-model and hides one discipline at a time.
+the one it came from, which is what lets a reader list the files a federated
+model was built from and hide one discipline at a time.
 
 The server takes a federation as one upload per file under a shared set name,
 the last marked complete:
@@ -475,8 +463,7 @@ curl -X POST --data-binary @mep.ifc 'localhost:8800/upload?name=mep.ifc&set=towe
 
 Each of the first two replies with how many files are held; the last starts one
 job that reads them all and answers with it. `POST /export-ifc` takes the same
-three parameters. Dropping several files on the viewer's model panel does this
-for you.
+three parameters.
 
 **Coordinates are not reconciled.** Each file's geometry arrives in whatever
 world system that file stated. Files exported from one coordinated project
@@ -504,77 +491,16 @@ section is raw deflate, which a browser decompresses natively through
 `DecompressionStream("deflate-raw")`; the manifest is located by a 24-byte
 trailer, so a reader needs two range requests before the first triangle. A face
 the tessellator cannot read is counted and reported, never replaced by a box.
-The viewer provides perspective and orthographic plan/front/right views, an
-X-ray mode with a translucent ghosted shell and depth-tested edges on the dark canvas,
-persistent point-to-point metric measurements (including multiple rulers), and
-a relationship graph for the selected element. The graph combines the
-relations the source file states with the element's recovered level, type,
-category, Revit class, and IFC export class, and each related element is a
-node you can open to re-root the graph there. From an IFC those relations are
-read outright: which wall hosts a door or window (composed from the stated
-`IfcRelVoidsElement` and `IfcRelFillsElement` pair, since a file never names
-the two directly), which spaces an element physically bounds, and what an
-assembly aggregates. Nothing is inferred from geometry, and an edge whose
-either end is not an element - an opening, a storey, a group - is dropped
-rather than invented. An RVT states no relations yet, so there the graph shows
-what the element is. Press `2`/`3` to switch between plan and 3D, `X` to
-toggle X-ray, `M` to enter or leave measurement mode, and `F` to frame the
-selection or model.
+The viewer is a separate project. What this repository holds is the scene:
+`export-scene` writes it, `groma-api` serves it by range, and anything able to
+read the format above can draw it. `groma-api --viewer <dir>` points the server
+at a directory holding a `viewer.html` and a `viewer-ui.js` and serves that page
+at `/` and `/viewer`; started without the flag, the server is the JSON API and
+the scene routes alone, and those two routes answer a 404 naming the flag.
 
-The same page is also the workspace, and it has three screens behind three
-routes. `/files` lists every scene the server holds as a card - a preview, the
-model's name, whether it came from an RVT or an IFC, the application that
-wrote it, and its element and level counts - and can be searched, sorted, and
-filtered by раздел. A раздел is named by its own code - АР, КЖ, КМ, ОВ, ВК,
-ЭОМ, ГП - and is not a field in any of these files: a name carrying a code
-(`..._AR01_...`, `КЖ`, `OV`, `ВК`) is read as the engineer's own answer, and a
-name that carries none falls back to what the model actually holds, weighted
-by how much of it there is - and then only to the base code of a family,
-because a category can say "structural" but never "КЖ rather than КМ". A file dropped on
-that screen is converted to a scene and opened in 3D as soon as the server has
-read it, because listing models is what someone was doing when they dropped
-one. Several models can be ticked and opened together - one tab each, and only
-the one on screen fetches geometry - which is how the architecture, the
-structure and the services of a building are read side by side; `＋` in the tab
-strip goes back for another.
-
-`/convert` is the conversion screen, and it opens nothing. It walks three
-steps in order - the files, then the output, then start - because the order is
-not ceremony: the output decides which files are even allowed (JSON reads one
-RVT), and the summary before the button is the last chance to see what a
-conversion that runs for minutes is about to be given. A step that cannot be
-honoured is refused rather than half-entered. Confirming starts a numbered
-conversion that joins a queue below: how many files it holds, how far
-it has come, and how long it has taken. Opening a queue card shows every
-source file of that conversion on its own row, each with its own progress, the
-stages it has finished with their seconds, what it produced and what it can be
-downloaded as. `/viewer` draws the models that are open, one tab each.
-
-What a card shows is read from that scene's own manifest by range, so listing
-a 450 MB scene costs the same two short requests as listing a small one, and
-the server never inflates a scene to describe it. A preview is rendered by the
-viewer itself the first time a model is opened and cached through
-`PUT /previews/{scene}`, so it is a picture of the real geometry rather than
-an approximation of it.
-
-Being one page is what makes it embeddable: another application mounts a
-single URL in an `iframe` and gets the library, the conversions and the 3D
-view, with `/viewer?tabs=NAME` linking straight to one model. Every route the
-page calls is resolved against the directory the page was served from, so the
-whole viewer also works behind a path prefix - proxied at `/groma/viewer`
-inside another application - and it degrades rather than breaks where an
-embedder denies it history or storage access.
-
-The product shell is written in React (`web/src/viewer-ui.jsx`) and bundled
-with Anime.js into `web/viewer-ui.js`; the WebGL reader remains a focused
-inline engine in `web/viewer.html`. Rebuild the UI before compiling the Rust
-server whenever the React components change:
-
-```bash
-npm ci
-npm run build:web
-cargo build --release -p groma-api
-```
+The eight bytes `OPENRVTS` that open the format are the name this project used
+when the format was settled, and are kept because scenes already written carry
+them; `crates/scene-pack` says so where the constants are declared.
 
 Unknown stream bytes are always available through `dump-stream` and the
 `rvt-container` API.
@@ -604,7 +530,7 @@ Writers:
 Applications:
 
 - `groma-cli`: command-line interface
-- `groma-api`: HTTP server and the viewer it serves
+- `groma-api`: read-only HTTP/JSON server over exported models and scenes
 
 Every reader ends at `bim-core` and every writer starts there, so a new source
 format is a reader crate plus an arm in `Format::sniff` - not a change to any

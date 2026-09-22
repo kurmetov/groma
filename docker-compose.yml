@@ -1,5 +1,9 @@
-# Run the viewer:  docker compose up --build
-# Then open:       http://127.0.0.1:8800/viewer
+# Run the server:  docker compose up --build
+# Then open:       http://127.0.0.1:8800/api
+#
+# The viewer is a separate project and is not in this image. To draw the scenes
+# this holds, mount a directory with its `viewer.html` and `viewer-ui.js` and
+# add `--viewer <dir>` to the entrypoint's arguments.
 
 services:
   groma:

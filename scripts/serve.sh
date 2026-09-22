@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Build and run the viewer locally, without Docker.
+# Build and run the server locally, without Docker.
 #
 #   scripts/serve.sh                 # release build, port 8800
 #   scripts/serve.sh 9000            # another port
 #   SCENES=/path/to/scenes scripts/serve.sh
+#   VIEWER=/path/to/viewer scripts/serve.sh   # serve a page at /viewer too
 #
 # Stop it with Ctrl-C. Scenes are served from $SCENES (default data/scenes);
 # anything uploaded through the page is converted into the same directory.
@@ -31,5 +32,5 @@ exec ./target/release/groma-api \
   --groma "$PWD/target/release/groma" \
   --data "$MODELS" \
   --scenes "$SCENES" \
-  --viewer "$PWD/web" \
+  ${VIEWER:+--viewer "$VIEWER"} \
   --addr "127.0.0.1:$PORT"
