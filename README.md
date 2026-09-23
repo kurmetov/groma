@@ -509,6 +509,54 @@ at a directory holding a `viewer.html` and a `viewer-ui.js` and serves that page
 at `/` and `/viewer`; started without the flag, the server is the JSON API and
 the scene routes alone, and those two routes answer a 404 naming the flag.
 
+## Scene versions
+
+Converting a model the server has converted before does not overwrite the
+scene. Each conversion writes the next version under
+`versions/<scene>/<n>.rvs`, the name resolves to the newest, and every version
+before it stays readable by number - which is what lets a model be converted
+again, after a decode improvement or from a newer save, without taking away
+the scene someone is already looking at.
+
+```bash
+curl -X POST --data-binary @model.rvt 'localhost:8800/upload?name=model'
+# {"job":"...","scene":"model","version":2,...}
+curl 'localhost:8800/scenes/model/versions'
+# {"scene":"model","current":2,"versions":[{"version":1,...},{"version":2,...}]}
+curl 'localhost:8800/scenes/model?version=1' -H 'Range: bytes=-24'
+```
+
+`GET /scenes/{scene}` answers out of the newest version and states which one
+that was in a `Scene-Version` header. A viewer reads this format over several
+range requests - the trailer, then the manifest, then the chunks it means to
+draw - so it takes the version from the first answer and asks for that one by
+name afterwards; without that, a conversion landing between two requests would
+have it stitch one version's trailer to another's chunks with neither side
+noticing. `/scenes` reports each scene's current version and how many are kept.
+
+A version number is never reused. Deleting a version frees its bytes but not
+its number, so a reader that pinned version 3 is never later handed a
+different model under that name. `DELETE /scenes/{scene}?version=N` removes
+one version - including the newest, which makes the one before it current
+again, the way back from a conversion that came out worse than the one it
+followed - and refuses with a 409 when it is the only version there is, since
+that is deleting the scene rather than a version of it.
+`DELETE /scenes/{scene}` is that request: it takes the whole history, the
+cached preview, and - with `?source=rvt|ifc` - the file it was converted from.
+
+Two things are deliberately *not* versioned. The uploaded model itself is not:
+one upload per scene name is kept, the most recent, because the corpus runs to
+450 MB a file and keeping every one of them would cost more than the scenes
+do. Neither is the cached preview, which is a picture of whatever version was
+newest when a viewer drew it: a conversion that lands drops it rather than
+showing yesterday's model on the card.
+
+A scene already on disk from before any of this - a plain `<scene>.rvs` in the
+scene directory, which is what `groma export-scene` writes and what every
+scene converted before versions existed is - is read as that scene's version
+1. Its next conversion is version 2, so its history starts where it actually
+started rather than at the first conversion after the change.
+
 The eight bytes `OPENRVTS` that open the format are the name this project used
 when the format was settled, and are kept because scenes already written carry
 them; `crates/scene-pack` says so where the constants are declared.

@@ -196,19 +196,36 @@ impl Uploads {
         let _ = std::fs::remove_dir_all(self.set_directory(set));
     }
 
-    /// Start the conversion. The child's stdout carries one JSON object per
-    /// stage, which [`stream_progress`] forwards to the caller as it arrives.
+    /// Where converting this scene next would write: one past its newest
+    /// version. Asked before the conversion starts so the caller can report
+    /// the version a job is producing and measure the file as it grows.
     ///
     /// # Errors
     ///
-    /// Fails where the converter cannot be started.
+    /// Fails where the name could not resolve inside the scene directory, or
+    /// where the directory for it cannot be made.
+    pub fn next_scene_version(&self, scene_name: &str) -> std::io::Result<PathBuf> {
+        crate::scenes::next_version_path(&self.scenes, scene_name)
+    }
+
+    /// Start the conversion. The child's stdout carries one JSON object per
+    /// stage, which [`stream_progress`] forwards to the caller as it arrives.
+    ///
+    /// The scene is written as a new version rather than over the one that is
+    /// there, so a model can be converted again - after a decode improvement,
+    /// or from a newer save - without taking away the scene someone is
+    /// already looking at.
+    ///
+    /// # Errors
+    ///
+    /// Fails where the converter cannot be started, or where the version to
+    /// write could not be settled.
     pub fn convert(
         &self,
         sources: &[PathBuf],
-        scene_name: &str,
+        scene: &Path,
         formats: &[Format],
     ) -> std::io::Result<Child> {
-        let scene = self.scenes.join(format!("{scene_name}.rvs"));
         let mut command = Command::new(&self.groma);
         command.arg("export-scene");
         // Several sources are read as one federated model. The converter
@@ -217,7 +234,7 @@ impl Uploads {
         for source in sources {
             command.arg(source);
         }
-        command.arg("--output").arg(&scene).arg("--progress");
+        command.arg("--output").arg(scene).arg("--progress");
         // The converter guards its own reading with the same ceiling, derived
         // the same way from the same host. It is passed explicitly all the
         // same: this server may have been given a different `--max-upload`,

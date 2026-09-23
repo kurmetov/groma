@@ -579,6 +579,22 @@ fn serve_upload(
         set,
         bytes,
     } = received;
+    // Settled before the job is announced, so the reply can say which version
+    // it is making rather than leaving the client to find out by listing.
+    let scene = match slot.uploads.next_scene_version(&stem) {
+        Ok(scene) => scene,
+        Err(failure) => {
+            for source in &sources {
+                let _ = std::fs::remove_file(source);
+            }
+            if let Some(set) = &set {
+                slot.uploads.discard_set(set);
+            }
+            eprintln!("scene {stem}: {failure}");
+            return request.respond(error(500, "the scene version could not be settled"));
+        }
+    };
+    let version = scene_version_of(&scene);
     let label = format_label(&formats);
     if let Ok(mut held) = job.lock() {
         describe_batch(&mut held, &id, params, "scene");
@@ -593,6 +609,7 @@ fn serve_upload(
         &serde_json::json!({
             "job": id,
             "scene": stem,
+            "version": version,
             "format": label,
             "documents": sources.len(),
         }),
@@ -611,14 +628,20 @@ fn serve_upload(
             }
             return;
         }
-        match uploads.convert(&sources, &stem, &formats) {
-            Ok(child) => upload::follow(
-                child,
-                &stem,
-                upload::Product::Scene,
-                Some(&uploads.scenes.join(format!("{stem}.rvs"))),
-                &job,
-            ),
+        match uploads.convert(&sources, &scene, &formats) {
+            Ok(child) => {
+                upload::follow(child, &stem, upload::Product::Scene, Some(&scene), &job);
+                // The cached preview pictures the version that was newest
+                // when it was drawn. A conversion that landed has made a
+                // newer one, so the picture is of the version before it and
+                // is dropped rather than shown for the model.
+                let landed = job
+                    .lock()
+                    .is_ok_and(|held| held.state == upload::JobState::Done);
+                if landed {
+                    scenes::forget_preview_in(&uploads.scenes, &stem);
+                }
+            }
             Err(failure) => {
                 if let Ok(mut held) = job.lock() {
                     if !held.is_cancelled() {
@@ -893,29 +916,54 @@ fn serve_cancel_job(
 /// A viewer reads this format by range - 24 bytes of trailer, then the
 /// manifest, then the chunks it means to draw - so the range path is the
 /// normal one here, not an optimisation.
-fn serve_scene(scenes: Option<&Scenes>, name: &str, request: Request) -> std::io::Result<()> {
+fn serve_scene(
+    scenes: Option<&Scenes>,
+    name: &str,
+    params: &BTreeMap<String, String>,
+    request: Request,
+) -> std::io::Result<()> {
     let Some(scenes) = scenes else {
         return request.respond(error(404, "this server was started without --scenes"));
+    };
+    let version = match wanted_version(params) {
+        Ok(version) => version,
+        Err(message) => return request.respond(error(400, message)),
     };
     let wanted = request
         .headers()
         .iter()
         .find(|header| header.field.equiv("Range"))
         .and_then(|header| scenes::parse_range(header.value.as_str()));
-    match scenes.read(name, wanted) {
-        Ok((bytes, range, total)) => {
-            let mut response = Response::from_data(bytes)
+    match scenes.read(name, version, wanted) {
+        Ok(served) => {
+            let mut response = Response::from_data(served.bytes)
                 .with_header(content_type("application/octet-stream"))
-                .with_header(header("Accept-Ranges", "bytes"));
+                .with_header(header("Accept-Ranges", "bytes"))
+                // Which version these bytes came out of. A viewer reads this
+                // format over several requests, so it takes the version from
+                // the first answer and asks for that one by name afterwards;
+                // without it a conversion landing mid-read would be stitched
+                // into the one already being read.
+                .with_header(header("Scene-Version", &served.version.to_string()));
             if wanted.is_some() {
                 response = response.with_status_code(206).with_header(header(
                     "Content-Range",
-                    &format!("bytes {}-{}/{total}", range.start, range.end),
+                    &format!(
+                        "bytes {}-{}/{}",
+                        served.range.start, served.range.end, served.total
+                    ),
                 ));
             }
             request.respond(response)
         }
-        Err(SceneError::NotFound) => request.respond(error(404, "unknown scene")),
+        Err(SceneError::NotFound) => request.respond(error(
+            404,
+            if version.is_some() {
+                "unknown scene version"
+            } else {
+                "unknown scene"
+            },
+        )),
         // A 416 must state the length, so a reader that got it wrong can
         // correct itself rather than only learning that it failed.
         Err(SceneError::NotSatisfiable(total)) => request.respond(
@@ -926,7 +974,38 @@ fn serve_scene(scenes: Option<&Scenes>, name: &str, request: Request) -> std::io
             eprintln!("scene {name}: {failure}");
             request.respond(error(500, "the scene could not be read"))
         }
+        // Reading never asks to delete one, so this cannot be reached; it is
+        // answered rather than ignored so a new variant is not lost here.
+        Err(SceneError::OnlyVersion) => request.respond(error(500, "the scene could not be read")),
     }
+}
+
+/// The `version` query parameter: a version number, or none for the newest.
+///
+/// A parameter that is not a version number is refused rather than ignored: a
+/// request asking for one version and being answered with another is worse
+/// than a request that fails.
+fn wanted_version(params: &BTreeMap<String, String>) -> Result<Option<u32>, &'static str> {
+    match params.get("version").map(String::as_str) {
+        // Unstated, stated empty, and stated `latest` all mean the newest,
+        // which is what a request that does not care about versions gets.
+        None | Some("" | "latest") => Ok(None),
+        Some(value) => match value.parse::<u32>() {
+            Ok(version) if version > 0 => Ok(Some(version)),
+            _ => Err("version must be a positive whole number, or `latest`"),
+        },
+    }
+}
+
+/// The version a scene path names, read back off the file the conversion is
+/// about to write. One place settles what that path is; this only says what
+/// it turned out to be.
+fn scene_version_of(scene: &std::path::Path) -> u32 {
+    scene
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<u32>().ok())
+        .unwrap_or(1)
 }
 
 /// Delete one scene, and the file it was converted from where the caller asks
@@ -945,19 +1024,44 @@ fn serve_delete(
     let Some(scenes) = scenes else {
         return request.respond(error(404, "this server was started without --scenes"));
     };
+    let version = match wanted_version(params) {
+        Ok(version) => version,
+        Err(message) => return request.respond(error(400, message)),
+    };
     let source = params.get("source").map(String::as_str);
-    match scenes.remove(name, source) {
+    // A named version is one version; without one the request is to forget
+    // the model, which takes its whole history, its preview and - where the
+    // caller says so - the file it was converted from.
+    let removed = match version {
+        Some(version) => scenes.remove_version(name, version),
+        None => scenes.remove(name, source),
+    };
+    match removed {
         Ok(removed) => request.respond(json_response(
             200,
             &serde_json::json!({
                 "deleted": name,
+                "version": version,
                 "scene": removed.scene,
+                "versions": removed.versions,
                 "preview": removed.preview,
                 "source": removed.source,
                 "bytes": removed.bytes,
             }),
         )),
-        Err(SceneError::NotFound) => request.respond(error(404, "unknown scene")),
+        Err(SceneError::NotFound) => request.respond(error(
+            404,
+            if version.is_some() {
+                "unknown scene version"
+            } else {
+                "unknown scene"
+            },
+        )),
+        Err(SceneError::OnlyVersion) => request.respond(error(
+            409,
+            "that is the only version this scene has: delete the scene itself \
+             to remove it",
+        )),
         Err(failure) => {
             eprintln!("delete {name}: {failure:?}");
             request.respond(error(500, "the scene could not be deleted"))
@@ -1074,6 +1178,10 @@ fn handle(
                         "name": entry.name,
                         "bytes": entry.bytes,
                         "modified": entry.modified,
+                        // The version the name resolves to, and how many are
+                        // kept behind it.
+                        "version": entry.version,
+                        "versions": entry.versions,
                         "hasPreview": entry.has_preview,
                         // What deleting this model could also remove.
                         "sources": entry.sources.iter().map(|(extension, bytes)| {
@@ -1086,7 +1194,28 @@ fn handle(
         ["scenes", name] if request.method() == &Method::Delete => {
             return serve_delete(scenes, name, &params, request);
         }
-        ["scenes", name] => return serve_scene(scenes, name, request),
+        ["scenes", name] => return serve_scene(scenes, name, &params, request),
+        ["scenes", name, "versions"] => {
+            let Some(scenes) = scenes else {
+                return request.respond(error(404, "this server was started without --scenes"));
+            };
+            let versions = scenes.versions(name);
+            let Some(current) = versions.last() else {
+                return request.respond(error(404, "unknown scene"));
+            };
+            return request.respond(json_response(
+                200,
+                &serde_json::json!({
+                    "scene": name,
+                    "current": current.number,
+                    "versions": versions.iter().map(|version| serde_json::json!({
+                        "version": version.number,
+                        "bytes": version.bytes,
+                        "modified": version.modified,
+                    })).collect::<Vec<_>>(),
+                }),
+            ));
+        }
         ["previews", name] => return serve_preview(scenes, name, request),
         ["upload"] => return serve_upload(uploads, &params, request),
         ["export-ifc"] => return serve_export_ifc(uploads, &params, request),
@@ -1151,9 +1280,11 @@ fn handle(
                     "/ (the workspace: /files, /convert and /viewer - needs --viewer)",
                     "/api (this list)",
                     "/scenes",
-                    "/scenes/{scene}",
+                    "/scenes/{scene}?version= (newest when not named)",
+                    "/scenes/{scene}/versions",
                     "/previews/{scene}",
-                    "DELETE /scenes/{scene}?source=rvt|ifc",
+                    "DELETE /scenes/{scene}?source=rvt|ifc (the model and every \
+                     version of it), or ?version=N (one version)",
                     "POST /upload?name= (one file), or ?name=&set=&complete= to \
                      federate several: repeat with the same set, mark the last one \
                      complete, and every file held is read as one model",
