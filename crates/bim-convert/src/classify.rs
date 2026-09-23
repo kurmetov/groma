@@ -16,15 +16,37 @@ struct SourceMapping {
 }
 
 /// Source classes that determine the element type on their own, without a
-/// category. These are Revit's architectural system families, and the mapping
-/// is not inferred: joining our decode to the IFC Revit itself exported from
-/// the same model on the Revit element id, each of these classes maps to one
-/// IFC entity with no spread at all - `SWall` is `IfcWall` for 7 610 of 7 610
-/// matched elements, `Floor` is `IfcSlab` for 527 of 527, and the stair and
-/// roof classes for every one of theirs. A loadable `FamilyInstance` is
-/// deliberately absent: it spreads across eight IFC entities in the same
-/// join, so its category is required and the class alone may not stand in.
+/// category.
+///
+/// A loadable `FamilyInstance` is deliberately absent: it spreads across
+/// eight IFC entities in the reference join below, so its category is
+/// required and the class alone may not stand in. What is here is the system
+/// families, whose class is the element type on its own.
+///
+/// The architectural ones are measured. Joining our decode to the IFC Revit
+/// itself exported from the same model on the Revit element id, each maps to
+/// one IFC entity with no spread at all - `SWall` is `IfcWall` for 7 610 of
+/// 7 610 matched elements, `Floor` is `IfcSlab` for 527 of 527, and the stair
+/// and roof classes for every one of theirs.
+///
+/// The MEP runs below them have no reference export to join against - the
+/// corpus has none for a plumbing, ventilation or electrical model - and they
+/// are here for a different reason: each already pairs with one element type
+/// in [`SOURCE_MAPPINGS`], and a run of that class states no category of its
+/// own often enough that requiring one loses most of a model. Measured on a
+/// ventilation model of 22 783 elements, 5 432 `RbsPipeCurve` and 750
+/// `RbsDuctCurve` records declare no category; on an electrical model of
+/// 12 627, 1 355 `RbsConduitCurve` records do not. Without these rows every
+/// one of them is an anonymous proxy in a file that names the pipe beside it.
+/// A class here says no more than the row it mirrors: an `RbsConduitCurve` is
+/// a conduit run whether or not its own record repeats the category.
 const CLASS_MAPPINGS: &[(&str, BimElementType)] = &[
+    ("RbsPipeCurve", BimElementType::PipeSegment),
+    ("RbsFlexPipeCurve", BimElementType::PipeSegment),
+    ("RbsDuctCurve", BimElementType::DuctSegment),
+    ("RbsFlexDuctCurve", BimElementType::DuctSegment),
+    ("RbsConduitCurve", BimElementType::CableCarrierSegment),
+    ("CableTray", BimElementType::CableCarrierSegment),
     ("SWall", BimElementType::Wall),
     ("Floor", BimElementType::Slab),
     // A stair landing is a slab in IFC, which is what Revit emits for it.
@@ -82,6 +104,16 @@ const SOURCE_MAPPINGS: &[SourceMapping] = &[
         category_name: "OST_PipeFitting",
         element_type: BimElementType::PipeFitting,
     },
+    // The duct run's fitting, beside the pipe run's above it. The two
+    // categories are the same statement about two systems and IFC has an
+    // entity for each, so the row that carried only one of them left every
+    // bend of a ventilation model an anonymous proxy - 792 on one model of
+    // 22 783.
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_DuctFitting",
+        element_type: BimElementType::DuctFitting,
+    },
     SourceMapping {
         class_name: None,
         category_name: "OST_PlumbingFixtures",
@@ -107,11 +139,79 @@ const SOURCE_MAPPINGS: &[SourceMapping] = &[
         category_name: "OST_CableTrayFitting",
         element_type: BimElementType::CableCarrierFitting,
     },
+    // A conduit fitting is the cable tray fitting's sibling: both are the
+    // fitting of a cable carrier, and IFC has the one entity for them. The
+    // row above carried only one of the two, so on an electrical model every
+    // conduit bend arrived as a proxy - 1 787 of them over three.
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_ConduitFitting",
+        element_type: BimElementType::CableCarrierFitting,
+    },
+    // The one electrical category IFC names outright. `IfcLightFixture` is
+    // defined as a lighting fixture and nothing else, so the pairing is the
+    // name rather than a reading of it.
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_LightingFixtures",
+        element_type: BimElementType::LightFixture,
+    },
     // The category names below identify the discipline but not the device, so
     // they resolve to the IFC supertype instead of guessing a leaf entity.
     SourceMapping {
         class_name: None,
         category_name: "OST_ElectricalEquipment",
+        element_type: BimElementType::DistributionElement,
+    },
+    // The two categories an electrical model is mostly made of. Both are
+    // certainly distribution elements and neither names the device: a
+    // lighting device is a switch, a dimmer or a sensor, and an electrical
+    // fixture is a socket, a junction box or a floor box. IFC has a leaf for
+    // several of those - `IfcSwitchingDevice`, `IfcOutlet` - and no way to
+    // tell from the category which one a given instance is, so the supertype
+    // is recorded rather than a leaf guessed. Together they are 13 988 of the
+    // 22 169 elements of three electrical models, so what this decides is
+    // most of what such a model holds.
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_LightingDevices",
+        element_type: BimElementType::DistributionElement,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_ElectricalFixtures",
+        element_type: BimElementType::DistributionElement,
+    },
+    // Revit's other device categories, which say the same thing about the
+    // low-voltage systems that the two above say about power and lighting.
+    // They are here as a set rather than one at a time as a model turns one
+    // up: the statement each of them makes is the same, and a data device
+    // left as a proxy while a lighting device beside it is typed would be an
+    // accident of which model was looked at first. `OST_FireAlarmDevices` is
+    // not among them - IFC names that one, and it is an `IfcAlarm` above.
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_DataDevices",
+        element_type: BimElementType::DistributionElement,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_CommunicationDevices",
+        element_type: BimElementType::DistributionElement,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_SecurityDevices",
+        element_type: BimElementType::DistributionElement,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_NurseCallDevices",
+        element_type: BimElementType::DistributionElement,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_TelephoneDevices",
         element_type: BimElementType::DistributionElement,
     },
     SourceMapping {
@@ -257,11 +357,13 @@ pub fn ifc_entity_name(element_type: BimElementType) -> &'static str {
     match element_type {
         BimElementType::PipeSegment => "IFCPIPESEGMENT",
         BimElementType::PipeFitting => "IFCPIPEFITTING",
+        BimElementType::DuctFitting => "IFCDUCTFITTING",
         BimElementType::SanitaryTerminal => "IFCSANITARYTERMINAL",
         BimElementType::AirTerminal => "IFCAIRTERMINAL",
         BimElementType::FireSuppressionTerminal => "IFCFIRESUPPRESSIONTERMINAL",
         BimElementType::Alarm => "IFCALARM",
         BimElementType::CableCarrierFitting => "IFCCABLECARRIERFITTING",
+        BimElementType::LightFixture => "IFCLIGHTFIXTURE",
         BimElementType::DuctSegment => "IFCDUCTSEGMENT",
         BimElementType::CableCarrierSegment => "IFCCABLECARRIERSEGMENT",
         // The two distribution supertypes are instantiable but, unlike the
@@ -381,6 +483,115 @@ mod tests {
         }
     }
 
+    /// The categories a mechanical or electrical model is made of, which is
+    /// most of what either holds.
+    #[test]
+    fn maps_the_categories_a_services_model_is_made_of() {
+        for (category_name, expected) in [
+            ("OST_DuctFitting", BimElementType::DuctFitting),
+            ("OST_ConduitFitting", BimElementType::CableCarrierFitting),
+            ("OST_LightingFixtures", BimElementType::LightFixture),
+            // A device category names a discipline and not a device, so it
+            // resolves to the supertype. Every one of Revit's reads alike.
+            ("OST_LightingDevices", BimElementType::DistributionElement),
+            (
+                "OST_ElectricalFixtures",
+                BimElementType::DistributionElement,
+            ),
+            ("OST_DataDevices", BimElementType::DistributionElement),
+            (
+                "OST_CommunicationDevices",
+                BimElementType::DistributionElement,
+            ),
+            ("OST_SecurityDevices", BimElementType::DistributionElement),
+            ("OST_NurseCallDevices", BimElementType::DistributionElement),
+            ("OST_TelephoneDevices", BimElementType::DistributionElement),
+            // Except the one IFC names, which keeps its own entity rather
+            // than falling in with the supertype above.
+            ("OST_FireAlarmDevices", BimElementType::Alarm),
+        ] {
+            assert_eq!(
+                element_type_for_source(Some("FamilyInstance"), Some(category_name)),
+                expected,
+                "{category_name}"
+            );
+        }
+    }
+
+    /// A run of a building system states no category of its own on most of
+    /// the records that carry one, so requiring a category loses most of a
+    /// mechanical or electrical model: 5 432 pipe runs and 750 duct runs on
+    /// one ventilation model of 22 783 elements, 1 355 conduit runs on one
+    /// electrical model of 12 627. The class says what the run is on its own.
+    #[test]
+    fn types_a_building_system_run_from_its_class_alone() {
+        for (class_name, expected) in [
+            ("RbsPipeCurve", BimElementType::PipeSegment),
+            ("RbsFlexPipeCurve", BimElementType::PipeSegment),
+            ("RbsDuctCurve", BimElementType::DuctSegment),
+            ("RbsFlexDuctCurve", BimElementType::DuctSegment),
+            ("RbsConduitCurve", BimElementType::CableCarrierSegment),
+            ("CableTray", BimElementType::CableCarrierSegment),
+        ] {
+            assert_eq!(element_type_for_source(Some(class_name), None), expected);
+            // And the class agrees with the row it mirrors, which is what
+            // makes it no new claim: the pair says the same as the class.
+            let category = match expected {
+                BimElementType::PipeSegment if class_name.contains("Flex") => "OST_FlexPipeCurves",
+                BimElementType::PipeSegment => "OST_PipeCurves",
+                BimElementType::DuctSegment if class_name.contains("Flex") => "OST_FlexDuctCurves",
+                BimElementType::DuctSegment => "OST_DuctCurves",
+                _ if class_name == "CableTray" => "OST_CableTray",
+                _ => "OST_Conduit",
+            };
+            assert_eq!(
+                element_type_for_source(Some(class_name), Some(category)),
+                expected
+            );
+        }
+        // A run's class is not a licence to type anything else: an insulation
+        // record is its own class and stays unread rather than being called
+        // the run it wraps.
+        assert_eq!(
+            element_type_for_source(Some("RbsPipeInsulation"), None),
+            BimElementType::Unknown
+        );
+    }
+
+    /// Every electrical category IFC has an entity for gets one, and the two
+    /// that name a discipline rather than a device get the supertype.
+    #[test]
+    fn writes_the_electrical_entities_ifc_names() {
+        for (element_type, entity) in [
+            (BimElementType::LightFixture, "IFCLIGHTFIXTURE"),
+            (
+                BimElementType::CableCarrierSegment,
+                "IFCCABLECARRIERSEGMENT",
+            ),
+            (
+                BimElementType::CableCarrierFitting,
+                "IFCCABLECARRIERFITTING",
+            ),
+            (BimElementType::DuctFitting, "IFCDUCTFITTING"),
+            (
+                BimElementType::DistributionElement,
+                "IFCDISTRIBUTIONELEMENT",
+            ),
+        ] {
+            assert_eq!(ifc_entity_name(element_type), entity);
+        }
+        // A category nothing in the table names is still a proxy: the point
+        // of the rows above is the ones that are named, not a rule that
+        // guesses at the rest.
+        assert_eq!(
+            ifc_entity_name(element_type_for_source(
+                Some("FamilyInstance"),
+                Some("OST_SpecialityEquipment")
+            )),
+            "IFCBUILDINGELEMENTPROXY"
+        );
+    }
+
     #[test]
     fn types_an_architectural_system_family_from_its_class_alone() {
         // Verified against the IFC Revit exported from the same model: joined
@@ -492,9 +703,24 @@ mod tests {
                 BimElementType::Unknown
             );
         }
-        assert_eq!(
-            element_type_for_source(Some("RbsPipeCurve"), None),
-            BimElementType::Unknown
-        );
+        // A building system's run used to be here too: its class typed it
+        // only when its own record repeated the category. That was the
+        // conservative reading while no mechanical or electrical model had
+        // been looked at - and measured against three electrical models and
+        // one ventilation model, it left most of each of them untyped, since
+        // most such records declare no category at all. The class alone is
+        // what types them now; see
+        // `types_a_building_system_run_from_its_class_alone`.
+        //
+        // What stays refused is a class the table does not name. An
+        // insulation record wraps a run and is not one, and nothing types it
+        // from the run it sits on.
+        for class_name in ["RbsPipeInsulation", "RbsDuctInsulation", "CableTrayFitting"] {
+            assert_eq!(
+                element_type_for_source(Some(class_name), None),
+                BimElementType::Unknown,
+                "{class_name}"
+            );
+        }
     }
 }

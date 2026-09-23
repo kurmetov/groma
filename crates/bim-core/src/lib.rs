@@ -309,7 +309,14 @@ pub enum BimElementType {
     AirTerminal,
     FireSuppressionTerminal,
     Alarm,
+    /// A duct fitting: the bend, tee or reducer of a duct run, as
+    /// [`Self::PipeFitting`] is of a pipe run.
+    DuctFitting,
     CableCarrierFitting,
+    /// A luminaire. The one electrical category IFC names outright, against
+    /// the devices and fixtures around it that it does not - see
+    /// [`Self::DistributionElement`].
+    LightFixture,
     /// A run of a building system, named by the category its own type
     /// declares: a pipe, a duct, or a conduit or cable tray carrying cable.
     /// No reference export measures these - the corpus has none for a plumbing
