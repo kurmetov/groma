@@ -441,6 +441,7 @@ fn kind_name(kind: BimElementType) -> &'static str {
         BimElementType::PipeSegment => "PipeSegment",
         BimElementType::PipeFitting => "PipeFitting",
         BimElementType::DuctFitting => "DuctFitting",
+        BimElementType::Insulation => "Insulation",
         BimElementType::SanitaryTerminal => "SanitaryTerminal",
         BimElementType::AirTerminal => "AirTerminal",
         BimElementType::FireSuppressionTerminal => "FireSuppressionTerminal",

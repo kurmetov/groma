@@ -47,6 +47,12 @@ const CLASS_MAPPINGS: &[(&str, BimElementType)] = &[
     ("RbsFlexDuctCurve", BimElementType::DuctSegment),
     ("RbsConduitCurve", BimElementType::CableCarrierSegment),
     ("CableTray", BimElementType::CableCarrierSegment),
+    // The insulation that follows a run, which declares a category no more
+    // often than the run does: on one ventilation model 6 331 of its 6 331
+    // `RbsPipeInsulation` records state none, and 180 of 1 430
+    // `RbsDuctInsulation` records.
+    ("RbsPipeInsulation", BimElementType::Insulation),
+    ("RbsDuctInsulation", BimElementType::Insulation),
     ("SWall", BimElementType::Wall),
     ("Floor", BimElementType::Slab),
     // A stair landing is a slab in IFC, which is what Revit emits for it.
@@ -129,6 +135,23 @@ const SOURCE_MAPPINGS: &[SourceMapping] = &[
         class_name: None,
         category_name: "OST_DuctFitting",
         element_type: BimElementType::DuctFitting,
+    },
+    // The insulation wrapping a run. IFC has no entity for it and does not
+    // need one: a covering is the thing that clads another, and `INSULATION`
+    // is one of the kinds `IfcCovering` declares - which is how Revit's own
+    // exporter writes it too. No reference export measures the pairing here,
+    // the corpus having none for a mechanical model; what stands behind it is
+    // that the schema names this kind and the source names this category, and
+    // the two say the same thing.
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_PipeInsulations",
+        element_type: BimElementType::Insulation,
+    },
+    SourceMapping {
+        class_name: None,
+        category_name: "OST_DuctInsulations",
+        element_type: BimElementType::Insulation,
     },
     SourceMapping {
         class_name: None,
@@ -337,6 +360,27 @@ pub fn element_type_for_source(
         .map_or(BimElementType::Unknown, |mapping| mapping.element_type)
 }
 
+/// The `PredefinedType` an element type fixes, where it fixes one.
+///
+/// Almost none do: an entity's own kind is left at the `NOTDEFINED` its
+/// schema declares, because the source says nothing about which kind of pipe
+/// segment or which kind of door a thing is. Insulation is the exception, and
+/// it is one because the entity alone does not carry the reading:
+/// `IfcCovering` says something clads something else, and only the kind says
+/// what sort of cladding. A covering of unstated kind would lose exactly what
+/// the source stated.
+///
+/// The value is a member of the entity's own enumeration - see
+/// `the_predefined_types_this_names_are_the_schema_members` in the IFC writer,
+/// which checks that against the generated schema table.
+#[must_use]
+pub fn ifc_predefined_type(element_type: BimElementType) -> Option<&'static str> {
+    match element_type {
+        BimElementType::Insulation => Some("INSULATION"),
+        _ => None,
+    }
+}
+
 /// The element's own type where it has one, and what its source vocabulary
 /// says otherwise.
 ///
@@ -371,6 +415,7 @@ pub fn ifc_entity_name(element_type: BimElementType) -> &'static str {
         BimElementType::PipeSegment => "IFCPIPESEGMENT",
         BimElementType::PipeFitting => "IFCPIPEFITTING",
         BimElementType::DuctFitting => "IFCDUCTFITTING",
+        BimElementType::Insulation => "IFCCOVERING",
         BimElementType::SanitaryTerminal => "IFCSANITARYTERMINAL",
         BimElementType::AirTerminal => "IFCAIRTERMINAL",
         BimElementType::FireSuppressionTerminal => "IFCFIRESUPPRESSIONTERMINAL",
@@ -545,6 +590,8 @@ mod tests {
             ("RbsFlexDuctCurve", BimElementType::DuctSegment),
             ("RbsConduitCurve", BimElementType::CableCarrierSegment),
             ("CableTray", BimElementType::CableCarrierSegment),
+            ("RbsPipeInsulation", BimElementType::Insulation),
+            ("RbsDuctInsulation", BimElementType::Insulation),
         ] {
             assert_eq!(element_type_for_source(Some(class_name), None), expected);
             // And the class agrees with the row it mirrors, which is what
@@ -554,6 +601,8 @@ mod tests {
                 BimElementType::PipeSegment => "OST_PipeCurves",
                 BimElementType::DuctSegment if class_name.contains("Flex") => "OST_FlexDuctCurves",
                 BimElementType::DuctSegment => "OST_DuctCurves",
+                BimElementType::Insulation if class_name.contains("Pipe") => "OST_PipeInsulations",
+                BimElementType::Insulation => "OST_DuctInsulations",
                 _ if class_name == "CableTray" => "OST_CableTray",
                 _ => "OST_Conduit",
             };
@@ -562,13 +611,39 @@ mod tests {
                 expected
             );
         }
-        // A run's class is not a licence to type anything else: an insulation
-        // record is its own class and stays unread rather than being called
-        // the run it wraps.
+        // A run's class is not a licence to type anything else: the lining of
+        // a duct is neither the duct nor its insulation, and stays unread.
         assert_eq!(
-            element_type_for_source(Some("RbsPipeInsulation"), None),
+            element_type_for_source(Some("RbsDuctLining"), None),
             BimElementType::Unknown
         );
+    }
+
+    /// Insulation is an `IfcCovering`, and a covering says what it is only
+    /// through its kind: without `INSULATION` the file would state that a run
+    /// is clad in something unspecified.
+    #[test]
+    fn insulation_is_a_covering_of_a_stated_kind() {
+        for (class_name, category_name) in [
+            (Some("RbsPipeInsulation"), None),
+            (Some("RbsDuctInsulation"), None),
+            (Some("FamilyInstance"), Some("OST_PipeInsulations")),
+            (Some("FamilyInstance"), Some("OST_DuctInsulations")),
+        ] {
+            let element_type = element_type_for_source(class_name, category_name);
+            assert_eq!(element_type, BimElementType::Insulation, "{class_name:?}");
+            assert_eq!(ifc_entity_name(element_type), "IFCCOVERING");
+            assert_eq!(ifc_predefined_type(element_type), Some("INSULATION"));
+        }
+        // And it is the only type that fixes one: everything else leaves the
+        // entity's own `NOTDEFINED` standing, because the source says nothing
+        // about which kind of pipe segment or which kind of door a thing is.
+        let fixed: Vec<BimElementType> = BimElementType::ALL
+            .iter()
+            .copied()
+            .filter(|element_type| ifc_predefined_type(*element_type).is_some())
+            .collect();
+        assert_eq!(fixed, vec![BimElementType::Insulation]);
     }
 
     /// Every electrical category IFC has an entity for gets one, and the two
@@ -586,6 +661,7 @@ mod tests {
                 "IFCCABLECARRIERFITTING",
             ),
             (BimElementType::DuctFitting, "IFCDUCTFITTING"),
+            (BimElementType::Insulation, "IFCCOVERING"),
             (
                 BimElementType::DistributionElement,
                 "IFCDISTRIBUTIONELEMENT",
@@ -736,10 +812,10 @@ mod tests {
         // what types them now; see
         // `types_a_building_system_run_from_its_class_alone`.
         //
-        // What stays refused is a class the table does not name. An
-        // insulation record wraps a run and is not one, and nothing types it
-        // from the run it sits on.
-        for class_name in ["RbsPipeInsulation", "RbsDuctInsulation", "CableTrayFitting"] {
+        // What stays refused is a class the table does not name. A duct's
+        // lining is not the duct, nor the insulation wrapped round its
+        // outside, and nothing types it from either.
+        for class_name in ["RbsDuctLining", "CableTrayFitting"] {
             assert_eq!(
                 element_type_for_source(Some(class_name), None),
                 BimElementType::Unknown,

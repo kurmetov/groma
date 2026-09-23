@@ -312,6 +312,15 @@ pub enum BimElementType {
     /// A duct fitting: the bend, tee or reducer of a duct run, as
     /// [`Self::PipeFitting`] is of a pipe run.
     DuctFitting,
+    /// The insulation wrapping a run of a building system.
+    ///
+    /// IFC has no entity of its own for it: a covering is the thing that
+    /// clads another, and which kind of cladding it is, is said by the
+    /// covering's own `PredefinedType`. So this is an `IfcCovering` whose kind
+    /// is `INSULATION` - the one element type here that fixes a predefined
+    /// type rather than leaving the entity's `NOTDEFINED`, because without it
+    /// the file would say a run is wrapped in something unspecified.
+    Insulation,
     CableCarrierFitting,
     /// A luminaire. The one electrical category IFC names outright, against
     /// the devices and fixtures around it that it does not - see
@@ -369,6 +378,42 @@ pub enum BimElementType {
 }
 
 impl BimElementType {
+    /// Every type there is, so that a table keyed on them can be checked to
+    /// be total rather than checked against a list someone remembered to
+    /// extend. See `every_type_is_listed`, which is what keeps this in step
+    /// with the enum.
+    pub const ALL: &'static [Self] = &[
+        Self::Unknown,
+        Self::PipeSegment,
+        Self::PipeFitting,
+        Self::SanitaryTerminal,
+        Self::AirTerminal,
+        Self::FireSuppressionTerminal,
+        Self::Alarm,
+        Self::DuctFitting,
+        Self::Insulation,
+        Self::CableCarrierFitting,
+        Self::LightFixture,
+        Self::DuctSegment,
+        Self::CableCarrierSegment,
+        Self::DistributionElement,
+        Self::DistributionFlowElement,
+        Self::Wall,
+        Self::Slab,
+        Self::Roof,
+        Self::Stair,
+        Self::StairFlight,
+        Self::Railing,
+        Self::Column,
+        Self::Member,
+        Self::Plate,
+        Self::Window,
+        Self::Door,
+        Self::Furniture,
+        Self::CurtainWall,
+        Self::Space,
+    ];
+
     /// Whether this type belongs to the spatial structure - a place the model
     /// is divided into - rather than to the elements the structure holds.
     #[must_use]
@@ -1676,5 +1721,53 @@ mod tests {
             unit: Some(BimUnit::new("autodesk.unit.unit:general-1.0.1", "General")),
         };
         assert_ne!(unknown, unitless);
+    }
+
+    /// [`BimElementType::ALL`] is the list every table keyed on the enum is
+    /// checked against, so it has to hold every variant. The match below is
+    /// exhaustive: a variant added to the enum and not to `ALL` stops this
+    /// compiling rather than quietly leaving a table unchecked.
+    #[test]
+    fn every_type_is_listed() {
+        for element_type in BimElementType::ALL {
+            match element_type {
+                BimElementType::Unknown
+                | BimElementType::PipeSegment
+                | BimElementType::PipeFitting
+                | BimElementType::SanitaryTerminal
+                | BimElementType::AirTerminal
+                | BimElementType::FireSuppressionTerminal
+                | BimElementType::Alarm
+                | BimElementType::DuctFitting
+                | BimElementType::Insulation
+                | BimElementType::CableCarrierFitting
+                | BimElementType::LightFixture
+                | BimElementType::DuctSegment
+                | BimElementType::CableCarrierSegment
+                | BimElementType::DistributionElement
+                | BimElementType::DistributionFlowElement
+                | BimElementType::Wall
+                | BimElementType::Slab
+                | BimElementType::Roof
+                | BimElementType::Stair
+                | BimElementType::StairFlight
+                | BimElementType::Railing
+                | BimElementType::Column
+                | BimElementType::Member
+                | BimElementType::Plate
+                | BimElementType::Window
+                | BimElementType::Door
+                | BimElementType::Furniture
+                | BimElementType::CurtainWall
+                | BimElementType::Space => {}
+            }
+        }
+        let mut seen = BimElementType::ALL.to_vec();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            BimElementType::ALL.len(),
+            "a type is listed twice"
+        );
     }
 }

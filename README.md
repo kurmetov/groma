@@ -327,8 +327,8 @@ mechanical or electrical one. What stands behind it is how much the category
 requirement was costing: most such records declare none. Measured over nine
 electrical models of 63 801 elements, the share reaching IFC as an untyped
 proxy falls from 87% to 1%, and on one ventilation model of 22 783 from 64% to
-34%; not one element gains or loses geometry, and the triangle counts are
-identical on every model.
+34% - and to 0% once its insulation is typed, below; not one element gains or
+loses geometry, and the triangle counts are identical on every model.
 
 Two electrical categories resolve to `IfcDistributionElement` rather than to a
 leaf entity. A lighting device is a switch, a dimmer or a sensor and an
@@ -391,11 +391,21 @@ alone: nine elements of one family, in a `ReferenceView` export, where the
 disagreement is Revit declining to pick a leaf rather than picking a different
 one - and the category does name this leaf.
 
-What is left untyped on a mechanical model is the insulation wrapping a run -
-`RbsPipeInsulation` and `RbsDuctInsulation`, 7 761 of that one model's
-elements. Revit exports those as `IfcCovering` with an `INSULATION` kind;
-nothing here has measured that pairing, so they stay proxies rather than being
-named on the strength of it. Verified straight pipes receive an
+The insulation wrapping a run is an `IfcCovering` whose `PredefinedType` is
+`INSULATION`. IFC has no entity of its own for it and needs none: a covering
+is the thing that clads another, and which sort of cladding it is, is said by
+the kind. That makes it the one element type here that fixes a predefined type
+rather than leaving the entity's own `NOTDEFINED` - a covering of unstated
+kind would lose exactly what the source stated - and the type entity behind it
+says the same, so a reader taking the kind from either gets it. No reference
+export measures the pairing, the corpus having none for a mechanical model;
+what stands behind it is that the schema names this kind and the source names
+this category. On the ventilation model that is 7 729 coverings, and the share
+of it reaching IFC as an untyped proxy falls from 34% to 0%: 39 elements of
+22 783, none of them a run or its insulation.
+
+The lining inside a duct is left alone. It is neither the duct nor the
+insulation wrapped round its outside, and nothing types it from either. Verified straight pipes receive an
 `IfcPolyline` axis and `IfcSweptDiskSolid` body. Pipe fittings with one
 unambiguous straight `PipeFittingCenterLine` receive an `IfcPolyline` axis but
 no invented body. Bounds-verified, right-handed `GInstance` transforms become

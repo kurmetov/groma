@@ -16,7 +16,7 @@ pub use class_mapping::{ClassMapping, ClassMappingError, Mapped};
 // Both tables live in `bim-convert`, which the viewer scene and the RVT
 // reader also ask. Re-exported so that this crate's published surface - the
 // one mapping `export-ifc` applies - is unchanged by where it is kept.
-pub use bim_convert::{element_type_for_source, ifc_entity_name};
+pub use bim_convert::{element_type_for_source, ifc_entity_name, ifc_predefined_type};
 pub use metadata::{MetadataError, MetadataOptions, metadata_ifc, metadata_ifc_reported};
 pub use settings::{
     ExportSettings, LengthUnit, ProjectSettings, PropertySetSettings, SettingsError, ViewDefinition,

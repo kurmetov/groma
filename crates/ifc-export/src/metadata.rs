@@ -5,7 +5,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use bim_convert::{ifc_entity_name, resolved_element_type};
+use bim_convert::{ifc_entity_name, ifc_predefined_type, resolved_element_type};
 use bim_core::{
     BimBoundingBox, BimBrep, BimBrepCurve, BimBrepEdge, BimBrepFace, BimBrepProfile, BimBrepRuling,
     BimBrepSurface, BimDocumentIdentity, BimElement, BimElementId, BimExternalId, BimGeometry,
@@ -1004,7 +1004,7 @@ impl ElementTables {
         let type_carries_properties = context.options.settings.types
             && self
                 .types
-                .associate(file, element, entity, written_as.name, body_map, context);
+                .associate(file, element, entity, &written_as, body_map, context);
         push_property_set(file, element, entity, context, type_carries_properties);
         if context.options.settings.property_sets.ifc_common {
             self.common_sets
@@ -1382,10 +1382,16 @@ fn resolve_entity<'a>(
             name: name.as_str(),
             predefined_type: predefined_type.as_deref(),
         }),
-        None => Some(ResolvedEntity {
-            name: ifc_entity_name(resolved_element_type(element)),
-            predefined_type: None,
-        }),
+        None => {
+            let element_type = resolved_element_type(element);
+            Some(ResolvedEntity {
+                name: ifc_entity_name(element_type),
+                // Almost always nothing, and the entity's own `NOTDEFINED`
+                // stands. See `ifc_predefined_type` for the one reading that
+                // the entity alone would not carry.
+                predefined_type: ifc_predefined_type(element_type),
+            })
+        }
     }
 }
 
@@ -1494,6 +1500,11 @@ struct TypeEntry {
     body_maps: Vec<EntityRef>,
     /// Whether the type was written holding its own parameters.
     carries_properties: bool,
+    /// The kind its products are written with, where the element type fixes
+    /// one. A type saying `NOTDEFINED` about products that all say
+    /// `INSULATION` would leave a reader taking the kind from the type with
+    /// the one thing the source did state about them missing.
+    predefined_type: Option<String>,
 }
 
 #[derive(Default)]
@@ -1514,10 +1525,14 @@ impl TypeLibrary {
         file: &mut StepFile,
         element: &BimElement,
         product: EntityRef,
-        product_entity: &str,
+        written_as: &ResolvedEntity<'_>,
         body_map: Option<EntityRef>,
         context: WriteContext<'_>,
     ) -> bool {
+        let ResolvedEntity {
+            name: product_entity,
+            predefined_type,
+        } = *written_as;
         // A space names no family type - Revit has none to declare - but
         // Revit's own export still gives every space its own `IfcSpaceType`,
         // named after the room rather than shared, and that alone is over a
@@ -1568,6 +1583,7 @@ impl TypeLibrary {
                     products: Vec::new(),
                     body_maps: Vec::new(),
                     carries_properties: properties.is_some(),
+                    predefined_type: predefined_type.map(str::to_owned),
                 })
             }
         };
@@ -1614,6 +1630,9 @@ impl TypeLibrary {
                 omitted(),
             ];
             attributes.extend(declared_attributes(entry.table, entity));
+            if let Some(kind) = &entry.predefined_type {
+                set_predefined_type(entry.table, entity, &mut attributes, kind);
+            }
             let written = file.push(entity, attributes);
             file.push(
                 "IFCRELDEFINESBYTYPE",
@@ -6267,32 +6286,13 @@ mod tests {
     /// attributes itself.
     #[test]
     fn every_entity_this_exporter_writes_is_in_the_schema_table() {
-        for element_type in [
-            BimElementType::PipeSegment,
-            BimElementType::PipeFitting,
-            BimElementType::SanitaryTerminal,
-            BimElementType::AirTerminal,
-            BimElementType::FireSuppressionTerminal,
-            BimElementType::Alarm,
-            BimElementType::CableCarrierFitting,
-            BimElementType::DuctSegment,
-            BimElementType::CableCarrierSegment,
-            BimElementType::DistributionElement,
-            BimElementType::DistributionFlowElement,
-            BimElementType::Wall,
-            BimElementType::Slab,
-            BimElementType::Roof,
-            BimElementType::Stair,
-            BimElementType::StairFlight,
-            BimElementType::CurtainWall,
-            BimElementType::Railing,
-            BimElementType::Column,
-            BimElementType::Member,
-            BimElementType::Plate,
-            BimElementType::Window,
-            BimElementType::Door,
-            BimElementType::Unknown,
-        ] {
+        // Every type there is, rather than a list kept here by hand: one that
+        // was kept by hand had fallen three types behind the enum, and a type
+        // missing from it is exactly the case this is meant to catch.
+        for element_type in BimElementType::ALL.iter().copied() {
+            if element_type == BimElementType::Space {
+                continue;
+            }
             let name = ifc_entity_name(element_type);
             assert!(
                 IFC4_ELEMENTS.iter().any(|entity| entity.name == name),
@@ -6308,6 +6308,33 @@ mod tests {
         assert_eq!(ifc_entity_name(BimElementType::Space), "IFCSPACE");
         let (space_type, table) = type_entity_for("IFCSPACE").expect("a space has a type entity");
         assert!(table.iter().any(|entity| entity.name == space_type));
+    }
+
+    /// A kind this exporter fixes has to be one the entity declares, on the
+    /// element and on its type alike. The mapping table's own values are
+    /// checked when it is read; these are checked here, against the same
+    /// generated schema.
+    #[test]
+    fn the_predefined_types_this_names_are_the_schema_members() {
+        for element_type in BimElementType::ALL.iter().copied() {
+            let Some(kind) = ifc_predefined_type(element_type) else {
+                continue;
+            };
+            let name = ifc_entity_name(element_type);
+            for (entity, table) in
+                std::iter::once((name, IFC4_ELEMENTS)).chain(type_entity_for(name))
+            {
+                let declared = table
+                    .iter()
+                    .find(|candidate| candidate.name == entity)
+                    .and_then(|candidate| candidate.predefined_type)
+                    .unwrap_or_else(|| panic!("{entity} declares no PredefinedType"));
+                assert!(
+                    declared.members.contains(&kind),
+                    "{kind} is not a member of {entity}'s own enumeration"
+                );
+            }
+        }
     }
 
     /// IFC's own set, written once per type and related to every element of
