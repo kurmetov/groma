@@ -309,12 +309,93 @@ apart from one found by scanning.
 `export-ifc` writes an IFC4 Design Transfer View file with
 `IfcProject -> IfcSite -> IfcBuilding -> IfcBuildingStorey`, metric units,
 deterministic 22-character GlobalIds, and typed elements. The current
-conservative mapping covers pipe segments/fittings and sanitary/air/fire-
-suppression terminals by category, and the architectural system families by
-class alone - `IfcWall`, `IfcSlab`, `IfcRoof`, `IfcStair`, `IfcStairFlight`.
+conservative mapping covers pipe and duct segments/fittings, cable carrier
+segments/fittings and sanitary/air/fire-suppression terminals by category, and
+the architectural system families by class alone - `IfcWall`, `IfcSlab`,
+`IfcRoof`, `IfcStair`, `IfcStairFlight`.
 A `RoomElem` becomes an `IfcSpace` named by its room number and called by its
 room name, decomposed by the storey it sits on rather than contained in it.
-Unknown class/category pairs remain `IfcBuildingElementProxy` instances. Verified straight pipes receive an
+Unknown class/category pairs remain `IfcBuildingElementProxy` instances.
+
+A building system's run is typed by its class where its own record declares no
+category. `RbsPipeCurve`, `RbsDuctCurve`, `RbsConduitCurve`, their flexible
+siblings and `CableTray` each pair with one element type by category already,
+and the class says the same thing one record narrower. That is a weaker
+standing than the architectural classes beside them, which are measured
+against Revit's own export of the same model; no reference export exists for a
+mechanical or electrical one. What stands behind it is how much the category
+requirement was costing: most such records declare none. Measured over nine
+electrical models of 63 801 elements, the share reaching IFC as an untyped
+proxy falls from 87% to 1%, and on one ventilation model of 22 783 from 64% to
+34%; not one element gains or loses geometry, and the triangle counts are
+identical on every model.
+
+Two electrical categories resolve to `IfcDistributionElement` rather than to a
+leaf entity. A lighting device is a switch, a dimmer or a sensor and an
+electrical fixture is a socket, a junction box or a floor box; IFC names
+several of those - `IfcSwitchingDevice`, `IfcOutlet` - and the category does
+not say which one an instance is, so the supertype is recorded rather than a
+leaf guessed. Revit's other device categories - data, communication, security,
+nurse call, telephone - say the same thing about the low-voltage systems and
+are read the same way. `OST_FireAlarmDevices` is not among them: IFC names
+that one, and it stays an `IfcAlarm`.
+
+One row was measured wrong and is corrected. Furniture used to be written as
+`IfcFurnishingElement`, the supertype, on the strength of Revit's published
+category table rather than of a join - AR S1's export drops the category, so
+there was nothing to join against. A second reference export that keeps it
+settles it: joined on the Revit element id over a 1 952-element match, Revit
+writes `IfcFurniture` for all 289 of its furnishings and the supertype for
+none. Agreement with that file's typing goes from 87.4% to 99.5% with the row
+corrected. The scene calls the kind `Furniture` rather than `FurnishingElement`
+to match.
+
+The same join measures what the export leaves out, which is a different
+question from what it types wrongly. Of that file's 2 215 products, 263 had no
+counterpart in ours. They are three things and only one of them was a defect.
+
+160 are elements this decode recovered no body for, which the default export
+holds back on purpose - a box is what is known about where a thing is, not
+what the thing is. `--elements-without-a-body` writes them, and with it the
+match goes from 1 952 to 2 112. That is also why a scene and an IFC of one
+model do not hold the same elements: the scene draws a verified extent, the
+IFC does not write one.
+
+96 are one class of record, `CurveElem`, which Revit's export writes in two
+guises. 84 it writes as `IfcBuildingElementProxy`, named `Линии модели:<id>` -
+model lines, drawn in space and carrying no volume. The other 12 it writes as
+`IfcOpeningElement`: the sketch of a shaft cut through a slab.
+
+Those 12 are not holes this export loses. Revit states such a hole twice, as a
+void subtracted from the slab and as the slab itself; this decode reads the
+slab's boundary and finds the hole already cut into it. Taking the first of
+them: Revit voids slab `15183511` with it, we write that slab under the same
+`GlobalId`, and its decoded body carries 14 faces whose top and bottom hold
+three loops each - an outer boundary and two inner ones. The geometry agrees;
+only the bookkeeping differs. Openings themselves are written where the source
+states one against the element it cuts, and on this model that is 960 of them
+against the reference's 371.
+
+The remaining 7 were the defect: railings drawn as a system family. The
+loadable kind reaches `IfcRailing` through its family's category, and the
+system kind declares no category at all, so nothing admitted it - `BaseRailing`
+was missing from both the building-element classes and the class table. With
+it there, all 7 are written and the match reaches 2 119 of 2 215. The class
+costs precision to buy that recall: the file holds 14 such records, Revit
+exports 7, and no field this decode recovers separates them. All 14 are
+bodiless, so only a scene and `--elements-without-a-body` pay it.
+
+The nine elements still disagreeing there are plumbing fixtures we write as
+`IfcSanitaryTerminal` and that file writes as `IfcFlowTerminal`. It is left
+alone: nine elements of one family, in a `ReferenceView` export, where the
+disagreement is Revit declining to pick a leaf rather than picking a different
+one - and the category does name this leaf.
+
+What is left untyped on a mechanical model is the insulation wrapping a run -
+`RbsPipeInsulation` and `RbsDuctInsulation`, 7 761 of that one model's
+elements. Revit exports those as `IfcCovering` with an `INSULATION` kind;
+nothing here has measured that pairing, so they stay proxies rather than being
+named on the strength of it. Verified straight pipes receive an
 `IfcPolyline` axis and `IfcSweptDiskSolid` body. Pipe fittings with one
 unambiguous straight `PipeFittingCenterLine` receive an `IfcPolyline` axis but
 no invented body. Bounds-verified, right-handed `GInstance` transforms become

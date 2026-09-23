@@ -54,6 +54,22 @@ const CLASS_MAPPINGS: &[(&str, BimElementType)] = &[
     ("StairsRun", BimElementType::StairFlight),
     ("StairsElement", BimElementType::Stair),
     ("ProfileRoof", BimElementType::Roof),
+    // A railing drawn as a system family rather than placed as a loadable
+    // one. `OST_StairsRailing` below reaches the second kind through its
+    // family; this reaches the first, which declares no category at all, and
+    // which nothing else admitted - on a second reference export Revit writes
+    // `IfcRailing` for seven records of this class and we wrote nothing for
+    // any of them.
+    //
+    // It costs precision to buy that recall, and the cost is stated rather
+    // than left to be found: the same file has fourteen records of the class,
+    // Revit exports seven, and no field this decode recovers separates the
+    // two halves - none of the fourteen carries a level, a type, a host or a
+    // name. That is the trade the classes above it were accepted on as well,
+    // at 56.9% to 69.3% precision for 100% recall. Every one of the fourteen
+    // is bodiless, so the default export writes none of them and the cost is
+    // paid only by a scene and by `--elements-without-a-body`.
+    ("BaseRailing", BimElementType::Railing),
     // A room is not a building element, but it is established by its class in
     // the same way and against the same reference: Revit's export of AR S1
     // carries 553 `IfcSpace` and the decode yields 554 `RoomElem`, each with a
@@ -601,9 +617,20 @@ mod tests {
             ("StairsRun", BimElementType::StairFlight),
             ("StairsElement", BimElementType::Stair),
             ("ProfileRoof", BimElementType::Roof),
+            // Drawn as a system family, so it declares no category and the
+            // loadable railing's `OST_StairsRailing` never reaches it.
+            ("BaseRailing", BimElementType::Railing),
         ] {
             assert_eq!(element_type_for_source(Some(class_name), None), expected);
         }
+        // Both readings of a railing land on the one entity.
+        assert_eq!(
+            ifc_entity_name(element_type_for_source(Some("BaseRailing"), None)),
+            ifc_entity_name(element_type_for_source(
+                Some("FamilyInstance"),
+                Some("OST_StairsRailing")
+            ))
+        );
     }
 
     #[test]

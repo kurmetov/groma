@@ -2409,6 +2409,7 @@ fn is_building_element_class(class_name: &str) -> bool {
             | "StairsRun"
             | "StairsElement"
             | "ProfileRoof"
+            | "BaseRailing"
             | "FamilyInstance"
     )
 }
