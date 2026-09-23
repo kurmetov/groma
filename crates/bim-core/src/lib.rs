@@ -347,13 +347,18 @@ pub enum BimElementType {
     Plate,
     Window,
     Door,
-    /// Furniture. Unlike the loadable families above, no reference join fixes
-    /// this one: Revit's own export of AR S1 carries no furniture at all, its
-    /// export settings having dropped the category. What stands behind it is
-    /// Revit's own published category table, `data/importIFCClassMapping.txt`,
-    /// which pairs `IfcFurnishingElement` with the furniture category and is
-    /// the table Revit reads when it maps the two itself.
-    FurnishingElement,
+    /// Furniture, and measured like the loadable families above rather than
+    /// taken from Revit's published category table as it once was.
+    ///
+    /// That table, `data/importIFCClassMapping.txt`, pairs the category with
+    /// the supertype `IfcFurnishingElement`, and is what stood behind this
+    /// while the corpus had no export carrying furniture to join against: AR
+    /// S1's own export drops the category. One that does carry it settles it
+    /// the other way. Joined on the Revit element id over a 1 952-element
+    /// match, Revit writes `IfcFurniture` for all 289 of its furnishings and
+    /// the supertype for none, and the 237 of them we had matched disagreed
+    /// with us on every one.
+    Furniture,
     /// A wall whose type is a curtain-wall type: a framed assembly rather than
     /// a layered build-up.
     CurtainWall,

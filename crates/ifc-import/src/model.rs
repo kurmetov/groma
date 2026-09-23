@@ -671,7 +671,7 @@ pub fn element_type(entity_name: &str) -> BimElementType {
         "IFCCURTAINWALL" => BimElementType::CurtainWall,
         "IFCRAILING" => BimElementType::Railing,
         "IFCFURNISHINGELEMENT" | "IFCFURNITURE" | "IFCSYSTEMFURNITUREELEMENT" => {
-            BimElementType::FurnishingElement
+            BimElementType::Furniture
         }
         "IFCCOLUMN" => BimElementType::Column,
         "IFCMEMBER" => BimElementType::Member,

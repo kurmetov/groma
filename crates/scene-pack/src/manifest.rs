@@ -457,7 +457,7 @@ fn kind_name(kind: BimElementType) -> &'static str {
         BimElementType::Stair => "Stair",
         BimElementType::StairFlight => "StairFlight",
         BimElementType::Railing => "Railing",
-        BimElementType::FurnishingElement => "FurnishingElement",
+        BimElementType::Furniture => "Furniture",
         BimElementType::Column => "Column",
         BimElementType::Member => "Member",
         BimElementType::Plate => "Plate",
