@@ -140,6 +140,9 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
         let id = *id;
         let type_id = index.type_of.get(&id).copied();
         let element_id = identity(parsed, id, entity);
+        // Read before the element is built: the category it carries is stated
+        // by one of these rather than by the entity.
+        let own_properties = properties(parsed, &index, id, units);
         Some((
             id,
             read,
@@ -162,7 +165,7 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
                     .starts_with("IFCSPACE")
                     .then(|| text(entity.attribute(7)))
                     .flatten(),
-                category: None,
+                category: category(&own_properties),
                 level_id: index
                     .storey_of(id)
                     .and_then(|storey| level_of_storey.get(&storey).cloned()),
@@ -180,7 +183,7 @@ pub fn convert(parsed: &Parsed, options: &Options) -> Import {
                 host_id: None,
                 placement: world.map(placement),
                 geometry,
-                properties: properties(parsed, &index, id, units),
+                properties: own_properties,
                 type_properties: type_id
                     .map(|type_id| properties(parsed, &index, type_id, units))
                     .unwrap_or_default(),
@@ -943,11 +946,38 @@ fn material_layers(
     })
 }
 
-/// Kept so that a caller can name the category an element carries; IFC states
-/// none, and one is not invented here.
+/// The property this converter's own export states the source category in.
+const SOURCE_CATEGORY_PROPERTY: &str = "Revit Category";
+
+/// The source category an element's own properties state.
+///
+/// IFC has no category of its own, and none is invented here: what this reads
+/// is the one a converter wrote down. This converter's export puts the source
+/// category in a `Revit Category` property beside `Revit Element Id` and
+/// `Revit Class` - see `trusted_source_properties` in the RVT reader - so a
+/// model converted to IFC and read back keeps the category it was converted
+/// under instead of arriving with none. Revit's own export states no such
+/// property and nothing here infers one from a class name, so a file that
+/// does not carry the category still has none.
+///
+/// The property set the value sits in is deliberately not named. The same
+/// three properties have been written under `Rivet Properties`, `openRVT
+/// Properties` and `groma Properties` as this converter was renamed, and a
+/// file written by any of them says the same thing.
 #[must_use]
-pub fn category(_entity: &Entity) -> Option<BimCategory> {
-    None
+pub fn category(properties: &[BimProperty]) -> Option<BimCategory> {
+    properties
+        .iter()
+        .find(|property| property.name == SOURCE_CATEGORY_PROPERTY)
+        .and_then(|property| match &property.value {
+            // The name is all the export states. The built-in code it was
+            // read from is not written, so nothing is claimed about it here.
+            BimPropertyValue::Text(name) => Some(BimCategory {
+                id: None,
+                name: name.clone(),
+            }),
+            _ => None,
+        })
 }
 
 #[cfg(test)]
@@ -1131,5 +1161,60 @@ mod tests {
             1,
             "an unfilled void produced a host edge: {found:?}"
         );
+    }
+
+    /// Two proxies this converter's own export would have written: one whose
+    /// source stated a category, one whose source did not. The first is what
+    /// a converted model looks like on the way back in; the second is what
+    /// every IFC written by anything else looks like.
+    const CONVERTED: &str = "ISO-10303-21;\n\
+        HEADER;\n\
+        FILE_SCHEMA(('IFC4'));\n\
+        ENDSEC;\n\
+        DATA;\n\
+        #1=IFCCARTESIANPOINT((0.,0.,0.));\n\
+        #2=IFCAXIS2PLACEMENT3D(#1,$,$);\n\
+        #3=IFCLOCALPLACEMENT($,#2);\n\
+        #4=IFCCARTESIANPOINT((0.,0.));\n\
+        #5=IFCAXIS2PLACEMENT2D(#4,$);\n\
+        #6=IFCRECTANGLEPROFILEDEF(.AREA.,$,#5,2.,1.);\n\
+        #7=IFCDIRECTION((0.,0.,1.));\n\
+        #8=IFCEXTRUDEDAREASOLID(#6,#2,#7,3.);\n\
+        #9=IFCSHAPEREPRESENTATION($,'Body','SweptSolid',(#8));\n\
+        #10=IFCPRODUCTDEFINITIONSHAPE($,$,(#9));\n\
+        #11=IFCBUILDINGELEMENTPROXY('named',$,'Pipe',$,$,#3,#10,$,$);\n\
+        #12=IFCBUILDINGELEMENTPROXY('bare',$,'Other',$,$,#3,#10,$,$);\n\
+        #13=IFCPROPERTYSINGLEVALUE('Revit Element Id',$,IFCLABEL('12'),$);\n\
+        #14=IFCPROPERTYSINGLEVALUE('Revit Class',$,IFCLABEL('RbsPipeCurve'),$);\n\
+        #15=IFCPROPERTYSINGLEVALUE('Revit Category',$,IFCLABEL('OST_PipeCurves'),$);\n\
+        #16=IFCPROPERTYSET('p1',$,'groma Properties',$,(#13,#14,#15));\n\
+        #17=IFCRELDEFINESBYPROPERTIES('d1',$,$,$,(#11),#16);\n\
+        #18=IFCPROPERTYSET('p2',$,'groma Properties',$,(#13,#14));\n\
+        #19=IFCRELDEFINESBYPROPERTIES('d2',$,$,$,(#12),#18);\n\
+        ENDSEC;\n\
+        END-ISO-10303-21;\n";
+
+    /// The category a conversion wrote down survives the way back in. Without
+    /// it every element of an IFC-sourced model carries none, which is one
+    /// undifferentiated category for a whole model rather than the ten or
+    /// eleven the same model has when it is read from its `.rvt`.
+    #[test]
+    fn the_category_a_conversion_stated_is_read_back() {
+        let parsed = parse(CONVERTED.as_bytes()).unwrap();
+        let model = convert(&parsed, &Options::default()).model;
+        let category = |id: &str| {
+            model
+                .elements
+                .iter()
+                .find(|element| element.id.0 == id)
+                .and_then(|element| element.category.clone())
+        };
+        let stated = category("named").expect("the stated category is read");
+        assert_eq!(stated.name, "OST_PipeCurves");
+        // The built-in code behind the name is not written by the export, so
+        // nothing is claimed about it here.
+        assert_eq!(stated.id, None);
+        // And nothing is invented for an element whose file states none.
+        assert_eq!(category("bare"), None);
     }
 }
