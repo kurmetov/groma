@@ -282,6 +282,21 @@ const SOURCE_MAPPINGS: &[SourceMapping] = &[
     // which Revit exports as an `IfcBuildingElementProxy` for all 444 of them,
     // and `OST_GenericModel`, which it turns into an `IfcOpeningElement` - a
     // void, which cannot be written without the element it voids.
+    //
+    // That reading of `OST_GenericModel` is an architectural model's, and it
+    // does not travel. Over 40 electrical models of 229 936 elements the
+    // category is nearly the whole of what is left untyped - 12 203 of the
+    // 12 331, all of them in one project's seven files - and it is not a void
+    // there: 3 866 of one model's 3 867 carry a body, and they are named
+    // `коробка_потолочная`, `Выключатель одноклавишный`, `гофрированная_труба`.
+    // Junction boxes, switches and conduit, drawn in a generic family.
+    //
+    // No row is added for it on that evidence alone. The category really is
+    // where an architectural model puts its openings, so typing it outright
+    // would write a void as a product on every AR file this converts. What
+    // would separate the two is that an opening names the element it cuts and
+    // a switch names nothing, which is a claim to be measured against a Revit
+    // export of an electrical model rather than assumed here.
     SourceMapping {
         class_name: Some("FamilyInstance"),
         category_name: "OST_StairsRailing",

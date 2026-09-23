@@ -405,7 +405,19 @@ of it reaching IFC as an untyped proxy falls from 34% to 0%: 39 elements of
 22 783, none of them a run or its insulation.
 
 The lining inside a duct is left alone. It is neither the duct nor the
-insulation wrapped round its outside, and nothing types it from either. Verified straight pipes receive an
+insulation wrapped round its outside, and nothing types it from either.
+
+Run over 40 electrical models - every one of a corpus of 229 936 elements and
+35.4 million triangles - the conversion fails on none, warns on none, and
+leaves 5.4% of elements untyped. 34 of the 40 leave fewer than twenty each.
+The remainder is one category in one project's seven files: `OST_GenericModel`,
+12 203 of the 12 331. That category is deliberately untyped, and the reason is
+an architectural model's - Revit turns a generic model into an
+`IfcOpeningElement` there, and a void cannot be written without the element it
+voids. It is plainly not a void in these: 3 866 of one file's 3 867 carry a
+body, and they are junction boxes, switches and corrugated conduit drawn in a
+generic family. Separating the two readings needs a Revit export of an
+electrical model to measure against, which no corpus here has. Verified straight pipes receive an
 `IfcPolyline` axis and `IfcSweptDiskSolid` body. Pipe fittings with one
 unambiguous straight `PipeFittingCenterLine` receive an `IfcPolyline` axis but
 no invented body. Bounds-verified, right-handed `GInstance` transforms become
